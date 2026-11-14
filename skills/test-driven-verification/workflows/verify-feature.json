@@ -1,0 +1,101 @@
+{
+  "name": "verify-feature",
+  "description": "Run SDD/hygiene verification, ephemeral HTTP surface smoke probe, and 7-stage System Doctor with OODA reasoning recovery on failure.",
+  "inputs": {
+    "feature": "Verify active feature implementation against all SDD, hygiene, HTTP smoke, and unit test gates."
+  },
+  "nodes": [
+    {
+      "id": "sdd_and_hygiene",
+      "type": "tool",
+      "tier": "fast",
+      "tool": "sdd_manage",
+      "args": {
+        "action": "verify"
+      }
+    },
+    {
+      "id": "web_smoke_probe",
+      "type": "tool",
+      "tier": "fast",
+      "tool": "workflow_manage",
+      "args": {
+        "action": "http_smoke",
+        "module": "surfaces.web_server"
+      }
+    },
+    {
+      "id": "doctor_gate",
+      "type": "tool",
+      "tier": "fast",
+      "tool": "system_doctor",
+      "args": {
+        "run_tests": true
+      }
+    },
+    {
+      "id": "ooda_recover",
+      "type": "subagent",
+      "tier": "reasoning",
+      "skill": "ooda-troubleshooting",
+      "max_iters": 8,
+      "prompt": "Feature verification failed for: {{inputs.feature}}\n\nLatest Gate Output:\n{{last_output}}\n\nDiagnose root cause and fix all failing code, SDD, or test checks."
+    },
+    {
+      "id": "final_doctor",
+      "type": "tool",
+      "tier": "fast",
+      "tool": "system_doctor",
+      "args": {
+        "run_tests": true
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "sdd_and_hygiene",
+      "to": "web_smoke_probe",
+      "condition": "passed"
+    },
+    {
+      "from": "sdd_and_hygiene",
+      "to": "ooda_recover",
+      "condition": "failed"
+    },
+    {
+      "from": "web_smoke_probe",
+      "to": "doctor_gate",
+      "condition": "passed"
+    },
+    {
+      "from": "web_smoke_probe",
+      "to": "ooda_recover",
+      "condition": "failed"
+    },
+    {
+      "from": "doctor_gate",
+      "to": "COMPLETE",
+      "condition": "passed"
+    },
+    {
+      "from": "doctor_gate",
+      "to": "ooda_recover",
+      "condition": "failed"
+    },
+    {
+      "from": "ooda_recover",
+      "to": "final_doctor",
+      "condition": "always"
+    },
+    {
+      "from": "final_doctor",
+      "to": "COMPLETE",
+      "condition": "passed"
+    },
+    {
+      "from": "final_doctor",
+      "to": "ABORTED",
+      "condition": "failed"
+    }
+  ]
+}

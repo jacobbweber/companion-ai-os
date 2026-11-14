@@ -1,0 +1,47 @@
+# Python cache & virtual environments
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+*.pyc
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+.venv/
+venv/
+
+# Environment variables & Blind Credential Vault (keep .env.example tracked)
+.env
+secrets.env
+**/secrets.env
+
+# Isolated User Runtime Data (Generated automatically on first boot — NEVER commit)
+data/
+companion-data/
+MEMORY.md
+IDENTITY.md
+.companion_backups/
+memory/*.db
+memory/*.db-*
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Frontend dev dependencies & installer build outputs (keep surfaces/static/ tracked)
+node_modules/
+frontend/node_modules/
+frontend/.vite/
+frontend/dist/
+dist/
+build/
+*.exe
+
+# OS metadata
+.DS_Store
+Thumbs.db

@@ -1,0 +1,28 @@
+# Agentic AI Harness Architecture & Scaling Patterns
+
+## 1. The 3-Layer Capability Model (Tools vs. Skills vs. Harness — 44 Core Modules)
+- **L1 — Tools (`companion/tools.py`, `companion/os_tools.py`, `companion/harvest_tools.py`, `companion/tool_schemas.py`, `companion/grounding.py`)**: 26 deterministic, `(tool, action)` phase-gated and `R0..R3` risk-gated execution primitives routed through `ExecutionTarget` (`LocalWorkspaceTarget`), kept compact so tool schemas never bloat the LLM prompt.
+- **L2 — 3-Tier Progressive Disclosure Skills & Forge (`skills/<name>/` + `companion/skill_forge.py`)**:
+  - **Tier 1 (Top-K Relevance Index — `<10ms` in `companion/grounding.py`)**: `name` and `description` from `SKILL.md` frontmatter ranked deterministically for the active turn.
+  - **Tier 2 (`SKILL.md` Runbook — loaded on demand)**: Step-by-step procedural instructions and a map of the skill folder's bundled resources.
+  - **Tier 3 (`references/*.md`, `workflows/*.json`, `scripts/*.py` — 0 tokens until needed)**: Deep domain reference docs, reusable JSON DAG workflow recipes, and `--self-test`-verified pure-stdlib or PEP 723 `uv run` scripts promoted transactionally by `companion/skill_forge.py`.
+- **L3 — The A-Frame Harness (`companion/`)**:
+  - **Infrastructure (`config.py`, `telemetry.py`, `streaming.py`, `llm_wire.py`, `llm.py`)**: Multi-provider & multi-dialect (`openai_compat`, `anthropic_messages`, `gemini_native`) HTTP/SSE gateway, `ContextVar` live stream event bus, `ModelGate` swap mutex, `<think>`/`<tool_call>` normalization, LAN privacy lock, and Waterfall telemetry.
+  - **Domain (`checkpoints.py`, `safety.py`, `semantic_memory.py`, `memory_store.py`, `disciplines.py`, `grounding.py`, `archive_and_approvals.py`, `vault.py`, `model_registry.py`, `wiki_templates.py`, `wiki_engine.py`, `wiki_curation.py`, `wiki_maintenance.py`, `attachments.py`, `agile_boards.py`, `education_engine.py`, `hygiene.py`, `sdd.py`)**: Pluggable `WorkspaceContract` & `KnowledgePort`, Blind Credential Vault, Hot-Reload Multi-Provider LLM Registry & Capability Tier Matrix, Co-Owned 4-Folder Knowledge Wiki 3.1 (11 governed templates, `ontology` bridges & synonym consolidation, Multi-Turn Curation, Visual Diffs, Staleness Cadences & Reversible Lineage), Multimodal Chat Attachments, Universal Multi-Board Agile & Kanban Engine, Headless Socratic Education & SM-2 Mastery Engine, Cold Chat Archive & Approvals Queue, zero-swap hybrid semantic RRF engine, `<5ms` micro-linter, `ActionRiskTier` (`R0..R3`), AST Repo Radar, and 4-File SDD verifier.
+  - **Workflow Crossbar (`workflow_graph.py`, `workflow_dag.py`)**: Macro lifecycle state machine (`INTAKE`..`COMPLETE`) + dynamic `GoalPlan` step DAGs, `VerificationSpec`, and JSON recipe engine.
+  - **Application (`agent.py`, `intake.py`, `blueprint.py`, `autonomy.py`, `skill_forge.py`, `context.py`, `compaction.py`, `background_jobs.py`, `endpoints.py`, `mcp_hub.py`, `routines.py`, `calendar_engine.py`, `core_actions.py`, `harvest_tools.py`, `tools.py`, `os_tools.py`, `tool_schemas.py`, `hobbies.py`, `eval_harness.py`)**: Uncompromised `reasoning` tier routing, Forever-Chat Background Job Dispatch, Universal Remote Endpoints, Partner-Aware Federated MCP Hub, Hardware-Gated Routines & Clone Sandboxes, Unified Multi-Source Calendar, Unified Core Actions, stateful Blueprint Q&A/alignment, `REFLECT` fact distillation, hobbies, and multi-flight evals.
+
+## 2. Memory Taxonomy (Episodic vs. Procedural vs. Semantic)
+1. **Episodic & Project-Scoped Working Memory (`conversations.db` + `MEMORY.md` via `companion/memory_store.py`)**: Raw conversation history (FTS5 BM25 search), `project_id`-isolated tasks and resumable `workflow_runs`, engineering backlog, and recent system notes.
+2. **Procedural Memory (`skills/<name>/SKILL.md` + `companion/skill_forge.py`)**: Step-by-step runbooks, JSON workflow recipes, and verified helper scripts explaining *how* and *when* to combine primitive tools.
+3. **Semantic & Epistemic Fact Memory (`KnowledgePort` in `companion/grounding.py`, `knowledge_facts` table, & `skills/knowledge-wiki/references/*.md`)**: `<10ms` query-driven facts separating `[KNOWN CONTEXT]` from `[UNVERIFIED GAPS]`, pluggable external Wiki adapters, and `author: user` provenance-guarded reference articles.
+
+## 3. Scaling Beyond a Single Context Window
+- **2-Stage `KeyTokens`-Verified Compaction (`companion/compaction.py`)**:
+  - Triggered at a configurable percentage watermark (`COMPANION_COMPACT_TRIGGER_PCT=25` of `262,144` tokens = `65,536` tokens) without polluting `system_notes`.
+  - **Stage 1**: Zero-loss pruning of stale tool outputs (`read_file`, `run_shell`) from older turns.
+  - **Stage 2**: Folds older turns into a structured executive handoff verified against extracted `KeyTokens` (file paths, identifiers, IPs/numbers) while preserving the verbatim archive in SQLite.
+- **Isolated Subagent Workers (`companion/agent.py:run_subagent`)**:
+  - Spawns a disposable worker loop with a clean isolated context window (optionally pre-loading a Tier-2 `SKILL.md` and bound to `fast`, `coding`, or `reasoning`) and returns only a concise synthesis to the parent turn.
+- **Dynamic `GoalPlan` & Declarative JSON Workflow DAGs (`companion/workflow_dag.py`, `companion/workflow_graph.py` + `skills/<name>/workflows/*.json`)**:
+  - Combines per-goal topological `GoalStep` graphs with `VerificationSpec` (`evidence_file`, `check_command`, `script_validator`, `assertion`, `human_gate`) and reusable JSON graph recipes (`tool`, `subagent`, `llm`, `recipe`) backed by `ExecutorBindings` and checkpoint rollback on `ABORTED`.

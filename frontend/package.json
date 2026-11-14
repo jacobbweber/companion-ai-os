@@ -1,0 +1,27 @@
+{
+  "name": "companion-web-studio",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Companion AI OS 3.0 — Multi-Studio Matte Brutalist Sci-Fi Web Interface (Ring-1 Build -> surfaces/static/ Ring-0 Runtime)",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --environment happy-dom",
+    "build": "tsc --noEmit && vite build && node scripts/sync_static.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.475.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "happy-dom": "^21.0.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0",
+    "vitest": "^5.1.0"
+  }
+}

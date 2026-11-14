@@ -1,0 +1,106 @@
+# Companion AI OS — Architecture Specification (`ARCHITECTURE.md`)
+
+> **Canonical Architecture Truth**: This document defines the A-Frame layered structure, the authoritative 1-to-1 Module Registry, downward dependency laws, and code simplicity budgets. Every `.py` module in `companion/` and `surfaces/` MUST be registered here.
+
+---
+
+## 1. The A-Frame Layered Architecture
+
+```text
+      [ APEX (PRESENTATION): harness.py, surfaces/web_server.py & web_assets.py ]
+        CLI/REPL, Disconnect-Proof LAN Web UI & Non-Blocking Idle Watcher
+                                    /    \
+                                   /      \
+  [ UPPER A-FRAME (APPLICATION): agent.py, autonomy.py, blueprint.py, intake.py,      ]
+  [   skill_forge.py, eval_harness.py, context.py, compaction.py, tools.py,           ]
+  [   os_tools.py, tool_schemas.py, hobbies.py                                        ]
+     Intent & Tier Router, Blueprint Gate, Skill Forge, Phase-Gated Tools (17), Eval
+                               /              \
+                              /================\
+                             /     CROSSBAR     \
+                  [ workflow_graph.py & workflow_dag.py ]
+             Persistent State-Machine Graph & Dynamic GoalPlan / Recipe DAGs
+                           /                      \
+                          /                        \
+       [ LEFT LEG: INFRASTRUCTURE ]        [ RIGHT LEG: DOMAIN & SDD ]
+       - companion/config.py               - companion/checkpoints.py
+       - companion/telemetry.py            - companion/safety.py
+       - companion/streaming.py            - companion/semantic_memory.py
+       - companion/llm.py                  - companion/memory_store.py
+                                           - companion/disciplines.py
+                                           - companion/grounding.py
+                                           - companion/hygiene.py
+                                           - companion/sdd.py
+                                           - configs/architecture.py
+                                           - memory/chat_memory.py
+```
+
+---
+
+## 2. Authoritative Module Registry & Simplicity Budgets
+
+Every module in the system has a single cohesive responsibility and is subject to deterministic AST hygiene and line-count budgets (`max_module_lines = 550`, `max_function_lines = 100`):
+
+| Module Path | A-Frame Layer | Single Responsibility | Governing Spec |
+| :--- | :--- | :--- | :--- |
+| `companion/config.py` | `Infrastructure` | Stdlib `.env` parser, per-tier temperature `TierConfig`, `tier_override_context`, `agent_tool_turn_context` / `Self-Dev Mode` deployment gates (`ADR-019`), and mechanical `WorkspaceContext` (`ADR-007`) | `SPEC-01` |
+| `companion/telemetry.py` | `Infrastructure` | Thread-safe (`RLock` + `ContextVar`) SQLite Waterfall Tracer, Structured App Logger, SecretRedactor, retention pruner, and KPI Scorecard | `SPEC-04`, `SPEC-06` |
+| `companion/streaming.py` | `Infrastructure` | `ContextVar` stream event bus (`stream_event_context`, `emit_stream_event`), `<think>` tag stream splitter (`ThinkTagStreamSplitter`), `<tool_call>` rescue, and OpenAI SSE delta/tool assembler (`read_completion_or_sse_stream`) | `SPEC-01`, `SPEC-06` |
+| `companion/llm_wire.py` | `Infrastructure` | Pure-stdlib wire request, multimodal (`image`/`audio`/`video`/`pdf`), reasoning, and SSE stream translators for `openai_compat`, `anthropic_messages`, and `gemini_native` (`thoughtSignature` & `thinking` signature preservation) plus `is_local_or_lan_endpoint` | `SPEC-01` |
+| `companion/llm.py` | `Infrastructure` | Multi-dialect HTTP/SSE LLM client, `discover_provider_models`, `ModelGate`, HTTP 400 parameter self-healing, `local_only` LAN Privacy Lock, and per-tier + global failover | `SPEC-01` |
+| `companion/checkpoints.py` | `Domain` | `WorkspaceContext`-bound atomic file backups, full snapshot checkpoints, `snapshot_readonly_tree`/`enforce_readonly_tree` guards, local Git save-points, and post-exec syntax healing | `SPEC-04` |
+| `companion/safety.py` | `Domain` | `ADR-007` path & `.env` read/write confinement, `<5ms` inline post-edit micro-linter (`lint_single_file_edit`), `LoopGuard`, and `run_system_doctor` | `SPEC-04` |
+| `companion/hygiene.py` | `Domain` | Import-qualified AST dead-code & unused-private-method scanner across `companion/`, `surfaces/`, and `configs/`, `<15ms` AST Repo Headroom Map, and symbol slicer | `SPEC-04`, `SPEC-06` |
+| `companion/sdd.py` | `Domain` | 4-File Canonical SDD verifier, PEP 723 `parse_pep723_dependencies` + 3-Tier Skill & JSON Recipe Linter, Wiki provenance guard, and ADR compactor | `SPEC-04` |
+| `companion/semantic_memory.py` | `Domain` | Zero-swap morphological stemmer, bidirectional everyday-to-technical concept clusters, sparse cosine similarity, optional float32 vectors, and `hybrid_rrf_rank` | `SPEC-02`, `SPEC-04` |
+| `companion/memory_store.py` | `Domain` | Thread-safe (`RLock`) SQLite persistence for chats, hybrid FTS5 + semantic RRF recall, project-scoped `tasks` & `workflow_runs`, `knowledge_facts`, backlog, ADRs, and hobby journal | `SPEC-02` |
+| `companion/disciplines.py` | `Domain` | Engineering discipline playbooks, `MODULE_LAYER_MAP`, `ActionRiskTier` (`R0`..`R3`), `WorkspaceContract`, and AST syntax verifier | `SPEC-03`, `SPEC-04` |
+| `companion/grounding.py` | `Domain` | Pluggable `KnowledgePort` (`LocalKnowledgeAdapter` bridged to live `WikiEngine` + external adapter hook), `<10ms` `build_epistemic_grounding`, Top-K skill ranking, and `ExecutionTarget` (`LocalWorkspaceTarget`) | `SPEC-04`, `SPEC-06`, `SPEC-07` |
+| `companion/archive_and_approvals.py` | `Domain` | 3-Tier `TRUST_MODES`, fingerprint-verified `ApprovalQueue`, Hot (`<=90d`) / Cold (`>90d`) Forever-Chat Archive (`conversations_cold` + FTS5 + Hybrid RRF), session-scoped quiet nudges, and `saved_prompts` library | `SPEC-02`, `SPEC-07` |
+| `companion/vault.py` | `Domain` | Write-only Zero-Reveal `VaultManager` (`secrets.env` + `vault_entries` / `vault_audit_log`), JIT `resolve_for_call`, output scrubber, and secret-free snapshot backup/restore (`missing_secrets` checklist) | `SPEC-04`, `SPEC-07` |
+| `companion/model_registry.py` | `Domain` | 12-preset local & frontier LLM Provider Registry (`llm_providers`), Zero-Reveal Blind Vault API key binding (`credential_ref`), hot-reload 8-slot Capability Tier Matrix (`llm_tier_routes`), `CORE_ACTIONS["models"]`, `/providers`, and `local_only`/`hybrid`/`cloud_allowed` privacy lock | `SPEC-01`, `SPEC-07` |
+| `companion/wiki_templates.py` | `Domain` | 11 built-in non-education Wiki templates (`03_resources/templates/`), `03_resources/tag-authority.md` ontology authority, pure-stdlib YAML frontmatter parser/serializer, template recommender, and curated-note validator | `SPEC-02`, `SPEC-07` |
+| `companion/wiki_engine.py` | `Domain` | Co-owned 4-Folder Markdown Warehouse (`01_inbox`..`04_archive` + `trash/`), Option A Inbox-First & Dual-Author guards, `proxy-asset-note` companions, 2-hop `ontology` bridges, SHA-256 `content_hash` locks, and SQLite 2D Mind Map sidecar | `SPEC-02`, `SPEC-07` |
+| `companion/wiki_curation.py` | `Domain` | Deliberate Multi-Turn Wiki Curation Engine (`inspect_graduation` -> mandatory full-read gate -> `CREATE_NEW`/`MERGE_AND_REFINE`/`SPLIT_MULTI`/`KEEP_SEPARATE` -> `validate_curation_plan` -> `commit_curation_plan`) with Never-Delete `04_archive/` lineage and 1-click `revert_curation` | `SPEC-02`, `SPEC-07` |
+| `companion/wiki_maintenance.py` | `Domain` | Wiki 3.1 Unified & Side-by-Side lineage/approval diffs (`compute_wiki_diff`), governed `alias -> canonical` ontology consolidation (`consolidate_ontology`), `90d/180d/365d` freshness cadences (`verify_note_freshness`, `list_stale_notes`), Obsidian-compatible inline diagrams (`03_resources/assets/`), and 1-click Forever Chat `stage_chat_turn_to_inbox` | `SPEC-02`, `SPEC-07` |
+| `companion/attachments.py` | `Domain` | Multimodal Forever Chat image & document attachment engine (`.png`/`.jpg`/`.webp`/`.gif`, `.pdf`, `.docx`/`.xlsx`/`.pptx`, `.md`/`.csv`/`.json`/code), Vault scrubbing, and `03_resources/` Wiki auto-filing | `SPEC-06`, `SPEC-07` |
+| `companion/agile_boards.py` | `Domain` | Universal Multi-Board Kanban, Master Active Sprint (`all-active-sprint`), Weekday/Weekend slot capacity math, dependency guard, Aging/Procrastination Radar, `slice_unblocker_card`, and live `/plan`/`/goal` workflow-to-board sync | `SPEC-08` |
+| `companion/education_engine.py` | `Domain` | Headless Education courses, 4-stage Socratic pedagogy (`priming`..`mastered`), SM-2 spaced repetition (`education_mastery`), Wiki study curation, and fenced `companion-flashcards` Chat decks | `SPEC-08` |
+| `companion/workflow_dag.py` | `Workflow` | Dynamic `GoalPlan` & `GoalStep` DAG, `VerificationSpec` (`evidence_file`, `check_command`, `script_validator`, `assertion`, `human_gate`), `ExecutorBindings`, and JSON recipe runner | `SPEC-03` |
+| `companion/workflow_graph.py` | `Workflow` | Persistent directed-graph state machine (`INTAKE` .. `COMPLETE` + `RECOVER`), phase gates, and recipe facade | `SPEC-03` |
+| `companion/intake.py` | `Application` | Domain-neutral `assess_turn_readiness`, `classify_turn_intent`, uncompromised `select_turn_step_tier` across single/multi-GPU endpoints, and `run_http_smoke_probe` | `SPEC-06` |
+| `companion/skill_forge.py` | `Application` | `check_make_vs_borrow`, transactional `stage_and_promote_skill` (`--self-test` + checkpoint), `run_skill_script`, and `distill_workflow_reflection` | `SPEC-04`, `SPEC-06` |
+| `companion/compaction.py` | `Application` | `KeyTokens` extractor, lossless phase handoffs, workflow task carry-forward ledger (`format_task_carry_forward`, `classify_task_autoskip`), and spam-free 2-stage conversation compactor | `SPEC-06` |
+| `companion/tool_schemas.py` | `Application` | 26 rich OpenAI tool schemas with per-parameter descriptions and fine-grained `(tool, action)` `PHASE_ALLOWED_TOOLS` gating | `SPEC-06`, `SPEC-07`, `SPEC-08` |
+| `companion/hobbies.py` | `Application` | Two-Lever Operating Architecture (`Hobby Mode` × `Self-Dev Mode`), 2-Track `personal`/`self_dev` hobbies, `WebIdleHobbyWatcher`, and Morning Briefing (`ADR-006`, `ADR-019`) | `SPEC-05` |
+| `companion/background_jobs.py` | `Application` | SQLite-backed `BackgroundJobManager`, crash-interrupt recovery, Zero-Identity Workers under `ModelGate.background_context()`, and `<=200`-token Wiki Inbox overflow marshalling | `SPEC-07` |
+| `companion/endpoints.py` | `Application` | Symbolic-only `EndpointManager` (`ssh`, `winrm`, `http_api`) with JIT Blind Vault injection, SSRF & command safety gates, and remote CPU/RAM/GPU profiling | `SPEC-07` |
+| `companion/mcp_hub.py` | `Application` | Outbound `stdio`/HTTP MCP Client (`tools_fingerprint` approval), token-authenticated Inbound "Order Counter" MCP Server, and Partner-Aware Federation HUD (`[CONNECTED FEDERATED PARTNERS]`) | `SPEC-07` |
+| `companion/routines.py` | `Application` | Hardware-gated `RoutineManager` (cron/interval schedules, downtime missed-run reconciliation, overlap skip) and isolated Clone-Based Self-Development Sandboxes | `SPEC-07` |
+| `companion/calendar_engine.py` | `Application` | Unified Month/Week/Agenda Calendar merging `calendar_events`, active sprints, card `planned_date`/`due_date`, projected `RoutineManager` schedules, and daily due SRS study counts | `SPEC-08` |
+| `companion/core_actions.py` | `Application` | Unified actor-aware `CORE_ACTIONS` registry, `execute_core_action`, and `handle_harvest_slash` shared across CLI, REPL, Web API, and LLM tools | `SPEC-07`, `SPEC-08` |
+| `companion/harvest_tools.py` | `Application` | Thin `actor="companion"` tool adapters (`job_manage`, `wiki_manage`, `vault_manage`, `endpoint_manage`, `mcp_manage`, `routine_manage`, `agile_manage`, `calendar_manage`, `education_manage`) | `SPEC-07`, `SPEC-08` |
+| `companion/os_tools.py` | `Application` | Companion OS state, Hot+Cold memory/KnowledgePort, task, workflow/Skill Forge, checkpoint, SDD, hobby, project, telemetry, and doctor tool handlers | `SPEC-06`, `SPEC-07` |
+| `companion/tools.py` | `Application` | 26 `WorkspaceContext`-bound, phase- and `R3`-risk-gated tools with `ExecutionTarget` isolation, AST symbol reading, and inline linting | `SPEC-06`, `SPEC-07`, `SPEC-08` |
+| `companion/context.py` | `Application` | Dynamic System Prompt HUD with `<10ms` Epistemic Grounding, `[CONNECTED FEDERATED PARTNERS]` HUD, Trust Mode, Workspace Radar, and Skill catalog | `SPEC-06`, `SPEC-07` |
+| `companion/agent.py` | `Application` | Executive loop with Step-0 Intent & Tier Router, quiet turn-boundary session nudges, stateful Blueprint Q&A/approval routing, `<think>` scratchpad continuity, and `/slash` handler | `SPEC-06`, `SPEC-07` |
+| `companion/autonomy.py` | `Application` | Multi-phase `GoalPlan` DAG driver (`/goal`, `pause_at_plan`, `/goal resume`, `human_gate`/`R3` mid-run pauses, `WorkspaceContract` verification, `REFLECT` distillation) | `SPEC-03`, `SPEC-06` |
+| `companion/blueprint.py` | `Application` | Interactive `Plan -> Align -> Approve -> Build` Blueprint gate (`create_or_revise_blueprint`, `handle_blueprint_conversation_turn`, `approve_blueprint_and_build`) | `SPEC-03`, `SPEC-06` |
+| `companion/eval_harness.py` | `Application` | Isolated multi-flight live behavioral evaluation suite (`quick`, `full`, `general`, `all`) & head-to-head `coding` model benchmark (`run_live_flight_eval`, `run_coding_model_comparison`) | `SPEC-06` |
+| `harness.py` | `Presentation` | Self-recovering CLI/REPL entry point, `--jobs`/`--wiki`/`--vault`/`--endpoints`/`--mcp`/`--partners`/`--routines` flags, startup routine reconciliation, and Windows idle watcher | `SPEC-05`, `SPEC-06`, `SPEC-07` |
+| `surfaces/web_assets.py` | `Presentation` | Static asset loader (`surfaces/static/index.html`, `styles.css`, `app.js` compiled from `frontend/`), safe `<\/script` escaping, mtime caching, and zero-login CSRF meta-tag injection | `SPEC-06`, `SPEC-07` |
+| `surfaces/api_extensions.py` | `Presentation` | Headless `GET/POST /api/actions` CoreActions adapter, `GET /api/status` Harvest + `session_nudges` enrichments, and Bearer-token `POST /api/mcp` Order Counter adapter | `SPEC-07` |
+| `surfaces/web_server.py` | `Presentation` | Stdlib `ThreadingHTTPServer` LAN web server (`0.0.0.0`) with Zero-Login LAN security (`Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF`), live SSE (`GET /api/jobs/<id>/stream`), CoreActions, Hosted MCP, and WAL reads | `SPEC-06`, `SPEC-07` |
+| `surfaces/windows_tray.py` | `Presentation` | Zero-dependency Win32 `ctypes` System Tray controller (`--tray`), single-instance `/api/health` detection, user `data/` folder opener, and graceful port-conflict diagnostics | `SPEC-06` |
+| `configs/architecture.py` | `Domain` | Executable A-Frame component registry (47 core components), dependency name validator, and downward layer dependency verifier | `SPEC-01`, `SPEC-03`, `SPEC-07`, `SPEC-08` |
+| `memory/chat_memory.py` | `Domain` | Backward-compatible `ChatMemory` facade over `companion/memory_store.py` | `SPEC-02` |
+
+---
+
+## 3. Architectural Laws (Enforced by `system_doctor` & Inline Micro-Linter)
+
+1. **No Undocumented Modules**: Adding a `.py` file to `companion/` or `surfaces/` without registering it in `specs/ARCHITECTURE.md` and `specs/CONTRACTS.md` fails Stage 4 of `system_doctor`.
+2. **Import-Qualified Dead-Code & Budget Law**: `companion/hygiene.py` resolves cross-file `from companion.<mod> import <sym>` and `alias.<sym>` references so unimported definitions, unused imports, `>550L` modules, or `>100L` functions fail both inline `lint_single_file_edit` and Stage 5 of `system_doctor`.
+3. **Strict 4-File `specs/` Cap**: `specs/` may only ever contain `PRODUCT.md`, `ARCHITECTURE.md`, `CONTRACTS.md`, and `DECISIONS.md`.
+4. **Mandatory Spine Telemetry**: Every LLM call (`companion/llm.py`), tool dispatch (`companion/tools.py`), and agent turn (`companion/agent.py`) is traced via thread-safe `companion/telemetry.py`.
+5. **Headless Core vs. Frontend UI Boundary Law**: Modules inside `companion/` remain 100% presentation-agnostic; `harness.py` and `surfaces/` act strictly as presentation views over `companion/` APIs and `data/conversations.db`.

@@ -1,0 +1,542 @@
+"""
+Multimodal Image & Document Attachment Engine (`companion/attachments.py` — A-Frame Domain Layer).
+
+Provides 100% Python 3.12 stdlib ingestion, validation, secret-scrubbed text extraction,
+Co-Owned Wiki `03_resources/` overflow filing, and OpenAI multimodal wire preparation for:
+- Images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) -> Vision routing + base64 `data:image/...` URIs
+- PDFs (`.pdf`) -> Ring-1 `scripts/extract_pdf.py` (`pypdf`) subprocess + stdlib stream fallback
+- Office (`.docx`, `.xlsx`, `.pptx`) -> Pure stdlib `zipfile` + `xml.etree.ElementTree`
+- Data, Text & Code (`.md`, `.txt`, `.csv`, `.tsv`, `.json`, `.yaml`, `.toml`, `.html`, `.log`, code)
+"""
+
+import base64
+import csv
+import hashlib
+import html.parser
+import io
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+import zipfile
+import zlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from companion.config import settings
+from companion.memory_store import MemoryStore, get_memory_store
+from companion.vault import get_vault_manager
+from companion.wiki_engine import get_wiki_engine
+
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB per file
+INLINE_DOC_CHAR_LIMIT = 12_000
+MAX_EXTRACTED_CHARS = 250_000
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+AUDIO_MIMES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg"}
+VIDEO_MIMES = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}
+OFFICE_EXTENSIONS = {".docx", ".xlsx", ".pptx"}
+DATA_EXTENSIONS = {".csv", ".tsv", ".json", ".yaml", ".yml", ".toml", ".xml", ".ini", ".cfg"}
+TEXT_EXTENSIONS = {".md", ".markdown", ".txt", ".rst", ".log", ".html", ".htm"}
+CODE_EXTENSIONS = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".css", ".sql", ".sh", ".ps1",
+    ".bat", ".c", ".cpp", ".h", ".rs", ".go", ".java", ".cs", ".rb", ".php",
+}
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | set(AUDIO_MIMES) | set(VIDEO_MIMES) | {".pdf"} | OFFICE_EXTENSIONS | DATA_EXTENSIONS | TEXT_EXTENSIONS | CODE_EXTENSIONS
+
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+@dataclass(frozen=True)
+class PreparedAttachmentTurn:
+    """Prepared user chat message + ephemeral wire context for multimodal/document turns."""
+
+    display_message: str
+    wire_doc_context: str
+    wire_image_uris: Tuple[str, ...]
+    attachments: List[Dict[str, Any]]
+
+
+class _HTMLTextExtractor(html.parser.HTMLParser):
+    """Lightweight stdlib HTML-to-text stripper ignoring `<script>` and `<style>` blocks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip = 0
+        self.parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        t = tag.lower()
+        if t in ("script", "style", "noscript"):
+            self._skip += 1
+        elif t in ("p", "br", "div", "li", "tr", "h1", "h2", "h3", "h4"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in ("script", "style", "noscript") and self._skip > 0:
+            self._skip -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip == 0 and data.strip():
+            self.parts.append(data.strip() + " ")
+
+
+def _attachments_base_dir(store: MemoryStore) -> Path:
+    if store.db_path.resolve() == settings.db_path.resolve():
+        base = settings.effective_data_dir
+    else:
+        parent = store.db_path.parent
+        base = parent if parent.name == "data" else (parent / "data")
+    out = (base / "attachments").resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _ensure_attachments_schema(store: MemoryStore) -> None:
+    with store._lock:
+        store.conn.execute(
+            """CREATE TABLE IF NOT EXISTS chat_attachments (
+                attachment_id TEXT PRIMARY KEY, filename TEXT NOT NULL, mime_type TEXT NOT NULL,
+                kind TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
+                storage_path TEXT NOT NULL, extracted_path TEXT NOT NULL DEFAULT '',
+                extracted_text TEXT NOT NULL DEFAULT '', extracted_chars INTEGER NOT NULL DEFAULT 0,
+                meta_label TEXT NOT NULL DEFAULT '', wiki_resource_path TEXT NOT NULL DEFAULT '',
+                width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+            )"""
+        )
+        store.conn.commit()
+
+
+def _format_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    return f"{num_bytes / 1024.0:.1f} KB" if num_bytes < 1024 * 1024 else f"{num_bytes / (1024.0 * 1024.0):.2f} MB"
+
+
+def inspect_image_bytes(raw: bytes) -> Optional[Tuple[str, int, int]]:
+    """Validate image magic bytes and return `(mime_type, width, height)` or `None`."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n") and len(raw) >= 24:
+        w, h = struct.unpack(">II", raw[16:24])
+        return "image/png", int(w), int(h)
+    if raw.startswith((b"GIF87a", b"GIF89a")) and len(raw) >= 10:
+        w, h = struct.unpack("<HH", raw[6:10])
+        return "image/gif", int(w), int(h)
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP" and len(raw) >= 30:
+        chunk = raw[12:16]
+        if chunk == b"VP8X" and len(raw) >= 30:
+            w = 1 + int.from_bytes(raw[24:27], "little")
+            h = 1 + int.from_bytes(raw[27:30], "little")
+            return "image/webp", w, h
+        return "image/webp", 0, 0
+    if raw.startswith(b"\xff\xd8\xff"):
+        idx = 2
+        while idx + 9 < len(raw):
+            if raw[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = raw[idx + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                h, w = struct.unpack(">HH", raw[idx + 5 : idx + 9])
+                return "image/jpeg", int(w), int(h)
+            if marker in (0xD8, 0xD9) or idx + 4 > len(raw):
+                break
+            seg_len = struct.unpack(">H", raw[idx + 2 : idx + 4])[0]
+            if seg_len < 2:
+                break
+            idx += 2 + seg_len
+        return "image/jpeg", 0, 0
+    return None
+
+
+def _extract_pdf_stdlib_fallback(raw: bytes) -> str:
+    """Minimal pure-stdlib FlateDecode PDF text token fallback when `pypdf` is unavailable."""
+    out: List[str] = []
+    for m in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", raw, re.S):
+        chunk = m.group(1)
+        for candidate in (chunk,):
+            try:
+                dec = zlib.decompress(candidate)
+            except Exception:
+                dec = chunk
+            txt = dec.decode("latin-1", errors="ignore")
+            for lit in re.findall(r"\(([^()\\]*(?:\\.[^()\\]*)*)\)\s*Tj", txt):
+                cleaned = lit.replace(r"\(", "(").replace(r"\)", ")").replace(r"\n", "\n").strip()
+                if cleaned:
+                    out.append(cleaned)
+            for arr in re.findall(r"\[(.*?)\]\s*TJ", txt, re.S):
+                seg = "".join(re.findall(r"\(([^()\\]*(?:\\.[^()\\]*)*)\)", arr)).strip()
+                if seg:
+                    out.append(seg)
+    return "\n".join(out).strip()
+
+
+def _extract_pdf(pdf_path: Path, raw: bytes) -> Tuple[str, str]:
+    """Extract PDF text via Ring-1 `scripts/extract_pdf.py` (`pypdf`), falling back to stdlib stream scan."""
+    script = (settings.root / "skills" / "web-surface-dev" / "scripts" / "extract_pdf.py").resolve()
+    if script.is_file():
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-B", str(script), str(pdf_path)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                data = json.loads(proc.stdout.strip().splitlines()[-1])
+                if data.get("ok"):
+                    pages = int(data.get("pages") or 0)
+                    txt = str(data.get("text") or "").strip()
+                    label = f"{pages} page{'s' if pages != 1 else ''}"
+                    if not txt:
+                        txt = "[Scanned or image-only PDF: no selectable text layer found. Attach page screenshots for vision OCR.]"
+                    return txt, label
+        except Exception:
+            pass
+    fb = _extract_pdf_stdlib_fallback(raw)
+    return (fb or "[PDF attached — no selectable text stream extracted.]"), "PDF"
+
+
+def _extract_docx(raw: bytes) -> Tuple[str, str]:
+    """Extract paragraphs and Markdown tables from `.docx` in 100% Python stdlib."""
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        xml_bytes = zf.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+    body = root.find("w:body", ns)
+    if body is None:
+        return "", "DOCX"
+    blocks: List[str] = []
+    for child in list(body):
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            txt = "".join(t.text or "" for t in child.findall(".//w:t", ns)).strip()
+            if txt:
+                blocks.append(txt)
+        elif tag == "tbl":
+            rows: List[List[str]] = []
+            for tr in child.findall(".//w:tr", ns):
+                cells = ["".join(t.text or "" for t in tc.findall(".//w:t", ns)).strip().replace("|", "\\|") for tc in tr.findall("./w:tc", ns)]
+                if any(cells):
+                    rows.append(cells)
+            if rows:
+                width = max(len(r) for r in rows)
+                padded = [r + [""] * (width - len(r)) for r in rows]
+                md_tbl = ["| " + " | ".join(padded[0]) + " |", "| " + " | ".join(["---"] * width) + " |"]
+                md_tbl.extend("| " + " | ".join(r) + " |" for r in padded[1:])
+                blocks.append("\n".join(md_tbl))
+    return "\n\n".join(blocks).strip(), f"{len(blocks)} blocks"
+
+
+def _col_letters_to_idx(cell_ref: str) -> int:
+    letters = "".join(ch for ch in cell_ref if ch.isalpha()).upper()
+    idx = 0
+    for ch in letters:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return max(0, idx - 1)
+
+
+def _extract_xlsx(raw: bytes) -> Tuple[str, str]:
+    """Extract worksheets from `.xlsx` as clean Markdown tables in 100% Python stdlib."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        shared: List[str] = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            s_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in s_root.iter():
+                if si.tag.rsplit("}", 1)[-1] == "si":
+                    shared.append("".join(( node.text or "") for node in si.iter() if node.tag.rsplit("}", 1)[-1] == "t"))
+        sheet_names = sorted(n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
+        sections: List[str] = []
+        for s_idx, s_name in enumerate(sheet_names, 1):
+            s_root = ET.fromstring(zf.read(s_name))
+            rows_out: List[List[str]] = []
+            for row_el in s_root.iter():
+                if row_el.tag.rsplit("}", 1)[-1] != "row":
+                    continue
+                vals: Dict[int, str] = {}
+                for c_el in list(row_el):
+                    if c_el.tag.rsplit("}", 1)[-1] != "c":
+                        continue
+                    col_i = _col_letters_to_idx(c_el.attrib.get("r", "A1"))
+                    c_type = c_el.attrib.get("t", "")
+                    v_txt = ""
+                    for sub in c_el.iter():
+                        stag = sub.tag.rsplit("}", 1)[-1]
+                        if stag == "v" and sub.text:
+                            v_txt = shared[int(sub.text)] if c_type == "s" and sub.text.isdigit() and int(sub.text) < len(shared) else sub.text
+                        elif stag == "t" and c_type == "inlineStr" and sub.text:
+                            v_txt += sub.text
+                    vals[col_i] = v_txt.strip().replace("|", "\\|").replace("\n", " ")
+                if vals and len(rows_out) < 150:
+                    max_c = min(max(vals) + 1, 24)
+                    rows_out.append([vals.get(ci, "") for ci in range(max_c)])
+            if rows_out:
+                w = max(len(r) for r in rows_out)
+                norm = [r + [""] * (w - len(r)) for r in rows_out]
+                tbl = [f"### Sheet {s_idx}", "| " + " | ".join(norm[0]) + " |", "| " + " | ".join(["---"] * w) + " |"]
+                tbl.extend("| " + " | ".join(r) + " |" for r in norm[1:])
+                sections.append("\n".join(tbl))
+    return "\n\n".join(sections).strip(), f"{len(sheet_names)} sheet{'s' if len(sheet_names) != 1 else ''}"
+
+
+def _extract_pptx(raw: bytes) -> Tuple[str, str]:
+    """Extract slide text runs from `.pptx` in 100% Python stdlib."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        slides = sorted(n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml"))
+        out: List[str] = []
+        for idx, s_name in enumerate(slides, 1):
+            root = ET.fromstring(zf.read(s_name))
+            runs = [el.text.strip() for el in root.iter() if el.tag.rsplit("}", 1)[-1] == "t" and el.text and el.text.strip()]
+            if runs:
+                out.append(f"### Slide {idx}\n" + "\n".join(runs))
+    return "\n\n".join(out).strip(), f"{len(slides)} slide{'s' if len(slides) != 1 else ''}"
+
+
+def _extract_csv_or_text(ext: str, raw: bytes) -> Tuple[str, str, str]:
+    """Extract structured data, HTML, Markdown, or source code from UTF-8 bytes."""
+    text = raw.decode("utf-8", errors="replace")
+    if ext in (".csv", ".tsv"):
+        delim = "\t" if ext == ".tsv" else ","
+        rows = list(csv.reader(io.StringIO(text), delimiter=delim))
+        if not rows:
+            return "", "data", "0 rows"
+        preview = rows[:80]
+        w = max(1, min(max(len(r) for r in preview), 24))
+        norm = [[c.strip().replace("|", "\\|") for c in (r[:w] + [""] * max(0, w - len(r)))] for r in preview]
+        md = ["| " + " | ".join(norm[0]) + " |", "| " + " | ".join(["---"] * w) + " |"]
+        md.extend("| " + " | ".join(r) + " |" for r in norm[1:])
+        if len(rows) > 80:
+            md.append(f"\n*(Showing first 80 of {len(rows)} rows)*\n\n```csv\n{text[:40000]}\n```")
+        return "\n".join(md), "data", f"{len(rows)} rows"
+    if ext == ".json":
+        try:
+            parsed = json.loads(text)
+            pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+            return f"```json\n{pretty}\n```", "data", "JSON"
+        except Exception:
+            return text, "data", "JSON (raw)"
+    if ext in (".html", ".htm"):
+        parser = _HTMLTextExtractor()
+        parser.feed(text)
+        cleaned = re.sub(r"\n{3,}", "\n\n", "".join(parser.parts)).strip()
+        return cleaned or text, "text", "HTML"
+    if ext in DATA_EXTENSIONS:
+        return text, "data", ext.lstrip(".").upper()
+    if ext in CODE_EXTENSIONS:
+        lang = ext.lstrip(".")
+        return f"```{lang}\n{text}\n```", "code", f"{len(text.splitlines())} lines"
+    return text, "text", f"{len(text.splitlines())} lines"
+
+
+def _serialize_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
+    (aid, fname, mime, kind, sz, sha, _sp, _ep, _etxt, echars, mlabel, wpath, w, h, cat) = row
+    return {
+        "id": str(aid), "filename": str(fname), "mime_type": str(mime), "kind": str(kind),
+        "size_bytes": int(sz), "size_human": _format_size(int(sz)), "sha256": str(sha),
+        "extracted_chars": int(echars), "meta_label": str(mlabel), "wiki_resource_path": str(wpath),
+        "width": int(w), "height": int(h), "raw_url": f"/api/attachments/{aid}/raw", "created_at": str(cat),
+    }
+
+
+def ingest_attachment(
+    filename: str, data_base64: str, mime_type: str = "", store: Optional[MemoryStore] = None,
+) -> Dict[str, Any]:
+    """Validate, persist, extract, scrub, and index an uploaded Forever Chat attachment."""
+    mem = store or get_memory_store()
+    _ensure_attachments_schema(mem)
+    clean_orig = Path((filename or "attachment").strip()).name
+    safe_name = _SAFE_NAME_RE.sub("_", clean_orig).strip("._") or "attachment.txt"
+    ext = Path(safe_name).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return {"ok": False, "error": f"Unsupported file extension `{ext or '(none)'}`. Allowed: images (.png/.jpg/.webp/.gif), .pdf, .docx, .xlsx, .pptx, .md, .txt, .csv, .json, .yaml, and source code."}
+    b64_clean = (data_base64 or "").strip()
+    if "," in b64_clean[:256] and b64_clean.lower().startswith("data:"):
+        b64_clean = b64_clean.split(",", 1)[1]
+    try:
+        raw = base64.b64decode(b64_clean, validate=False)
+    except Exception as exc:
+        return {"ok": False, "error": f"Invalid base64 attachment payload: {exc}"}
+    if not raw:
+        return {"ok": False, "error": "Attachment file is empty (0 bytes)."}
+    if len(raw) > MAX_ATTACHMENT_BYTES:
+        return {"ok": False, "error": f"Attachment exceeds 20 MB limit ({_format_size(len(raw))})."}
+
+    now_dt = datetime.now(timezone.utc)
+    aid = f"att_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+    month_dir = _attachments_base_dir(mem) / now_dt.strftime("%Y-%m")
+    month_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = month_dir / f"{aid}_{safe_name}"
+
+    width = height = 0
+    extracted_text = extracted_path_str = wiki_path = ""
+    if ext in IMAGE_EXTENSIONS:
+        img_info = inspect_image_bytes(raw)
+        if img_info is None:
+            return {"ok": False, "error": f"File `{safe_name}` does not contain valid PNG/JPEG/WEBP/GIF image bytes."}
+        eff_mime, width, height = img_info
+        kind = "image"
+        meta_label = f"{width}×{height} • {_format_size(len(raw))}" if width and height else _format_size(len(raw))
+        raw_path.write_bytes(raw)
+    elif ext in AUDIO_MIMES or ext in VIDEO_MIMES:
+        kind = "audio" if ext in AUDIO_MIMES else "video"
+        eff_mime, meta_label = AUDIO_MIMES.get(ext) or VIDEO_MIMES[ext], f"{kind.upper()} • {_format_size(len(raw))}"
+        raw_path.write_bytes(raw)
+    else:
+        raw_path.write_bytes(raw)
+        try:
+            if ext == ".pdf":
+                if not raw.lstrip().startswith(b"%PDF-"):
+                    raw_path.unlink(missing_ok=True)
+                    return {"ok": False, "error": f"File `{safe_name}` is not a valid PDF document."}
+                extracted_text, sub_lbl = _extract_pdf(raw_path, raw)
+                kind, eff_mime = "pdf", "application/pdf"
+            elif ext == ".docx":
+                extracted_text, sub_lbl = _extract_docx(raw)
+                kind, eff_mime = "office", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            elif ext == ".xlsx":
+                extracted_text, sub_lbl = _extract_xlsx(raw)
+                kind, eff_mime = "office", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            elif ext == ".pptx":
+                extracted_text, sub_lbl = _extract_pptx(raw)
+                kind, eff_mime = "office", "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            else:
+                extracted_text, kind, sub_lbl = _extract_csv_or_text(ext, raw)
+                eff_mime = (mime_type or "text/plain; charset=utf-8").strip()
+        except Exception as exc:
+            raw_path.unlink(missing_ok=True)
+            return {"ok": False, "error": f"Failed to parse `{safe_name}`: {type(exc).__name__}: {exc}"}
+
+        extracted_text = get_vault_manager(store=mem).scrub_output(extracted_text[:MAX_EXTRACTED_CHARS]).strip()
+        meta_label = f"{sub_lbl} • {_format_size(len(raw))}"
+        ext_file = month_dir / f"{aid}.extracted.md"
+        ext_file.write_text(f"# Extracted Attachment: {safe_name}\n\n{extracted_text}\n", encoding="utf-8")
+        extracted_path_str = str(ext_file)
+
+        if len(extracted_text) > INLINE_DOC_CHAR_LIMIT:
+            slug = _SLUG_RE.sub("-", Path(safe_name).stem.lower()).strip("-")[:48] or "document"
+            rel_wiki = f"03_resources/{now_dt.strftime('%Y-%m-%d')}-{slug}-{aid[-6:]}.md"
+            proxy_body = f"# {safe_name}\n\n## Asset Metadata & Location\n- **Source**: `{safe_name}` (`{meta_label}`, id=`{aid}`)\n\n## Executive Summary & Key Facts\nAuto-filed Forever Chat `{kind}` attachment.\n\n## Extracted Highlights\n{extracted_text}"
+            w_res = get_wiki_engine(store=mem).save_or_update_note(
+                rel_wiki, content=proxy_body, title=f"Attachment: {safe_name}",
+                tags=["attachment", "resource", kind], actor="web", template="proxy-asset-note", ontology=["asset-provenance", "reference-knowledge"],
+            )
+            if w_res.get("ok"):
+                wiki_path = str(w_res.get("path") or rel_wiki)
+
+    sha = hashlib.sha256(raw).hexdigest()[:24]
+    created_at = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    with mem._lock:
+        mem.conn.execute(
+            """INSERT INTO chat_attachments
+               (attachment_id, filename, mime_type, kind, size_bytes, sha256, storage_path,
+                extracted_path, extracted_text, extracted_chars, meta_label, wiki_resource_path, width, height, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (aid, safe_name, eff_mime, kind, len(raw), sha, str(raw_path), extracted_path_str,
+             extracted_text, len(extracted_text), meta_label, wiki_path, width, height, created_at),
+        )
+        mem.conn.commit()
+    rec = get_attachment_record(aid, store=mem)
+    return {"ok": True, "attachment": rec}
+
+
+def get_attachment_record(attachment_id: str, store: Optional[MemoryStore] = None) -> Optional[Dict[str, Any]]:
+    """Fetch attachment metadata dictionary by `attachment_id`."""
+    mem = store or get_memory_store()
+    _ensure_attachments_schema(mem)
+    clean_id = re.sub(r"[^A-Za-z0-9_-]", "", (attachment_id or "").strip())
+    if not clean_id:
+        return None
+    rows = mem._fetch_rows(
+        """SELECT attachment_id, filename, mime_type, kind, size_bytes, sha256, storage_path,
+                  extracted_path, extracted_text, extracted_chars, meta_label, wiki_resource_path, width, height, created_at
+           FROM chat_attachments WHERE attachment_id = ? LIMIT 1""",
+        (clean_id,),
+    )
+    return _serialize_row(rows[0]) if rows else None
+
+
+def read_attachment_raw(attachment_id: str, store: Optional[MemoryStore] = None) -> Optional[Tuple[str, bytes, str]]:
+    """Return `(mime_type, raw_bytes, safe_filename)` for `GET /api/attachments/<id>/raw`."""
+    mem = store or get_memory_store()
+    _ensure_attachments_schema(mem)
+    clean_id = re.sub(r"[^A-Za-z0-9_-]", "", (attachment_id or "").strip())
+    if not clean_id:
+        return None
+    rows = mem._fetch_rows(
+        "SELECT mime_type, storage_path, filename FROM chat_attachments WHERE attachment_id = ? LIMIT 1",
+        (clean_id,),
+    )
+    if not rows:
+        return None
+    mime, spath, fname = str(rows[0][0]), Path(str(rows[0][1])), str(rows[0][2])
+    if not spath.is_file():
+        return None
+    safe_ct = mime if mime.startswith(("image/", "audio/", "video/")) or mime == "application/pdf" else "text/plain; charset=utf-8"
+    return safe_ct, spath.read_bytes(), fname
+
+
+def prepare_turn_attachments(
+    user_message: str, attachment_ids: Optional[List[str]], store: Optional[MemoryStore] = None,
+) -> PreparedAttachmentTurn:
+    """Assemble clean persistent chat badges + active-turn wire context (multimodal images & extracted docs)."""
+    clean_ids = [re.sub(r"[^A-Za-z0-9_-]", "", str(x)) for x in (attachment_ids or []) if str(x).strip()][:8]
+    base_msg = (user_message or "").strip()
+    if not clean_ids:
+        return PreparedAttachmentTurn(base_msg, "", (), [])
+
+    mem = store or get_memory_store()
+    _ensure_attachments_schema(mem)
+    badges: List[str] = []
+    doc_blocks: List[str] = []
+    image_uris: List[str] = []
+    loaded_meta: List[Dict[str, Any]] = []
+
+    for aid in clean_ids:
+        rows = mem._fetch_rows(
+            """SELECT attachment_id, filename, mime_type, kind, size_bytes, sha256, storage_path,
+                      extracted_path, extracted_text, extracted_chars, meta_label, wiki_resource_path, width, height, created_at
+               FROM chat_attachments WHERE attachment_id = ? LIMIT 1""",
+            (aid,),
+        )
+        if not rows:
+            continue
+        row = rows[0]
+        meta = _serialize_row(row)
+        loaded_meta.append(meta)
+        fname, mime, kind = meta["filename"], meta["mime_type"], meta["kind"]
+        spath, ep_str, etxt = Path(str(row[6])), str(row[7]), str(row[8])
+        mlabel, wpath = meta["meta_label"], meta["wiki_resource_path"]
+        raw_url = meta["raw_url"]
+
+        if kind in ("image", "audio", "video") and spath.is_file():
+            b64 = base64.b64encode(spath.read_bytes()).decode("ascii")
+            image_uris.append(f"data:{mime};base64,{b64}")
+            badges.append(f"![{fname}]({raw_url})" if kind == "image" else f"[🎬 {fname} ({mlabel})]({raw_url})")
+            doc_blocks.append(f"[ATTACHED {kind.upper()}: `{fname}` ({mlabel}) — provided directly to your multimodal input.]")
+        else:
+            wiki_tag = f" • Wiki: [[{wpath.removesuffix('.md')}]]" if wpath else ""
+            badges.append(f"[📎 {fname} ({mlabel})]({raw_url}){wiki_tag}")
+            if wpath:
+                preview = etxt[:4000]
+                doc_blocks.append(
+                    f"[ATTACHED LARGE DOCUMENT: `{fname}` ({mlabel})]\n"
+                    f"Full searchable Markdown auto-filed in Co-Owned Wiki: `{wpath}` (`[[{wpath.removesuffix('.md')}]]`).\n"
+                    f"--- Preview (first {len(preview)} of {len(etxt)} chars) ---\n{preview}\n"
+                    f"--- Use `wiki_manage(action='read', path='{wpath}')` or `wiki_manage(action='search', ...)` for deeper sections ---\n"
+                    f"[/ATTACHED LARGE DOCUMENT]"
+                )
+            else:
+                loc_note = f" | local_extract: `{ep_str}`" if ep_str else ""
+                doc_blocks.append(
+                    f"[ATTACHED DOCUMENT: `{fname}` ({mlabel}){loc_note}]\n{etxt}\n[/ATTACHED DOCUMENT]"
+                )
+
+    if not base_msg and loaded_meta:
+        base_msg = "Please inspect the attached file(s) and summarize or extract the key details."
+    badge_block = "\n\n".join(badges)
+    display = f"{base_msg}\n\n{badge_block}".strip() if badge_block else base_msg
+    return PreparedAttachmentTurn(display, "\n\n".join(doc_blocks).strip(), tuple(image_uris), loaded_meta)

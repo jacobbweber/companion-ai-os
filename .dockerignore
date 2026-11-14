@@ -1,0 +1,26 @@
+# Exclude VCS, local secrets, runtime user data, caches, and Node dev dependencies
+.git
+.github
+.env
+secrets.env
+data
+companion-data
+.companion_backups
+MEMORY.md
+IDENTITY.md
+memory/*.db
+memory/*.db-shm
+memory/*.db-wal
+frontend/node_modules
+frontend/dist
+dist
+build
+*.exe
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage

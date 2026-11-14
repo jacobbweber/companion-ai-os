@@ -1,0 +1,21 @@
+services:
+  companion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: companion-ai-os:latest
+    container_name: companion-ai-os
+    restart: unless-stopped
+    ports:
+      - "${COMPANION_WEB_PORT:-8000}:8000"
+    volumes:
+      - ./companion-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      COMPANION_DATA_DIR: /data
+      COMPANION_IMMUTABLE_CORE: "1"
+      COMPANION_SELF_DEV_LOCKED: "1"
+      COMPANION_BASE_URL: "${COMPANION_BASE_URL:-http://host.docker.internal:11434}"
+      COMPANION_MODEL: "${COMPANION_MODEL:-qwen2.5:7b}"
+      COMPANION_PRIVACY_MODE: "${COMPANION_PRIVACY_MODE:-local_only}"
