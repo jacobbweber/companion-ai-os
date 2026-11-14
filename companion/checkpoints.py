@@ -313,6 +313,7 @@ class CheckpointManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             return proc.returncode, ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
         except Exception as exc:

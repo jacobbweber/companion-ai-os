@@ -20,6 +20,7 @@ Usage:
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -38,6 +39,18 @@ for _s in ("stdout", "stderr"):
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+if os.name == "nt" and (sys.stdout is None or Path(sys.executable).name.lower().startswith("pythonw")):
+    _no_win_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if _no_win_flag and not getattr(subprocess.Popen, "_companion_no_window", False):
+        _orig_popen_init = subprocess.Popen.__init__
+
+        def _windowless_popen_init(self, *args, **kwargs):
+            kwargs["creationflags"] = int(kwargs.get("creationflags") or 0) | _no_win_flag
+            return _orig_popen_init(self, *args, **kwargs)
+
+        subprocess.Popen.__init__ = _windowless_popen_init  # type: ignore[method-assign]
+        setattr(subprocess.Popen, "_companion_no_window", True)
 
 
 def _emergency_boot_rollback(root_dir: Path, err: Exception) -> bool:

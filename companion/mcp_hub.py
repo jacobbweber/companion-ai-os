@@ -92,7 +92,7 @@ def _detect_local_hardware() -> Dict[str, Any]:
     smi, lspci = shutil.which("nvidia-smi"), shutil.which("lspci")
     if smi:
         try:
-            proc = subprocess.run([smi, "--query-gpu=name,memory.total", "--format=csv,noheader"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2)
+            proc = subprocess.run([smi, "--query-gpu=name,memory.total", "--format=csv,noheader"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if proc.returncode == 0 and proc.stdout.strip():
                 gpu_summary = "; ".join(ln.strip().replace(", [N/A]", " (Unified Memory)") for ln in proc.stdout.splitlines() if ln.strip())[:140]
         except Exception:

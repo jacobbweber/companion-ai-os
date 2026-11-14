@@ -27,6 +27,21 @@ from companion.telemetry import telemetry
 from surfaces.web_server import create_web_server
 
 
+def enable_windowless_subprocesses() -> None:
+    """Prevent child CLI tools (`git`, `nvidia-smi`, `ssh`) from flashing console windows on Windows."""
+    no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name != "nt" or not no_win or getattr(subprocess.Popen, "_companion_no_window", False):
+        return
+    orig_init = subprocess.Popen.__init__
+
+    def _silent_popen_init(self, *args, **kwargs):
+        kwargs["creationflags"] = int(kwargs.get("creationflags") or 0) | no_win
+        return orig_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _silent_popen_init  # type: ignore[method-assign]
+    setattr(subprocess.Popen, "_companion_no_window", True)
+
+
 def is_companion_running_on_port(port: int, timeout: float = 0.6) -> bool:
     """Return `True` if a live Companion Web UI already answers `/api/health` on `127.0.0.1:<port>`."""
     url = f"http://127.0.0.1:{int(port)}/api/health"
@@ -297,6 +312,7 @@ def _run_win32_tray_loop(local_url: str, on_quit) -> None:
 
 def start_tray_app(host: str = "0.0.0.0", port: Optional[int] = None, auto_open_browser: bool = True) -> None:
     """Start Companion's Web Studio in the background and attach a desktop System Tray controller."""
+    enable_windowless_subprocesses()
     pref_port = int(port if port is not None else int(os.environ.get("COMPANION_WEB_PORT", "8000")))
     if is_companion_running_on_port(pref_port):
         existing_url = f"http://127.0.0.1:{pref_port}"

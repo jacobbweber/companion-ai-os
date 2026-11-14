@@ -490,7 +490,7 @@ class LocalWorkspaceTarget:
         try:
             r = subprocess.run(
                 cmd_or_args, shell=shell, cwd=cwd_override or cwd, env=env, stdin=subprocess.DEVNULL,
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=eff_timeout,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=eff_timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except subprocess.TimeoutExpired:
             active_cp.guard_py_files_after_exec(pre_snap)
