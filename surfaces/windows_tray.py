@@ -91,24 +91,127 @@ def open_user_data_folder(data_dir: Optional[Path] = None) -> Path:
     return target
 
 
+class _Guid(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _NotifyIconDataW(ctypes.Structure):
+    """Full Windows 10/11 `NOTIFYICONDATAW` layout (valid `cbSize` on 64-bit Windows)."""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND), ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT), ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128), ("dwState", wintypes.DWORD), ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256), ("uTimeoutOrVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64), ("dwInfoFlags", wintypes.DWORD),
+        ("guidItem", _Guid), ("hBalloonIcon", wintypes.HICON),
+    ]
+
+
+class _BitmapInfoHeader(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG), ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class _IconInfo(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL), ("xHotspot", wintypes.DWORD), ("yHotspot", wintypes.DWORD),
+        ("hbmMask", wintypes.HBITMAP), ("hbmColor", wintypes.HBITMAP),
+    ]
+
+
+def _create_companion_hicon(user32, gdi32, shell32, hinst: int) -> int:
+    """Build a crisp 32x32 ARGB emerald Companion tray icon (falling back to the Python executable icon)."""
+    try:
+        gdi32.CreateDIBSection.argtypes = [wintypes.HDC, ctypes.POINTER(_BitmapInfoHeader), wintypes.UINT, ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
+        gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+        gdi32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+        gdi32.CreateBitmap.restype = wintypes.HBITMAP
+        gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+        user32.CreateIconIndirect.argtypes = [ctypes.POINTER(_IconInfo)]
+        user32.CreateIconIndirect.restype = wintypes.HICON
+
+        bmi = _BitmapInfoHeader(ctypes.sizeof(_BitmapInfoHeader), 32, -32, 1, 32, 0, 32 * 32 * 4, 0, 0, 0, 0)
+        bits = ctypes.c_void_p()
+        hbm_color = gdi32.CreateDIBSection(None, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+        if hbm_color and bits.value:
+            px = (ctypes.c_uint32 * (32 * 32)).from_address(bits.value)
+            for y in range(32):
+                for x in range(32):
+                    dx, dy = x - 15.5, y - 15.5
+                    d2 = dx * dx + dy * dy
+                    if d2 <= 210:
+                        if 68 <= d2 <= 132 and dx < 7.5:
+                            px[y * 32 + x] = 0xFF34D399  # Emerald "C" arc
+                        elif d2 <= 18:
+                            px[y * 32 + x] = 0xFF38BDF8  # Cyan core spark
+                        else:
+                            px[y * 32 + x] = 0xFF0F172A  # Deep slate orb
+                    else:
+                        px[y * 32 + x] = 0x00000000
+            hbm_mask = gdi32.CreateBitmap(32, 32, 1, 1, None)
+            ii = _IconInfo(True, 0, 0, hbm_mask, hbm_color)
+            hicon = user32.CreateIconIndirect(ctypes.byref(ii))
+            gdi32.DeleteObject(hbm_color)
+            gdi32.DeleteObject(hbm_mask)
+            if hicon:
+                return int(hicon)
+    except Exception:
+        pass
+    shell32.ExtractIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT]
+    shell32.ExtractIconW.restype = wintypes.HICON
+    ico = shell32.ExtractIconW(hinst, sys.executable, 0)
+    if ico:
+        return int(ico)
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+    user32.LoadIconW.restype = wintypes.HICON
+    return int(user32.LoadIconW(None, ctypes.cast(32512, wintypes.LPCWSTR)))
+
+
+def _bind_win32_apis(user32, shell32, kernel32) -> None:
+    """Configure 64-bit-safe `ctypes` prototypes for Win32 window and tray functions."""
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterWindowMessageW.restype = wintypes.UINT
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+    ]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.CreatePopupMenu.restype = wintypes.HMENU
+    user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.LPVOID]
+    user32.DestroyMenu.argtypes = [wintypes.HMENU]
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(_NotifyIconDataW)]
+    shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+
 def _run_win32_tray_loop(local_url: str, on_quit) -> None:
-    """Run a pure-stdlib Win32 `Shell_NotifyIconW` message loop on Windows."""
+    """Run a pure-stdlib 64-bit Win32 `Shell_NotifyIconW` message loop on Windows."""
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    gdi32 = ctypes.windll.gdi32  # type: ignore[attr-defined]
+    _bind_win32_apis(user32, shell32, kernel32)
 
-    wm_tray = 0x0400 + 20
-    wm_destroy, wm_command = 0x0002, 0x0111
-    wm_lbuttondblclk, wm_rbuttonup, wm_contextmenu = 0x0203, 0x0205, 0x007B
-    nim_add, nim_delete = 0x00000000, 0x00000002
-    nif_message, nif_icon, nif_tip = 0x00000001, 0x00000002, 0x00000004
-    mf_string, mf_separator = 0x0000, 0x0800
-    tpm_returncmd, tpm_rightbutton = 0x0100, 0x0002
-
-    lresult_t = ctypes.c_ssize_t
-    wndproc_t = ctypes.WINFUNCTYPE(lresult_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-    user32.DefWindowProcW.restype = lresult_t
+    wm_tray, wm_destroy, wm_command = 0x0414, 0x0002, 0x0111
+    wm_lbuttonup, wm_lbuttondblclk, wm_rbuttonup, wm_contextmenu = 0x0202, 0x0203, 0x0205, 0x007B
+    wm_taskbar_created = int(user32.RegisterWindowMessageW("TaskbarCreated") or 0)
+    wndproc_t = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
     class WndClassW(ctypes.Structure):
         _fields_ = [
@@ -118,23 +221,19 @@ def _run_win32_tray_loop(local_url: str, on_quit) -> None:
             ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
         ]
 
-    class NotifyIconDataW(ctypes.Structure):
-        _fields_ = [
-            ("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND), ("uID", wintypes.UINT),
-            ("uFlags", wintypes.UINT), ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
-            ("szTip", wintypes.WCHAR * 128),
-        ]
+    nid = _NotifyIconDataW()
 
     def _show_menu(hwnd: int) -> None:
         menu = user32.CreatePopupMenu()
-        user32.AppendMenuW(menu, mf_string, 1001, "Open Companion Studio")
-        user32.AppendMenuW(menu, mf_string, 1002, "Open User Data Folder")
-        user32.AppendMenuW(menu, mf_separator, 0, None)
-        user32.AppendMenuW(menu, mf_string, 1003, "Quit Companion")
+        user32.AppendMenuW(menu, 0x0000, 1001, "Open Companion Studio")
+        user32.AppendMenuW(menu, 0x0000, 1002, "Open User Data Folder")
+        user32.AppendMenuW(menu, 0x0800, 0, None)
+        user32.AppendMenuW(menu, 0x0000, 1003, "Quit Companion")
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
         user32.SetForegroundWindow(hwnd)
-        cmd = user32.TrackPopupMenu(menu, tpm_returncmd | tpm_rightbutton, pt.x, pt.y, 0, hwnd, None)
+        cmd = int(user32.TrackPopupMenu(menu, 0x0102, pt.x, pt.y, 0, hwnd, None))
+        user32.PostMessageW(hwnd, 0, 0, 0)
         user32.DestroyMenu(menu)
         if cmd == 1001:
             webbrowser.open(local_url)
@@ -144,10 +243,14 @@ def _run_win32_tray_loop(local_url: str, on_quit) -> None:
             user32.DestroyWindow(hwnd)
 
     def _wnd_proc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+        if wm_taskbar_created and msg == wm_taskbar_created:
+            shell32.Shell_NotifyIconW(0, ctypes.byref(nid))
+            return 0
         if msg == wm_tray:
-            if lparam == wm_lbuttondblclk:
+            ev = int(lparam) & 0xFFFF
+            if ev == wm_lbuttondblclk:
                 webbrowser.open(local_url)
-            elif lparam in (wm_rbuttonup, wm_contextmenu):
+            elif ev in (wm_rbuttonup, wm_contextmenu, wm_lbuttonup):
                 _show_menu(hwnd)
             return 0
         if msg == wm_command and (wparam & 0xFFFF) == 1003:
@@ -159,24 +262,36 @@ def _run_win32_tray_loop(local_url: str, on_quit) -> None:
         return int(user32.DefWindowProcW(hwnd, msg, wparam, lparam))
 
     cb_proc = wndproc_t(_wnd_proc)
-    hinst = kernel32.GetModuleHandleW(None)
+    hinst = int(kernel32.GetModuleHandleW(None))
+    hicon = _create_companion_hicon(user32, gdi32, shell32, hinst)
     cls_name = f"CompanionTrayWnd_{os.getpid()}"
-    wc = WndClassW(0, cb_proc, 0, 0, hinst, user32.LoadIconW(None, 32512), None, None, None, cls_name)
+    wc = WndClassW(0, cb_proc, 0, 0, hinst, hicon, None, None, None, cls_name)
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WndClassW)]
     user32.RegisterClassW(ctypes.byref(wc))
-    hwnd = user32.CreateWindowExW(0, cls_name, "Companion AI OS", 0, 0, 0, 0, 0, None, None, hinst, None)
+    hwnd = int(user32.CreateWindowExW(0, cls_name, "Companion AI OS", 0, 0, 0, 0, 0, None, None, hinst, None))
 
-    nid = NotifyIconDataW(
-        ctypes.sizeof(NotifyIconDataW), hwnd, 1, nif_message | nif_icon | nif_tip,
-        wm_tray, user32.LoadIconW(None, 32512), f"Companion AI OS ({local_url})"[:127],
-    )
-    shell32.Shell_NotifyIconW(nim_add, ctypes.byref(nid))
+    nid.cbSize = ctypes.sizeof(_NotifyIconDataW)
+    nid.hWnd = hwnd
+    nid.uID = 1
+    nid.uFlags = 0x00000001 | 0x00000002 | 0x00000004
+    nid.uCallbackMessage = wm_tray
+    nid.hIcon = hicon
+    nid.szTip = f"Companion AI OS ({local_url})"[:127]
+
+    added = False
+    for _ in range(10):
+        if bool(shell32.Shell_NotifyIconW(0, ctypes.byref(nid))):
+            added = True
+            break
+        threading.Event().wait(0.5)
+    telemetry.log("INFO" if added else "WARN", "tray", f"Win32 tray icon registered={added} ({local_url})")
     try:
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
     finally:
-        shell32.Shell_NotifyIconW(nim_delete, ctypes.byref(nid))
+        shell32.Shell_NotifyIconW(2, ctypes.byref(nid))
         on_quit()
 
 

@@ -79,7 +79,7 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
 
     def test_studios_1_to_3_chat_wiki_and_jobs_http_contracts(self) -> None:
         """Verify HTTP contracts for Forever Chat, Co-Owned Wiki + 2D Graph + Trash, and Jobs/Approvals."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             tmp_root = Path(tmp)
             store = MemoryStore(db_path=tmp_root / "data" / "companion.db")
             enqueue_session_nudge("job_done", "Job job_123 completed.", ref_id="job_123", session_id="web_ui", store=store)
@@ -135,7 +135,7 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
 
     def test_studios_4_to_6_vault_federation_and_ops_http_contracts(self) -> None:
         """Verify HTTP contracts for Blind Vault + Endpoints, Federation + MCP, and Routines/Ops."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             tmp_root = Path(tmp)
             store = MemoryStore(db_path=tmp_root / "data" / "companion.db")
             with patch.dict(os.environ, {"COMPANION_SECRETS_FILE": str(tmp_root / "secrets.env")}):
@@ -197,7 +197,7 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
         msg = format_port_conflict_error("0.0.0.0", 65531, OSError("Address already in use"))
         self.assertIn("--port", msg)
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             tmp_root = Path(tmp)
             data_dir = tmp_root / "isolated_data"
             store = MemoryStore(db_path=data_dir / "conversations.db")
