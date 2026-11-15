@@ -29,14 +29,28 @@ skills/<skill-name>/
 2. **Author `SKILL.md` with YAML Frontmatter**:
    - `name` must be kebab-case (`[a-z0-9-]+`) matching the folder name.
    - `description` must be at least 10 characters.
-   - `required_tools` (optional) lists primitive tools used by the skill.
+   - `required_tools` (non-empty list, e.g. `[read_file, workflow_manage]`) lists primitive tools used by the skill.
    - Body must include `## When to Use This Skill` and `## Step-by-Step Procedure` (or `## How to ...`).
 3. **Author Code-Controlled Python DAGs (`dags/<dag_name>.py`)**:
-   - Import `DAGNode, DAGSpec, dry_run_dag` from `companion.dag_runtime`.
-   - Expose `DAG = DAGSpec(name="<kebab-name>", description="...", nodes=[...])` supporting `python_step`, `tool_or_script_step`, `mcp_step`, `bounded_llm_step`, `human_gate`, typed `input_schema`/`output_schema`, `foreach` fan-out/fan-in, and `retries`.
-   - Include a `--self-test` / `self_test_fn` check so `stage_and_promote_skill` verifies acyclic topology and contracts before promotion.
+   - Import `DAGNode, DAGSpec` from `companion.dag_runtime`.
+   - Expose `DAG = DAGSpec(name="<kebab-name>", description="...", input_schema={...}, nodes=[...], self_test_fn=...)` supporting `python_step`, `tool_or_script_step`, `mcp_step`, `bounded_llm_step`, `human_gate`, `foreach` fan-out/fan-in, and `retries`:
+     ```python
+     from companion.dag_runtime import DAGNode, DAGSpec
+
+     def _step(ctx):
+         items = ctx["params"].get("items", [])
+         return {"count": len(items)}
+
+     DAG = DAGSpec(
+         name="example-dag",
+         description="Deterministic Python DAG template.",
+         input_schema={"items": "list"},
+         nodes=[DAGNode(node_id="count", kind="python_step", output_schema={"count": "int"}, fn=_step)],
+         self_test_fn=lambda: _step({"params": {"items": [1, 2]}})["count"] == 2,
+     )
+     ```
 4. **Author Helper Scripts & Domain Validators (`scripts/<helper>.py`)**:
    - Default to 100% Python 3.12 stdlib (`<= 700` lines/module, `<= 100` lines/function, `--self-test` flag).
    - When specialized third-party libraries (CAD, vision, PDF, data) are needed, declare `# /// script` PEP 723 dependencies for isolated `uv run` execution.
 5. **Stage, Lint & Promote**:
-   - Use `workflow_manage(action="promote_skill", skill="<name>", ...)` (which runs AST/SDD linting, DAG `--dry-run` & `--self-test`, and script `--self-test` in staging before atomic promotion) or run `system_doctor(run_tests=True)`.
+   - Call `workflow_manage(action="bootstrap_skill", skill="<name>", scope="user", skill_md="...", dags={"my_dag.py": "..."}, scripts={...})` (which runs AST linting, DAG `dry_run_dag` & `self_test_fn`, and script `--self-test` in staging before atomic promotion into `data/skills/<name>/`).

@@ -13,6 +13,7 @@ Pure-stdlib Python DAG engine replacing static JSON recipes with verifiable code
 
 import concurrent.futures
 import importlib.util
+import inspect
 import json
 import re
 import subprocess
@@ -149,15 +150,49 @@ def dag_node(
     return _wrap
 
 
+def _norm_schema(sch: Any) -> Dict[str, str]:
+    if not isinstance(sch, dict):
+        return {}
+    return {str(k): (v.__name__ if isinstance(v, type) else str(v)) for k, v in sch.items()}
+
+
 @dataclass
 class DAGSpec:
     """Verified directed acyclic graph definition with topological ordering and dry-run checks."""
 
     name: str
-    description: str
-    nodes: List[DAGNode]
+    description: str = ""
+    nodes: List[DAGNode] = field(default_factory=list)
     input_schema: Dict[str, str] = field(default_factory=dict)
     self_test_fn: Optional[Callable[[], bool]] = None
+
+    def __post_init__(self) -> None:
+        self.input_schema = _norm_schema(self.input_schema)
+        if not self.description and self.name:
+            self.description = f"Verified Python DAG `{self.name}`."
+        coerced: List[DAGNode] = []
+        valid_fields = set(DAGNode.__dataclass_fields__)
+        kind_alias = {"python": "python_step", "tool": "tool_or_script_step", "script": "tool_or_script_step", "mcp": "mcp_step", "llm": "bounded_llm_step"}
+        for nd in list(self.nodes or []):
+            if isinstance(nd, dict):
+                d = dict(nd)
+                if "self_test_fn" in d and self.self_test_fn is None:
+                    self.self_test_fn = d.pop("self_test_fn")
+                nid = d.get("node_id") or d.get("id") or d.get("name") or ""
+                raw_k = str(d.get("kind") or d.get("type") or "python_step")
+                kw = {k: v for k, v in d.items() if k in valid_fields}
+                kw["node_id"] = nid
+                kw["kind"] = kind_alias.get(raw_k, raw_k)
+                if "func" in d and "fn" not in kw:
+                    kw["fn"] = d["func"]
+                kw["input_schema"] = _norm_schema(kw.get("input_schema"))
+                kw["output_schema"] = _norm_schema(kw.get("output_schema"))
+                coerced.append(DAGNode(**kw))
+            else:
+                nd.input_schema = _norm_schema(nd.input_schema)
+                nd.output_schema = _norm_schema(nd.output_schema)
+                coerced.append(nd)
+        self.nodes = coerced
 
     def validate(self) -> Optional[str]:
         if not self.name or not _KEBAB_RE.match(self.name):
@@ -312,7 +347,12 @@ def _invoke_single_unit(node: DAGNode, unit_ctx: Dict[str, Any], bindings: DAGRu
         return {"approved": True, "node_id": node.node_id}
     if node.kind == "python_step":
         assert node.fn is not None
-        out = node.fn(unit_ctx)
+        params = list(inspect.signature(node.fn).parameters.values())
+        merged = unit_ctx.get("input", unit_ctx.get("params", {}))
+        if params and all(p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) for p in params) and params[0].name not in ("ctx", "context", "_ctx", "unit_ctx") and all(p.name in merged or p.default is not p.empty for p in params):
+            out = node.fn(**{p.name: merged[p.name] for p in params if p.name in merged})
+        else:
+            out = node.fn(unit_ctx)
     elif node.kind == "tool_or_script_step":
         if bindings.tool_fn is None:
             raise RuntimeError("No tool executor bound to DAG runtime.")
@@ -360,11 +400,15 @@ def _execute_node_with_retries(node: DAGNode, ctx: Dict[str, Any], bindings: DAG
                         raise ValueError(f"Node `{node.node_id}` foreach `{node.foreach}` resolved to {type(seq).__name__}, expected list.")
                     results: List[Dict[str, Any]] = []
                     for idx, elem in enumerate(seq):
-                        sub_ctx = {**ctx, "item": elem, "item_index": idx, "input": elem if isinstance(elem, dict) else {"item": elem, **ctx["params"]}}
+                        sub_in = elem if isinstance(elem, dict) else {"item": elem, **ctx["params"]}
+                        top_in = {k: v for k, v in sub_in.items() if k not in ("params", "nodes", "run_id", "input", "item", "item_index")}
+                        sub_ctx = {**top_in, **ctx, "item": elem, "item_index": idx, "input": sub_in}
                         fut = pool.submit(_invoke_single_unit, node, sub_ctx, bindings)
                         results.append(fut.result(timeout=max(0.5, float(node.timeout_sec))))
                     return {"items": results, "count": len(results)}, attempt
-                unit_ctx = {**ctx, "input": {**ctx["params"], **{k: v for dep in node.depends_on for k, v in (ctx["nodes"].get(dep) or {}).items() if isinstance(ctx["nodes"].get(dep), dict)}}}
+                merged_in = {**ctx["params"], **{k: v for dep in node.depends_on for k, v in (ctx["nodes"].get(dep) or {}).items() if isinstance(ctx["nodes"].get(dep), dict)}}
+                top_in = {k: v for k, v in merged_in.items() if k not in ("params", "nodes", "run_id", "input", "item", "item_index")}
+                unit_ctx = {**top_in, **ctx, "input": merged_in}
                 fut = pool.submit(_invoke_single_unit, node, unit_ctx, bindings)
                 return fut.result(timeout=max(0.5, float(node.timeout_sec))), attempt
         except Exception as exc:
@@ -413,11 +457,11 @@ def execute_dag_spec(
     """Execute a `DAGSpec` with SQLite step checkpointing, `foreach` fan-out/fan-in, and `R3` pause/resume."""
     val_err = dag.validate()
     if val_err:
-        return {"ok": False, "status": "invalid_dag", "error": val_err}
+        return {"ok": False, "status": "invalid_dag", "error": val_err, "summary": f"DAG `{dag.name}` validation failed: {val_err}"}
     eff_params = dict(params or {})
     p_err = validate_typed_payload(eff_params, dag.input_schema, f"DAG `{dag.name}` params")
     if p_err:
-        return {"ok": False, "status": "invalid_params", "error": p_err}
+        return {"ok": False, "status": "invalid_params", "error": p_err, "summary": f"DAG `{dag.name}` input error: {p_err}"}
 
     mem = store or get_memory_store()
     mem.ensure_schema("dag_runtime", _init_dag_tables)
@@ -447,7 +491,7 @@ def execute_dag_spec(
                         (json.dumps(ctx["nodes"]), node.node_id, apr["approval_id"], rid),
                     )
                     mem.conn.commit()
-                return {"ok": True, "status": "waiting_approval", "run_id": rid, "dag_name": dag.name, "paused_node_id": node.node_id, "approval_id": apr["approval_id"], "nodes": ctx["nodes"]}
+                return {"ok": True, "status": "waiting_approval", "run_id": rid, "dag_name": dag.name, "paused_node_id": node.node_id, "approval_id": apr["approval_id"], "nodes": ctx["nodes"], "summary": f"DAG `{dag.name}` (`{rid}`) paused at `{node.node_id}` awaiting approval (`{apr['approval_id']}`)."}
         t0 = time.perf_counter()
         try:
             out, attempts = _execute_node_with_retries(node, ctx, eff_bindings)
@@ -458,14 +502,15 @@ def execute_dag_spec(
                 mem.conn.execute("UPDATE dag_runs SET status = 'failed', outputs_json = ?, paused_node_id = ?, error = ?, updated_at = CURRENT_TIMESTAMP WHERE run_id = ?", (json.dumps(ctx["nodes"]), node.node_id, err_msg, rid))
                 mem.conn.commit()
             telemetry.log("WARN", "dag_runtime", f"DAG `{dag.name}` failed at `{node.node_id}`: {err_msg[:140]}")
-            return {"ok": False, "status": "failed", "run_id": rid, "dag_name": dag.name, "failed_node_id": node.node_id, "error": err_msg, "nodes": ctx["nodes"]}
+            return {"ok": False, "status": "failed", "run_id": rid, "dag_name": dag.name, "failed_node_id": node.node_id, "error": err_msg, "nodes": ctx["nodes"], "summary": f"DAG `{dag.name}` (`{rid}`) failed at `{node.node_id}`: {err_msg}"}
         ctx["nodes"][node.node_id] = out
         _save_node_checkpoint(mem, rid, node.node_id, "completed", attempts, out, "", (time.perf_counter() - t0) * 1000.0)
 
     with mem._lock:
         mem.conn.execute("UPDATE dag_runs SET status = 'completed', outputs_json = ?, paused_node_id = '', error = '', updated_at = CURRENT_TIMESTAMP WHERE run_id = ?", (json.dumps(ctx["nodes"]), rid))
         mem.conn.commit()
-    return {"ok": True, "status": "completed", "run_id": rid, "dag_name": dag.name, "nodes": ctx["nodes"], "final_output": ctx["nodes"].get(ordered[-1].node_id, {})}
+    final_out = ctx["nodes"].get(ordered[-1].node_id, {})
+    return {"ok": True, "status": "completed", "run_id": rid, "dag_name": dag.name, "nodes": ctx["nodes"], "final_output": final_out, "summary": f"DAG `{dag.name}` (`{rid}`) completed ({len(ordered)} node(s)). Final output: {json.dumps(final_out, default=str)}"}
 
 
 def load_dag_spec_from_file(path: Path) -> DAGSpec:
@@ -529,7 +574,7 @@ def discover_dags(root: Optional[Path] = None) -> List[Dict[str, Any]]:
     base = (root or settings.root).resolve()
     search_roots = [base / "skills", base / "data" / "skills"]
     data_skills = settings.effective_data_dir.resolve() / "skills"
-    if root is None and data_skills.is_dir() and data_skills not in search_roots:
+    if (root is None or base == settings.root.resolve()) and data_skills.is_dir() and data_skills not in search_roots:
         search_roots.append(data_skills)
     found: Dict[str, Dict[str, Any]] = {}
     for sroot in search_roots:
@@ -568,7 +613,8 @@ def execute_dag_by_name(
     clean = (dag_name or "").strip().lower().removesuffix(".py").replace("_", "-")
     catalog = {d["name"]: d for d in discover_dags(root=root)}
     if clean not in catalog:
-        return {"ok": False, "status": "not_found", "error": f"DAG `{dag_name}` not found. Available: {sorted(catalog)}"}
+        err = f"DAG `{dag_name}` not found. Available: {sorted(catalog)}"
+        return {"ok": False, "status": "not_found", "error": err, "summary": err}
     dag = load_dag_spec_from_file(Path(catalog[clean]["path"]))
     return execute_dag_spec(dag, params=params, store=store, bindings=bindings, run_id=run_id, approved_nodes=approved_nodes)
 
@@ -587,7 +633,8 @@ def resume_dag_run(
     mem.ensure_schema("dag_runtime", _init_dag_tables)
     rows = mem._fetch_dicts(["run_id", "dag_name", "status", "params_json", "paused_node_id"], "SELECT run_id, dag_name, status, params_json, paused_node_id FROM dag_runs WHERE run_id = ?", (run_id.strip(),))
     if not rows:
-        return {"ok": False, "status": "not_found", "error": f"DAG run `{run_id}` not found."}
+        err = f"DAG run `{run_id}` not found."
+        return {"ok": False, "status": "not_found", "error": err, "summary": err}
     rec = rows[0]
     try:
         params = json.loads(rec["params_json"] or "{}")

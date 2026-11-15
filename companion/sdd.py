@@ -196,10 +196,19 @@ def validate_skill_markdown(content: str, expected_name: Optional[str] = None) -
     fm_block = norm[4:end_idx]
     body = norm[end_idx + 4 :].strip()
     meta: Dict[str, str] = {}
+    cur_key = ""
     for line in fm_block.splitlines():
-        if ":" in line:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if (line.startswith(" ") or line.startswith("\t")) and cur_key:
+            item = s[1:].strip().strip("'\"") if s.startswith("-") else s.strip("'\"")
+            meta[cur_key] = f"{meta[cur_key]}, {item}" if (meta[cur_key] and s.startswith("-")) else f"{meta[cur_key]} {item}".strip()
+        elif ":" in line:
             k, v = line.split(":", 1)
-            meta[k.strip().lower()] = v.strip().strip("'\"")
+            cur_key = k.strip().lower()
+            val = v.strip().strip("'\"")
+            meta[cur_key] = "" if val in (">", "|", ">-", "|-") else val
     name = meta.get("name", "")
     if not name or not _KEBAB_RE.match(name):
         return f"SKILL.md frontmatter `name` must be kebab-case (`[a-z0-9-]+`), got `{name}`."

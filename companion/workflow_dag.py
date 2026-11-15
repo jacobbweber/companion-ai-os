@@ -344,8 +344,14 @@ def evaluate_step_verification(
 
     if spec.kind == "evidence_file":
         if spec.target and spec.target != "*":
-            p = (target_root / spec.target).resolve()
-            if not p.is_relative_to(target_root):
+            norm_t = spec.target.replace("\\", "/").strip("/")
+            data_root = settings.effective_data_dir.resolve()
+            if target_root == settings.root.resolve() and norm_t.startswith("data/"):
+                cand_data = (data_root / norm_t[5:]).resolve()
+                p = cand_data if cand_data.exists() else (target_root / norm_t).resolve()
+            else:
+                p = (Path(spec.target) if Path(spec.target).is_absolute() else (target_root / spec.target)).resolve()
+            if not (p.is_relative_to(target_root) or p.is_relative_to(data_root)):
                 return False, f"Evidence file path `{spec.target}` escapes workspace root."
             try:
                 txt = get_execution_target().read_text(p)

@@ -376,7 +376,7 @@ class ProjectGraphManager:
                     continue
                 all_done = all((by_key.get(d) or {}).get("status") in DONE_STATUSES for d in deps)
                 st = str(it["status"]).lower()
-                if not all_done and st in READY_STATUSES:
+                if not all_done and st in (*READY_STATUSES, "backlog"):
                     self.store.conn.execute("UPDATE work_items SET status = 'blocked', updated_at = CURRENT_TIMESTAMP WHERE item_id = ?", (it["item_id"],))
                 elif all_done and st == "blocked":
                     self.store.conn.execute("UPDATE work_items SET status = 'ready', updated_at = CURRENT_TIMESTAMP WHERE item_id = ?", (it["item_id"],))

@@ -5,6 +5,7 @@ Extracted from `companion/tools.py` so workspace I/O tools and OS state/governan
 each maintain clean single-responsibility focus and generous `<465L` headroom.
 """
 
+import json
 from typing import Any, Dict
 
 from companion.archive_and_approvals import format_forever_search_results, search_forever_history
@@ -154,22 +155,57 @@ def tool_task_manage(args: Dict[str, Any]) -> str:
     return f"error: unknown task_manage action '{action}'."
 
 
+def _dict_arg(args: Dict[str, Any], *keys: str) -> Dict[str, Any] | None:
+    for k in keys:
+        val = args.get(k)
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str) and val.strip().startswith("{"):
+            raw = val.strip()
+            for cand in (raw, raw + "}"):
+                try:
+                    parsed = json.loads(cand, strict=False)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    continue
+    return None
+
+
+def _bad_json_dict_err(args: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        val = args.get(k)
+        if isinstance(val, str) and val.strip() and _dict_arg({k: val}, k) is None:
+            return f"error: parameter `{k}` must be a dict object (could not parse string as JSON object)."
+    return ""
+
+
 def _handle_skill_forge_action(action: str, args: Dict[str, Any]) -> str:
-    """Handle `check_skill`, `bootstrap_skill`, and `run_script` actions for `tool_workflow_manage`."""
+    """Handle `check_skill`, `bootstrap_skill`/`promote_skill`, and `run_script` actions for `tool_workflow_manage`."""
     if action == "check_skill":
         q = str_arg(args, "goal") or str_arg(args, "skill")
         return "error: goal or skill query is required for check_skill" if not q else str(check_make_vs_borrow(q)["summary"])
-    if action == "bootstrap_skill":
-        raw_dags = args.get("dags") if isinstance(args.get("dags"), dict) else (args.get("workflows") if isinstance(args.get("workflows"), dict) else None)
+    if action in ("bootstrap_skill", "promote_skill"):
+        jerr = _bad_json_dict_err(args, "dags", "workflows", "scripts", "references")
+        if jerr:
+            return jerr
+        raw_dags = dict(_dict_arg(args, "dags", "workflows") or {})
+        raw_scripts = dict(_dict_arg(args, "scripts") or {})
+        for fname in list(raw_scripts):
+            src = str(raw_scripts[fname])
+            if "DAGSpec(" in src and "--self-test" not in src:
+                raw_dags.setdefault(fname, raw_scripts.pop(fname))
+        default_scope = "core" if settings.is_self_dev_enabled() else "user"
+        eff_scope = str_arg(args, "scope", default_scope) or default_scope
         return str(
             stage_and_promote_skill(
                 name=str_arg(args, "skill"),
                 skill_md=str(args.get("skill_md") or ""),
-                scripts=args.get("scripts") if isinstance(args.get("scripts"), dict) else None,
-                dags=raw_dags,
-                references=args.get("references") if isinstance(args.get("references"), dict) else None,
+                scripts=raw_scripts or None,
+                dags=raw_dags or None,
+                references=_dict_arg(args, "references"),
                 overwrite=bool_arg(args, "overwrite", False),
-                scope=str_arg(args, "scope", "core") or "core",
+                scope=eff_scope,
             )["summary"]
         )
     raw_sa = args.get("script_args")
@@ -243,7 +279,7 @@ def tool_workflow_manage(args: Dict[str, Any]) -> str:
         return f"=== Subagent Worker Result (`{skill or 'worker'}` | tier=`{tier or 'fast'}`) ===\n{run_subagent(goal=goal, skill_name=skill, max_iters=int_arg(args, 'max_iters', 8), verbose=False, tier=tier)}"
     if action in ("list_dags", "list_recipes"):
         return workflow_engine.format_dags_catalog()
-    if action in ("check_skill", "bootstrap_skill", "run_script"):
+    if action in ("check_skill", "bootstrap_skill", "promote_skill", "run_script"):
         return _handle_skill_forge_action(action, args)
     if action in ("run_dag", "run_recipe"):
         dag_name = str_arg(args, "dag") or str_arg(args, "recipe") or str_arg(args, "recipe_name") or str_arg(args, "goal")
@@ -252,8 +288,9 @@ def tool_workflow_manage(args: Dict[str, Any]) -> str:
         from companion.agent import ensure_dag_runtime_bound
 
         ensure_dag_runtime_bound()
-        raw_params = args.get("params") or args.get("recipe_inputs") or args.get("inputs")
-        return str(workflow_engine.run_dag(dag_name, params=raw_params if isinstance(raw_params, dict) else {})["summary"])
+        raw_params = _dict_arg(args, "params", "recipe_inputs", "inputs") or {}
+        res = workflow_engine.run_dag(dag_name, params=raw_params)
+        return str(res.get("summary") or json.dumps(res, indent=2, default=str))
     if action == "resume_dag":
         run_id = str_arg(args, "run_id") or str_arg(args, "goal")
         if not run_id:
@@ -261,7 +298,8 @@ def tool_workflow_manage(args: Dict[str, Any]) -> str:
         from companion.agent import ensure_dag_runtime_bound
 
         ensure_dag_runtime_bound()
-        return str(resume_dag_run(run_id, store=get_memory_store())["summary"])
+        res = resume_dag_run(run_id, store=get_memory_store())
+        return str(res.get("summary") or json.dumps(res, indent=2, default=str))
     if action == "blueprint":
         return str(create_or_revise_blueprint(str_arg(args, "goal") or "status", workflow_type=str_arg(args, "workflow_type", "engineering_feature") or "engineering_feature", max_phase_iters=int_arg(args, "max_iters", 10), verbose=False)["summary"])
     if action == "approve":

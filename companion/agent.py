@@ -244,8 +244,9 @@ def run_agent_turn(
     bp_action = classify_blueprint_reply(user_text) if awaiting_bp else None
     intent = triage_turn(user_text, store=mem, root=settings.active_project_root) if is_top else triage_turn("")
     can_orchestrate = is_top and not awaiting_bp and (auto_promote is True or (auto_promote is None and max_iters is None and mem.get_active_workflow() is None))
-    should_blueprint = can_orchestrate and intent.needs_blueprint
-    should_promote = can_orchestrate and not should_blueprint and intent.mode == "AUTONOMOUS_BUILD"
+    code_build_allowed = (not settings.get_workspace().is_self_project) or settings.is_self_dev_enabled() or intent.risk_tier == "R3"
+    should_blueprint = can_orchestrate and intent.needs_blueprint and code_build_allowed
+    should_promote = can_orchestrate and not should_blueprint and intent.mode == "AUTONOMOUS_BUILD" and code_build_allowed
     tid = telemetry.start_trace(trace_type=session_tag or "user_turn", name=user_text[:100]) if mem.db_path.resolve() == settings.db_path.resolve() else None
     if awaiting_bp and is_user_msg and not user_text.strip().startswith(("/", ".")):
         try:

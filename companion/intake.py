@@ -94,19 +94,30 @@ def _tokenize_words(text: str) -> List[str]:
     return [w.lower() for w in re.findall(r"[A-Za-z0-9_-]+", text or "")]
 
 
+_COMPANION_ID_PREFIXES = (
+    "wi_", "crd_", "prj_", "ms_", "ep_", "tb_", "sp_", "apr_", "bgj_", "sbx_", "rt_", "dagrun_", "edu_", "evt_", "cur_", "ctx_",
+)
+_COMPANION_SDK_SYMBOLS = frozenset({
+    "dagspec", "dagnode", "triggerpolicy", "verificationspec", "goalplan", "goalstep", "memorystore", "skillforge",
+})
+
+
 def _filter_external_unknown_targets(clean_text: str, raw_unknowns: List[str]) -> Tuple[str, ...]:
-    """Retain genuine unverified system/component identifiers while ignoring artifact filenames and prose."""
-    first_word = clean_text.split()[0].strip(".,:;!?()[]{}\"'") if clean_text.split() else ""
+    """Retain genuine unverified external system/component identifiers while ignoring Companion IDs, slugs, and code literals."""
+    first_word = clean_text.split()[0].strip(".,:;!?()[]{}\"'`") if clean_text.split() else ""
     filtered: List[str] = []
     for tok in raw_unknowns:
-        norm = tok.strip(".,:;!?()[]{}\"'")
+        norm = tok.strip(".,:;!?()[]{}\"'`")
         low = norm.lower().strip("./-")
-        if not low or low in _GENERIC_TECH_TERMS or "." in norm and _ARTIFACT_PATH_RE.search(norm):
+        if not low or low in _GENERIC_TECH_TERMS or low in _COMPANION_SDK_SYMBOLS:
+            continue
+        if low.startswith(_COMPANION_ID_PREFIXES) or norm.isupper() or norm == norm.lower():
+            continue
+        if "." in norm and _ARTIFACT_PATH_RE.search(norm):
             continue
         has_internal_cap_or_digit = any(c.isupper() for c in norm[1:]) or any(c.isdigit() for c in norm)
-        has_struct_sep = any(ch in norm for ch in ("_", "/", ".")) or ("-" in norm and low not in _GENERIC_TECH_TERMS)
-        is_mid_sentence_proper = norm[0].isupper() and norm != first_word
-        if (has_internal_cap_or_digit or has_struct_sep or is_mid_sentence_proper) and norm not in filtered:
+        is_mid_sentence_proper = norm[0].isupper() and norm != first_word and len(norm) >= 4
+        if (has_internal_cap_or_digit or is_mid_sentence_proper) and norm not in filtered:
             filtered.append(norm)
     return tuple(filtered)
 
@@ -149,12 +160,15 @@ def match_verified_dag(user_text: str, root: Optional[Path] = None) -> str:
     run_cues = {"run", "execute", "trigger", "invoke", "launch", "audit", "verify", "diagnose", "check"}
     if not (tokens & run_cues):
         return ""
+    best_pos, best_name = -1, ""
     for d in discover_dags(root=root):
         name = str(d.get("name") or "").lower()
         alt = name.replace("-", " ")
         if name and (f"dag {name}" in clean or f"`{name}`" in clean or (len(name) >= 6 and (name in tokens or alt in clean) and "dag" in tokens)):
-            return str(d["name"])
-    return ""
+            pos = max(clean.rfind(name), clean.rfind(alt))
+            if pos >= best_pos:
+                best_pos, best_name = pos, str(d["name"])
+    return best_name
 
 
 def assess_turn_readiness(
@@ -290,7 +304,7 @@ def triage_turn(
     multi_deliverable = len(artifact_refs) >= 3 or len(_NUMBERED_SPEC_RE.findall(clean)) >= 3 or ("end-to-end" in clean.lower() and bool({"test", "tests"} & word_set) and has_mutation)
 
     if readiness.status == "NEEDS_ALIGNMENT" and (readiness.risk_tier == ActionRiskTier.R3_HIGH_IMPACT_MUTATION or has_mutation):
-        return TriageDecision("DEEP_CONSULT", "reasoning", "high-impact or underspecified goal routed to Blueprint alignment", readiness.status, readiness.reasons, needs_blueprint=True, route="GOAL_ALIGN_PLAN", risk_tier=risk_code)
+        return TriageDecision("GUIDED_CHANGE", "reasoning", "high-impact or underspecified goal routed to Blueprint alignment", readiness.status, readiness.reasons, needs_blueprint=True, route="GOAL_ALIGN_PLAN", risk_tier=risk_code)
     if (is_question or (not has_mutation and bool(word_set & consult_cues))) and not multi_deliverable:
         is_deep = len(words_list) >= 14 or bool(word_set & consult_cues)
         return TriageDecision("DEEP_CONSULT" if is_deep else "CHAT_DIRECT", "reasoning" if is_deep else "fast", "analytical consultation" if is_deep else "direct question", readiness.status, readiness.reasons, route="DIRECT_TURN", risk_tier=risk_code)

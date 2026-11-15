@@ -388,7 +388,7 @@ LIVE SYSTEM HUD (Auto-Refreshed from SQLite State Store)
 Host Runtime   : {host_hud}
 Active Project : `{ws.project_id}` -> {ws.project_root}
 Workspace Guard: {ws_lock}
-Companion Core : {settings.root} (Entry: `harness.py` | Specs: `specs/` | Skills: `skills/` | Wiki: `{settings.wiki_dir}`)
+Companion Core : {settings.root} (Entry: `harness.py` | Specs: `specs/` | Skills: `skills/` | Data: `{settings.effective_data_dir}` | Wiki: `{settings.wiki_dir}`)
 Memory & DB    : {settings.memory_md_path} | {mem.db_path}
 Trust Mode     : `{trust_mode}` (Blind Vault Zero-Reveal Active | Approvals Queue: `/approvals`)
 Model Routing  : mode=`{active_mode}` | privacy=`{settings.effective_privacy_mode()}` | fast=`{fast_cfg.model}` (temp={fast_cfg.temperature}){code_hud} | reasoning=`{reas_cfg.model}` (temp={reas_cfg.temperature})

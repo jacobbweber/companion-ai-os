@@ -286,12 +286,19 @@ def discover_skills(root: Optional[Path] = None) -> List[Dict[str, str]]:
         if text.startswith("---\n"):
             end_idx = text.find("\n---\n", 4)
             if end_idx != -1:
+                cur_k = ""
                 for line in text[4:end_idx].splitlines():
-                    if ":" in line:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    if (line.startswith(" ") or line.startswith("\t")) and cur_k in ("name", "description", "required_tools"):
+                        item = s[1:].strip().strip("'\"") if s.startswith("-") else s.strip("'\"")
+                        meta[cur_k] = f"{meta[cur_k]}, {item}" if (meta[cur_k] and s.startswith("-")) else f"{meta[cur_k]} {item}".strip()
+                    elif ":" in line:
                         k, _, v = line.partition(":")
-                        k, v = k.strip().lower(), v.strip().strip("'\"")
-                        if k in ("name", "description", "required_tools") and v:
-                            meta[k] = v
+                        cur_k, val = k.strip().lower(), v.strip().strip("'\"")
+                        if cur_k in ("name", "description", "required_tools"):
+                            meta[cur_k] = "" if val in (">", "|", ">-", "|-") else (val or meta[cur_k])
         skills.append(meta)
     if len(_SKILLS_CACHE) > 8:
         _SKILLS_CACHE.clear()

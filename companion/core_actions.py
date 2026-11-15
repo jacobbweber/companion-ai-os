@@ -129,14 +129,16 @@ def _apply_approved_request(req: Dict[str, Any], mem: MemoryStore) -> Optional[s
     if cat == "mcp_server":
         hub = get_mcp_hub(store=mem)
         if act == "register_mcp_server" and payload.get("server_id"):
+            sid = str(payload["server_id"])
             r = hub.register_server(
-                server_id=str(payload["server_id"]), transport=str(payload.get("transport") or "stdio"),
+                server_id=sid, transport=str(payload.get("transport") or "stdio"),
                 label=str(payload.get("label") or ""), command=str(payload.get("command") or ""),
                 args=_as_list(payload.get("args")), url=str(payload.get("url") or ""),
                 credential_ref=str(payload.get("credential_ref") or ""), allowed_tools=_as_list(payload.get("allowed_tools")),
                 actor="user", confirmed=True,
             )
-            return r.get("summary") if r.get("ok") else None
+            disc = hub.discover_server(sid, actor="user") if r.get("ok") else {}
+            return (disc.get("summary") if disc.get("ok") else r.get("summary")) if r.get("ok") else None
         if act == "approve_mcp_tools" and payload.get("server_id"):
             r = hub.approve_server(str(payload["server_id"]), actor="user")
             return r.get("summary") if r.get("ok") else None
@@ -164,7 +166,7 @@ def _act_approvals(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str,
     if sub in ("dismiss_nudges", "clear_nudges", "mark_nudges_seen"):
         raw_ids = p.get("nudge_ids") if isinstance(p.get("nudge_ids"), list) else ([p["nudge_id"]] if p.get("nudge_id") is not None else None)
         return dismiss_session_nudges(nudge_ids=[int(x) for x in raw_ids] if raw_ids else None, category=str(p.get("category") or ""), store=mem)
-    if sub in ("approve", "deny", "reject", "resolve"):
+    if sub in ("approve", "deny", "reject", "resolve", "decide"):
         dec = str(p.get("decision") or ("approve" if sub == "approve" else "deny"))
         res = aq.resolve(str(p.get("approval_id") or ""), decision=dec, actor=actor, note=str(p.get("note") or ""))
         if res.get("ok") and dec.strip().lower() in ("approve", "approved", "yes", "allow"):
@@ -544,10 +546,10 @@ def _act_agile(p: Dict[str, Any], _actor: str, mem: MemoryStore) -> Dict[str, An
         projs = mgr.list_projects()
         return {"ok": True, "boards": projs, "projects": projs, "summary": "Projects & Goals: " + ", ".join(f"`{x['slug']}` ({x['kind']})" for x in projs)}
     view = mgr.get_board_projection(pid or None, timebox_id=str(p.get("sprint_id") or p.get("timebox_id") or "") or None, owner_filter=str(p.get("owner") or "") or None)
-    cnt = view["counts"]
+    cnt, rows = view["counts"], [f"  - `{it['item_id']}` [`{it['owner']}` | `{it['status']}`]: {it['title']}" for it in view.get("items", [])[:15]]
     return {
         "ok": True, **view, "boards": mgr.list_projects(), "aging_cards": [],
-        "summary": f"Project `{view['project']['title']}`: total={cnt['total']}, companion_ready={cnt['companion_ready']}, human_pending={cnt['human_pending']}, blocked={cnt['blocked']}, done={cnt['done']}.",
+        "summary": f"Project `{view['project']['title']}`: total={cnt['total']}, companion_ready={cnt['companion_ready']}, human_pending={cnt['human_pending']}, blocked={cnt['blocked']}, done={cnt['done']}." + ("\n" + "\n".join(rows) if rows else ""),
     }
 
 

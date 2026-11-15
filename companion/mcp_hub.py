@@ -12,7 +12,7 @@ Implements Pillar 4 of the Companion 3.0 Harvest Blueprint:
    instances (e.g., Workstation <-> Lab GPU Node) and renders `[CONNECTED FEDERATED PARTNERS]` into Companion's HUD.
 """
 
-import ctypes, hashlib, json, os, platform, re, secrets, shutil, socket, subprocess, time, urllib.error, urllib.request
+import ctypes, hashlib, json, os, platform, re, secrets, shlex, shutil, socket, subprocess, time, urllib.error, urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -279,7 +279,9 @@ class MCPHub:
         notif_line = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         stdin_payload = "\n".join([init_line, notif_line, json.dumps(rpc_req)]) + "\n"
         try:
-            proc = subprocess.run([srv["command"], *srv.get("args", [])], input=stdin_payload, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+            raw_cmd, raw_args = str(srv["command"]).strip(), list(srv.get("args", []))
+            argv = [t.strip('"') for t in shlex.split(raw_cmd, posix=(os.name != "nt"))] if (not raw_args and (" " in raw_cmd or '"' in raw_cmd)) else [raw_cmd, *raw_args]
+            proc = subprocess.run(argv, input=stdin_payload, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
             target_id = rpc_req.get("id")
             parsed_last: Dict[str, Any] = {}
             for ln in (proc.stdout or "").splitlines():
@@ -639,7 +641,7 @@ def harvest_mcp_capability_pack(
         "## Step-by-Step Procedure\n"
         "1. Read `references/mcp-tools.md` to inspect exact JSON input schemas.\n"
         f"2. Run `workflow_manage(action='run_dag', dag='{dag_name}', params=...)` for deterministic multi-step execution.\n"
-        f"3. Or invoke `mcp_manage(subaction='call_tool', server_id='{srv['server_id']}', tool_name=..., arguments=...)`.\n"
+        f"3. Or invoke `mcp_manage(action='call_tool', server_id='{srv['server_id']}', tool_name=..., arguments=...)`.\n"
     )
     helper_py = (
         '"""Self-tested schema helper for harvested MCP capability pack."""\n\n'
@@ -677,7 +679,8 @@ def harvest_mcp_capability_pack(
         dags={f"{dag_stem}.py": dag_py}, references={"mcp-tools.md": "\n".join(ref_lines)},
         overwrite=overwrite, root=root, scope="user",
     )
-    return {**res, "ok": bool(res.get("promoted")), "pack_name": pack, "dag_name": dag_name}
+    hint = f" Harvested DAG `{dag_name}` (run via `workflow_manage(action='run_dag', dag='{dag_name}', params=...)` or `mcp_manage(action='call_tool', server_id='{srv['server_id']}', tool_name='{first_tool}', arguments=...)`)." if res.get("promoted") else ""
+    return {**res, "ok": bool(res.get("promoted")), "pack_name": pack, "dag_name": dag_name, "summary": str(res.get("summary") or "") + hint}
 
 
 def get_mcp_hub(

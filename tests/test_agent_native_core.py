@@ -30,16 +30,20 @@ from companion.dag_runtime import (
     self_test_dag,
 )
 from companion.endpoints import get_endpoint_manager
-from companion.intake import triage_turn
+from companion.intake import match_verified_dag, triage_turn
 from companion.mcp_hub import get_mcp_hub, harvest_mcp_capability_pack
 from companion.memory_store import MemoryStore, memory_store_context
+from companion.os_tools import _dict_arg
 from companion.project_graph import get_project_graph
 from companion.routines import (
     IdleAutonomyWatcher,
     format_morning_briefing,
     get_routine_manager,
 )
+from companion.safety import lint_single_file_edit
+from companion.sdd import validate_skill_markdown
 from companion.skill_forge import run_skill_script, stage_and_promote_skill
+from companion.tools import resolve
 from companion.trigger_policy import (
     TriggerPolicy,
     evaluate_trigger_eligibility,
@@ -467,6 +471,104 @@ class TestPhase5SelfWiringHarvesterAndDomainValidators(unittest.TestCase):
             passed, detail = evaluate_step_verification(vspec, tmp_root, step_output='{"sensors": ["temp_living"]}')
             self.assertTrue(passed)
             self.assertIn("sensor_budget_verified", detail)
+
+
+class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
+    """Regression suite covering real-world gaps uncovered during live LLM dogfooding."""
+
+    def test_triage_ignores_companion_ids_slugs_and_rightmost_dag_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.closing(MemoryStore(db_path=Path(tmp) / "df_triage.db")) as store:
+            prompt = (
+                "Create an `on_idle` routine `overnight-backup` -> `snapshot_backup` and mark "
+                "`wi_0ed8c2722f` done; digest `INFO` / `WARN` / `ERROR` lines via `DAGSpec`."
+            )
+            td = triage_turn(prompt, store=store, root=settings.root)
+            self.assertEqual(td.readiness, "READY")
+            self.assertEqual(td.route, "DIRECT_TURN")
+
+            picked = match_verified_dag(
+                "Run the `sdd-verify` or `full-audit` DAG check? Wait: run the `release-check` DAG.",
+                root=settings.root,
+            )
+            self.assertEqual(picked, "release-check")
+
+    def test_dag_spec_dict_coercion_kwarg_fn_and_summary_output(self) -> None:
+        dag = DAGSpec(
+            name="log-digest-check",
+            description="Count ERROR and WARN log lines deterministically.",
+            input_schema={"lines": list},
+            nodes=[
+                {
+                    "name": "count_levels",
+                    "type": "python",
+                    "output_schema": {"errors": int, "warns": int},
+                    "func": lambda lines: {
+                        "errors": sum(1 for ln in lines if "ERROR" in ln),
+                        "warns": sum(1 for ln in lines if "WARN" in ln),
+                    },
+                    "self_test_fn": lambda: True,
+                }
+            ],
+        )
+        self.assertIsNone(dag.validate())
+        res = execute_dag_spec(dag, params={"lines": ["INFO ok", "WARN disk", "ERROR p1", "ERROR p2"]})
+        self.assertEqual(res["status"], "completed")
+        self.assertEqual(res["final_output"], {"errors": 2, "warns": 1})
+        self.assertIn('"errors": 2', res["summary"])
+        self.assertEqual(_dict_arg({"dags": '{"a.py": "x\ny"'}, "dags"), {"a.py": "x\ny"})
+        folded_md = (
+            "---\nname: log-digest\ndescription: >\n  Digest log lines deterministically.\n"
+            "required_tools:\n  - workflow_manage\n---\n"
+            "## When to Use This Skill\nWhen digesting logs.\n\n## Step-by-Step Procedure\n1. Run DAG.\n"
+        )
+        self.assertIsNone(validate_skill_markdown(folded_md, expected_name="log-digest"))
+
+    def test_custom_data_dir_resolution_dag_discovery_and_skill_linting(self) -> None:
+        orig_data = settings.data_dir
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                custom_data = (Path(tmp) / "ext_data").resolve()
+                (custom_data / "notes").mkdir(parents=True)
+                settings.data_dir = custom_data
+                self.assertEqual(resolve("data/notes/test.md").resolve(), (custom_data / "notes" / "test.md").resolve())
+                (custom_data / "notes" / "test.md").write_text("12ft shelving", encoding="utf-8")
+                ok, detail = evaluate_step_verification(
+                    VerificationSpec(kind="evidence_file", target="data/notes/test.md", contains="12ft"),
+                    settings.root,
+                )
+                self.assertTrue(ok, detail)
+
+                dag_src = (
+                    "from companion.dag_runtime import DAGNode, DAGSpec\n"
+                    "DAG = DAGSpec(name='ext-data-dag', description='External data dir DAG test', "
+                    "nodes=[DAGNode('n1', fn=lambda _c: {'ok': True})], self_test_fn=lambda: True)\n"
+                )
+                err, _warn = lint_single_file_edit(
+                    settings.root / "data" / "skills" / "ext-pack" / "dags" / "ext_dag.py",
+                    dag_src,
+                )
+                self.assertIsNone(err)
+                dag_dir = custom_data / "skills" / "ext-pack" / "dags"
+                dag_dir.mkdir(parents=True)
+                (dag_dir / "ext_dag.py").write_text(dag_src, encoding="utf-8")
+                names = [d["name"] for d in discover_dags(root=settings.root)]
+                self.assertIn("ext-data-dag", names)
+        finally:
+            settings.data_dir = orig_data
+
+    def test_backlog_dependency_blocking_and_pending_decide_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.closing(MemoryStore(db_path=Path(tmp) / "df_graph.db")) as store:
+            pg = get_project_graph(store=store)
+            proj = pg.create_project("Alias Check", kind="project")
+            up = pg.create_item(proj["project_id"], "Upstream step", owner="human", status="ready")
+            down = pg.create_item(proj["project_id"], "Downstream step", owner="companion", status="backlog", depends_on=[up["item_id"]])
+            self.assertEqual(down["status"], "blocked")
+
+            ep_prop = get_endpoint_manager(store=store).propose_endpoint("metrics-ep", "http_api", "http://127.0.0.1:9099", actor="companion")
+            pending = get_approval_queue(store=store).list_requests(status="pending")
+            self.assertEqual(len(pending), 1)
+            dec = execute_core_action("approvals", {"subaction": "decide", "approval_id": ep_prop["approval_id"], "decision": "approved"}, actor="web", store=store)
+            self.assertTrue(dec["ok"])
 
 
 if __name__ == "__main__":

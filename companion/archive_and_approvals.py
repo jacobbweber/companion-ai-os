@@ -240,8 +240,9 @@ class ApprovalQueue:
             "payload_json", "requester", "session_id", "status", "decided_by", "decision_note", "created_at", "decided_at",
         ]
         if status and status.strip().lower() != "all":
+            eff_st = "waiting" if status.strip().lower() == "pending" else status.strip().lower()
             sql = f"SELECT {', '.join(cols)} FROM approval_requests WHERE status = ? ORDER BY rowid DESC LIMIT ?"
-            return self.store._fetch_dicts(cols, sql, (status.strip().lower(), max(1, int(limit))))
+            return self.store._fetch_dicts(cols, sql, (eff_st, max(1, int(limit))))
         sql = f"SELECT {', '.join(cols)} FROM approval_requests ORDER BY rowid DESC LIMIT ?"
         return self.store._fetch_dicts(cols, sql, (max(1, int(limit)),))
 

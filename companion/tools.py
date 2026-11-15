@@ -47,11 +47,15 @@ __all__ = [
 
 
 def resolve(p: str, for_write: bool = False) -> Path:
-    """Resolve `p` against the active `WorkspaceContext` (allowing read fallback to Companion `skills/` & `specs/`)."""
+    """Resolve `p` against the active `WorkspaceContext` (mapping `data/...` to `effective_data_dir` on `self`)."""
     cand = Path(p)
     if cand.is_absolute():
         return cand
     ws = settings.get_workspace()
+    norm = p.replace("\\", "/").strip("/")
+    if ws.is_self_project and (norm == "data" or norm.startswith("data/")):
+        sub = norm[5:] if norm.startswith("data/") else ""
+        return (settings.effective_data_dir / sub) if sub else settings.effective_data_dir
     if not for_write and not ws.is_self_project:
         if (ws.project_root / p).exists():
             return ws.project_root / p

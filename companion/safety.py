@@ -191,7 +191,7 @@ def _check_python_governed_rules(tree: ast.Module, lines: List[str], rel: str) -
     parts = rel.split("/")
     if len(parts) == 1 and parts[0] not in ALLOWED_ROOT_FILES:
         return f"HYGIENE GUARD REJECTED `{rel}`: root `.py` file not allowed (place inside {sorted(ALLOWED_TOP_DIRS)})."
-    if len(parts) > 1 and parts[0] not in ALLOWED_TOP_DIRS:
+    if len(parts) > 1 and parts[0] not in (*ALLOWED_TOP_DIRS, "data"):
         return f"HYGIENE GUARD REJECTED `{rel}`: top-level folder `{parts[0]}` not in {sorted(ALLOWED_TOP_DIRS)}."
     if len(lines) > settings.max_module_lines:
         return (
@@ -213,7 +213,7 @@ def _check_python_governed_rules(tree: ast.Module, lines: List[str], rel: str) -
                     if fn_len > fn_cap:
                         return f"HYGIENE GUARD REJECTED `{rel}:{sub.lineno}`: `{node.name}.{sub.name}()` is {fn_len} lines (> budget {fn_cap})."
 
-    if parts[0] not in ("tests", "skills"):
+    if parts[0] not in ("tests", "skills", "data"):
         semi = find_semicolon_chains(tree, rel)
         if semi:
             return f"HYGIENE GUARD REJECTED `{semi[0]}`: write one statement per line (do not chain statements with `;`)."
@@ -278,7 +278,7 @@ def lint_single_file_edit(
         if js_err:
             return f"SYNTAX GUARD REJECTED {op_name} on {path}:\n  {js_err}\nOperation was NOT applied.", ""
 
-    if resolved.suffix.lower() in {".py", ".html", ".js"} and not rel.startswith(("tests/", "skills/")) and rel not in ("companion/safety.py", "companion/disciplines.py"):
+    if resolved.suffix.lower() in {".py", ".html", ".js"} and not rel.startswith(("tests/", "skills/", "data/")) and rel not in ("companion/safety.py", "companion/disciplines.py"):
         for rx, label in STUB_PATTERNS:
             if rx.search(content):
                 warnings.append(f"Detected {label} in `{rel}` — replace stubs with complete working logic before verification.")
