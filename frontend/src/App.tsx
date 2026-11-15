@@ -25,6 +25,8 @@ import { WikiStudio } from './studios/WikiStudio';
 import type { StudioId, ThemeId, WebStatus } from './types';
 
 const THEMES: Array<{ id: ThemeId; label: string }> = [
+  { id: 'storm', label: 'Storm & Safety Orange' },
+  { id: 'loftra', label: 'Loftra Industrial' },
   { id: 'obsidian', label: 'Obsidian Matte' },
   { id: 'orbital', label: 'Orbital Brutalist' },
   { id: 'graphite', label: 'Graphite Minimal' },
@@ -35,9 +37,9 @@ export const App: React.FC = () => {
   const [studio, setStudio] = useState<StudioId>('chat');
   const [theme, setTheme] = useState<ThemeId>(() => {
     const saved = window.localStorage.getItem('companion_theme') as ThemeId | null;
-    return saved && THEMES.some((t) => t.id === saved) ? saved : 'obsidian';
+    return saved && THEMES.some((t) => t.id === saved) ? saved : 'storm';
   });
-  const [lastDarkTheme, setLastDarkTheme] = useState<ThemeId>('obsidian');
+  const [lastDarkTheme, setLastDarkTheme] = useState<ThemeId>('storm');
   const [status, setStatus] = useState<WebStatus | null>(null);
   const [wikiTargetNote, setWikiTargetNote] = useState<string>('');
   const [systemTab, setSystemTab] = useState<SystemSubTab>('models');

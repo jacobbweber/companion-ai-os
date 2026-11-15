@@ -1,9 +1,66 @@
 /* ==========================================================================
-   Companion AI OS 3.0 — Matte Brutalist Sci-Fi / Obsidian Studio Design System
-   4 Themes: Obsidian Matte (default), Orbital Brutalist, Graphite Minimal, Daylight Paper
+   Companion AI OS 3.4 — Matte Industrial / Storm & Safety Orange Design System
+   6 Themes: Storm & Safety Orange (default), Loftra Industrial, Obsidian Matte,
+             Orbital Brutalist, Graphite Minimal, Daylight Paper
    ========================================================================== */
 
 :root,
+html[data-theme='storm'] {
+  /* 60% Storm Grey workspace + 30% Matte Black chrome + 10% Safety Orange (#FF5F00) */
+  --bg-canvas: #22252a;
+  --bg-rail: #131518;
+  --bg-panel: #292d33;
+  --bg-elevated: #31363e;
+  --bg-input: #15171b;
+  --bg-hover: #383e47;
+  --bg-active: #414852;
+  --border-hairline: #3b414b;
+  --border-strong: #545c68;
+  --text-primary: #eef0f3;
+  --text-secondary: #b4bac4;
+  --text-muted: #828a97;
+  --accent-primary: #ff5f00;
+  --accent-soft: rgba(255, 95, 0, 0.15);
+  --accent-secondary: #98a1ad;
+  --status-ok: #45b27c;
+  --status-warn: #ff8c24;
+  --status-danger: #e0524e;
+  --status-info: #7ea8ce;
+  --code-bg: #111316;
+  --shadow-panel: 0 12px 32px rgba(0, 0, 0, 0.5);
+  --border-subtle: var(--border-hairline);
+  --bg-surface: var(--bg-panel);
+  --accent-warn: var(--status-warn);
+  --radius-sm: 0px;
+  color-scheme: dark;
+}
+
+html[data-theme='loftra'] {
+  /* Mid-tone Storm Grey 60% canvas + Matte Black 30% rail/inputs + Safety Orange 10% */
+  --bg-canvas: #575c63;
+  --bg-rail: #16181b;
+  --bg-panel: #464b52;
+  --bg-elevated: #383c43;
+  --bg-input: #1b1e22;
+  --bg-hover: #4f555d;
+  --bg-active: #2e3238;
+  --border-hairline: #6b717a;
+  --border-strong: #878e98;
+  --text-primary: #f4f5f7;
+  --text-secondary: #d3d7dd;
+  --text-muted: #b0b6c0;
+  --accent-primary: #ff5f00;
+  --accent-soft: rgba(255, 95, 0, 0.18);
+  --accent-secondary: #b8bfc9;
+  --status-ok: #4bc488;
+  --status-warn: #ff9838;
+  --status-danger: #f06460;
+  --status-info: #90bce0;
+  --code-bg: #15171a;
+  --shadow-panel: 0 12px 30px rgba(10, 12, 15, 0.42);
+  color-scheme: dark;
+}
+
 html[data-theme='obsidian'] {
   --bg-canvas: #0b0c0f;
   --bg-rail: #0f1116;

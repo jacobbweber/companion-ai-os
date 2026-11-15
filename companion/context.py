@@ -1,6 +1,8 @@
 """Dynamic System Prompt Builder, Multi-Project Workspace Manager & Context Facade (A-Frame Application Layer)."""
 
 import json
+import platform
+import socket
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -338,41 +340,30 @@ def _format_identity_hud_block(prof: Dict[str, str]) -> str:
     )
 
 
-def build_system_prompt(
-    store: Optional[MemoryStore] = None,
-    wf_engine: Optional[WorkflowEngine] = None,
-    user_query: str = "",
-) -> str:
+def _format_host_runtime_hud() -> str:
+    """Return dynamic stdlib host/OS/arch/Python runtime line for `LIVE SYSTEM HUD`."""
+    return f"host=`{socket.gethostname()}` | os=`{platform.system()} {platform.release()} ({platform.machine()})` | python=`{platform.python_version()}`"
+
+
+def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional[WorkflowEngine] = None, user_query: str = "") -> str:
     """Construct the live, state-aware System Prompt with WorkspaceContext, Epistemic Grounding, and Workspace Radar."""
-    mem = store or get_memory_store()
-    wf = wf_engine or workflow_engine
+    mem, wf = (store or get_memory_store()), (wf_engine or workflow_engine)
     is_identity_bootstrapped(store=mem)
     default_md = settings.memory_md_path if mem.db_path.resolve() == settings.db_path.resolve() else (mem.db_path.parent / "MEMORY.md")
     if not default_md.is_file():
         mem.sync_memory_md(target_path=default_md)
-    prof = mem.get_user_profile()
-    identity_text = _format_identity_hud_block(prof)
-
-    ws = settings.get_workspace()
-    self_dev_on = mem.is_self_dev_mode_enabled()
+    prof, ws, self_dev_on = mem.get_user_profile(), settings.get_workspace(), mem.is_self_dev_mode_enabled()
+    identity_text, host_hud = _format_identity_hud_block(prof), _format_host_runtime_hud()
     ws_lock = (
-        (
-            "Self-Evolution Mode (`companion-self` | `Self-Dev Mode = ON` — edit with SDD & `system_doctor` discipline)"
-            if self_dev_on
-            else "DAILY-DRIVER STABLE MODE (`companion-self` | `Self-Dev Mode = OFF` per ADR-019 — core repo is MECHANICALLY READ-ONLY; `data/` & external `/project` workspaces are 100% writable; only human `/selfdev on` or Web System Studio can unlock)"
-        )
+        ("Self-Evolution Mode (`companion-self` | `Self-Dev Mode = ON` — edit with SDD & `system_doctor` discipline)" if self_dev_on else "DAILY-DRIVER STABLE MODE (`companion-self` | `Self-Dev Mode = OFF` per ADR-019 — core repo is MECHANICALLY READ-ONLY; `data/` & external `/project` workspaces are 100% writable; only human `/selfdev on` or Web System Studio can unlock)")
         if ws.is_self_project
         else f"EXTERNAL PROJECT MODE (`{ws.self_root}` is MECHANICALLY LOCKED READ-ONLY per ADR-007)"
     )
-    repo_radar = build_workspace_radar(ws.project_root)
-    hud = wf.render_hud()
-    hobby_on = mem.is_hobby_mode_enabled()
+    repo_radar, hud, hobby_on = build_workspace_radar(ws.project_root), wf.render_hud(), mem.is_hobby_mode_enabled()
     self_dev_lock = f" [{settings.self_dev_lock_reason()}]" if settings.is_self_dev_locked_by_env() else ""
-    trust_mode = get_trust_mode(store=mem)
-    partners_hud = format_connected_partners_hud(store=mem)
+    trust_mode, partners_hud = get_trust_mode(store=mem), format_connected_partners_hud(store=mem)
     partners_section = f"\n{partners_hud}\n" if partners_hud else ""
-    agile_hud = format_agile_hud(store=mem)
-    edu_hud = format_education_hud(store=mem)
+    agile_hud, edu_hud = format_agile_hud(store=mem), format_education_hud(store=mem)
     active_mode = prof.get("active_model_tier", "auto").strip().lower() or "auto"
     fast_cfg, code_cfg, reas_cfg = settings.resolve_tier("fast"), settings.resolve_tier("coding"), settings.resolve_tier("reasoning")
     code_hud = f" | coding=`{code_cfg.model}` (temp={code_cfg.temperature})" if code_cfg.is_dedicated else ""
@@ -394,6 +385,7 @@ def build_system_prompt(
 ===========================================================================
 LIVE SYSTEM HUD (Auto-Refreshed from SQLite State Store)
 ===========================================================================
+Host Runtime   : {host_hud}
 Active Project : `{ws.project_id}` -> {ws.project_root}
 Workspace Guard: {ws_lock}
 Companion Core : {settings.root} (Entry: `harness.py` | Specs: `specs/` | Skills: `skills/` | Wiki: `{settings.wiki_dir}`)

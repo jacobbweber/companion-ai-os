@@ -343,7 +343,7 @@ describe('Companion 3.0 Multi-Studio Interactive UI + Real Python Backend', () =
     await bridge.stop();
   });
 
-  it('switches across all 4 Matte Brutalist / Obsidian themes and toggles Light/Dark mode', async () => {
+  it('switches across all 6 Storm / Industrial / Brutalist themes and toggles Light/Dark mode', async () => {
     const navItems = container.querySelector('.nav-items');
     expect(navItems).toBeTruthy();
     expect(navItems?.querySelectorAll('.nav-btn').length).toBe(6);
@@ -352,9 +352,9 @@ describe('Companion 3.0 Multi-Studio Interactive UI + Real Python Backend', () =
       'select[aria-label="Select Studio Theme"]'
     ) as HTMLSelectElement;
     expect(themeSelect).toBeTruthy();
-    expect(document.documentElement.getAttribute('data-theme')).toBe('obsidian');
+    expect(document.documentElement.getAttribute('data-theme')).toBe('storm');
 
-    for (const themeId of ['orbital', 'graphite', 'daylight', 'obsidian']) {
+    for (const themeId of ['loftra', 'orbital', 'graphite', 'daylight', 'obsidian', 'storm']) {
       await act(async () => {
         themeSelect.value = themeId;
         themeSelect.dispatchEvent(new Event('change', { bubbles: true }));
@@ -375,7 +375,7 @@ describe('Companion 3.0 Multi-Studio Interactive UI + Real Python Backend', () =
     await act(async () => {
       toggleBtn.click();
     });
-    expect(document.documentElement.getAttribute('data-theme')).toBe('obsidian');
+    expect(document.documentElement.getAttribute('data-theme')).toBe('storm');
   });
 
   it('exercises Studio 1 (Forever Chat): Saved Prompts, Archive drawer, and live SSE streaming turn', async () => {

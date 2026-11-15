@@ -477,13 +477,15 @@ _R3_SHELL_RE = re.compile(
     r"(?:\b(?:ssh|scp|sftp|rsync)\s+\S+|\bgit\s+push\b|\b(?:npm|twine|cargo)\s+publish\b|"
     r"\b(?:curl|wget)\b[^\n]*(?:\b(?:-X|--request)\s*(?:POST|PUT|DELETE|PATCH)\b|(?:\s|^)(?:-d|--data|--data-raw|--data-binary|--json|-F|--form)\b)|"
     r"\bInvoke-(?:RestMethod|WebRequest)\b[^\n]*(?:-Method\s+(?:Post|Put|Delete|Patch)\b|-Body\b)|"
-    r"\b(?:schtasks|reg\s+(?:add|delete)|netsh|systemctl|sc\s+(?:create|delete|config))\b)",
+    r"\b(?:kill|pkill|killall|taskkill|Stop-Process)\b|"
+    r"\bsystemctl\b(?!\s+(?:--[a-z0-9=-]+\s+|-[a-zA-Z]+\s+)*(?:status|list-(?:units|unit-files|timers|sockets|dependencies)|is-(?:active|enabled|failed|system-running)|show|cat|help)\b)|"
+    r"\b(?:schtasks|reg\s+(?:add|delete)|netsh|sc\s+(?:create|delete|config))\b)",
     re.I,
 )
 _R3_PYTHON_RE = re.compile(
     r"(?:\b(?:urllib\.request\.urlopen|http\.client\.HTTPConnection|http\.client\.HTTPSConnection|socket\.create_connection|smtplib\.SMTP|ftplib\.FTP)\b|"
     r"\bsubprocess\.(?:run|Popen|call|check_call|check_output)\b|"
-    r"\bos\.(?:system|popen)\b|"
+    r"\bos\.(?:system|popen|kill|killpg)\b|"
     r"\bshutil\.rmtree\s*\(\s*['\"](?:/|[A-Za-z]:\\|\.\.))",
 )
 _R0_ACTIONS: Dict[str, FrozenSet[str]] = {

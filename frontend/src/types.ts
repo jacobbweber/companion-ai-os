@@ -1,4 +1,4 @@
-export type ThemeId = 'obsidian' | 'orbital' | 'graphite' | 'daylight';
+export type ThemeId = 'storm' | 'loftra' | 'obsidian' | 'orbital' | 'graphite' | 'daylight';
 
 export type StudioId =
   | 'chat'

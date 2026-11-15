@@ -24,7 +24,7 @@ rawJs = rawJs.replace(/cdn\./gi, 'local-doc.');
 const rawCss = cssFiles.map((f) => fs.readFileSync(path.join(distDir, f), 'utf-8')).join('\n');
 
 const indexHtml = `<!DOCTYPE html>
-<html lang="en" data-theme="obsidian">
+<html lang="en" data-theme="storm">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">

@@ -68,22 +68,32 @@ _DESTRUCTIVE_CMD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:Remove-Item|ri|rm|del|rd|rmdir)\b[^\n;&|]*(?:-Recurse|-r\b)[^\n;&|]*(?:[a-zA-Z]:\\|/(?:\s|$|[a-zA-Z])|~|\.\.(?:/|\\|\s|$)|\*(?:\s|$))", re.I), "destructive recursive PowerShell item wipe on root/home/parent/wildcard"),
     (re.compile(r"\b(?:DROP\s+TABLE|TRUNCATE\s+TABLE)\b", re.I), "destructive SQL table drop/truncate"),
     (re.compile(r"(?:UPDATE\s+user_profile|INSERT\s+[^\n;]*user_profile|REPLACE\s+INTO\s+user_profile|set_self_dev_mode)\b[^\n;]*self_dev_mode|self_dev_mode[^\n;]*(?:UPDATE\s+user_profile|INSERT\s+INTO\s+user_profile)", re.I), "privilege-escalation mutation of human-only `self_dev_mode`"),
+    (re.compile(r"\b(?:pkill|killall)\b[^\n;&|]*\b(?:systemd|init|launchd|sshd)\b", re.I), "signaling OS/session init or SSH supervisor daemon"),
+    (re.compile(r"\bsystemctl\b[^\n;&|]*\b(?:stop|kill|disable|mask)\b[^\n;&|]*\bcompanion(?:\.service)?\b", re.I), "stopping or disabling Companion's own service unit"),
 )
 
 _TRAILING_OR_TRUE_RE = re.compile(r"\s*\|\|\s*(?:true|:\s*|exit\s+0)\s*$", re.I)
+_PY_SELF_KILL_RE = re.compile(r"\bos\.kill(?:pg)?\s*\(\s*(?:(-?\d+)|(os\.getp?pid\s*\(\s*\)))")
 
 
 def check_command_safety(command: str) -> Optional[str]:
-    """Inspect a shell command and return a rejection message if it matches a destructive pattern."""
+    """Inspect a shell command or Python snippet and reject destructive or self-terminating patterns."""
     cmd = (command or "").strip()
     if not cmd:
         return None
     for rx, reason in _DESTRUCTIVE_CMD_PATTERNS:
         if rx.search(cmd):
-            return (
-                f"SAFETY GUARD REJECTED command: blocked {reason}.\n"
-                "Command was NOT executed. Use safe, scoped project operations or `checkpoint_manage`."
-            )
+            return f"SAFETY GUARD REJECTED command: blocked {reason}.\nCommand was NOT executed. Use safe, scoped project operations or `checkpoint_manage`."
+    protected = {-1, 0, 1, os.getpid(), *([os.getppid()] if os.getppid() > 0 else [])}
+    for m in re.finditer(r"\bkill\b(?P<rest>[^\n;&|]+)", cmd, re.I):
+        args_part = re.sub(r"^(?:\s+(?:-[sSnN]\s+\S+|--signal(?:=|\s+)\S+|-[a-zA-Z0-9]+))?(?:\s+--)?", "", m.group("rest"))
+        if any(int(tok) in protected for tok in re.findall(r"(?<!\S)-?\d+(?!\S)", args_part)):
+            return "SAFETY GUARD REJECTED command: blocked signaling PID 1, process group, or Companion's own process/supervisor tree."
+    if any(int(p) in protected for p in re.findall(r"(?:/pid|-id)\s+(-?\d+)", cmd, re.I)):
+        return "SAFETY GUARD REJECTED command: blocked signaling PID 1 or Companion's own process/supervisor tree."
+    for pm in _PY_SELF_KILL_RE.finditer(cmd):
+        if pm.group(2) or (pm.group(1) and int(pm.group(1)) in protected):
+            return "SAFETY GUARD REJECTED command: blocked `os.kill`/`os.killpg` targeting PID 1 or Companion's own process/supervisor tree."
     return None
 
 
@@ -312,6 +322,9 @@ def try_indent_shifted_replace(text: str, old: str, new: str) -> Optional[str]:
     return "\n".join(t_lines[:idx] + adj_new + t_lines[idx + len(o_lines) :])
 
 
+_KILL_FAMILY_RE = re.compile(r"\b(?:kill|pkill|killall|taskkill|Stop-Process)\b", re.I)
+
+
 @dataclass
 class LoopGuard:
     """Detects and breaks infinite tool loops, stagnation, and repeated error cascades."""
@@ -319,6 +332,7 @@ class LoopGuard:
     max_identical_calls: int = 2
     max_consecutive_errors: int = 2
     call_counts: Counter = field(default_factory=Counter)
+    family_counts: Counter = field(default_factory=Counter)
     last_signature: Optional[str] = None
     consecutive_identical: int = 0
     consecutive_errors: int = 0
@@ -331,6 +345,14 @@ class LoopGuard:
         return f"{name}:{canonical}"
 
     def check_before_call(self, name: str, args: Dict[str, Any]) -> Optional[str]:
+        if name == "run_shell" and _KILL_FAMILY_RE.search(str(args.get("command") or "")):
+            self.family_counts["process_kill"] += 1
+            if self.family_counts["process_kill"] > 2:
+                self.consecutive_errors = max(self.consecutive_errors, self.max_consecutive_errors)
+                return (
+                    "LOOP GUARD INTERVENTION: Repeated process-kill attempts detected in this turn — a supervisor (`systemctl --user`, `systemctl`, Docker, or parent daemon) is likely respawning the process. "
+                    "Escalating to `reasoning`: inspect `systemctl --user list-units`, `systemctl status <pid>`, or `docker ps` instead of killing respawned PIDs."
+                )
         sig = self._signature(name, args)
         self.call_counts[sig] += 1
         if sig == self.last_signature:

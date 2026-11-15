@@ -42,10 +42,13 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
         js_text = js_asset[1].decode("utf-8")
         rendered_html = render_web_index_html(csrf_token="test-csrf-stage6")
 
-        for theme_id in ("obsidian", "orbital", "graphite", "daylight"):
+        for theme_id in ("storm", "loftra", "obsidian", "orbital", "graphite", "daylight"):
             self.assertIn(theme_id, js_text)
-        css_compact = css_text.replace('"', "").replace(" ", "")
+        css_compact = css_text.replace('"', "").replace("'", "").replace(" ", "")
         for token in (
+            "data-theme=storm",
+            "data-theme=loftra",
+            "#ff5f00",
             "data-theme=orbital",
             "data-theme=graphite",
             "data-theme=daylight",
@@ -58,6 +61,8 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
             self.assertIn(token, css_compact)
 
         for label in (
+            "Storm & Safety Orange",
+            "Loftra Industrial",
             "Obsidian Matte",
             "Orbital Brutalist",
             "Graphite Minimal",

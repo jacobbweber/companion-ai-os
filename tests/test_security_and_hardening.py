@@ -16,11 +16,12 @@ from companion.archive_and_approvals import ApprovalQueue, peek_session_nudges, 
 from companion.background_jobs import BackgroundJobManager
 from companion.config import agent_tool_turn_context, settings
 from companion.core_actions import execute_core_action
+from companion.disciplines import ActionRiskTier, classify_action_risk
 from companion.endpoints import EndpointManager
 from companion.llm import ModelGate
 from companion.llm_wire import urlopen_safe
 from companion.memory_store import MemoryStore
-from companion.safety import check_command_safety, check_path_safety
+from companion.safety import LoopGuard, check_command_safety, check_path_safety
 from companion.vault import VaultManager, restore_snapshot_backup
 from companion.workflow_graph import workflow_engine
 from surfaces.web_server import (
@@ -206,6 +207,42 @@ class TestSecurityAndHardening(unittest.TestCase):
         self.assertIsNotNone(check_command_safety("rm -rf /var"))
         self.assertIsNotNone(check_command_safety("rm -rf ~/Documents"))
         self.assertIsNotNone(check_command_safety(r"Remove-Item -Recurse -Force C:\Users\victim"))
+        self.assertIsNotNone(check_command_safety("kill -9 1"))
+        self.assertIsNotNone(check_command_safety("kill -9 -1"))
+        self.assertIsNotNone(check_command_safety(f"kill -9 {os.getpid()}"))
+        self.assertIsNotNone(check_command_safety("pkill -9 systemd"))
+        self.assertIsNotNone(check_command_safety("systemctl --user stop companion.service"))
+        self.assertIsNotNone(check_command_safety("import os\nos.kill(os.getpid(), 9)"))
+        self.assertIsNone(check_command_safety("kill -15 999999"))
+
+        self.assertEqual(
+            classify_action_risk("run_shell", {"command": "systemctl --user list-units --type=service --all"}),
+            ActionRiskTier.R1_LOCAL_REVERSIBLE,
+        )
+        self.assertEqual(
+            classify_action_risk("run_shell", {"command": "systemctl status ssh"}),
+            ActionRiskTier.R1_LOCAL_REVERSIBLE,
+        )
+        self.assertEqual(
+            classify_action_risk("run_shell", {"command": "systemctl --user stop example.service"}),
+            ActionRiskTier.R3_HIGH_IMPACT_MUTATION,
+        )
+        self.assertEqual(
+            classify_action_risk("run_shell", {"command": "kill -9 99999"}),
+            ActionRiskTier.R3_HIGH_IMPACT_MUTATION,
+        )
+        self.assertEqual(
+            classify_action_risk("run_python", {"code": "import os\nos.kill(99999, 15)"}),
+            ActionRiskTier.R3_HIGH_IMPACT_MUTATION,
+        )
+
+        lg = LoopGuard()
+        self.assertIsNone(lg.check_before_call("run_shell", {"command": "kill -9 40001"}))
+        self.assertIsNone(lg.check_before_call("run_shell", {"command": "kill -9 40002"}))
+        third_kill = lg.check_before_call("run_shell", {"command": "kill -9 40003"})
+        self.assertIsNotNone(third_kill)
+        self.assertIn("supervisor", str(third_kill))
+        self.assertGreaterEqual(lg.consecutive_errors, lg.max_consecutive_errors)
 
         wiki_target = settings.effective_data_dir / "wiki" / "02_knowledge" / "bypass.md"
         err = check_path_safety(wiki_target, write=True)

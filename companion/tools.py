@@ -228,7 +228,11 @@ def tool_search(args: Dict[str, Any]) -> str:
 
 def tool_run_python(args: Dict[str, Any]) -> str:
     """Execute Python code directly in the active `ExecutionTarget` with UTF-8 encoding."""
-    return get_execution_target().run_python_code(str(args.get("code") or ""), timeout=settings.shell_timeout)
+    code = str(args.get("code") or "")
+    cmd_err = check_command_safety(code)
+    if cmd_err and "self_dev_mode" not in cmd_err:
+        return cmd_err
+    return get_execution_target().run_python_code(code, timeout=settings.shell_timeout)
 
 
 _HEREDOC_RE = re.compile(r"python(?:3)?\s+<<-?\s*['\"]?(\w+)['\"]?\s*\n(.*?)\n\1\b", re.DOTALL)
