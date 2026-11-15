@@ -15,7 +15,7 @@ Use this runbook when implementing a new feature, fixing a bug, refactoring code
 
 ## Step-by-Step Procedure
 1. **Intake & Discovery (`INTAKE` -> `DISCOVER`)**:
-   - For multi-step feature builds, prefer `workflow_manage(action="autonomy", goal="...")` (or recipe `workflows/deliver-feature.json`) to step through all phases with dedicated per-phase context budgets and mechanical reasoning-tier routing, or start a manual workflow via `workflow_manage(action="start", workflow_type="engineering_feature", goal="...", acceptance_criteria="...")`.
+   - For multi-step feature builds, prefer `workflow_manage(action="autonomy", goal="...")` (or Python DAG `dags/deliver_feature.py` via `workflow_manage(action="run_dag", dag="deliver-feature")`) to step through all phases with dedicated per-phase context budgets and mechanical reasoning-tier routing, or start a manual workflow via `workflow_manage(action="start", workflow_type="engineering_feature", goal="...", acceptance_criteria="...")`.
    - Use `search` and `read_file` to inspect target files and existing unit tests in `tests/` before making edits.
 2. **Design & Safety Checkpoint (`DESIGN` / `PLAN`)**:
    - For complex architectural decisions or multi-module designs, read `skills/deep-thinking/SKILL.md` or spawn a reasoning subagent (`workflow_manage(action="subagent", tier="reasoning", skill="deep-thinking", goal="...")`).

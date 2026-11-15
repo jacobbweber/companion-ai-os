@@ -13,20 +13,22 @@ import json
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from companion.agile_boards import get_agile_manager
 from companion.archive_and_approvals import consume_session_nudges, session_id_context
-from companion.autonomy import run_autonomous_goal
+from companion.autonomy import run_autonomous_goal, run_autonomous_goal_slice
 from companion.blueprint import (approve_blueprint_and_build, classify_blueprint_reply, create_or_revise_blueprint, handle_blueprint_conversation_turn, is_awaiting_blueprint_approval)
 from companion.config import agent_tool_turn_context, settings
 from companion.context import (build_system_prompt, compact_messages_if_needed, estimate_messages_chars, estimate_messages_tokens, format_context_budget_status, format_identity_summary, format_skills_catalog, manage_active_project, manage_companion_tone, manage_model_tier, run_first_boot_onboarding)
 from companion.core_actions import HARVEST_SLASH_VERBS, handle_harvest_slash
+from companion.dag_runtime import register_dag_runtime_bindings
 from companion.education_engine import get_education_engine
 from companion.eval_harness import run_live_flight_eval
-from companion.hobbies import hobby_engine
 from companion.hygiene import analyze_workspace_hygiene
-from companion.intake import classify_turn_intent, select_turn_step_tier
+from companion.intake import select_turn_step_tier, triage_turn
 from companion.llm import chat, current_tier_name, normalize_assistant_message, recover_empty_synthesis, tier_context
+from companion.mcp_hub import get_mcp_hub
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
+from companion.project_graph import get_project_graph
+from companion.routines import execute_autonomy_mode_action, format_morning_briefing
 from companion.safety import LoopGuard, run_system_doctor
 from companion.sdd import verify_sdd
 from companion.streaming import emit_stream_event
@@ -240,7 +242,7 @@ def run_agent_turn(
         mem.log_message("user", user_text, session_tag=session_tag)
     awaiting_bp = is_top and is_awaiting_blueprint_approval(mem)
     bp_action = classify_blueprint_reply(user_text) if awaiting_bp else None
-    intent = classify_turn_intent(user_text, store=mem, root=settings.active_project_root) if is_top else classify_turn_intent("")
+    intent = triage_turn(user_text, store=mem, root=settings.active_project_root) if is_top else triage_turn("")
     can_orchestrate = is_top and not awaiting_bp and (auto_promote is True or (auto_promote is None and max_iters is None and mem.get_active_workflow() is None))
     should_blueprint = can_orchestrate and intent.needs_blueprint
     should_promote = can_orchestrate and not should_blueprint and intent.mode == "AUTONOMOUS_BUILD"
@@ -257,6 +259,21 @@ def run_agent_turn(
             messages.append({"role": "assistant", "content": summary})
             mem.log_message("assistant", summary, session_tag=session_tag)
             telemetry.end_trace(tid, status="ok" if res.get("passed") else "error")
+            return summary
+        except Exception:
+            telemetry.end_trace(tid, status="error")
+            raise
+    if can_orchestrate and intent.route in ("EXECUTE_VERIFIED_DAG", "ADVANCE_ACTIVE_GOAL"):
+        try:
+            if intent.route == "EXECUTE_VERIFIED_DAG":
+                dag_res = workflow_engine.run_dag(intent.matched_dag, params={"goal": user_text})
+                summary, ok_flag = str(dag_res.get("summary") or ""), bool(dag_res.get("ok") or dag_res.get("status") == "waiting_approval")
+            else:
+                sl_res = run_autonomous_goal_slice(project_id=intent.target_project_id or None, chat_fn=chat_fn, store=mem, verbose=verbose)
+                summary, ok_flag = str(sl_res.get("summary") or ""), bool(sl_res.get("ok"))
+            messages.append({"role": "assistant", "content": summary})
+            mem.log_message("assistant", summary, session_tag=session_tag)
+            telemetry.end_trace(tid, status="ok" if ok_flag else "error")
             return summary
         except Exception:
             telemetry.end_trace(tid, status="error")
@@ -336,23 +353,50 @@ def run_subagent(
             telemetry.active_trace_id = parent_tid
 
 
-workflow_engine.bind_executors(tool_fn=dispatch, subagent_fn=lambda g, s=None, m=6: run_subagent(goal=g, skill_name=s, max_iters=m, verbose=False))
-hobby_engine.bind_runner(lambda m, lim, st, tag: run_agent_turn(m, max_iters=lim, store=st, session_tag=tag))
+def _run_bounded_dag_llm(prompt: str, system_prompt: str = "", tier: str = "fast") -> str:
+    """Execute a single zero-tool bounded LLM synthesis step for `dag_runtime`."""
+    msgs = [
+        {"role": "system", "content": system_prompt or "Produce a concise, grounded output without calling tools."},
+        {"role": "user", "content": prompt},
+    ]
+    with tier_context((tier or "fast").strip().lower()):
+        data = chat(msgs, None, "none")
+    clean, _, _ = normalize_assistant_message((data.get("choices") or [{}])[0].get("message") or {})
+    return clean.strip()
+
+
+def ensure_dag_runtime_bound() -> None:
+    """Ensure `workflow_engine` and `dag_runtime` executor bindings are registered."""
+    workflow_engine.bind_executors(
+        tool_fn=dispatch,
+        subagent_fn=lambda g, s=None, m=6: run_subagent(goal=g, skill_name=s, max_iters=m, verbose=False),
+        llm_fn=_run_bounded_dag_llm,
+    )
+    register_dag_runtime_bindings(
+        tool_fn=dispatch,
+        mcp_fn=lambda srv, tn, a: get_mcp_hub().call_mcp_tool(srv, tn, arguments=a, actor="companion"),
+        llm_fn=_run_bounded_dag_llm,
+    )
+
+
+ensure_dag_runtime_bound()
 
 
 def check_in(store: Optional[MemoryStore] = None) -> str:
     """Provide a friendly proactive check-in summary of Companion's current state."""
     mem, ws = store or get_memory_store(), settings.get_workspace()
-    wf, spr, edu = mem.get_active_workflow(), get_agile_manager(store=mem).get_active_sprint(), get_education_engine(store=mem).get_progress_summary()
+    wf, spr, edu = mem.get_active_workflow(), get_project_graph(store=mem).get_active_timebox(), get_education_engine(store=mem).get_progress_summary()
     ac = edu.get("active_course")
+    bg_lbl = "ON" if mem.is_background_autonomy_enabled() else "OFF"
+    sd_lbl = "ON" if mem.is_self_dev_mode_enabled() else "OFF (Core Read-Only)"
+    spr_line = f"`{spr['title']}` ({spr['start_date']}..{spr['end_date']})" if spr else "(None active)"
+    edu_line = f"`{ac['title']}` ({ac['mastery_pct']}% mastery, {edu['due_total']} due)" if ac else f"(None active, {edu['due_total']} due)"
     return (
         f"=== Proactive Check-In ===\nActive Project  : `{ws.project_id}` ({ws.project_root})\n"
-        f"Hobby Mode      : {'ON' if mem.is_hobby_mode_enabled() else 'OFF'} | Self-Dev Mode: {'ON' if mem.is_self_dev_mode_enabled() else 'OFF (Core Read-Only)'}\n"
+        f"Autonomy Levers : Background Autonomy={bg_lbl} | Self-Dev Mode={sd_lbl}\n"
         f"Workflow State  : `{wf['current_state'] if wf else 'IDLE'}`\n"
-        f"Active Sprint   : `{spr['title']}` ({spr['start_date']}..{spr['end_date']})\n" if spr else f"=== Proactive Check-In ===\nActive Project  : `{ws.project_id}` ({ws.project_root})\nHobby Mode      : {'ON' if mem.is_hobby_mode_enabled() else 'OFF'} | Self-Dev Mode: {'ON' if mem.is_self_dev_mode_enabled() else 'OFF (Core Read-Only)'}\nWorkflow State  : `{wf['current_state'] if wf else 'IDLE'}`\nActive Sprint   : (None active)\n"
-    ) + (
-        f"Study Course    : `{ac['title']}` ({ac['mastery_pct']}% mastery, {edu['due_total']} due)\n" if ac else f"Study Course    : (None active, {edu['due_total']} due)\n"
-    ) + (
+        f"Active Timebox  : {spr_line}\n"
+        f"Study Course    : {edu_line}\n"
         f"Pending Tasks   : {len(mem.get_pending_tasks()[:6])} active | Pending Backlog: {len(mem.get_backlog(status='pending')[:6])}\n"
         f"Recent Notes    : {len(mem.get_system_notes(limit=5))} notes saved\n"
         "All systems operational. Ready for your next request."
@@ -361,7 +405,7 @@ def check_in(store: Optional[MemoryStore] = None) -> str:
 
 SLASH_HELP_TEXT = (
     "=== Companion AI OS Commands ===\n"
-    "  /status                 — Show live system status, WorkspaceContext, Hobby Mode, workflow HUD & tasks\n"
+    "  /status                 — Show live system status, WorkspaceContext, Background Autonomy, workflow HUD & tasks\n"
     "  /project [init|switch..]— Manage isolated workspaces (`/project list`, `init <name>`, `switch <name>`, `self`)\n"
     "  /model & /providers     — View, ping (`check`), switch model tiers, or inspect multi-provider & Vault matrix\n"
     "  /identity               — View Companion Soul & User Identity grounding cards\n"
@@ -369,11 +413,11 @@ SLASH_HELP_TEXT = (
     "  /onboard                — Run the 4-question First-Boot Soul & User Identity setup\n"
     "  /checkin                — Friendly executive check-in summary\n"
     "  /telemetry              — View live KPI & Observability Scorecard\n"
-    "  /traces [id]            — View Waterfall execution traces for turns & hobbies\n"
+    "  /traces [id]            — View Waterfall execution traces for turns & routines\n"
     "  /logs [level|component] — View structured application logs (DEBUG, INFO, WARN, ERROR)\n"
     "  /doctor                 — Run 7-stage System Doctor (Config, Syntax, Arch, SDD, Hygiene, DB, Tests)\n"
-    "  /hobby & /selfdev       — Independent Hobby Mode (`/hobby on|off|run`) & Human-Only Self-Dev Mode (`/selfdev on|off|status`)\n"
-    "  /morning                — View Morning Briefing of overnight autonomous hobby sessions\n"
+    "  /autonomy & /selfdev    — Background Autonomy (`/autonomy on|off|run`) & Human-Only Self-Dev Mode (`/selfdev on|off|status`)\n"
+    "  /morning                — View Morning Briefing of overnight background routines & goal slices\n"
     "  /specs                  — Verify 4-File Canonical SDD alignment & list spec status\n"
     "  /skills [name]          — List Progressive-Disclosure `SKILL.md` runbooks or read a skill\n"
     "  /plan <obj|revise ...>  — Draft or revise a read-only Blueprint (`DISCOVER -> DESIGN -> PLAN`) before coding\n"
@@ -382,7 +426,7 @@ SLASH_HELP_TEXT = (
     "  /eval [quick|full|all]  — Run Live Local-Model Flight Eval (`quick`, `full`, `general`, `all`, `compare`)\n"
     "  /subagent <goal>        — Spawn an isolated worker (`--tier reasoning` & `--skill <name>` optional)\n"
     "  /hygiene                — Run AST Dead-Code, Unused Import & Simplicity Budget scan\n"
-    "  /workflow [recipes|run] — Show State-Machine Workflow graph or run a JSON workflow recipe\n"
+    "  /workflow [dags|run]    — Show State-Machine Workflow graph or run a verified Python DAG\n"
     "  /backlog                — List all tasks and prioritized backlog items\n"
     "  /memory                 — Sync and display MEMORY.md\n"
     "  /compact [status|now]   — View context watermark status or trigger 2-stage compaction\n"
@@ -435,11 +479,13 @@ def _dispatch_workflow_slash(arg: str) -> str:
     sub, rest = (arg.split()[0].lower() if arg else "status"), (arg.split(None, 1)[1].strip() if len(arg.split(None, 1)) > 1 else "")
     if sub in ("abort", "cancel", "reset"):
         return dispatch("workflow_manage", {"action": "abort", "summary": "Aborted via CLI slash command"})
-    if sub in ("recipes", "list_recipes"):
-        return dispatch("workflow_manage", {"action": "list_recipes"})
-    if sub in ("run", "run_recipe") and rest:
+    if sub in ("dags", "list_dags", "recipes", "list_recipes"):
+        return dispatch("workflow_manage", {"action": "list_dags"})
+    if sub in ("run", "run_dag", "run_recipe") and rest:
         r_parts = rest.split(None, 1)
-        return dispatch("workflow_manage", {"action": "run_recipe", "recipe": r_parts[0], "params": {"goal": r_parts[1]} if len(r_parts) > 1 else {}})
+        return dispatch("workflow_manage", {"action": "run_dag", "dag": r_parts[0], "params": {"goal": r_parts[1]} if len(r_parts) > 1 else {}})
+    if sub == "resume_dag" and rest:
+        return dispatch("workflow_manage", {"action": "resume_dag", "run_id": rest})
     return dispatch("workflow_manage", {"action": "status"})
 
 
@@ -488,13 +534,13 @@ def handle_slash_command(cmd_str: str, messages: List[Dict[str, Any]], store: Op
         return out
     if verb in ("status", "stat"):
         ws, hud, tasks, backlog = settings.get_workspace(), workflow_engine.render_hud(), mem.get_pending_tasks(), mem.get_backlog(status="pending")
-        spr, edu = get_agile_manager(store=mem).get_active_sprint(), get_education_engine(store=mem).get_progress_summary()
+        spr, edu = get_project_graph(store=mem).get_active_timebox(), get_education_engine(store=mem).get_progress_summary()
         ac = edu.get("active_course")
         mode, f_cfg, c_cfg, r_cfg = mem.get_user_profile().get("active_model_tier", "auto"), settings.resolve_tier("fast"), settings.resolve_tier("coding"), settings.resolve_tier("reasoning")
         code_seg = f" | coding=`{c_cfg.model}` (temp={c_cfg.temperature})" if c_cfg.is_dedicated else ""
         spr_s = f"`{spr['title']}` ({spr['start_date']}..{spr['end_date']})" if spr else "(none)"
         edu_s = f"`{ac['title']}` ({ac['mastery_pct']}%, {edu['due_total']} due)" if ac else "(none)"
-        return f"=== Companion AI OS v3.4 Status ===\nProject    : `{ws.project_id}` ({ws.project_root})\nRouting    : mode=`{mode}` | fast=`{f_cfg.model}` (temp={f_cfg.temperature}){code_seg} | reasoning=`{r_cfg.model}` (temp={r_cfg.temperature})\nTwo-Lever  : Hobby Mode={'ON' if mem.is_hobby_mode_enabled() else 'OFF'} | Self-Dev Mode={'ON' if mem.is_self_dev_mode_enabled() else 'OFF (Core Read-Only)'} (Idle: {settings.idle_minutes}m | Cooldown: {settings.hobby_cooldown_minutes}m)\nSprint/Edu : Sprint={spr_s} | Study={edu_s}\n\n{hud}\n\nPending Tasks: {len(tasks)} | Pending Backlog: {len(backlog)}"
+        return f"=== Companion AI OS v3.5 Status ===\nProject    : `{ws.project_id}` ({ws.project_root})\nRouting    : mode=`{mode}` | fast=`{f_cfg.model}` (temp={f_cfg.temperature}){code_seg} | reasoning=`{r_cfg.model}` (temp={r_cfg.temperature})\nTwo-Lever  : Background Autonomy={'ON' if mem.is_background_autonomy_enabled() else 'OFF'} | Self-Dev Mode={'ON' if mem.is_self_dev_mode_enabled() else 'OFF (Core Read-Only)'} (Idle: {settings.idle_minutes}m | Cooldown: {settings.hobby_cooldown_minutes}m)\nTimebox/Edu: Timebox={spr_s} | Study={edu_s}\n\n{hud}\n\nPending Tasks: {len(tasks)} | Pending Backlog: {len(backlog)}"
     if verb in ("doctor", "doc"):
         return str(run_system_doctor(run_tests=True)["summary"])
     if verb in ("plan", "blueprint"):
@@ -516,11 +562,12 @@ def handle_slash_command(cmd_str: str, messages: List[Dict[str, Any]], store: Op
         return format_skills_catalog(skill_name=arg or None)
     if verb in ("subagent", "worker"):
         return _dispatch_subagent_slash(arg)
-    if verb == "hobby":
+    if verb in ("autonomy", "hobby"):
         sub, sub_arg = (arg.split()[0].lower() if arg else "status"), (arg.split(None, 1)[1].strip() if len(arg.split(None, 1)) > 1 else None)
-        return dispatch("hobby_manage", {"action": sub, "hobby_name": sub_arg})
+        res_aut = execute_autonomy_mode_action({"subaction": sub, "routine_id": sub_arg}, actor="cli", store=mem)
+        return str(res_aut.get("summary") or res_aut.get("error") or "")
     if verb in ("morning", "journal"):
-        return hobby_engine.get_morning_briefing(mark_seen=True)
+        return format_morning_briefing(store=mem, mark_seen=True)
     if verb in ("checkin", "check-in"):
         return check_in(store=mem)
     if verb in ("telemetry", "kpis", "metrics"):

@@ -8,12 +8,12 @@ enforcing a strict 4-Document Living Spec Pyramid in `specs/`:
   3. specs/CONTRACTS.md    — Bounded Subsystem Contracts (SPEC-01..SPEC-08) & Test Links
   4. specs/DECISIONS.md    — Self-Compacting Architecture Decision Records (ADRs)
 
-Provides bidirectional Spec <-> Code drift verification and anti-sprawl enforcement.
+Provides bidirectional Spec <-> Code drift verification, Capability Pack (`SKILL.md`,
+`dags/*.py`, `scripts/*.py`) validation, and anti-sprawl enforcement.
 """
 
 import ast
 import contextlib
-import json
 import re
 import sqlite3
 import sys
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from companion.config import CAPABILITY_TIERS, settings
+from companion.config import settings
 from companion.disciplines import FORBIDDEN_EXTERNAL_IMPORTS, iter_ast_import_targets
 from companion.memory_store import FOUNDATIONAL_ADRS, MemoryStore, get_memory_store
 
@@ -47,15 +47,29 @@ CANONICAL_SPEC_FILES = (
     "CONTRACTS.md",
     "DECISIONS.md",
 )
-MAX_ACTIVE_ADRS = 19
-ALLOWED_SKILL_SUBDIRS = {"references", "workflows", "scripts"}
+MAX_ACTIVE_ADRS = 20
+ALLOWED_SKILL_SUBDIRS = {"references", "dags", "scripts"}
 
 _MODULE_PATH_RE = re.compile(r"`((?:companion|configs|memory|surfaces|tests)/[a-zA-Z0-9_]+\.py|harness\.py)`")
 _SPEC_HEADER_RE = re.compile(r"^##\s+(SPEC-\d+:\s+.+)$", re.MULTILINE)
 _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SKILL_ASSET_REF_RE = re.compile(
-    r"(?<![a-zA-Z0-9_<*/-])((?:skills/[a-z0-9-]+/)?(?:references/[a-zA-Z0-9_-]+\.md|workflows/[a-zA-Z0-9_-]+\.json|scripts/[a-zA-Z0-9_-]+\.py))(?![a-zA-Z0-9_>*-])"
+    r"(?<![a-zA-Z0-9_<*/-])((?:skills/[a-z0-9-]+/)?(?:references/[a-zA-Z0-9_-]+\.md|dags/[a-zA-Z0-9_-]+\.py|scripts/[a-zA-Z0-9_-]+\.py))(?![a-zA-Z0-9_>*-])"
 )
+
+_WIKI_USER_AUTHOR_RE = re.compile(r"(?im)^author\s*:\s*['\"]?(user|human|partner)\b")
+_PEP723_BLOCK_RE = re.compile(r"(?m)^# /// script\s*\n((?:#(?: .*|)\n)*?)# ///\s*$")
+_DEP_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+_PYPI_IMPORT_ALIASES: Dict[str, str] = {
+    "beautifulsoup4": "bs4",
+    "pillow": "pil",
+    "pyyaml": "yaml",
+    "scikit-learn": "sklearn",
+    "opencv-python": "cv2",
+    "opencv-python-headless": "cv2",
+    "pymupdf": "fitz",
+    "python-dotenv": "dotenv",
+}
 
 
 @dataclass
@@ -127,7 +141,6 @@ def sync_decisions_md(store: Optional[MemoryStore] = None, root: Optional[Path] 
     active_adrs = [a for a in adrs if a.get("status", "accepted") == "accepted"]
     superseded_adrs = [a for a in adrs if a.get("status") != "accepted"]
 
-    # If active ADRs exceed MAX_ACTIVE_ADRS, compact oldest beyond limit into historical summary and persist status
     if len(active_adrs) > MAX_ACTIVE_ADRS:
         overflow = active_adrs[:-MAX_ACTIVE_ADRS]
         active_adrs = active_adrs[-MAX_ACTIVE_ADRS:]
@@ -203,77 +216,6 @@ def validate_skill_markdown(content: str, expected_name: Optional[str] = None) -
     return None
 
 
-def validate_workflow_recipe_json(content: str, expected_name: Optional[str] = None) -> Optional[str]:
-    """Validate a declarative JSON workflow recipe (`skills/<name>/workflows/<recipe>.json`)."""
-    try:
-        data = json.loads(content)
-    except Exception as exc:
-        return f"Invalid JSON in workflow recipe: {exc}"
-    if not isinstance(data, dict):
-        return "Workflow recipe root must be a JSON object."
-    name = str(data.get("name") or "").strip()
-    if not name or not _KEBAB_RE.match(name):
-        return f"Workflow recipe `name` must be kebab-case (`[a-z0-9-]+`), got `{name}`."
-    if expected_name and _KEBAB_RE.match(expected_name) and name != expected_name:
-        return f"Workflow recipe `name: {name}` does not match filename stem `{expected_name}`."
-    if len(str(data.get("description") or "").strip()) < 10:
-        return "Workflow recipe must include a `description` (>= 10 chars)."
-    nodes = data.get("nodes")
-    if not isinstance(nodes, list) or not nodes:
-        return "Workflow recipe must include a non-empty `nodes` list."
-    node_ids: Set[str] = set()
-    for idx, node in enumerate(nodes):
-        if not isinstance(node, dict):
-            return f"Node #{idx} must be a JSON object."
-        nid = str(node.get("id") or "").strip()
-        ntype = str(node.get("type") or "").strip()
-        if not nid or nid in ("COMPLETE", "ABORTED") or nid in node_ids:
-            return f"Node #{idx} has invalid, reserved, or duplicate `id`: `{nid}`."
-        node_ids.add(nid)
-        if ntype not in ("tool", "subagent", "llm", "recipe"):
-            return f"Node `{nid}` has invalid `type: {ntype}` (must be `tool`, `subagent`, `llm`, or `recipe`)."
-        if ntype == "tool" and not str(node.get("tool") or "").strip():
-            return f"Tool node `{nid}` must specify a non-empty `tool` name."
-        if ntype == "recipe" and not str(node.get("recipe") or "").strip():
-            return f"Recipe node `{nid}` must specify a non-empty `recipe` name."
-        if ntype in ("subagent", "llm") and not str(node.get("prompt") or "").strip():
-            return f"Node `{nid}` (`{ntype}`) must specify a non-empty `prompt`."
-        ntier = str(node.get("tier") or "").strip().lower()
-        if ntier and ntier not in CAPABILITY_TIERS:
-            return f"Node `{nid}` has invalid `tier: {ntier}` (must be one of {list(CAPABILITY_TIERS)})."
-    edges = data.get("edges")
-    if not isinstance(edges, list) or not edges:
-        return "Workflow recipe must include a non-empty `edges` list."
-    valid_targets = node_ids | {"COMPLETE", "ABORTED"}
-    for idx, edge in enumerate(edges):
-        if not isinstance(edge, dict):
-            return f"Edge #{idx} must be a JSON object."
-        src, dst = str(edge.get("from") or "").strip(), str(edge.get("to") or "").strip()
-        cond = str(edge.get("condition") or "always").strip()
-        if src not in node_ids:
-            return f"Edge #{idx} `from: {src}` does not match any node `id`."
-        if dst not in valid_targets:
-            return f"Edge #{idx} `to: {dst}` must be a valid node `id`, `COMPLETE`, or `ABORTED`."
-        if cond not in ("always", "passed", "failed") and not cond.startswith(("contains:", "not_contains:")):
-            return f"Edge #{idx} (`{src}->{dst}`) has invalid `condition: {cond}`."
-    return None
-
-
-_WIKI_USER_AUTHOR_RE = re.compile(r"(?im)^author\s*:\s*['\"]?(user|human|partner)\b")
-_PEP723_BLOCK_RE = re.compile(r"(?m)^# /// script\s*\n((?:#(?: .*|)\n)*?)# ///\s*$")
-_DEP_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
-_PYPI_IMPORT_ALIASES: Dict[str, str] = {
-    "beautifulsoup4": "bs4",
-    "pillow": "pil",
-    "pyyaml": "yaml",
-    "scikit-learn": "sklearn",
-    "opencv-python": "cv2",
-    "opencv-python-headless": "cv2",
-    "pymupdf": "fitz",
-    "python-dotenv": "dotenv",
-}
-
-
 def parse_pep723_dependencies(source: str) -> Tuple[List[str], Set[str], Optional[str]]:
     """Parse PEP 723 `# /// script` metadata, returning `(raw_deps, allowed_import_roots, error)`."""
     match = _PEP723_BLOCK_RE.search((source or "").replace("\r\n", "\n"))
@@ -304,6 +246,32 @@ def parse_pep723_dependencies(source: str) -> Tuple[List[str], Set[str], Optiona
     return raw_deps, allowed_imports, None
 
 
+def validate_dag_python_source(content: str, filename: str = "<dag.py>", sibling_stems: Iterable[str] = ()) -> Optional[str]:
+    """Validate a code-controlled Python DAG file (`skills/<pack>/dags/*.py`)."""
+    _raw_deps, allowed_imports, pep_err = parse_pep723_dependencies(content)
+    if pep_err:
+        return pep_err
+    try:
+        tree = ast.parse(content, filename=filename)
+    except SyntaxError as exc:
+        return f"SyntaxError in DAG module: {exc}"
+    has_dag_symbol = False
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "DAG" for t in node.targets):
+            has_dag_symbol = True
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "DAG":
+            has_dag_symbol = True
+        elif isinstance(node, ast.FunctionDef) and node.name == "build_dag":
+            has_dag_symbol = True
+    if not has_dag_symbol:
+        return "Python DAG file must define top-level `DAG = DAGSpec(...)` or `def build_dag() -> DAGSpec:`."
+    for target, lineno in iter_ast_import_targets(tree):
+        top_pkg = target.split(".")[0].lower()
+        if is_undeclared_skill_import(top_pkg, allowed_imports, sibling_stems=sibling_stems):
+            return f"Line {lineno}: undeclared third-party import `{top_pkg}` violates ADR-001."
+    return None
+
+
 def check_wiki_author_guard(path: Path) -> Optional[str]:
     """Block overwriting an existing Knowledge Wiki reference article that carries `author: user` provenance."""
     if path.suffix.lower() != ".md" or path.parent.name.lower() != "references" or not path.is_file():
@@ -319,7 +287,7 @@ def check_wiki_author_guard(path: Path) -> Optional[str]:
 
 
 def validate_skill_or_recipe_path(path: Path, content: str) -> Optional[str]:
-    """If `path` targets `skills/<name>/SKILL.md`, `workflows/*.json`, `scripts/*.py`, or Wiki articles, enforce guards."""
+    """Enforce deterministic SDD/ADR-001 guards on `SKILL.md`, `dags/*.py`, `scripts/*.py`, and Wiki articles."""
     parts = [pt.lower() for pt in path.parts]
     if "skills" not in parts:
         return None
@@ -329,9 +297,10 @@ def validate_skill_or_recipe_path(path: Path, content: str) -> Optional[str]:
     if path.name == "SKILL.md":
         err = validate_skill_markdown(content, expected_name=path.parent.name)
         return f"SKILL LINTER REJECTED {path}:\n  {err}\nFile was NOT modified. Fix SKILL.md structure and retry." if err else None
-    if path.suffix.lower() == ".json" and path.parent.name.lower() == "workflows":
-        err = validate_workflow_recipe_json(content, expected_name=path.stem)
-        return f"WORKFLOW RECIPE LINTER REJECTED {path}:\n  {err}\nFile was NOT modified. Fix recipe JSON and retry." if err else None
+    if path.suffix.lower() == ".py" and path.parent.name.lower() == "dags":
+        sibs = [p.stem for p in path.parent.glob("*.py")] if path.parent.is_dir() else []
+        err = validate_dag_python_source(content, filename=path.name, sibling_stems=sibs)
+        return f"SKILL LINTER REJECTED {path}:\n  {err}\nFile was NOT modified." if err else None
     if path.suffix.lower() == ".py" and path.parent.name.lower() == "scripts":
         if "--self-test" not in content:
             return f"SKILL LINTER REJECTED {path}:\n  Skill script must support a `--self-test` mode.\nFile was NOT modified."
@@ -355,7 +324,7 @@ def validate_skill_or_recipe_path(path: Path, content: str) -> Optional[str]:
 
 
 def verify_skills_directory(root: Optional[Path] = None) -> List[str]:
-    """Verify all 3-Tier Skill Packs under `skills/` (scaffolding, SKILL.md, workflows/*.json, and Wiki index)."""
+    """Verify all 3-Tier Skill Packs under `skills/` (`SKILL.md`, `dags/*.py`, `scripts/*.py`, and Wiki index)."""
     target_root = (root or settings.root).resolve()
     skills_dir = target_root / "skills"
     if not skills_dir.is_dir():
@@ -388,18 +357,13 @@ def verify_skills_directory(root: Optional[Path] = None) -> List[str]:
             if sub.is_dir():
                 if sub.name not in ALLOWED_SKILL_SUBDIRS:
                     issues.append(f"Disallowed subfolder `skills/{entry.name}/{sub.name}/` (allowed: {sorted(ALLOWED_SKILL_SUBDIRS)}).")
-                elif sub.name == "workflows":
-                    for wf_file in sorted(sub.glob("*.json")):
-                        wf_err = validate_workflow_recipe_json(wf_file.read_text(encoding="utf-8", errors="replace"), expected_name=wf_file.stem)
-                        if wf_err:
-                            issues.append(f"`skills/{entry.name}/workflows/{wf_file.name}`: {wf_err}")
-                elif sub.name == "scripts":
-                    for sc_file in sorted(sub.glob("*.py")):
-                        sc_err = validate_skill_or_recipe_path(sc_file, sc_file.read_text(encoding="utf-8", errors="replace"))
-                        if sc_err:
-                            issues.append(f"`skills/{entry.name}/scripts/{sc_file.name}`: {sc_err.splitlines()[1].strip() if len(sc_err.splitlines()) > 1 else sc_err}")
+                elif sub.name in ("dags", "scripts"):
+                    for py_file in sorted(sub.glob("*.py")):
+                        py_err = validate_skill_or_recipe_path(py_file, py_file.read_text(encoding="utf-8", errors="replace"))
+                        if py_err:
+                            issues.append(f"`skills/{entry.name}/{sub.name}/{py_file.name}`: {py_err.splitlines()[1].strip() if len(py_err.splitlines()) > 1 else py_err}")
             else:
-                issues.append(f"Unexpected root file `skills/{entry.name}/{sub.name}` (place in `references/`, `workflows/`, or `scripts/`).")
+                issues.append(f"Unexpected root file `skills/{entry.name}/{sub.name}` (place in `references/`, `dags/`, or `scripts/`).")
 
     wiki_refs = skills_dir / "knowledge-wiki" / "references"
     index_md = wiki_refs / "INDEX.md"
@@ -437,7 +401,6 @@ def verify_sdd(root: Optional[Path] = None, store: Optional[MemoryStore] = None)
         report.missing_spec_files = list(CANONICAL_SPEC_FILES)
         return report
 
-    # 1. Check canonical files & anti-sprawl rule
     existing_files = sorted(f.name for f in specs_dir.iterdir() if f.is_file())
     for canon in CANONICAL_SPEC_FILES:
         if canon in existing_files:
@@ -449,7 +412,6 @@ def verify_sdd(root: Optional[Path] = None, store: Optional[MemoryStore] = None)
         if fname not in CANONICAL_SPEC_FILES:
             report.sprawl_files.append(fname)
 
-    # 2. Check bidirectional module mapping in ARCHITECTURE.md and CONTRACTS.md
     arch_path = specs_dir / "ARCHITECTURE.md"
     contracts_path = specs_dir / "CONTRACTS.md"
     arch_refs: Set[str] = set()
@@ -473,13 +435,11 @@ def verify_sdd(root: Optional[Path] = None, store: Optional[MemoryStore] = None)
                     if req_section not in block:
                         report.contract_issues.append(f"Missing `{req_section}` in `{header}` of specs/CONTRACTS.md")
 
-    # Verify every referenced module/test file in ARCHITECTURE.md and CONTRACTS.md exists on disk
     all_referenced = sorted(arch_refs | contract_refs)
     for ref_rel in all_referenced:
         if not (target_root / ref_rel).is_file():
             report.missing_referenced_files.append(ref_rel)
 
-    # Verify every actual module in companion/*.py and surfaces/*.py (excluding __init__.py) is documented in both ARCHITECTURE.md & CONTRACTS.md
     for pkg_name in ("companion", "surfaces"):
         pkg_dir = target_root / pkg_name
         if pkg_dir.is_dir():
@@ -490,7 +450,6 @@ def verify_sdd(root: Optional[Path] = None, store: Optional[MemoryStore] = None)
                 if rel not in arch_refs or rel not in contract_refs:
                     report.undocumented_modules.append(rel)
 
-    # 3. Check ADR budget and 3-Tier Skill Pack integrity
     report.active_adr_count = _count_active_adrs(target_root, store)
     if report.active_adr_count > MAX_ACTIVE_ADRS:
         report.contract_issues.append(

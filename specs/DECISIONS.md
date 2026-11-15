@@ -1,7 +1,7 @@
 # Companion AI OS — Architecture Decision Records (Living ADR Log)
 
 > **Anti-Pileup Policy**: This single canonical document replaces scattered `ADR-xxx.md` files.
-> At most **19 active decisions** are kept in full detail. Superseded decisions
+> At most **20 active decisions** are kept in full detail. Superseded decisions
 > are automatically compacted into single-line historical notes at the bottom.
 
 ## Active Architectural Decisions
@@ -36,16 +36,16 @@
 - **Decision**: Maintain strictly 4 living canonical files in specs/ (PRODUCT.md, ARCHITECTURE.md, CONTRACTS.md, DECISIONS.md) verified bidirectionally against code.
 - **Consequences**: Zero spec sprawl, self-compacting ADRs, and automated detection of undocumented code.
 
-### ADR-006: AST Dead-Code Hygiene & Bounded Autonomous Agent Hobbies
+### ADR-006: AST Dead-Code Hygiene & Windowed Idle Maintenance Routines
 - **Status**: `accepted`
-- **Context**: AI agents tend to leave dead code over iterations and sit idle overnight without structured bounds.
-- **Decision**: Enforce AST dead-code/unused-import verification in system_doctor and run checkpoint-guarded Autonomous Hobbies during idle windows.
-- **Consequences**: Codebase stays simple and lean while Companion safely improves itself during idle windows.
+- **Context**: AI agents tend to leave dead code over iterations and waste tokens if background tasks poll blindly.
+- **Decision**: Enforce AST dead-code/unused-import verification in system_doctor and run `<5ms` precheck-gated `on_idle` Maintenance Routines (`companion/routines.py`, `companion/trigger_policy.py`) during allowed idle windows.
+- **Consequences**: Codebase stays simple and lean while Companion curates knowledge and audits health without wasting tokens.
 
 ### ADR-007: Active Project Registry & Rollback Lesson Memory
 - **Status**: `accepted`
 - **Context**: Companion needs to remember why rollbacks occurred without leaving tasks falsely completed, and must support working on external projects via a mechanical toggle rather than AI memory.
-- **Decision**: Snapshot/rewind tasks, backlog, and ADRs inside checkpoints while recording rollback_lesson notes; enforce WorkspaceContext so tools bind to active_project_root and lock Companion core read-only when working on external projects.
+- **Decision**: Snapshot/rewind work items and ADRs inside checkpoints while recording rollback_lesson notes; enforce WorkspaceContext so tools bind to active_project_root and lock Companion core read-only when working on external projects.
 - **Consequences**: Companion never relies on LLM memory to stay in the right project folder - path and read-only rules are mechanically enforced.
 
 ### ADR-008: Spine-Level Waterfall Telemetry & Headless Core UI Boundary
@@ -57,8 +57,8 @@
 ### ADR-009: Two-Tier Progressive Disclosure Skills vs. Primitive Tools
 - **Status**: `accepted`
 - **Context**: Hardcoding domain runbooks into Python modules or the system prompt causes bloat.
-- **Decision**: Separate L1 atomic tools from L2/L3 declarative skill packs (skills/<name>/SKILL.md) loaded progressively on demand.
-- **Consequences**: Horizontal scalability for new skills and workflows with minimal prompt overhead.
+- **Decision**: Separate L1 atomic tools from L2/L3 declarative skill packs (`skills/<name>/SKILL.md`, `dags/*.py`, `scripts/*.py`) loaded progressively on demand.
+- **Consequences**: Horizontal scalability for new skills, deterministic Python DAGs, and domain validators with minimal prompt overhead.
 
 ### ADR-010: Stdlib LAN Web Surface (surfaces/) & Multi-Phase Autonomous Goal Driver
 - **Status**: `accepted`
@@ -75,7 +75,7 @@
 ### ADR-012: Interactive Blueprint Approval Gate, Dedicated Coding Tier & Live Flight Eval
 - **Status**: `accepted`
 - **Context**: Non-technical product partners need plain-English design/plan review before code edits, while local coding specialists benefit from dedicated IMPLEMENT routing and empirical flight benchmarks.
-- **Decision**: Add pause-at-PLAN Blueprint approval/revision (`companion/blueprint.py`), dedicated `coding` tier routing + task carry-forward auto-skip (`companion/compaction.py`, `companion/autonomy.py`), local Git save-points, and isolated 3-flight behavioral eval (`companion/eval_harness.py`).
+- **Decision**: Add pause-at-PLAN Blueprint approval/revision (`companion/blueprint.py`), dedicated `coding` tier routing + task carry-forward auto-skip (`companion/compaction.py`, `companion/autonomy.py`), local Git save-points, and isolated behavioral eval (`companion/eval_harness.py`).
 - **Consequences**: Safe human-in-the-loop steering, higher first-pass implementation quality, and reproducible model benchmarking.
 
 ### ADR-013: Web UI Conversation Search & Git Save-Points Surface
@@ -87,7 +87,7 @@
 ### ADR-014: Domain-Neutral Cognitive Architecture, KnowledgePort, Dynamic GoalPlan DAGs & Skill Forge
 - **Status**: `accepted`
 - **Context**: Complex open-ended goals across diverse workspaces require epistemic grounding, uncompromised reasoning routing, action-level risk gates, evidence-verified GoalPlan DAGs, and safe transactional skill promotion without hardcoding domain-specific tools.
-- **Decision**: Introduce `KnowledgePort` & `ExecutionTarget` (`companion/grounding.py`), readiness-aware uncompromised reasoning routing (`companion/intake.py`), dynamic `GoalPlan` DAGs (`companion/workflow_dag.py`), and staged capability promotion + `REFLECT` distillation (`companion/skill_forge.py`).
+- **Decision**: Introduce `KnowledgePort` & `ExecutionTarget` (`companion/grounding.py`), Cognitive Triage (`companion/intake.py`), dynamic `GoalPlan` & pluggable `VerificationSpec` validators (`companion/workflow_dag.py`), and staged capability + DAG promotion (`companion/skill_forge.py`).
 - **Consequences**: General-purpose reliability across any domain, clean external Wiki/Sandbox ports, and compounding verified capabilities.
 
 ### ADR-015: Live SSE Token Streaming, Hybrid Semantic RRF Memory & Loopback/Token-Gated LAN Security
@@ -104,21 +104,27 @@
 
 ### ADR-017: Stage 6 Multi-Studio React + TypeScript Frontend (`frontend/`) Compiling into Zero-Node Stdlib `surfaces/static/`
 - **Status**: `accepted`
-- **Context**: Surfacing all 6 Companion 3.0 Harvest studios (Forever Chat, Wiki & 2D Canvas Mind Map, Jobs & Approvals, Blind Vault & Endpoints, Federation & MCP, Routines & Ops) in raw vanilla JS strings would cause unmaintainable UI sprawl, while adding a runtime Node server would violate `ADR-001`.
+- **Context**: Surfacing all 6 Companion 3.0 Harvest studios in raw vanilla JS strings would cause unmaintainable UI sprawl, while adding a runtime Node server would violate `ADR-001`.
 - **Decision**: Author a modular React 19 + TypeScript + Vite frontend in `frontend/` with a Matte Brutalist Sci-Fi / Obsidian 4-preset theme system (`obsidian`, `orbital`, `graphite`, `daylight` + 1-click Light/Dark toggle) that compiles deterministically (`iife`) into `surfaces/static/{index.html,styles.css,app.js}` served directly by stdlib `surfaces/web_server.py` (`python harness.py --web`).
 - **Consequences**: Typed, self-maintainable 6-Studio AI workstation UI with zero runtime Node dependency, 100% offline LAN execution, and strict Ring-0 Python stdlib purity.
 
 ### ADR-018: Multi-Provider LLM Registry, Pure-Stdlib Wire Dialects, Blind Vault Key Binding & Mechanical LAN Privacy Lock
 - **Status**: `accepted`
-- **Context**: Supporting both local LAN servers (Ollama, vLLM, LM Studio, llama.cpp) and frontier cloud APIs (Gemini, Anthropic Claude, OpenAI, xAI Grok, OpenRouter, DeepSeek, Groq) via static `.env` edits forced restarts, risked API key leakage, and lost provider-native reasoning/multimodal capabilities (`thoughtSignature`, Extended Thinking signatures, native audio/video).
+- **Context**: Supporting both local LAN servers (Ollama, vLLM, LM Studio, llama.cpp) and frontier cloud APIs (Gemini, Anthropic Claude, OpenAI, xAI Grok, OpenRouter, DeepSeek, Groq) via static `.env` edits forced restarts, risked API key leakage, and lost provider-native reasoning/multimodal capabilities.
 - **Decision**: Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`-by-default/`hybrid`/`cloud_allowed` outbound privacy lock).
-- **Consequences**: Instant hot-reload routing across local LAN and frontier models from Web UI (`System -> Models, Tiers & Context`) and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy.
+- **Consequences**: Instant hot-reload routing across local LAN and frontier models from Web UI and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy.
 
-### ADR-019: Independent Two-Lever Operating Architecture (`Hobby Mode` x `Self-Dev Mode`), Mechanical Read-Only Core Lock & 2-Track Hobby Split
+### ADR-019: Independent Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`) & Mechanical Read-Only Core Lock
 - **Status**: `accepted`
-- **Context**: Running a daily-driver Companion release with background hobbies risked unrequested code mutations, while coupling hobbies to self-evolution prevented quiet personal knowledge/study maintenance on stable builds or isolated Lab/VM self-evolution.
-- **Decision**: Maintain `Hobby Mode` (`on`/`off`) and `Self-Dev Mode` (`on`/`off`, seedable/lockable via `COMPANION_SELF_DEV`, `COMPANION_SELF_DEV_LOCKED`, `COMPANION_IMMUTABLE_CORE`) as two independent levers; mechanically lock Companion core files read-only (`safety.py`, `checkpoints.py`, `grounding.py`, `skill_forge.py`) while keeping `data/` and external `/project` workspaces writable when `Self-Dev Mode = OFF`; forbid LLM tool turns or subprocesses from enabling `Self-Dev Mode`; and split hobbies into `personal` vs `self_dev` tracks with CLI + Web UI `System` Studio + Web idle parity.
-- **Consequences**: Safe stable daily-driver operation with personal/ops hobbies (`wiki_gardener`, `memory_curator`, `trace_reviewer`, `life_study_organizer`) alongside deliberate or full Lab/VM self-evolution when `Self-Dev Mode` is explicitly enabled by the human partner.
+- **Context**: Running a daily-driver Companion release with background execution risked unrequested code mutations, while coupling idle autonomy to self-evolution prevented quiet knowledge/routine/goal execution on stable builds.
+- **Decision**: Maintain `Background Autonomy` (`on`/`off`) and `Self-Dev Mode` (`on`/`off`, seedable/lockable via `COMPANION_SELF_DEV`, `COMPANION_SELF_DEV_LOCKED`, `COMPANION_IMMUTABLE_CORE`) as two independent levers; mechanically lock Companion core files read-only (`safety.py`, `checkpoints.py`, `grounding.py`, `skill_forge.py`) while keeping `data/` and external `/project` workspaces writable when `Self-Dev Mode = OFF`; and gate self-dev routines (`code_hygiene`) behind `Self-Dev Mode = ON`.
+- **Consequences**: Safe stable daily-driver operation with quiet `on_idle` routines and windowed autonomous Goal slices alongside deliberate Lab/VM self-evolution when `Self-Dev Mode` is explicitly enabled by the human partner.
+
+### ADR-020: Agent-Native Headless Core Consolidation — Unified TriggerPolicy, Code-Controlled Python DAG Runtime, Universal Project & Goal Graph, Cognitive Triage & MCP Capability Harvesting
+- **Status**: `accepted`
+- **Context**: Separate Hobbies vs. Routines subsystems, rigid 20-step JSON workflow recipes, human-chore-coupled Agile boards vs. flat task tables, regex keyword-spotting intake, and manual-only MCP/endpoint wiring prevented true multi-session agent autonomy.
+- **Decision**: Consolidate all time/idle triggers into `TriggerPolicy` (`companion/trigger_policy.py`) and `Routines` (`companion/routines.py`); introduce pure-stdlib Python `DAGSpec` execution with `foreach` fan-out/fan-in and SQLite node checkpointing (`companion/dag_runtime.py`); unify tasks, backlog, `/plan`, `/goal`, and Kanban projections onto the domain-blind Universal Project & Goal Graph (`companion/project_graph.py`) with `skills/personal-agile-coach/` in Ring-1; replace regex intake with Cognitive Triage (`companion/intake.py`); and add ApprovalQueue-staged endpoint/MCP self-wiring, MCP-to-Skill harvesting, and pluggable `VerificationSpec` domain validators.
+- **Consequences**: Cohesive, domain-blind headless core capable of forging deterministic Python DAGs, wiring external tools via human approval, and advancing multi-session Companion + Human goals safely.
 
 ## Historical / Superseded Decisions (Compacted)
 - *(None yet — all foundational ADRs are currently active.)*

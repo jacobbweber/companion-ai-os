@@ -163,8 +163,8 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             self.assertNotIn("INLINE LINT WARNING", res_e)
 
     def test_upgrade5_rich_tool_parameter_schemas_and_phase_tool_gating(self) -> None:
-        """Verify every parameter across all 26 tools has a description and `DESIGN`/`PLAN` lock out file writes."""
-        self.assertEqual(len(TOOLS), 26)
+        """Verify every parameter across all 25 tools has a description and `DESIGN`/`PLAN` lock out file writes."""
+        self.assertEqual(len(TOOLS), 25)
         for tool_spec in TOOLS:
             fn_name = tool_spec["function"]["name"]
             props = tool_spec["function"]["parameters"]["properties"]
@@ -384,7 +384,7 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             self.assertNotIn(".rglob(", py_f.read_text(encoding="utf-8"), f"Unpruned `.rglob(` left in {py_f.name}")
 
         stems = sorted(p.stem for p in (settings.root / "companion").glob("*.py") if p.name != "__init__.py")
-        self.assertEqual(len(stems), 44)
+        self.assertEqual(len(stems), 45)
         readme_txt = (settings.root / "README.md").read_text(encoding="utf-8")
         sdd_skill_txt = (settings.root / "skills" / "sdd-compliance" / "SKILL.md").read_text(encoding="utf-8")
         patterns_txt = (settings.root / "skills" / "knowledge-wiki" / "references" / "agentic-patterns.md").read_text(encoding="utf-8")

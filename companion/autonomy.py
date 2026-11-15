@@ -18,9 +18,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from companion.agile_boards import sync_workflow_to_agile_board
 from companion.compaction import build_lossless_phase_handoff, classify_task_autoskip, format_task_carry_forward
 from companion.config import settings
+from companion.dag_runtime import execute_dag_by_name
 from companion.disciplines import (
     FORBIDDEN_EXTERNAL_IMPORTS as FORBIDDEN_STDLIB_VIOLATION_IMPORTS, STUB_PATTERNS,
     iter_ast_import_targets, resolve_workspace_contract, verify_repository_syntax, walk_pruned_files,
@@ -28,6 +28,7 @@ from companion.disciplines import (
 from companion.intake import PHASE_TIERS, IntentDecision, classify_turn_intent, resolve_workflow_phase_tier, run_http_smoke_probe
 from companion.llm import chat, model_gate, tier_context
 from companion.memory_store import MemoryStore, get_memory_store
+from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
 from companion.safety import CheckpointManager, get_active_checkpoint_manager, run_system_doctor, run_unit_tests
 from companion.sdd import sync_decisions_md
 from companion.skill_forge import distill_workflow_reflection
@@ -39,7 +40,7 @@ from companion.workflow_graph import WorkflowEngine, workflow_engine
 
 __all__ = [
     "IntentDecision", "PHASE_TIERS", "classify_turn_intent", "resolve_goal_engines", "resolve_workflow_phase_tier",
-    "run_autonomous_goal", "run_http_smoke_probe", "run_phase_turn", "scan_placeholder_violations",
+    "run_autonomous_goal", "run_autonomous_goal_slice", "run_http_smoke_probe", "run_phase_turn", "scan_placeholder_violations",
 ]
 
 
@@ -164,7 +165,7 @@ def _evaluate_hard_verification(
         stub_issues.append(struct_msg)
     if goal_plan is not None:
         for st in goal_plan.steps:
-            if st.verification.kind in ("evidence_file", "check_command", "script_validator"):
+            if st.verification.kind in ("evidence_file", "check_command", "script_validator", "domain_validator"):
                 ev_ok, ev_msg = evaluate_step_verification(st.verification, root, "ok", changed)
                 if ev_ok:
                     st.status = "completed"
@@ -311,7 +312,8 @@ def _execute_implement_tasks(
             continue
 
         step = ready[0]
-        sync_workflow_to_agile_board(mem, wf_id, goal, "IMPLEMENT", active_task_id=step.task_id)
+        if wf_id is not None:
+            sync_workflow_to_project_graph(mem, wf_id, goal, "IMPLEMENT")
         must_pause, pause_reason = goal_plan.requires_pause(step, r3_approved=legacy_r3, approved_r3_steps=approved_r3)
         if must_pause:
             if pause_only_human_gate and step.verification.kind != "human_gate":
@@ -395,7 +397,8 @@ def _finalize_autonomous_goal(
     git_res = eff_cp.create_git_savepoint(f"Complete Workflow #{wf_id}: {clean_goal[:72]}", init_if_needed=(target_root != settings.root.resolve())) if auto_git_commit else {}
     git_line = f"\nGit Save-Point: {git_res['summary']}" if git_res.get("summary") else ""
     wf.transition("COMPLETE", f"Autonomous goal verified and completed in {elapsed_s}s", run_tests_on_verify=False)
-    sync_workflow_to_agile_board(mem, wf_id, clean_goal, "COMPLETE")
+    if wf_id is not None:
+        sync_workflow_to_project_graph(mem, wf_id, clean_goal, "COMPLETE")
     telemetry.log("INFO", "autonomy", f"Autonomous goal completed ({elapsed_s}s): {clean_goal[:100]}")
     summary = (
         f"=== Autonomous Goal Execution: COMPLETE ({elapsed_s}s) ===\n"
@@ -442,7 +445,9 @@ def _run_planning_phases(
         meta["goal_dag"] = dag.to_dict()
         if wf_id is not None:
             mem.update_workflow_metadata(wf_id, {"plan_handoff": plan, "goal_dag": meta["goal_dag"]})
-    sync_workflow_to_agile_board(mem, wf_id, clean_goal, "PLAN")
+    get_project_graph(mem).seed_dikw_goal_milestones(settings.get_workspace().project_id)
+    if wf_id is not None:
+        sync_workflow_to_project_graph(mem, wf_id, clean_goal, "PLAN")
     return disc, design, plan
 
 
@@ -510,7 +515,8 @@ def run_autonomous_goal(
             }
 
         _ensure_wf_state(wf, mem, "VERIFY", "Implementation steps finished; running hard verification gate")
-        sync_workflow_to_agile_board(mem, wf_id, clean_goal, "VERIFY")
+        if wf_id is not None:
+            sync_workflow_to_project_graph(mem, wf_id, clean_goal, "VERIFY")
         passed, gate_report = _evaluate_hard_verification(target_root, baseline_hashes, run_doctor_tests, clean_goal, goal_plan)
         recoveries_used = 0
         while not passed and recoveries_used < max_recoveries:
@@ -548,3 +554,66 @@ def run_autonomous_goal(
             len(impl_notes), gate_report, round(time.perf_counter() - t0, 1),
             rollback_on_failure, target_root, baseline_hashes, mem, eff_cp, wf, auto_git_commit=eff_git,
         )
+
+
+def run_autonomous_goal_slice(
+    project_id: Optional[str] = None,
+    chat_fn: Callable[..., Dict[str, Any]] = chat,
+    store: Optional[MemoryStore] = None,
+    root: Optional[Path] = None,
+    max_iters: int = 6,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Execute a single unblocked `companion`/`collaborative` work-item slice on the Universal Project & Goal Graph."""
+    mem, target_root, eff_cp, _ = resolve_goal_engines(store, None, root)
+    mgr = get_project_graph(mem)
+    ready = mgr.next_ready_companion_items(project_id=project_id, limit=1)
+    if not ready:
+        return {"ok": True, "ran": False, "status": "idle", "summary": "No ready companion work items."}
+
+    item = ready[0]
+    pid = str(item["project_id"])
+    proj = mgr.get_project(pid)
+    cp_id = eff_cp.create_checkpoint(label=f"slice_{item['item_id']}")["checkpoint_id"]
+    pre_hashes = _snapshot_file_hashes(target_root)
+    mgr.update_item(item["item_id"], status="in_progress", checkpoint_id=cp_id)
+
+    if item.get("dag_name"):
+        dag_res = execute_dag_by_name(
+            str(item["dag_name"]),
+            params={"goal": item["title"], "item_id": item["item_id"], "project_id": pid},
+            store=mem,
+            root=target_root,
+        )
+        if dag_res.get("status") == "waiting_approval":
+            summary = str(dag_res.get("summary") or f"Paused awaiting approval (`{dag_res.get('approval_id')}`).")
+            mgr.update_item(item["item_id"], status="waiting_approval", checkpoint_id=cp_id, verification_result=summary[:240])
+            mem.log_autonomy_run(pid, summary, entry_kind="goal_slice", status="waiting_approval", details={"item_id": item["item_id"], "approval_id": dag_res.get("approval_id", "")})
+            return {"ok": True, "ran": True, "status": "waiting_approval", "project_id": pid, "item_id": item["item_id"], "approval_id": dag_res.get("approval_id", ""), "summary": summary}
+        out = str(dag_res.get("summary") or "")
+        exec_ok = bool(dag_res.get("ok"))
+    else:
+        prompt = (
+            f"Project / Goal: {proj['title']} ({proj['goal_summary']})\n"
+            f"Prerequisite Stage: {item['stage_kind']}\n"
+            f"Execute Work Item `{item['item_id']}`: {item['title']}\n"
+            f"Description: {item['description']}\n"
+            f"Acceptance Criteria: {item['acceptance_criteria'] or 'Complete cleanly with grounded verification.'}"
+        )
+        out = run_phase_turn("IMPLEMENT", prompt, max_iters, chat_fn, mem, verbose)
+        exec_ok = True
+
+    changed = _changed_paths_since(target_root, pre_hashes)
+    v_dict = item.get("verification") or {}
+    vspec = VerificationSpec.from_dict(v_dict) if v_dict else VerificationSpec("assertion")
+    ok_ver, ver_msg = evaluate_step_verification(vspec, target_root, out, changed)
+    ok_task, task_msg = _verify_task_completion(target_root, changed, run_doctor_tests=False)
+    passed = exec_ok and ok_ver and ok_task
+    new_status = "done" if passed else "blocked"
+    detail_msg = f"{ver_msg}; {task_msg}" if passed else f"NEEDS_FIX: {ver_msg if not ok_ver else task_msg}"
+    updated_item = mgr.update_item(item["item_id"], status=new_status, checkpoint_id=cp_id, verification_result=f"{detail_msg} | {out[:140]}"[:320])
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    mgr.update_project(pid, metadata={"last_slice_at": now_iso, "last_slice_item": item["item_id"]})
+    summary = f"Goal slice `{item['item_id']}` ({item['title'][:80]}) -> {new_status.upper()}: {detail_msg[:160]}"
+    mem.log_autonomy_run(pid, new_status, summary, checkpoint_id=cp_id, doctor_passed=passed, entry_kind="goal_slice")
+    return {"ok": passed, "ran": True, "status": new_status, "project_id": pid, "item": updated_item, "checkpoint_id": cp_id, "summary": summary}

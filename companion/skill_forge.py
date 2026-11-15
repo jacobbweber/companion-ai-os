@@ -1,12 +1,12 @@
 """
-Transactional Capability Forge, Safe Skill Script Runner & `REFLECT` Distiller
+Transactional Capability Forge, Python DAG Verifier, Safe Script Runner & `REFLECT` Distiller
 (`companion/skill_forge.py` — A-Frame Application Layer).
 
 Provides:
 1. `check_make_vs_borrow`: checks existing 3-Tier `skills/` and `KnowledgePort` before authoring.
-2. `stage_and_promote_skill`: stages candidate `SKILL.md`, `scripts/*.py`, `workflows/*.json`,
-   and `references/*.md` in an isolated temp directory, enforces AST/stdlib/hygiene/recipe linters
-   and `--self-test` execution, checkpoints `skills/`, and promotes atomically (`R2`).
+2. `stage_and_promote_skill`: stages candidate `SKILL.md`, `dags/*.py`, `scripts/*.py`,
+   and `references/*.md` in an isolated temp directory, enforces AST/stdlib/hygiene/DAG linters,
+   `dry_run_dag`, and `--self-test` execution, checkpoints `skills/`, and promotes atomically (`R2`).
 3. `run_skill_script`: executes promoted `skills/<skill>/scripts/<script>.py` inside the active
    `ExecutionTarget` with post-exec syntax healing.
 4. `distill_workflow_reflection`: deterministic post-`VERIFY` `REFLECT` compounding into `KnowledgePort`.
@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from companion.checkpoints import CheckpointManager, checkpoint_manager
 from companion.config import SELF_PROJECT_ID, settings
+from companion.dag_runtime import self_test_dag
 from companion.disciplines import iter_ast_import_targets
 from companion.grounding import (
     discover_skills,
@@ -40,8 +41,8 @@ from companion.sdd import (
     check_wiki_author_guard,
     is_undeclared_skill_import,
     parse_pep723_dependencies,
+    validate_dag_python_source,
     validate_skill_markdown,
-    validate_workflow_recipe_json,
     verify_skills_directory,
 )
 from companion.telemetry import redact_secrets, telemetry
@@ -73,35 +74,39 @@ def check_make_vs_borrow(capability_query: str, root: Optional[Path] = None) -> 
     return {"recommendation": rec, "existing_skills": matched_skills, "known_facts": [f.key for f in known_facts], "summary": summary}
 
 
-def _lint_staged_script(fname: str, code: str) -> Optional[str]:
-    """Enforce syntax, ADR-001 Ring-1 PEP 723 dependency rules, line budgets, and zero unused imports on a staged script."""
+def _lint_staged_python(fname: str, code: str, kind: str) -> Optional[str]:
+    """Enforce syntax, ADR-001 Ring-1 PEP 723 rules, line budgets, and zero unused imports on staged `.py` assets."""
     valid, syn_err = validate_python_syntax(code, filename=fname)
     if not valid:
-        return f"Script `{fname}` SyntaxError: {syn_err}"
+        return f"{kind} `{fname}` SyntaxError: {syn_err}"
     _raw_deps, allowed_imports, pep_err = parse_pep723_dependencies(code)
     if pep_err:
-        return f"Script `{fname}` {pep_err}"
+        return f"{kind} `{fname}` {pep_err}"
     lines = code.splitlines()
     if len(lines) > settings.max_module_lines:
-        return f"Script `{fname}` exceeds module budget ({len(lines)} > {settings.max_module_lines} lines)."
+        return f"{kind} `{fname}` exceeds module budget ({len(lines)} > {settings.max_module_lines} lines)."
     tree = ast.parse(code, filename=fname)
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             fn_len = getattr(node, "end_lineno", node.lineno) - node.lineno + 1
             if fn_len > settings.max_function_lines:
-                return f"Script `{fname}` function `{node.name}()` exceeds {settings.max_function_lines} lines ({fn_len}L)."
+                return f"{kind} `{fname}` function `{node.name}()` exceeds {settings.max_function_lines} lines ({fn_len}L)."
     for target, lineno in iter_ast_import_targets(tree):
         top_pkg = target.split(".")[0].lower()
         if is_undeclared_skill_import(top_pkg, allowed_imports):
             return (
-                f"Script `{fname}:{lineno}` imports undeclared third-party package `{top_pkg}` "
+                f"{kind} `{fname}:{lineno}` imports undeclared third-party package `{top_pkg}` "
                 "(declare in PEP 723 `# /// script` `dependencies = [...]` or use Python stdlib)."
             )
-    unused = find_unused_imports_in_source(tree, f"scripts/{fname}")
+    unused = find_unused_imports_in_source(tree, f"{kind.lower()}s/{fname}")
     if unused:
-        return f"Script `{fname}` has unused import(s): {'; '.join(unused)}"
-    if "--self-test" not in code:
+        return f"{kind} `{fname}` has unused import(s): {'; '.join(unused)}"
+    if kind == "Script" and "--self-test" not in code:
         return f"Script `{fname}` must implement a `--self-test` CLI entrypoint."
+    if kind == "DAG":
+        dag_err = validate_dag_python_source(code, filename=fname)
+        if dag_err:
+            return f"DAG `{fname}`: {dag_err}"
     return None
 
 
@@ -130,51 +135,59 @@ def _populate_staged_skill_dir(
     stage_skill: Path,
     skill_md: str,
     references: Optional[Dict[str, str]],
-    workflows: Optional[Dict[str, str]],
+    dags: Optional[Dict[str, str]],
     scripts: Optional[Dict[str, str]],
-) -> Tuple[Optional[str], List[Path]]:
-    """Write and lint `SKILL.md`, `references/`, `workflows/`, and `scripts/` inside `stage_skill`."""
+) -> Tuple[Optional[str], List[Path], List[Path]]:
+    """Write and lint `SKILL.md`, `references/`, `dags/`, and `scripts/` inside `stage_skill`."""
     stage_skill.mkdir(parents=True, exist_ok=True)
     (stage_skill / "SKILL.md").write_text((skill_md or "").replace("\r\n", "\n"), encoding="utf-8", newline="\n")
 
     for fname, content in (references or {}).items():
         clean_f = Path(fname).name
         if not clean_f.endswith(".md"):
-            return f"SKILL FORGE REJECTED: reference `{fname}` must end with `.md`.", []
+            return f"SKILL FORGE REJECTED: reference `{fname}` must end with `.md`.", [], []
         ref_d = stage_skill / "references"
         ref_d.mkdir(exist_ok=True)
         (ref_d / clean_f).write_text(str(content).replace("\r\n", "\n"), encoding="utf-8", newline="\n")
 
-    for fname, content in (workflows or {}).items():
+    staged_dags: List[Path] = []
+    for fname, content in (dags or {}).items():
         clean_f = Path(fname).name
-        if not clean_f.endswith(".json"):
-            return f"SKILL FORGE REJECTED: workflow recipe `{fname}` must end with `.json`.", []
-        wf_err = validate_workflow_recipe_json(str(content), expected_name=Path(clean_f).stem)
-        if wf_err:
-            return f"SKILL FORGE REJECTED (`workflows/{clean_f}`): {wf_err}", []
-        wf_d = stage_skill / "workflows"
-        wf_d.mkdir(exist_ok=True)
-        (wf_d / clean_f).write_text(str(content).replace("\r\n", "\n"), encoding="utf-8", newline="\n")
+        if not clean_f.endswith(".py"):
+            return f"SKILL FORGE REJECTED: Python DAG `{fname}` must end with `.py`.", [], []
+        norm_code = str(content).replace("\r\n", "\n")
+        lint_err = _lint_staged_python(clean_f, norm_code, "DAG")
+        if lint_err:
+            return f"SKILL FORGE REJECTED (`dags/{clean_f}`): {lint_err}", [], []
+        dag_d = stage_skill / "dags"
+        dag_d.mkdir(exist_ok=True)
+        dag_p = dag_d / clean_f
+        dag_p.write_text(norm_code, encoding="utf-8", newline="\n")
+        staged_dags.append(dag_p)
 
     staged_scripts: List[Path] = []
     for fname, content in (scripts or {}).items():
         clean_f = Path(fname).name
         if not clean_f.endswith(".py"):
-            return f"SKILL FORGE REJECTED: script `{fname}` must end with `.py`.", []
+            return f"SKILL FORGE REJECTED: script `{fname}` must end with `.py`.", [], []
         norm_code = str(content).replace("\r\n", "\n")
-        lint_err = _lint_staged_script(clean_f, norm_code)
+        lint_err = _lint_staged_python(clean_f, norm_code, "Script")
         if lint_err:
-            return f"SKILL FORGE REJECTED (`scripts/{clean_f}`): {lint_err}", []
+            return f"SKILL FORGE REJECTED (`scripts/{clean_f}`): {lint_err}", [], []
         sc_d = stage_skill / "scripts"
         sc_d.mkdir(exist_ok=True)
         sc_path = sc_d / clean_f
         sc_path.write_text(norm_code, encoding="utf-8", newline="\n")
         staged_scripts.append(sc_path)
-    return None, staged_scripts
+    return None, staged_dags, staged_scripts
 
 
-def _run_staged_self_tests(staged_scripts: List[Path], sandbox_dir: Path) -> Optional[str]:
-    """Execute `--self-test` on every staged script inside an isolated temporary directory."""
+def _run_staged_self_tests(staged_dags: List[Path], staged_scripts: List[Path], sandbox_dir: Path) -> Optional[str]:
+    """Execute `self_test_dag` on staged Python DAGs and `--self-test` on staged helper scripts."""
+    for dag_path in staged_dags:
+        dag_res = self_test_dag(dag_path)
+        if not dag_res.get("ok"):
+            return f"SKILL FORGE REJECTED (`dags/{dag_path.name}`): {dag_res.get('error', 'self-test failed')}"
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     for sc_path in staged_scripts:
         cmd, cmd_err = build_skill_script_command(sc_path, ["--self-test"])
@@ -203,14 +216,14 @@ def stage_and_promote_skill(
     name: str,
     skill_md: str,
     scripts: Optional[Dict[str, str]] = None,
-    workflows: Optional[Dict[str, str]] = None,
+    dags: Optional[Dict[str, str]] = None,
     references: Optional[Dict[str, str]] = None,
     self_test: bool = True,
     overwrite: bool = False,
     root: Optional[Path] = None,
     scope: str = "core",
 ) -> Dict[str, Any]:
-    """Stage, lint, `--self-test`, checkpoint, and atomically promote a 3-Tier Skill Pack (`R2`)."""
+    """Stage, lint, `--self-test`, checkpoint, and atomically promote a 3-Tier Capability Pack (`R2`)."""
     clean_name = (name or "").strip().lower()
     if not clean_name or not _KEBAB_RE.match(clean_name):
         msg = f"SKILL FORGE REJECTED: skill name `{name}` must be kebab-case (`[a-z0-9-]+`)."
@@ -244,7 +257,7 @@ def stage_and_promote_skill(
     with tempfile.TemporaryDirectory() as tmp:
         stage_root = Path(tmp) / "stage_repo"
         stage_skill = stage_root / "skills" / clean_name
-        pop_err, staged_scripts = _populate_staged_skill_dir(stage_skill, skill_md, references, workflows, scripts)
+        pop_err, staged_dags, staged_scripts = _populate_staged_skill_dir(stage_skill, skill_md, references, dags, scripts)
         if pop_err:
             return {"promoted": False, "error": pop_err, "summary": pop_err}
 
@@ -253,8 +266,8 @@ def stage_and_promote_skill(
             msg = f"SKILL FORGE REJECTED (structure check): {'; '.join(dir_issues)}"
             return {"promoted": False, "error": msg, "summary": msg}
 
-        if self_test and staged_scripts:
-            test_err = _run_staged_self_tests(staged_scripts, Path(tmp) / "self_test_sandbox")
+        if self_test and (staged_dags or staged_scripts):
+            test_err = _run_staged_self_tests(staged_dags, staged_scripts, Path(tmp) / "self_test_sandbox")
             if test_err:
                 return {"promoted": False, "error": test_err, "summary": test_err}
 
@@ -270,7 +283,7 @@ def stage_and_promote_skill(
         if "unittest" not in sys.modules or has_memory_store_override():
             get_knowledge_port().propose_update(
                 key=f"skill:{clean_name}",
-                value=f"Promoted verified 3-Tier skill `{rel_lbl}/SKILL.md` (scripts={list((scripts or {}).keys())}, workflows={list((workflows or {}).keys())}).",
+                value=f"Promoted verified 3-Tier skill `{rel_lbl}/SKILL.md` (scripts={list((scripts or {}).keys())}, dags={list((dags or {}).keys())}).",
                 project_id="global",
                 source="skill_forge",
                 confidence=1.0,
@@ -278,7 +291,7 @@ def stage_and_promote_skill(
     telemetry.log("INFO", "skill_forge", f"Promoted verified skill `{rel_lbl}` (cp={cp['checkpoint_id']})")
     summary = (
         f"Promoted verified skill `{rel_lbl}/` (checkpoint `{cp['checkpoint_id']}`; "
-        f"scripts={len(scripts or {})}, workflows={len(workflows or {})}, references={len(references or {})})."
+        f"scripts={len(scripts or {})}, dags={len(dags or {})}, references={len(references or {})})."
     )
     return {"promoted": True, "skill": clean_name, "scope": "user" if is_user_scope else "core", "path": str(dest_dir), "checkpoint_id": cp["checkpoint_id"], "summary": summary}
 

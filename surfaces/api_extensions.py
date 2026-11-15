@@ -17,7 +17,6 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from companion.agile_boards import MASTER_SPRINT_BOARD_ID, get_agile_manager
 from companion.archive_and_approvals import get_approval_queue, get_trust_mode, peek_session_nudges
 from companion.attachments import (
     get_attachment_record,
@@ -29,10 +28,11 @@ from companion.background_jobs import get_job_manager
 from companion.config import settings
 from companion.core_actions import execute_core_action, list_core_actions
 from companion.education_engine import get_education_engine
-from companion.hobbies import HobbyEngine, WebIdleHobbyWatcher, describe_operating_quadrant
 from companion.mcp_hub import get_mcp_hub
 from companion.memory_store import MemoryStore
 from companion.model_registry import get_model_matrix_snapshot
+from companion.project_graph import get_project_graph
+from companion.routines import IdleAutonomyWatcher, describe_operating_quadrant
 from companion.streaming import wire_attachment_context
 from companion.telemetry import telemetry
 from companion.wiki_engine import get_wiki_engine
@@ -141,8 +141,8 @@ def request_service_reload() -> Dict[str, Any]:
     return {"ok": True, "reloading": True, "summary": "Reloading Companion service with latest code..."}
 
 
-def create_session_idle_watcher(sess: Any, poll_interval_sec: float = 15.0) -> WebIdleHobbyWatcher:
-    """Create a `WebIdleHobbyWatcher` bound to `sess.store` that yields immediately to foreground chat or jobs."""
+def create_session_idle_watcher(sess: Any, poll_interval_sec: float = 15.0) -> IdleAutonomyWatcher:
+    """Create an `IdleAutonomyWatcher` bound to `sess.store` that yields immediately to foreground chat or jobs."""
 
     def _is_web_busy() -> bool:
         if bool(getattr(sess, "busy", False)) or bool(getattr(sess, "active_job_id", "")):
@@ -150,23 +150,23 @@ def create_session_idle_watcher(sess: Any, poll_interval_sec: float = 15.0) -> W
         jobs = get_job_manager(store=sess.store).list_jobs(limit=15)
         return any(j.get("status") == "running" for j in jobs)
 
-    return WebIdleHobbyWatcher(is_busy_fn=_is_web_busy, engine=HobbyEngine(store=sess.store), poll_interval_sec=poll_interval_sec)
+    return IdleAutonomyWatcher(is_busy_fn=_is_web_busy, store=sess.store, poll_interval_sec=poll_interval_sec)
 
 
 def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
-    """Return Companion 3.0 Harvest status fields merged into `GET /api/status`."""
+    """Return Companion 3.5 status fields merged into `GET /api/status`."""
     prof = store.get_user_profile()
     jobs = get_job_manager(store=store).list_jobs(limit=25)
     active_bg = [j for j in jobs if j["status"] in ("queued", "running", "waiting_approval")]
     partners = get_mcp_hub(store=store).list_partners()
     nudges = peek_session_nudges(session_id="web_ui", store=store) + peek_session_nudges(session_id="main", store=store)
-    agile_view = get_agile_manager(store=store).get_board_view(MASTER_SPRINT_BOARD_ID)
+    agile_view = get_project_graph(store=store).get_board_projection()
     edu_prog = get_education_engine(store=store).get_progress_summary()
     ac = edu_prog.get("active_course")
     sp = agile_view.get("active_sprint")
     m_snap = get_model_matrix_snapshot(store=store)
-    hobby_on, self_dev_on = store.is_hobby_mode_enabled(), store.is_self_dev_mode_enabled()
-    unseen_hobbies = store.get_hobby_journal(unseen_only=True, mark_seen=False, limit=20)
+    bg_on, self_dev_on = store.is_background_autonomy_enabled(), store.is_self_dev_mode_enabled()
+    unseen_journal = store.get_autonomy_journal(unseen_only=True, mark_seen=False, limit=20)
     waiting_approvals = get_approval_queue(store=store).list_requests(status="waiting")
     return {
         "onboarded": prof.get("onboarded", "false").strip().lower() in ("true", "1", "yes"),
@@ -176,12 +176,14 @@ def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
         "data_dir": str(settings.effective_data_dir),
         "trust_mode": get_trust_mode(store=store),
         "privacy_mode": settings.effective_privacy_mode(),
+        "background_autonomy": "on" if bg_on else "off",
         "self_dev_mode": "on" if self_dev_on else "off",
         "self_dev_enabled": self_dev_on,
         "self_dev_locked": settings.is_self_dev_locked_by_env(),
         "self_dev_lock_reason": settings.self_dev_lock_reason(),
-        "operating_quadrant": describe_operating_quadrant(hobby_on, self_dev_on),
-        "unseen_hobbies_count": len(unseen_hobbies),
+        "operating_quadrant": describe_operating_quadrant(bg_on, self_dev_on),
+        "unseen_autonomy_count": len(unseen_journal),
+        "unseen_hobbies_count": len(unseen_journal),
         "provider_count": len(m_snap["providers"]),
         "pending_approvals_count": len(waiting_approvals),
         "pending_approvals": waiting_approvals[:5],
@@ -190,8 +192,9 @@ def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
         "session_nudges": nudges[:8],
         "agile_summary": {
             "active_sprint_title": sp["title"] if sp else "",
-            "open_cards": sum(1 for c in agile_view["cards"] if c["status"] != "done"),
-            "aging_count": len(agile_view["aging_cards"]),
+            "open_cards": sum(1 for c in agile_view["cards"] if c["column_key"] != "done"),
+            "blocked_count": agile_view["counts"]["blocked"],
+            "aging_count": agile_view["counts"]["blocked"],
         },
         "education_summary": {
             "active_course_id": ac["course_id"] if ac else "",

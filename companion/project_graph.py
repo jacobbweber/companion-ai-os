@@ -1,0 +1,576 @@
+"""
+Universal Headless Project & Goal Graph (`companion/project_graph.py` — Domain Layer).
+
+Unifies tasks, backlog, `/plan`, `/goal`, and Kanban/Roadmap projections into one
+domain-blind execution graph (`Projects/Goals -> Milestones -> Work Items`):
+- Supports `owner` (`companion` | `human` | `collaborative`)
+- Supports prerequisite `stage_kind` (`OBSERVE_DATA`, `CURATE_DIKW`, `FORGE_CAPABILITY`, `DELIVER_AND_VERIFY`)
+- Enforces topological `depends_on` readiness (completing an `owner=human` blocker automatically
+  unblocks dependent `owner=companion` items)
+- Attaches `TriggerPolicy` to Goals/Projects for multi-session `on_idle` windowed execution
+"""
+
+import json
+import re
+import uuid
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from companion.config import SELF_PROJECT_ID, settings
+from companion.memory_store import MemoryStore, get_memory_store
+from companion.trigger_policy import (
+    TriggerPolicy,
+    evaluate_trigger_eligibility,
+    register_trigger_precheck,
+)
+
+VALID_ITEM_OWNERS = ("companion", "human", "collaborative")
+VALID_STAGE_KINDS = ("OBSERVE_DATA", "CURATE_DIKW", "FORGE_CAPABILITY", "DELIVER_AND_VERIFY")
+STAGE_ORDER: Dict[str, int] = {name: idx for idx, name in enumerate(VALID_STAGE_KINDS)}
+DONE_STATUSES = ("done", "completed")
+READY_STATUSES = ("ready", "pending")
+BOARD_COLUMNS = (
+    ("backlog", "Backlog"),
+    ("ready", "Ready"),
+    ("in_progress", "In Progress"),
+    ("blocked", "Blocked / Waiting"),
+    ("verify", "Verify"),
+    ("done", "Done"),
+)
+
+_ITEM_COLS = [
+    "id", "item_id", "project_id", "milestone_id", "timebox_id", "workflow_id", "item_kind",
+    "title", "description", "category", "status", "owner", "stage_kind", "priority",
+    "depends_on_json", "verification_json", "dag_name", "checkpoint_id",
+    "acceptance_criteria", "verification_result", "estimate_minutes",
+    "planned_date", "due_date", "checklist_json", "tags_json", "position",
+    "created_at", "updated_at", "completed_at",
+]
+
+
+def _slugify(text: str, fallback: str = "project") -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").strip().lower()).strip("-")
+    return s[:48] or fallback
+
+
+def _norm_column_key(status: str, item_kind: str = "task") -> str:
+    st = (status or "ready").strip().lower()
+    if st in DONE_STATUSES:
+        return "done"
+    if st == "backlog" or (item_kind == "backlog" and st in READY_STATUSES):
+        return "backlog"
+    if st in ("blocked", "waiting_approval"):
+        return "blocked"
+    if st == "verify":
+        return "verify"
+    if st == "in_progress":
+        return "in_progress"
+    return "ready"
+
+
+def _hydrate_item(raw: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(raw)
+    for jcol, key, default in (
+        ("depends_on_json", "depends_on", []),
+        ("verification_json", "verification", {}),
+        ("checklist_json", "checklist", []),
+        ("tags_json", "tags", []),
+    ):
+        try:
+            out[key] = json.loads(out.get(jcol) or ("[]" if isinstance(default, list) else "{}"))
+        except Exception:
+            out[key] = list(default) if isinstance(default, list) else dict(default)
+    out["column_key"] = _norm_column_key(str(out.get("status") or ""), str(out.get("item_kind") or "task"))
+    out["card_id"] = out["item_id"]
+    out["epic_id"] = out.get("milestone_id") or ""
+    out["sprint_id"] = out.get("timebox_id") or ""
+    return out
+
+
+def _hydrate_project(raw: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(raw)
+    try:
+        tp_raw = json.loads(out.get("trigger_policy_json") or "{}")
+    except Exception:
+        tp_raw = {}
+    try:
+        meta = json.loads(out.get("metadata_json") or "{}")
+    except Exception:
+        meta = {}
+    out["trigger_policy"] = TriggerPolicy.from_dict(tp_raw).to_dict() if tp_raw else TriggerPolicy(mode="manual").to_dict()
+    out["metadata"] = meta
+    out["board_id"] = out["project_id"]
+    return out
+
+
+class ProjectGraphManager:
+    """Domain-blind manager for Goals/Projects, Milestones, Timeboxes, and Work Items."""
+
+    def __init__(self, store: Optional[MemoryStore] = None):
+        self.store = store or get_memory_store()
+        self._ensure_default_projects()
+
+    def _ensure_default_projects(self) -> None:
+        ws = settings.get_workspace()
+        with self.store._lock:
+            for pid, title in ((SELF_PROJECT_ID, "Companion Self & Core"), (ws.project_id, ws.project_id.replace("-", " ").title())):
+                self.store.conn.execute(
+                    "INSERT OR IGNORE INTO projects (project_id, slug, title, kind, workspace_id) VALUES (?, ?, ?, 'project', ?)",
+                    (pid, _slugify(pid), title, pid),
+                )
+            self.store.conn.commit()
+
+    def resolve_project_id(self, project_id: Optional[str] = None) -> str:
+        raw = (project_id or "").strip()
+        if not raw:
+            return settings.get_workspace().project_id or SELF_PROJECT_ID
+        row = self.store._fetch_rows("SELECT project_id FROM projects WHERE project_id = ? OR slug = ? LIMIT 1", (raw, raw))
+        return str(row[0][0]) if row else raw
+
+    def create_project(
+        self,
+        title: str,
+        goal_summary: str = "",
+        slug: Optional[str] = None,
+        kind: str = "goal",
+        workspace_id: Optional[str] = None,
+        wiki_hub_path: str = "",
+        risk_ceiling: str = "R2",
+        trigger_policy: Optional[Union[TriggerPolicy, Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        clean_title = (title or "").strip()
+        if not clean_title:
+            raise ValueError("Project/Goal title is required.")
+        base_slug = _slugify(slug or clean_title, "goal")
+        pid = (project_id or f"proj_{base_slug}_{uuid.uuid4().hex[:6]}").strip()
+        tp = trigger_policy if isinstance(trigger_policy, TriggerPolicy) else TriggerPolicy.from_dict(trigger_policy)
+        ws_id = (workspace_id or settings.get_workspace().project_id or SELF_PROJECT_ID).strip()
+        with self.store._lock:
+            final_slug = base_slug
+            if self.store.conn.execute("SELECT 1 FROM projects WHERE slug = ? AND project_id != ?", (final_slug, pid)).fetchone():
+                final_slug = f"{base_slug}-{uuid.uuid4().hex[:4]}"
+            self.store.conn.execute(
+                "INSERT INTO projects (project_id, slug, title, goal_summary, kind, status, workspace_id, wiki_hub_path, risk_ceiling, trigger_policy_json, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_id) DO UPDATE SET title = excluded.title, goal_summary = excluded.goal_summary, kind = excluded.kind, "
+                "wiki_hub_path = excluded.wiki_hub_path, risk_ceiling = excluded.risk_ceiling, trigger_policy_json = excluded.trigger_policy_json, metadata_json = excluded.metadata_json, updated_at = CURRENT_TIMESTAMP",
+                (pid, final_slug, clean_title, goal_summary.strip(), kind, ws_id, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(metadata or {})),
+            )
+            self.store.conn.commit()
+        return self.get_project(pid)
+
+    def get_project(self, project_id: Optional[str] = None) -> Dict[str, Any]:
+        pid = self.resolve_project_id(project_id)
+        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
+        rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM projects WHERE project_id = ?", (pid,))
+        if not rows:
+            with self.store._lock:
+                self.store._ensure_project_record(pid)
+                self.store.conn.commit()
+            rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM projects WHERE project_id = ?", (pid,))
+        return _hydrate_project(rows[0])
+
+    def list_projects(self, status: Optional[str] = None, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
+        clauses: List[Tuple[str, Any]] = []
+        if status:
+            clauses.append(("status = ?", status))
+        if kind:
+            clauses.append(("kind = ?", kind))
+        where = (" WHERE " + " AND ".join(c for c, _ in clauses)) if clauses else ""
+        rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM projects{where} ORDER BY updated_at DESC, created_at ASC", tuple(v for _, v in clauses))
+        return [_hydrate_project(r) for r in rows]
+
+    def update_project(self, project_id: str, **updates: Any) -> Dict[str, Any]:
+        proj = self.get_project(project_id)
+        pid = proj["project_id"]
+        tp_dict = dict(proj["trigger_policy"])
+        if "trigger_policy" in updates and updates["trigger_policy"] is not None:
+            raw_tp = updates["trigger_policy"]
+            tp_dict = raw_tp.to_dict() if isinstance(raw_tp, TriggerPolicy) else TriggerPolicy.from_dict({**tp_dict, **dict(raw_tp)}).to_dict()
+        meta = {**dict(proj["metadata"]), **dict(updates.get("metadata") or {})}
+        title = str(updates.get("title") or proj["title"]).strip()
+        goal_s = str(updates.get("goal_summary") if updates.get("goal_summary") is not None else proj["goal_summary"]).strip()
+        status = str(updates.get("status") or proj["status"]).strip()
+        wiki_p = str(updates.get("wiki_hub_path") if updates.get("wiki_hub_path") is not None else proj["wiki_hub_path"]).strip()
+        with self.store._lock:
+            self.store.conn.execute(
+                "UPDATE projects SET title = ?, goal_summary = ?, status = ?, wiki_hub_path = ?, trigger_policy_json = ?, metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
+                (title, goal_s, status, wiki_p, json.dumps(tp_dict), json.dumps(meta), pid),
+            )
+            self.store.conn.commit()
+        return self.get_project(pid)
+
+    def create_milestone(self, project_id: str, title: str, description: str = "", stage_kind: str = "DELIVER_AND_VERIFY", target_date: str = "", sort_order: Optional[int] = None) -> Dict[str, Any]:
+        pid = self.resolve_project_id(project_id)
+        sk = stage_kind if stage_kind in VALID_STAGE_KINDS else "DELIVER_AND_VERIFY"
+        mid = f"ms_{uuid.uuid4().hex[:8]}"
+        order_val = int(sort_order) if sort_order is not None else STAGE_ORDER.get(sk, 3) * 10
+        with self.store._lock:
+            self.store._ensure_project_record(pid)
+            self.store.conn.execute(
+                "INSERT INTO milestones (milestone_id, project_id, title, description, stage_kind, status, sort_order, target_date) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+                (mid, pid, title.strip(), description.strip(), sk, order_val, target_date.strip()),
+            )
+            self.store.conn.commit()
+        return {"milestone_id": mid, "epic_id": mid, "project_id": pid, "title": title.strip(), "description": description.strip(), "stage_kind": sk, "status": "active", "sort_order": order_val, "target_date": target_date.strip()}
+
+    def seed_dikw_goal_milestones(self, project_id: str) -> Dict[str, str]:
+        """Ensure the 4 DIKW/Capability prerequisite milestones exist for a broad Goal project."""
+        pid = self.resolve_project_id(project_id)
+        existing = {m["stage_kind"]: m["milestone_id"] for m in self.list_milestones(pid)}
+        titles = {
+            "OBSERVE_DATA": "1. Observe & Gather Grounding Data",
+            "CURATE_DIKW": "2. Synthesize & Curate DIKW Wiki Context",
+            "FORGE_CAPABILITY": "3. Forge & Self-Test Capabilities / DAGs",
+            "DELIVER_AND_VERIFY": "4. Deliver, Verify & Checkpoint Outcomes",
+        }
+        for idx, sk in enumerate(VALID_STAGE_KINDS):
+            if sk not in existing:
+                ms = self.create_milestone(pid, titles[sk], stage_kind=sk, sort_order=idx * 10)
+                existing[sk] = ms["milestone_id"]
+        return existing
+
+    def list_milestones(self, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        pid = self.resolve_project_id(project_id)
+        cols = ["milestone_id", "project_id", "title", "description", "stage_kind", "status", "sort_order", "target_date", "created_at"]
+        rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM milestones WHERE project_id = ? ORDER BY sort_order ASC, created_at ASC", (pid,))
+        for r in rows:
+            r["epic_id"] = r["milestone_id"]
+        return rows
+
+    def create_item(
+        self,
+        project_id: Optional[str],
+        title: str,
+        description: str = "",
+        owner: str = "companion",
+        stage_kind: str = "DELIVER_AND_VERIFY",
+        status: str = "ready",
+        priority: int = 3,
+        depends_on: Optional[List[str]] = None,
+        milestone_id: str = "",
+        timebox_id: str = "",
+        workflow_id: Optional[int] = None,
+        verification: Optional[Dict[str, Any]] = None,
+        dag_name: str = "",
+        acceptance_criteria: str = "",
+        estimate_minutes: int = 30,
+        planned_date: str = "",
+        due_date: str = "",
+        checklist: Optional[List[Any]] = None,
+        tags: Optional[List[str]] = None,
+        category: str = "general",
+        item_kind: str = "task",
+    ) -> Dict[str, Any]:
+        clean_title = (title or "").strip()
+        if not clean_title:
+            raise ValueError("Work item title is required.")
+        pid = self.resolve_project_id(project_id)
+        own = owner.strip().lower() if owner and owner.strip().lower() in VALID_ITEM_OWNERS else "companion"
+        sk = stage_kind if stage_kind in VALID_STAGE_KINDS else "DELIVER_AND_VERIFY"
+        deps = [str(d).strip() for d in (depends_on or []) if str(d).strip()]
+        iid = f"wi_{uuid.uuid4().hex[:10]}"
+        with self.store._lock:
+            self.store._ensure_project_record(pid)
+            self.store.conn.execute(
+                "INSERT INTO work_items (item_id, project_id, milestone_id, timebox_id, workflow_id, item_kind, title, description, category, status, owner, stage_kind, priority, depends_on_json, verification_json, dag_name, acceptance_criteria, estimate_minutes, planned_date, due_date, checklist_json, tags_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (iid, pid, milestone_id, timebox_id, workflow_id, item_kind, clean_title, description.strip(), category, status, own, sk, max(1, min(5, int(priority))), json.dumps(deps), json.dumps(verification or {}), dag_name.strip(), acceptance_criteria.strip(), max(5, int(estimate_minutes)), planned_date.strip(), due_date.strip(), json.dumps(checklist or []), json.dumps(tags or [])),
+            )
+            self.store.conn.commit()
+        self.recompute_readiness(pid)
+        return self.get_item(iid)
+
+    def get_item(self, item_ref: Union[str, int]) -> Dict[str, Any]:
+        ref_str = str(item_ref).strip()
+        where = "id = ?" if ref_str.isdigit() else "item_id = ?"
+        arg: Any = int(ref_str) if ref_str.isdigit() else ref_str
+        rows = self.store._fetch_dicts(_ITEM_COLS, f"SELECT {', '.join(_ITEM_COLS)} FROM work_items WHERE {where} LIMIT 1", (arg,))
+        if not rows:
+            raise ValueError(f"Work item `{item_ref}` not found.")
+        return _hydrate_item(rows[0])
+
+    def list_items(self, project_id: Optional[str] = None, owner: Optional[str] = None, status: Optional[str] = None, timebox_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        clauses: List[Tuple[str, Any]] = []
+        if project_id:
+            clauses.append(("project_id = ?", self.resolve_project_id(project_id)))
+        if owner:
+            clauses.append(("owner = ?", owner.strip().lower()))
+        if status:
+            clauses.append(("status = ?", status.strip().lower()))
+        if timebox_id:
+            clauses.append(("timebox_id = ?", timebox_id.strip()))
+        where = (" WHERE " + " AND ".join(c for c, _ in clauses)) if clauses else ""
+        rows = self.store._fetch_dicts(_ITEM_COLS, f"SELECT {', '.join(_ITEM_COLS)} FROM work_items{where} ORDER BY priority ASC, position ASC, id ASC", tuple(v for _, v in clauses))
+        return [_hydrate_item(r) for r in rows]
+
+    def update_item(self, item_ref: Union[str, int], **updates: Any) -> Dict[str, Any]:
+        cur = self.get_item(item_ref)
+        iid, pid = cur["item_id"], cur["project_id"]
+        new_status = str(updates.get("status") or updates.get("column_key") or cur["status"]).strip().lower()
+        comp_at = cur.get("completed_at")
+        if new_status in DONE_STATUSES and not comp_at:
+            comp_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        deps = updates["depends_on"] if "depends_on" in updates and updates["depends_on"] is not None else cur["depends_on"]
+        chk = updates["checklist"] if "checklist" in updates and updates["checklist"] is not None else cur["checklist"]
+        tags = updates["tags"] if "tags" in updates and updates["tags"] is not None else cur["tags"]
+        ver = updates["verification"] if "verification" in updates and updates["verification"] is not None else cur["verification"]
+        own = str(updates.get("owner") or cur["owner"]).strip().lower()
+        sk = str(updates.get("stage_kind") or cur["stage_kind"]).strip()
+        with self.store._lock:
+            self.store.conn.execute(
+                "UPDATE work_items SET title = ?, description = ?, status = ?, owner = ?, stage_kind = ?, priority = ?, milestone_id = ?, timebox_id = ?, "
+                "depends_on_json = ?, verification_json = ?, dag_name = ?, checkpoint_id = ?, verification_result = ?, estimate_minutes = ?, planned_date = ?, due_date = ?, "
+                "checklist_json = ?, tags_json = ?, completed_at = ?, updated_at = CURRENT_TIMESTAMP WHERE item_id = ?",
+                (
+                    str(updates.get("title") or cur["title"]).strip(),
+                    str(updates["description"] if "description" in updates and updates["description"] is not None else cur["description"]),
+                    new_status,
+                    own if own in VALID_ITEM_OWNERS else cur["owner"],
+                    sk if sk in VALID_STAGE_KINDS else cur["stage_kind"],
+                    max(1, min(5, int(updates.get("priority", cur["priority"])))),
+                    str(updates.get("milestone_id", updates.get("epic_id", cur["milestone_id"])) or ""),
+                    str(updates.get("timebox_id", updates.get("sprint_id", cur["timebox_id"])) or ""),
+                    json.dumps(list(deps)),
+                    json.dumps(dict(ver)),
+                    str(updates.get("dag_name", cur["dag_name"]) or ""),
+                    str(updates.get("checkpoint_id", cur["checkpoint_id"]) or ""),
+                    str(updates.get("verification_result", cur["verification_result"]) or ""),
+                    int(updates.get("estimate_minutes", cur["estimate_minutes"])),
+                    str(updates.get("planned_date", cur["planned_date"]) or ""),
+                    str(updates.get("due_date", cur["due_date"]) or ""),
+                    json.dumps(list(chk)),
+                    json.dumps(list(tags)),
+                    comp_at,
+                    iid,
+                ),
+            )
+            self.store.conn.commit()
+        self.recompute_readiness(pid)
+        return self.get_item(iid)
+
+    def delete_item(self, item_ref: Union[str, int]) -> bool:
+        cur = self.get_item(item_ref)
+        with self.store._lock:
+            res = self.store.conn.execute("DELETE FROM work_items WHERE item_id = ?", (cur["item_id"],))
+            self.store.conn.commit()
+        self.recompute_readiness(cur["project_id"])
+        return res.rowcount > 0
+
+    def recompute_readiness(self, project_id: str) -> List[str]:
+        """Promote `blocked -> ready` when all `depends_on` items are done; demote `ready -> blocked` when dependencies remain."""
+        pid = self.resolve_project_id(project_id)
+        items = self.list_items(project_id=pid)
+        by_key: Dict[str, Dict[str, Any]] = {}
+        for it in items:
+            by_key[it["item_id"]] = it
+            by_key[str(it["id"])] = it
+        unblocked_ids: List[str] = []
+        with self.store._lock:
+            for it in items:
+                deps = [str(d).strip() for d in it["depends_on"] if str(d).strip()]
+                if not deps:
+                    continue
+                all_done = all((by_key.get(d) or {}).get("status") in DONE_STATUSES for d in deps)
+                st = str(it["status"]).lower()
+                if not all_done and st in READY_STATUSES:
+                    self.store.conn.execute("UPDATE work_items SET status = 'blocked', updated_at = CURRENT_TIMESTAMP WHERE item_id = ?", (it["item_id"],))
+                elif all_done and st == "blocked":
+                    self.store.conn.execute("UPDATE work_items SET status = 'ready', updated_at = CURRENT_TIMESTAMP WHERE item_id = ?", (it["item_id"],))
+                    unblocked_ids.append(it["item_id"])
+            self.store.conn.commit()
+        return unblocked_ids
+
+    def next_ready_companion_items(self, project_id: Optional[str] = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """Return unblocked `companion`/`collaborative` items ordered by DIKW stage, priority, and creation."""
+        pid = self.resolve_project_id(project_id) if project_id else None
+        if pid:
+            self.recompute_readiness(pid)
+        items = self.list_items(project_id=pid)
+        ready = [
+            it for it in items
+            if it["owner"] in ("companion", "collaborative")
+            and str(it["status"]).lower() in READY_STATUSES
+            and it["item_kind"] != "backlog"
+        ]
+        ready.sort(key=lambda x: (STAGE_ORDER.get(x["stage_kind"], 3), int(x["priority"]), int(x["id"])))
+        return ready[: max(1, int(limit))]
+
+    def eligible_idle_goal_projects(
+        self,
+        idle_seconds: float,
+        now_utc: Optional[datetime] = None,
+        now_local: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return active `on_idle` Goals/Projects whose `TriggerPolicy` window/cooldown is open and have ready Companion items."""
+        bg_on = self.store.is_background_autonomy_enabled()
+        sd_on = self.store.is_self_dev_mode_enabled()
+        eligible: List[Dict[str, Any]] = []
+        for proj in self.list_projects(status="active"):
+            tp = TriggerPolicy.from_dict(proj.get("trigger_policy"))
+            if tp.mode != "on_idle":
+                continue
+            last_slice_at = str(proj.get("metadata", {}).get("last_slice_at") or "")
+            ok, _reason = evaluate_trigger_eligibility(
+                tp,
+                idle_seconds=idle_seconds,
+                last_run_at=last_slice_at,
+                self_dev_enabled=sd_on,
+                background_autonomy_enabled=bg_on,
+                now_utc=now_utc,
+                now_local=now_local,
+                store=self.store,
+            )
+            if ok and self.next_ready_companion_items(project_id=proj["project_id"], limit=1):
+                eligible.append(proj)
+        return eligible
+
+    def create_timebox(self, project_id: Optional[str], title: str, goal: str = "", start_date: str = "", end_date: str = "", metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        pid = self.resolve_project_id(project_id)
+        s_dt = start_date.strip() or date.today().isoformat()
+        e_dt = end_date.strip() or (date.fromisoformat(s_dt) + timedelta(days=6)).isoformat()
+        tid = f"tb_{uuid.uuid4().hex[:8]}"
+        with self.store._lock:
+            self.store._ensure_project_record(pid)
+            self.store.conn.execute(
+                "INSERT INTO project_timeboxes (timebox_id, project_id, title, goal, start_date, end_date, status, metadata_json) VALUES (?, ?, ?, ?, ?, ?, 'planning', ?)",
+                (tid, pid, title.strip(), goal.strip(), s_dt, e_dt, json.dumps(metadata or {})),
+            )
+            self.store.conn.commit()
+        return self.get_timebox(tid)
+
+    def get_timebox(self, timebox_id: str) -> Dict[str, Any]:
+        cols = ["timebox_id", "project_id", "title", "goal", "start_date", "end_date", "status", "metadata_json", "retro_notes", "created_at"]
+        rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM project_timeboxes WHERE timebox_id = ?", (timebox_id.strip(),))
+        if not rows:
+            raise ValueError(f"Timebox `{timebox_id}` not found.")
+        out = dict(rows[0])
+        out["sprint_id"] = out["timebox_id"]
+        try:
+            out["metadata"] = json.loads(out.get("metadata_json") or "{}")
+        except Exception:
+            out["metadata"] = {}
+        return out
+
+    def update_timebox_status(self, timebox_id: str, status: str, retro_notes: str = "") -> Dict[str, Any]:
+        tb = self.get_timebox(timebox_id)
+        with self.store._lock:
+            if status == "active":
+                self.store.conn.execute("UPDATE project_timeboxes SET status = 'completed' WHERE project_id = ? AND status = 'active'", (tb["project_id"],))
+            self.store.conn.execute("UPDATE project_timeboxes SET status = ?, retro_notes = COALESCE(NULLIF(?, ''), retro_notes) WHERE timebox_id = ?", (status, retro_notes.strip(), tb["timebox_id"]))
+            self.store.conn.commit()
+        return self.get_timebox(tb["timebox_id"])
+
+    def get_active_timebox(self, project_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        cols = ["timebox_id", "project_id", "title", "goal", "start_date", "end_date", "status", "metadata_json", "retro_notes", "created_at"]
+        where = "WHERE status = 'active'" + (" AND project_id = ?" if project_id else "")
+        params: Tuple[Any, ...] = (self.resolve_project_id(project_id),) if project_id else ()
+        rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM project_timeboxes {where} ORDER BY start_date DESC LIMIT 1", params)
+        if not rows:
+            return None
+        out = dict(rows[0])
+        out["sprint_id"] = out["timebox_id"]
+        return out
+
+    def list_timeboxes(self, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        cols = ["timebox_id", "project_id", "title", "goal", "start_date", "end_date", "status", "metadata_json", "retro_notes", "created_at"]
+        where = "WHERE project_id = ?" if project_id else ""
+        params: Tuple[Any, ...] = (self.resolve_project_id(project_id),) if project_id else ()
+        rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM project_timeboxes {where} ORDER BY created_at DESC", params)
+        for r in rows:
+            r["sprint_id"] = r["timebox_id"]
+        return rows
+
+    def list_dated_items(self, start_date: str, end_date: str, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        items = self.list_items(project_id=project_id)
+        return [
+            it for it in items
+            if (start_date <= str(it.get("planned_date") or "") <= end_date)
+            or (start_date <= str(it.get("due_date") or "") <= end_date)
+        ]
+
+    def get_board_projection(self, project_id: Optional[str] = None, timebox_id: Optional[str] = None, owner_filter: Optional[str] = None) -> Dict[str, Any]:
+        """Project the Universal Project & Goal Graph into a clean Kanban board view."""
+        proj = self.get_project(project_id)
+        pid = proj["project_id"]
+        self.recompute_readiness(pid)
+        items = self.list_items(project_id=pid, owner=owner_filter, timebox_id=timebox_id)
+        columns = [{"col_key": k, "title": lbl, "cards": [it for it in items if it["column_key"] == k]} for k, lbl in BOARD_COLUMNS]
+        milestones = self.list_milestones(pid)
+        active_tb = self.get_active_timebox(pid)
+        return {
+            "board": proj,
+            "project": proj,
+            "columns": columns,
+            "cards": items,
+            "epics": milestones,
+            "milestones": milestones,
+            "active_sprint": active_tb,
+            "sprints": self.list_timeboxes(pid),
+            "counts": {
+                "total": len(items),
+                "companion_ready": sum(1 for it in items if it["owner"] in ("companion", "collaborative") and it["column_key"] == "ready"),
+                "human_pending": sum(1 for it in items if it["owner"] == "human" and it["column_key"] != "done"),
+                "blocked": sum(1 for it in items if it["column_key"] == "blocked"),
+                "done": sum(1 for it in items if it["column_key"] == "done"),
+            },
+        }
+
+    def get_roadmap_projection(self, project_id: Optional[str] = None) -> Dict[str, Any]:
+        proj = self.get_project(project_id)
+        pid = proj["project_id"]
+        items = self.list_items(project_id=pid)
+        milestones = []
+        for ms in self.list_milestones(pid):
+            ms_items = [it for it in items if it["milestone_id"] == ms["milestone_id"]]
+            done_n = sum(1 for it in ms_items if it["column_key"] == "done")
+            pct = round((done_n / len(ms_items)) * 100.0, 1) if ms_items else 0.0
+            milestones.append({**ms, "item_count": len(ms_items), "done_count": done_n, "progress_pct": pct, "items": ms_items})
+        return {"project": proj, "milestones": milestones, "epics": milestones, "unassigned_count": sum(1 for it in items if not it["milestone_id"])}
+
+
+def get_project_graph(store: Optional[MemoryStore] = None) -> ProjectGraphManager:
+    """Return a `ProjectGraphManager` bound to the active `MemoryStore`."""
+    return ProjectGraphManager(store=store)
+
+
+def sync_workflow_to_project_graph(store: MemoryStore, workflow_id: int, goal: str, state: str) -> None:
+    """Keep active state-machine workflow runs reflected on the Universal Project & Goal Graph."""
+    mgr = get_project_graph(store)
+    pid = mgr.resolve_project_id()
+    col_state = "done" if state == "COMPLETE" else ("verify" if state == "VERIFY" else ("in_progress" if state == "IMPLEMENT" else "ready"))
+    existing = [it for it in mgr.list_items(project_id=pid) if it.get("workflow_id") == workflow_id and "workflow-tracker" in it.get("tags", [])]
+    if existing:
+        mgr.update_item(existing[0]["item_id"], status=col_state, title=f"[WF #{workflow_id}] {goal[:120]}")
+    else:
+        mgr.create_item(pid, f"[WF #{workflow_id}] {goal[:120]}", owner="companion", status=col_state, workflow_id=workflow_id, tags=["workflow-tracker"], item_kind="workflow_tracker")
+
+
+def format_project_graph_hud(store: Optional[MemoryStore] = None) -> str:
+    """Render concise Universal Project & Goal Graph summary block for the System Prompt."""
+    mgr = get_project_graph(store)
+    proj = mgr.get_project()
+    view = mgr.get_board_projection(proj["project_id"])
+    cnt = view["counts"]
+    tb = view["active_sprint"]
+    tb_txt = f"`{tb['title']}` ({tb['start_date']}..{tb['end_date']})" if tb else "(none)"
+    tp = proj["trigger_policy"]
+    win = f" [{tp['allowed_window']}]" if tp.get("allowed_window") else ""
+    return (
+        f"[PROJECT & GOAL GRAPH (`{proj['slug']}` | trigger=`{tp['mode']}{win}` | timebox={tb_txt})]\n"
+        f"  Items: total={cnt['total']} | companion_ready={cnt['companion_ready']} | human_pending={cnt['human_pending']} | blocked={cnt['blocked']} | done={cnt['done']}"
+    )
+
+
+def _precheck_active_goal_ready(store: MemoryStore) -> Tuple[bool, str]:
+    mgr = get_project_graph(store)
+    for proj in mgr.list_projects(status="active"):
+        if mgr.next_ready_companion_items(proj["project_id"], limit=1):
+            return True, f"ready_items_in:{proj['slug']}"
+    return False, "no_ready_goal_items"
+
+
+register_trigger_precheck("active_goal_has_ready_items", _precheck_active_goal_ready)

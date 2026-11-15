@@ -143,16 +143,15 @@ for _boot_attempt in range(2):
         from companion.agent import handle_slash_command, run_agent_turn
         from companion.config import settings
         from companion.context import build_system_prompt, is_identity_bootstrapped, run_first_boot_onboarding
-        from companion.hobbies import hobby_engine
         from companion.llm import chat, model_gate
         from companion.memory_store import get_memory_store
+        from companion.routines import IdleAutonomyWatcher, reconcile_startup_missed_runs
         from companion.safety import checkpoint_manager, run_system_doctor
-        from companion.routines import reconcile_startup_missed_runs
         from companion.sdd import sync_decisions_md
         from companion.tools import (
             TOOL_IMPLS, TOOLS, dispatch, resolve,
             tool_agile_manage, tool_calendar_manage, tool_checkpoint_manage, tool_edit_file,
-            tool_education_manage, tool_endpoint_manage, tool_hobby_manage,
+            tool_education_manage, tool_endpoint_manage,
             tool_job_manage, tool_list_dir, tool_mcp_manage, tool_memory_manage, tool_project_manage,
             tool_read_file, tool_routine_manage, tool_run_python, tool_run_shell, tool_sdd_manage,
             tool_search, tool_system_doctor, tool_task_manage, tool_telemetry_manage,
@@ -213,14 +212,15 @@ def _coalesce_pasted_lines(
     return "\n".join(lines).strip()
 
 
-def _read_interactive_input_with_idle_hobbies() -> Optional[str]:
-    """Read user input (coalescing multi-line pastes) while running preemptible background idle hobbies."""
+def _read_interactive_input_with_idle_autonomy() -> Optional[str]:
+    """Read user input (coalescing multi-line pastes) while running preemptible background idle routines & goal slices."""
     if not sys.stdin.isatty() or os.name != "nt":
         return input("\nyou> ").strip()
 
     import msvcrt
 
-    if not hobby_engine.is_enabled():
+    store = get_memory_store()
+    if not store.is_background_autonomy_enabled():
         first = input("\nyou> ")
         time.sleep(0.01)
         return _coalesce_pasted_lines(first, msvcrt.kbhit, sys.stdin.readline)
@@ -234,21 +234,21 @@ def _read_interactive_input_with_idle_hobbies() -> Optional[str]:
     ran_idle_cycle = False
     active_worker: Optional[threading.Thread] = None
     abort_event = threading.Event()
+    watcher = IdleAutonomyWatcher(is_busy_fn=lambda: msvcrt.kbhit(), store=store)
 
     while not msvcrt.kbhit():
         wait_mins = settings.hobby_cooldown_minutes if ran_idle_cycle else settings.idle_minutes
         if (active_worker is None or not active_worker.is_alive()) and (time.monotonic() - last_activity) >= (wait_mins * 60):
-            next_h = hobby_engine.select_next_hobby()
             abort_event.clear()
-            print(f"\n\n[IDLE AUTONOMY] Idle for {wait_mins}m — starting background Hobby `{next_h.name}` ({next_h.title})...")
 
-            def _bg_hobby(h_name: str = next_h.name) -> None:
-                res = hobby_engine.run_hobby_cycle(hobby_name=h_name, abort_check=lambda: abort_event.is_set() or msvcrt.kbhit())
-                print(f"\n[IDLE AUTONOMY] Finished `{res['hobby']}` ({res['status']}). Type `/morning` for full report.")
-                sys.stdout.write("\nyou> ")
-                sys.stdout.flush()
+            def _bg_tick(idle_sec: float = float(wait_mins * 60)) -> None:
+                res = watcher.tick_once(idle_seconds=idle_sec, abort_check=lambda: abort_event.is_set() or msvcrt.kbhit())
+                if res.get("action") in ("idle_routine", "idle_goal_slice", "scheduled_routine"):
+                    print(f"\n[IDLE AUTONOMY] Completed `{res.get('action')}`. Type `/morning` for full report.")
+                    sys.stdout.write("\nyou> ")
+                    sys.stdout.flush()
 
-            active_worker = threading.Thread(target=_bg_hobby, daemon=True)
+            active_worker = threading.Thread(target=_bg_tick, daemon=True)
             active_worker.start()
             ran_idle_cycle = True
             last_activity = time.monotonic()
@@ -310,7 +310,7 @@ def _handle_cli_args(argv: List[str], store) -> None:
         "--goal": "/goal", "-g": "/goal",
         "--backlog": "/backlog", "-b": "/backlog",
         "--specs": "/specs", "--skills": "/skills", "--subagent": "/subagent", "--hygiene": "/hygiene",
-        "--hobby": "/hobby", "--selfdev": "/selfdev", "--self-dev": "/selfdev", "--morning": "/morning",
+        "--autonomy": "/autonomy", "--hobby": "/hobby", "--selfdev": "/selfdev", "--self-dev": "/selfdev", "--morning": "/morning",
         "--memory": "/memory", "--checkpoint": "/checkpoint",
         "--rollback": "/rollback", "--reset": "/reset",
         "--identity": "/identity", "--tone": "/tone", "--model": "/model", "--models": "/model", "--providers": "/providers", "--onboard": "/onboard",
@@ -371,21 +371,21 @@ def main() -> None:
         _handle_cli_args(argv, store)
         return
 
-    hobby_badge = "ON" if store.is_hobby_mode_enabled() else "OFF"
+    autonomy_badge = "ON" if store.is_background_autonomy_enabled() else "OFF"
     sd_badge = "ON" if store.is_self_dev_mode_enabled() else "OFF(RO)"
-    print(f"Companion AI OS v{__version__[:3]}  |  model={settings.model}  |  project={settings.get_workspace().project_id}  |  hobbies={hobby_badge}  |  self_dev={sd_badge}")
-    print("Commands: /status, /selfdev, /hobby, /jobs, /wiki, /vault, /endpoints, /mcp, /routines, /trust, /goal, /doctor, /help, exit")
+    print(f"Companion AI OS v{__version__[:3]}  |  model={settings.model}  |  project={settings.get_workspace().project_id}  |  autonomy={autonomy_badge}  |  self_dev={sd_badge}")
+    print("Commands: /status, /selfdev, /autonomy, /jobs, /wiki, /vault, /endpoints, /mcp, /routines, /trust, /goal, /doctor, /help, exit")
     if not is_identity_bootstrapped(store=store) and sys.stdin.isatty():
         run_first_boot_onboarding(store=store)
-    unseen = store.get_hobby_journal(unseen_only=True, mark_seen=False)
+    unseen = store.get_autonomy_journal(unseen_only=True, mark_seen=False)
     if unseen:
-        print(f"[MORNING BRIEFING] {len(unseen)} autonomous hobby session(s) completed while you were away! Type `/morning` to review.")
+        print(f"[MORNING BRIEFING] {len(unseen)} background routine/goal session(s) completed while you were away! Type `/morning` to review.")
 
     messages = [{"role": "system", "content": build_system_prompt(store=store)}]
 
     while True:
         try:
-            user = _read_interactive_input_with_idle_hobbies()
+            user = _read_interactive_input_with_idle_autonomy()
         except (EOFError, KeyboardInterrupt):
             print()
             break

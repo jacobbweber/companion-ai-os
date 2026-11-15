@@ -20,7 +20,7 @@ Use this runbook whenever a request or engineering decision involves:
 ## Step-by-Step Procedure
 1. **Gather Ground-Truth Context (`tier="fast"`)**:
    - Read only the 1–3 most relevant files or specs (e.g., `specs/ARCHITECTURE.md` or target module) using `read_file` or `search` so you preserve your tool iteration budget for synthesis.
-   - Or trigger the deterministic recipe `skills/deep-thinking/workflows/deep-analysis.json` via `workflow_manage(action="run_recipe", recipe="deep-analysis", params={"question": "..."})`.
+   - Or trigger the deterministic Python DAG `skills/deep-thinking/dags/deep_analysis.py` via `workflow_manage(action="run_dag", dag="deep-analysis", params={"question": "..."})`.
 2. **First-Principles Decomposition (`tier="reasoning"`)**:
    - If running interactively on `fast`, delegate the analysis to an isolated reasoning subagent:
      `workflow_manage(action="subagent", tier="reasoning", skill="deep-thinking", goal="<problem + constraints>")`.

@@ -1,6 +1,21 @@
-"""SQLite Persistent Memory, Backlog, Task, ADR, Workflow & Two-Lever Mode Store (A-Frame Domain Layer)."""
+"""
+Persistent SQLite State & Memory Store (`companion/memory_store.py` — Domain Layer).
 
-import contextlib, contextvars, json, os, re, sqlite3, sys, threading
+Thread-safe WAL SQLite store managing conversation history (with FTS5 + semantic RRF),
+user profile & two-lever autonomy state (`background_autonomy` x `self_dev_mode`),
+ADRs, state-machine workflows, knowledge facts, autonomy journal, and the canonical
+Universal Project & Goal Graph (`projects`, `milestones`, `project_timeboxes`, `work_items`).
+"""
+
+import contextlib
+import contextvars
+import json
+import os
+import re
+import sqlite3
+import sys
+import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -11,17 +26,18 @@ from companion.semantic_memory import hybrid_rrf_rank
 from companion.telemetry import redact_secrets, telemetry_db_context
 
 
-def parse_time_window(window_expr: Optional[str], now: Optional[datetime] = None) -> Optional[Tuple[str, str]]:
-    """Resolve relative or explicit time-window expressions into UTC `(start_ts, end_ts)` SQLite bounds."""
-    w = (window_expr or "").strip().lower()
+def parse_time_window(window: str, now: Optional[datetime] = None) -> Optional[Tuple[str, str]]:
+    """Parse natural/relative time filters into `(start_utc, end_utc)` SQLite timestamps."""
+    w = (window or "").strip().lower()
     if not w:
         return None
-    ref = now or datetime.now(timezone.utc)
+    ref = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     if w == "today":
-        return ref.strftime("%Y-%m-%d 00:00:00"), ref.strftime("%Y-%m-%d 23:59:59")
+        d = ref.strftime("%Y-%m-%d")
+        return f"{d} 00:00:00", f"{d} 23:59:59"
     if w == "yesterday":
-        y = ref - timedelta(days=1)
-        return y.strftime("%Y-%m-%d 00:00:00"), y.strftime("%Y-%m-%d 23:59:59")
+        d = (ref - timedelta(days=1)).strftime("%Y-%m-%d")
+        return f"{d} 00:00:00", f"{d} 23:59:59"
     if w == "this week":
         start = ref - timedelta(days=ref.weekday())
         return start.strftime("%Y-%m-%d 00:00:00"), ref.strftime("%Y-%m-%d 23:59:59")
@@ -54,9 +70,9 @@ DEFAULT_USER_PROFILE: Dict[str, str] = {
     "role": "Human Partner & System Owner",
     "technical_delegation": "Own technical execution end-to-end with Spec-Driven Development (SDD), clean dead-code-free implementation, automated testing, and self-recovery while keeping explanations clear and actionable.",
     "communication_style": "Clear, warm, outcome-focused, and free of unnecessary jargon. Explain what was accomplished, verified, and what is recommended next.",
-    "operating_mode": "Spec-Driven, state-machine-governed execution with AST syntax guards, dead-code hygiene checks, and checkpoint rollback protection.",
+    "operating_mode": "Spec-Driven, state-machine & Python-DAG governed execution with AST syntax guards, dead-code hygiene checks, and checkpoint rollback protection.",
     "platform": _detect_runtime_platform(),
-    "hobby_mode": "off",
+    "background_autonomy": "off",
     "self_dev_mode": "off",
     "active_project_id": SELF_PROJECT_ID,
 }
@@ -67,34 +83,38 @@ FOUNDATIONAL_ADRS: List[Tuple[str, str, str, str]] = [
     ("ADR-003: Deterministic State-Machine Graph for Engineering & Self-Evolution", "Unstructured tool loops hit MAX_TOOL_ITERS or skip design/testing on multi-step tasks.", "Enforce a persistent directed-graph state machine (INTAKE -> DISCOVER -> DESIGN -> PLAN -> IMPLEMENT -> VERIFY -> REFLECT -> COMPLETE).", "Deterministic execution, automatic recovery via RECOVER state, and persistent state across restarts."),
     ("ADR-004: Self-Preservation via AST Syntax Guard & Workspace Checkpoints", "A self-modifying agent can break its own source code if it writes invalid syntax.", "Every write_file/edit_file on a .py file backs up the original and validates AST syntax before saving.", "Companion cannot brick itself with syntax errors and can rollback entire workflows."),
     ("ADR-005: Non-Sprawling 4-Document Living Spec-Driven Development (SDD)", "Per-feature spec folders and 1:1 file specs cause massive file sprawl and ADR pile-up.", "Maintain strictly 4 living canonical files in specs/ (PRODUCT.md, ARCHITECTURE.md, CONTRACTS.md, DECISIONS.md) verified bidirectionally against code.", "Zero spec sprawl, self-compacting ADRs, and automated detection of undocumented code."),
-    ("ADR-006: AST Dead-Code Hygiene & Bounded Autonomous Agent Hobbies", "AI agents tend to leave dead code over iterations and sit idle overnight without structured bounds.", "Enforce AST dead-code/unused-import verification in system_doctor and run checkpoint-guarded Autonomous Hobbies during idle windows.", "Codebase stays simple and lean while Companion safely improves itself during idle windows."),
-    ("ADR-007: Active Project Registry & Rollback Lesson Memory", "Companion needs to remember why rollbacks occurred without leaving tasks falsely completed, and must support working on external projects via a mechanical toggle rather than AI memory.", "Snapshot/rewind tasks, backlog, and ADRs inside checkpoints while recording rollback_lesson notes; enforce WorkspaceContext so tools bind to active_project_root and lock Companion core read-only when working on external projects.", "Companion never relies on LLM memory to stay in the right project folder - path and read-only rules are mechanically enforced."),
+    ("ADR-006: AST Dead-Code Hygiene & Windowed Idle Maintenance Routines", "AI agents tend to leave dead code over iterations and waste tokens if background tasks poll blindly.", "Enforce AST dead-code/unused-import verification in system_doctor and run `<5ms` precheck-gated `on_idle` Maintenance Routines (`companion/routines.py`, `companion/trigger_policy.py`) during allowed idle windows.", "Codebase stays simple and lean while Companion curates knowledge and audits health without wasting tokens."),
+    ("ADR-007: Active Project Registry & Rollback Lesson Memory", "Companion needs to remember why rollbacks occurred without leaving tasks falsely completed, and must support working on external projects via a mechanical toggle rather than AI memory.", "Snapshot/rewind work items and ADRs inside checkpoints while recording rollback_lesson notes; enforce WorkspaceContext so tools bind to active_project_root and lock Companion core read-only when working on external projects.", "Companion never relies on LLM memory to stay in the right project folder - path and read-only rules are mechanically enforced."),
     ("ADR-008: Spine-Level Waterfall Telemetry & Headless Core UI Boundary", "Companion needs step-by-step waterfall and KPI telemetry decoupled from any Frontend Web UI.", "Build thread-safe TelemetryEngine directly into llm.chat, tools.dispatch, and agent.run_agent_turn persisting traces, spans, and logs in SQLite while enforcing a Headless Core vs. Presentation UI boundary.", "Automatic SQLite waterfall observability across CLI and Web UI surfaces."),
-    ("ADR-009: Two-Tier Progressive Disclosure Skills vs. Primitive Tools", "Hardcoding domain runbooks into Python modules or the system prompt causes bloat.", "Separate L1 atomic tools from L2/L3 declarative skill packs (skills/<name>/SKILL.md) loaded progressively on demand.", "Horizontal scalability for new skills and workflows with minimal prompt overhead."),
+    ("ADR-009: Two-Tier Progressive Disclosure Skills vs. Primitive Tools", "Hardcoding domain runbooks into Python modules or the system prompt causes bloat.", "Separate L1 atomic tools from L2/L3 declarative skill packs (`skills/<name>/SKILL.md`, `dags/*.py`, `scripts/*.py`) loaded progressively on demand.", "Horizontal scalability for new skills, deterministic Python DAGs, and domain validators with minimal prompt overhead."),
     ("ADR-010: Stdlib LAN Web Surface (surfaces/) & Multi-Phase Autonomous Goal Driver", "Single-turn loops and external web frameworks caused unverified stub code during self-development.", "Serve zero-dependency ThreadingHTTPServer web interfaces in surfaces/ (defaulting to 127.0.0.1) with disconnect-proof async job streaming, and drive multi-step builds via companion/autonomy.py with mechanical tier routing and System Doctor gates.", "Mobile/desktop browser access with zero external dependencies and non-hallucinative feature delivery."),
     ("ADR-011: Mechanical Cognitive Grounding, Phase Tool Gates & Inline Post-Edit Micro-Linting", "Local open-weight models suffer reasoning amnesia between tool steps, waste turns exploring blindly, or make premature out-of-budget edits.", "Carry rolling 1-step <think> scratchpads, rescue text <tool_call> blocks, inject deterministic AST Repo & Line-Budget Maps, enforce phase-scoped AllowedTools, run inline post-edit AST/hygiene/layer micro-linters, and persist lossless resumable phase handoffs.", "Frontier-grade reliability on local models through deterministic Python harness mechanics."),
-    ("ADR-012: Interactive Blueprint Approval Gate, Dedicated Coding Tier & Live Flight Eval", "Non-technical product partners need plain-English design/plan review before code edits, while local coding specialists benefit from dedicated IMPLEMENT routing and empirical flight benchmarks.", "Add pause-at-PLAN Blueprint approval/revision (`companion/blueprint.py`), dedicated `coding` tier routing + task carry-forward auto-skip (`companion/compaction.py`, `companion/autonomy.py`), local Git save-points, and isolated 3-flight behavioral eval (`companion/eval_harness.py`).", "Safe human-in-the-loop steering, higher first-pass implementation quality, and reproducible model benchmarking."),
+    ("ADR-012: Interactive Blueprint Approval Gate, Dedicated Coding Tier & Live Flight Eval", "Non-technical product partners need plain-English design/plan review before code edits, while local coding specialists benefit from dedicated IMPLEMENT routing and empirical flight benchmarks.", "Add pause-at-PLAN Blueprint approval/revision (`companion/blueprint.py`), dedicated `coding` tier routing + task carry-forward auto-skip (`companion/compaction.py`, `companion/autonomy.py`), local Git save-points, and isolated behavioral eval (`companion/eval_harness.py`).", "Safe human-in-the-loop steering, higher first-pass implementation quality, and reproducible model benchmarking."),
     ("ADR-013: Web UI Conversation Search & Git Save-Points Surface", "Mobile and desktop browser users need direct access to FTS5 conversation search and recent Git save-points without dropping to CLI commands.", "Expose read-only `GET /api/search?q=<query>&limit=<n>` backed by `MemoryStore.search_conversations()` and include mtime-cached `recent_savepoints` in `GET /api/status` (`surfaces/web_server.py`, `surfaces/web_assets.py`).", "Zero-dependency browser search and save-point visibility with non-blocking WAL reads."),
-    ("ADR-014: Domain-Neutral Cognitive Architecture, KnowledgePort, Dynamic GoalPlan DAGs & Skill Forge", "Complex open-ended goals across diverse workspaces require epistemic grounding, uncompromised reasoning routing, action-level risk gates, evidence-verified GoalPlan DAGs, and safe transactional skill promotion without hardcoding domain-specific tools.", "Introduce `KnowledgePort` & `ExecutionTarget` (`companion/grounding.py`), readiness-aware uncompromised reasoning routing (`companion/intake.py`), dynamic `GoalPlan` DAGs (`companion/workflow_dag.py`), and staged capability promotion + `REFLECT` distillation (`companion/skill_forge.py`).", "General-purpose reliability across any domain, clean external Wiki/Sandbox ports, and compounding verified capabilities."),
+    ("ADR-014: Domain-Neutral Cognitive Architecture, KnowledgePort, Dynamic GoalPlan DAGs & Skill Forge", "Complex open-ended goals across diverse workspaces require epistemic grounding, uncompromised reasoning routing, action-level risk gates, evidence-verified GoalPlan DAGs, and safe transactional skill promotion without hardcoding domain-specific tools.", "Introduce `KnowledgePort` & `ExecutionTarget` (`companion/grounding.py`), Cognitive Triage (`companion/intake.py`), dynamic `GoalPlan` & pluggable `VerificationSpec` validators (`companion/workflow_dag.py`), and staged capability + DAG promotion (`companion/skill_forge.py`).", "General-purpose reliability across any domain, clean external Wiki/Sandbox ports, and compounding verified capabilities."),
     ("ADR-015: Live SSE Token Streaming, Hybrid Semantic RRF Memory & Loopback/Token-Gated LAN Security", "Desktop/mobile users expect real-time token/phase streaming, conceptual memory recall without GPU swaps, zero-login convenience on localhost, and strict authentication when exposed on LAN/Tailscale.", "Add ContextVar SSE streaming (`companion/streaming.py`, `GET /api/jobs/<id>/stream`), zero-swap hybrid BM25 + semantic RRF retrieval (`companion/semantic_memory.py`), static Web UI assets (`surfaces/static/`), and loopback-default binding (`127.0.0.1`) with `COMPANION_WEB_TOKEN` non-loopback auth plus unconditional `Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF` guards (`surfaces/web_server.py`).", "Responsive live UX, meaning-based memory recall in <5ms, zero-login localhost ergonomics, and authenticated LAN/Tailscale safety."),
     ("ADR-016: Companion 3.0 Harvest Backend — Shared CoreActions, Forever-Chat Jobs, Co-Owned Wiki 2.0, Blind Vault, Universal Endpoints, Partner-Aware Federated MCP & Respectful Routines", "Extracting capabilities from legacy homelab/agent systems risked mixing UI/core concerns, leaking secrets in a zero-login LAN environment, cluttering primary chat, or causing downtime cron storms.", "Introduce `CORE_ACTIONS` (`companion/core_actions.py`), Zero-Identity Background Jobs with <=200-token Wiki Inbox overflow (`companion/background_jobs.py`), 4-folder Dual-Author Knowledge Wiki (`companion/wiki_engine.py`), write-only Zero-Reveal `secrets.env` Vault + secret-free backups (`companion/vault.py`), SSH/WinRM/HTTP Connectors (`companion/endpoints.py`), Outbound + Inbound 'Order Counter' MCP Hub with Partner-Aware Federation (`companion/mcp_hub.py`), and Hardware-Gated Routines + Clone Sandboxes (`companion/routines.py`).", "Complete headless multi-machine & knowledge operating system honoring strict downward A-Frame boundaries and zero-reveal LAN security."),
-    ("ADR-017: Stage 6 Multi-Studio React + TypeScript Frontend (`frontend/`) Compiling into Zero-Node Stdlib `surfaces/static/`", "Surfacing all 6 Companion 3.0 Harvest studios (Forever Chat, Wiki & 2D Canvas Mind Map, Jobs & Approvals, Blind Vault & Endpoints, Federation & MCP, Routines & Ops) in raw vanilla JS strings would cause unmaintainable UI sprawl, while adding a runtime Node server would violate `ADR-001`.", "Author a modular React 19 + TypeScript + Vite frontend in `frontend/` with a Matte Brutalist Sci-Fi / Obsidian 4-preset theme system (`obsidian`, `orbital`, `graphite`, `daylight` + 1-click Light/Dark toggle) that compiles deterministically (`iife`) into `surfaces/static/{index.html,styles.css,app.js}` served directly by stdlib `surfaces/web_server.py` (`python harness.py --web`).", "Typed, self-maintainable 6-Studio AI workstation UI with zero runtime Node dependency, 100% offline LAN execution, and strict Ring-0 Python stdlib purity."),
-    ("ADR-018: Multi-Provider LLM Registry, Pure-Stdlib Wire Dialects, Blind Vault Key Binding & Mechanical LAN Privacy Lock", "Supporting both local LAN servers (Ollama, vLLM, LM Studio, llama.cpp) and frontier cloud APIs (Gemini, Anthropic Claude, OpenAI, xAI Grok, OpenRouter, DeepSeek, Groq) via static `.env` edits forced restarts, risked API key leakage, and lost provider-native reasoning/multimodal capabilities (`thoughtSignature`, Extended Thinking signatures, native audio/video).", "Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`-by-default/`hybrid`/`cloud_allowed` outbound privacy lock).", "Instant hot-reload routing across local LAN and frontier models from Web UI (`System -> Models, Tiers & Context`) and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy."),
-    ("ADR-019: Independent Two-Lever Operating Architecture (`Hobby Mode` x `Self-Dev Mode`), Mechanical Read-Only Core Lock & 2-Track Hobby Split", "Running a daily-driver Companion release with background hobbies risked unrequested code mutations, while coupling hobbies to self-evolution prevented quiet personal knowledge/study maintenance on stable builds or isolated Lab/VM self-evolution.", "Maintain `Hobby Mode` (`on`/`off`) and `Self-Dev Mode` (`on`/`off`, seedable/lockable via `COMPANION_SELF_DEV`, `COMPANION_SELF_DEV_LOCKED`, `COMPANION_IMMUTABLE_CORE`) as two independent levers; mechanically lock Companion core files read-only (`safety.py`, `checkpoints.py`, `grounding.py`, `skill_forge.py`) while keeping `data/` and external `/project` workspaces writable when `Self-Dev Mode = OFF`; forbid LLM tool turns or subprocesses from enabling `Self-Dev Mode`; and split hobbies into `personal` vs `self_dev` tracks with CLI + Web UI `System` Studio + Web idle parity.", "Safe stable daily-driver operation with personal/ops hobbies (`wiki_gardener`, `memory_curator`, `trace_reviewer`, `life_study_organizer`) alongside deliberate or full Lab/VM self-evolution when `Self-Dev Mode` is explicitly enabled by the human partner."),
+    ("ADR-017: Stage 6 Multi-Studio React + TypeScript Frontend (`frontend/`) Compiling into Zero-Node Stdlib `surfaces/static/`", "Surfacing all 6 Companion 3.0 Harvest studios in raw vanilla JS strings would cause unmaintainable UI sprawl, while adding a runtime Node server would violate `ADR-001`.", "Author a modular React 19 + TypeScript + Vite frontend in `frontend/` with a Matte Brutalist Sci-Fi / Obsidian 4-preset theme system (`obsidian`, `orbital`, `graphite`, `daylight` + 1-click Light/Dark toggle) that compiles deterministically (`iife`) into `surfaces/static/{index.html,styles.css,app.js}` served directly by stdlib `surfaces/web_server.py` (`python harness.py --web`).", "Typed, self-maintainable 6-Studio AI workstation UI with zero runtime Node dependency, 100% offline LAN execution, and strict Ring-0 Python stdlib purity."),
+    ("ADR-018: Multi-Provider LLM Registry, Pure-Stdlib Wire Dialects, Blind Vault Key Binding & Mechanical LAN Privacy Lock", "Supporting both local LAN servers (Ollama, vLLM, LM Studio, llama.cpp) and frontier cloud APIs (Gemini, Anthropic Claude, OpenAI, xAI Grok, OpenRouter, DeepSeek, Groq) via static `.env` edits forced restarts, risked API key leakage, and lost provider-native reasoning/multimodal capabilities.", "Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`-by-default/`hybrid`/`cloud_allowed` outbound privacy lock).", "Instant hot-reload routing across local LAN and frontier models from Web UI and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy."),
+    ("ADR-019: Independent Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`) & Mechanical Read-Only Core Lock", "Running a daily-driver Companion release with background execution risked unrequested code mutations, while coupling idle autonomy to self-evolution prevented quiet knowledge/routine/goal execution on stable builds.", "Maintain `Background Autonomy` (`on`/`off`) and `Self-Dev Mode` (`on`/`off`, seedable/lockable via `COMPANION_SELF_DEV`, `COMPANION_SELF_DEV_LOCKED`, `COMPANION_IMMUTABLE_CORE`) as two independent levers; mechanically lock Companion core files read-only (`safety.py`, `checkpoints.py`, `grounding.py`, `skill_forge.py`) while keeping `data/` and external `/project` workspaces writable when `Self-Dev Mode = OFF`; and gate self-dev routines (`code_hygiene`) behind `Self-Dev Mode = ON`.", "Safe stable daily-driver operation with quiet `on_idle` routines and windowed autonomous Goal slices alongside deliberate Lab/VM self-evolution when `Self-Dev Mode` is explicitly enabled by the human partner."),
+    ("ADR-020: Agent-Native Headless Core Consolidation — Unified TriggerPolicy, Code-Controlled Python DAG Runtime, Universal Project & Goal Graph, Cognitive Triage & MCP Capability Harvesting", "Separate Hobbies vs. Routines subsystems, rigid 20-step JSON workflow recipes, human-chore-coupled Agile boards vs. flat task tables, regex keyword-spotting intake, and manual-only MCP/endpoint wiring prevented true multi-session agent autonomy.", "Consolidate all time/idle triggers into `TriggerPolicy` (`companion/trigger_policy.py`) and `Routines` (`companion/routines.py`); introduce pure-stdlib Python `DAGSpec` execution with `foreach` fan-out/fan-in and SQLite node checkpointing (`companion/dag_runtime.py`); unify tasks, backlog, `/plan`, `/goal`, and Kanban projections onto the domain-blind Universal Project & Goal Graph (`companion/project_graph.py`) with `skills/personal-agile-coach/` in Ring-1; replace regex intake with Cognitive Triage (`companion/intake.py`); and add ApprovalQueue-staged endpoint/MCP self-wiring, MCP-to-Skill harvesting, and pluggable `VerificationSpec` domain validators.", "Cohesive, domain-blind headless core capable of forging deterministic Python DAGs, wiring external tools via human approval, and advancing multi-session Companion + Human goals safely."),
 ]
 
 SCHEMA_SQL = (
     "CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, content TEXT NOT NULL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, tool_call_id TEXT, session_tag TEXT)",
-    "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, completed_at DATETIME, priority INTEGER DEFAULT 5, acceptance_criteria TEXT, verification_result TEXT, workflow_id INTEGER, project_id TEXT DEFAULT 'companion-self')",
-    "CREATE TABLE IF NOT EXISTS backlog (id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL, category TEXT DEFAULT 'general', status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, estimated_effort TEXT, actual_effort TEXT, priority INTEGER DEFAULT 5)",
     "CREATE TABLE IF NOT EXISTS system_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL, category TEXT DEFAULT 'general', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS user_profile (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS architecture_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL UNIQUE, context TEXT NOT NULL, decision TEXT NOT NULL, consequences TEXT NOT NULL, status TEXT DEFAULT 'accepted', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS workflow_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_type TEXT NOT NULL, goal TEXT NOT NULL, current_state TEXT NOT NULL, acceptance_criteria TEXT DEFAULT '', checkpoint_id TEXT DEFAULT '', metadata_json TEXT DEFAULT '{}', status TEXT DEFAULT 'active', project_id TEXT DEFAULT 'companion-self', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS workflow_transitions (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, summary TEXT NOT NULL, verification_passed INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
-    "CREATE TABLE IF NOT EXISTS hobby_journal (id INTEGER PRIMARY KEY AUTOINCREMENT, hobby_name TEXT NOT NULL, status TEXT NOT NULL, checkpoint_id TEXT DEFAULT '', doctor_passed INTEGER DEFAULT 1, summary TEXT NOT NULL, seen_by_user INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS autonomy_journal (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_name TEXT NOT NULL, entry_kind TEXT DEFAULT 'routine', status TEXT NOT NULL, checkpoint_id TEXT DEFAULT '', doctor_passed INTEGER DEFAULT 1, summary TEXT NOT NULL, seen_by_user INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS knowledge_facts (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT DEFAULT 'companion-self', key TEXT NOT NULL, value TEXT NOT NULL, source TEXT DEFAULT 'agent', confidence REAL DEFAULT 1.0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE(project_id, key))",
-    "CREATE INDEX IF NOT EXISTS idx_tasks_proj_status ON tasks(project_id, status)",
+    "CREATE TABLE IF NOT EXISTS projects (project_id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title TEXT NOT NULL, goal_summary TEXT DEFAULT '', kind TEXT DEFAULT 'project', status TEXT DEFAULT 'active', workspace_id TEXT DEFAULT 'companion-self', wiki_hub_path TEXT DEFAULT '', risk_ceiling TEXT DEFAULT 'R2', trigger_policy_json TEXT DEFAULT '{}', metadata_json TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS milestones (milestone_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT DEFAULT '', stage_kind TEXT DEFAULT 'DELIVER_AND_VERIFY', status TEXT DEFAULT 'active', sort_order INTEGER DEFAULT 0, target_date TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS project_timeboxes (timebox_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, goal TEXT DEFAULT '', start_date TEXT NOT NULL, end_date TEXT NOT NULL, status TEXT DEFAULT 'planning', metadata_json TEXT DEFAULT '{}', retro_notes TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS work_items (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL UNIQUE, project_id TEXT NOT NULL DEFAULT 'companion-self', milestone_id TEXT DEFAULT '', timebox_id TEXT DEFAULT '', workflow_id INTEGER, item_kind TEXT NOT NULL DEFAULT 'task', title TEXT NOT NULL, description TEXT DEFAULT '', category TEXT DEFAULT 'general', status TEXT NOT NULL DEFAULT 'pending', owner TEXT NOT NULL DEFAULT 'companion', stage_kind TEXT NOT NULL DEFAULT 'DELIVER_AND_VERIFY', priority INTEGER DEFAULT 3, depends_on_json TEXT DEFAULT '[]', verification_json TEXT DEFAULT '{}', dag_name TEXT DEFAULT '', checkpoint_id TEXT DEFAULT '', acceptance_criteria TEXT DEFAULT '', verification_result TEXT DEFAULT '', estimated_effort TEXT DEFAULT '', actual_effort TEXT DEFAULT '', estimate_minutes INTEGER DEFAULT 30, planned_date TEXT DEFAULT '', due_date TEXT DEFAULT '', checklist_json TEXT DEFAULT '[]', tags_json TEXT DEFAULT '[]', position INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, completed_at DATETIME)",
+    "CREATE INDEX IF NOT EXISTS idx_work_items_proj_status ON work_items(project_id, item_kind, status)",
+    "CREATE INDEX IF NOT EXISTS idx_milestones_proj ON milestones(project_id, sort_order)",
     "CREATE INDEX IF NOT EXISTS idx_wf_runs_proj_status ON workflow_runs(project_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_facts_proj_key ON knowledge_facts(project_id, key)",
     "CREATE INDEX IF NOT EXISTS idx_conv_session_tag ON conversations(session_tag)",
@@ -130,13 +150,6 @@ class MemoryStore:
                 self.conn.commit()
                 self._initialized_schemas.add(key)
 
-    def _table_columns(self, table_name: str) -> set[str]:
-        return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
-
-    def _ensure_column(self, table: str, column: str, col_def: str) -> None:
-        if column not in self._table_columns(table):
-            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
-
     def _fetch_rows(self, sql: str, params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
         with self._lock:
             return self.conn.execute(sql, params).fetchall()
@@ -144,24 +157,21 @@ class MemoryStore:
     def _fetch_dicts(self, cols: List[str], sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
         return [dict(zip(cols, r)) for r in self._fetch_rows(sql, params)]
 
+    def _ensure_project_record(self, project_id: str) -> None:
+        slug = re.sub(r"[^a-z0-9-]+", "-", project_id.lower()).strip("-") or "companion-self"
+        self.conn.execute(
+            "INSERT OR IGNORE INTO projects (project_id, slug, title, kind, workspace_id) VALUES (?, ?, ?, 'project', ?)",
+            (project_id, slug, project_id.replace("-", " ").title(), project_id),
+        )
+
     def _init_and_migrate_db(self) -> None:
         cursor = self.conn.cursor()
         for ddl in SCHEMA_SQL:
             cursor.execute(ddl)
         cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(content)")
-        if cursor.execute(
-            "SELECT 1 FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts) LIMIT 1"
-        ).fetchone():
-            cursor.execute(
-                "INSERT INTO conversations_fts(rowid, content) "
-                "SELECT id, content FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts)"
-            )
-        self._ensure_column("tasks", "acceptance_criteria", "TEXT")
-        self._ensure_column("tasks", "verification_result", "TEXT")
-        self._ensure_column("tasks", "workflow_id", "INTEGER")
-        self._ensure_column("tasks", "project_id", f"TEXT DEFAULT '{SELF_PROJECT_ID}'")
-        self._ensure_column("workflow_runs", "project_id", f"TEXT DEFAULT '{SELF_PROJECT_ID}'")
-        self._ensure_column("backlog", "priority", "INTEGER DEFAULT 5")
+        if cursor.execute("SELECT 1 FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts) LIMIT 1").fetchone():
+            cursor.execute("INSERT INTO conversations_fts(rowid, content) SELECT id, content FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts)")
+        self._ensure_project_record(SELF_PROJECT_ID)
         self.conn.commit()
         self._seed_defaults()
         if self.db_path.resolve() == settings.db_path.resolve():
@@ -231,7 +241,6 @@ class MemoryStore:
             where_sql = "WHERE timestamp BETWEEN ? AND ? " if bounds else ""
             params: Tuple[Any, ...] = (*bounds, limit) if bounds else (limit,)
             return self._fetch_rows(f"SELECT id, role, content, timestamp FROM conversations {where_sql}ORDER BY id DESC LIMIT ?", params)
-
         tokens = [t for t in re.findall(r"[a-zA-Z0-9_]+", clean_q) if t.lower() not in ("and", "or")]
         fts_rows: List[Tuple[int, str, str, str]] = []
         with self._lock:
@@ -249,7 +258,6 @@ class MemoryStore:
             cand_params: Tuple[Any, ...] = (*bounds, 250) if bounds else (250,)
             cursor.execute(f"SELECT id, role, content, timestamp FROM conversations {cand_where}ORDER BY id DESC LIMIT ?", cand_params)
             recent_rows = cursor.fetchall()
-
         by_id: Dict[int, Tuple[int, str, str, str]] = {int(r[0]): r for r in recent_rows}
         for r in fts_rows:
             by_id[int(r[0])] = r
@@ -267,11 +275,13 @@ class MemoryStore:
     def get_user_profile(self) -> Dict[str, str]:
         return {k: v for k, v in self._fetch_rows("SELECT key, value FROM user_profile ORDER BY key ASC")}
 
-    def is_hobby_mode_enabled(self) -> bool:
-        return self.get_user_profile().get("hobby_mode", "off").strip().lower() in ("on", "true", "1", "enabled")
+    def is_background_autonomy_enabled(self) -> bool:
+        prof = self.get_user_profile()
+        val = prof.get("background_autonomy", "off").strip().lower()
+        return val in ("on", "true", "1", "enabled")
 
-    def set_hobby_mode(self, enabled: bool) -> None:
-        self.set_user_profile("hobby_mode", "on" if enabled else "off")
+    def set_background_autonomy(self, enabled: bool) -> None:
+        self.set_user_profile("background_autonomy", "on" if enabled else "off")
 
     def is_self_dev_mode_enabled(self) -> bool:
         override = settings.get_self_dev_override()
@@ -293,32 +303,65 @@ class MemoryStore:
             self.conn.execute("INSERT INTO user_profile (key, value, updated_at) VALUES ('self_dev_mode', ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP", ("on" if enabled else "off",))
             self.conn.commit()
 
-    def add_task(self, description: str, status: str = "pending", priority: int = 5, acceptance_criteria: Optional[str] = None, workflow_id: Optional[int] = None, project_id: Optional[str] = None) -> int:
+    def add_task(self, description: str, status: str = "pending", priority: int = 5, acceptance_criteria: Optional[str] = None, workflow_id: Optional[int] = None, project_id: Optional[str] = None, owner: str = "companion", stage_kind: str = "DELIVER_AND_VERIFY") -> int:
         pid = _eff_pid(project_id)
+        item_uid = f"wi_{uuid.uuid4().hex[:10]}"
         with self._lock:
-            cur = self.conn.execute("INSERT INTO tasks (description, status, priority, acceptance_criteria, workflow_id, project_id) VALUES (?, ?, ?, ?, ?, ?)", (description, status, int(priority), acceptance_criteria, workflow_id, pid))
+            self._ensure_project_record(pid)
+            cur = self.conn.execute(
+                "INSERT INTO work_items (item_id, project_id, workflow_id, item_kind, title, status, owner, stage_kind, priority, acceptance_criteria) VALUES (?, ?, ?, 'task', ?, ?, ?, ?, ?, ?)",
+                (item_uid, pid, workflow_id, description, status, owner, stage_kind, int(priority), acceptance_criteria or ""),
+            )
             self.conn.commit()
             return int(cur.lastrowid)
 
     def update_task(self, task_id: int, status: str, completed_at: Optional[str] = None, verification_result: Optional[str] = None) -> bool:
-        if status == "completed" and not completed_at:
+        if status in ("completed", "done") and not completed_at:
             completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         with self._lock:
-            cur = self.conn.execute("UPDATE tasks SET status = ?, completed_at = COALESCE(?, completed_at), verification_result = COALESCE(?, verification_result) WHERE id = ?", (status, completed_at, verification_result, task_id))
+            cur = self.conn.execute(
+                "UPDATE work_items SET status = ?, completed_at = COALESCE(?, completed_at), verification_result = COALESCE(?, verification_result), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, completed_at, verification_result, int(task_id)),
+            )
             self.conn.commit()
             return cur.rowcount > 0
 
     def get_pending_tasks(self, project_id: Optional[str] = None) -> List[Tuple[int, str, str, int]]:
-        return self._fetch_rows("SELECT id, description, status, priority FROM tasks WHERE project_id = ? AND status IN ('pending', 'in_progress') ORDER BY priority ASC, id ASC", (_eff_pid(project_id),))
+        return self._fetch_rows(
+            "SELECT id, title, CASE WHEN status = 'ready' THEN 'pending' ELSE status END, priority FROM work_items "
+            "WHERE project_id = ? AND item_kind = 'task' AND status IN ('pending', 'ready', 'in_progress', 'blocked', 'waiting_approval', 'verify') "
+            "ORDER BY priority ASC, id ASC",
+            (_eff_pid(project_id),),
+        )
 
     def get_all_tasks(self, status_filter: Optional[str] = None, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        pid, cols = _eff_pid(project_id), ["id", "description", "status", "priority", "acceptance_criteria", "verification_result", "workflow_id", "created_at", "completed_at"]
-        sql = f"SELECT {', '.join(cols)} FROM tasks WHERE project_id = ?" + (" AND status = ?" if status_filter else "") + " ORDER BY priority ASC, id ASC"
-        return self._fetch_dicts(cols, sql, (pid, status_filter) if status_filter else (pid,))
+        pid = _eff_pid(project_id)
+        cols = ["id", "description", "status", "priority", "acceptance_criteria", "verification_result", "workflow_id", "created_at", "completed_at"]
+        where = "WHERE project_id = ? AND item_kind = 'task'"
+        params: Tuple[Any, ...] = (pid,)
+        if status_filter:
+            if status_filter == "pending":
+                where += " AND status IN ('pending', 'ready')"
+            elif status_filter == "completed":
+                where += " AND status IN ('completed', 'done')"
+            else:
+                where += " AND status = ?"
+                params = (pid, status_filter)
+        sql = (
+            "SELECT id, title, CASE WHEN status = 'ready' THEN 'pending' WHEN status = 'done' THEN 'completed' ELSE status END, "
+            f"priority, acceptance_criteria, verification_result, workflow_id, created_at, completed_at FROM work_items {where} ORDER BY priority ASC, id ASC"
+        )
+        return self._fetch_dicts(cols, sql, params)
 
-    def add_backlog_item(self, description: str, category: str = "general", status: str = "pending", estimated_effort: Optional[str] = None, priority: int = 5) -> int:
+    def add_backlog_item(self, description: str, category: str = "general", status: str = "pending", estimated_effort: Optional[str] = None, priority: int = 5, project_id: Optional[str] = None) -> int:
+        pid = _eff_pid(project_id)
+        item_uid = f"wi_{uuid.uuid4().hex[:10]}"
         with self._lock:
-            cur = self.conn.execute("INSERT INTO backlog (description, category, status, estimated_effort, priority) VALUES (?, ?, ?, ?, ?)", (description, category, status, estimated_effort, int(priority)))
+            self._ensure_project_record(pid)
+            cur = self.conn.execute(
+                "INSERT INTO work_items (item_id, project_id, item_kind, title, category, status, estimated_effort, priority) VALUES (?, ?, 'backlog', ?, ?, ?, ?, ?)",
+                (item_uid, pid, description, category, status, estimated_effort or "", int(priority)),
+            )
             self.conn.commit()
             return int(cur.lastrowid)
 
@@ -326,14 +369,25 @@ class MemoryStore:
 
     def update_backlog_item(self, backlog_id: int, status: str, actual_effort: Optional[str] = None, priority: Optional[int] = None) -> bool:
         with self._lock:
-            cur = self.conn.execute("UPDATE backlog SET status = ?, actual_effort = COALESCE(?, actual_effort), priority = COALESCE(?, priority) WHERE id = ?", (status, actual_effort, int(priority) if priority is not None else None, backlog_id))
+            cur = self.conn.execute(
+                "UPDATE work_items SET status = ?, actual_effort = COALESCE(?, actual_effort), priority = COALESCE(?, priority), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, actual_effort, int(priority) if priority is not None else None, int(backlog_id)),
+            )
             self.conn.commit()
             return cur.rowcount > 0
 
     def get_backlog(self, category: Optional[str] = None, status: Optional[str] = None) -> List[Tuple[int, str, str, str]]:
-        clauses = ([("category = ?", category)] if category else []) + ([("status = ?", status)] if status else [])
-        where_sql = (" WHERE " + " AND ".join(c for c, _ in clauses)) if clauses else ""
-        return self._fetch_rows(f"SELECT id, description, category, status FROM backlog{where_sql} ORDER BY priority ASC, id ASC", tuple(v for _, v in clauses))
+        clauses: List[Tuple[str, Any]] = [("item_kind = 'backlog'", None)]
+        if category:
+            clauses.append(("category = ?", category))
+        if status:
+            if status == "pending":
+                clauses.append(("status IN ('pending', 'backlog', 'ready')", None))
+            else:
+                clauses.append(("status = ?", status))
+        where_sql = " WHERE " + " AND ".join(c for c, _ in clauses)
+        params = tuple(v for _, v in clauses if v is not None)
+        return self._fetch_rows(f"SELECT id, title, category, status FROM work_items{where_sql} ORDER BY priority ASC, id ASC", params)
 
     def add_system_note(self, note: str, category: str = "general") -> int:
         with self._lock:
@@ -374,22 +428,25 @@ class MemoryStore:
         cols = ["id", "title", "context", "decision", "consequences", "status", "created_at"]
         return self._fetch_dicts(cols, "SELECT id, title, context, decision, consequences, status, created_at FROM architecture_decisions ORDER BY CASE WHEN title LIKE 'ADR-%' THEN substr(title, 1, 8) ELSE printf('~%09d', id) END ASC, id ASC")
 
-    def log_hobby_run(self, hobby_name: str, status: str, summary: str, checkpoint_id: str = "", doctor_passed: bool = True) -> int:
+    def log_autonomy_run(self, entry_name: str, status: str, summary: str, checkpoint_id: str = "", doctor_passed: bool = True, entry_kind: str = "routine") -> int:
         with self._lock:
-            cur = self.conn.execute("INSERT INTO hobby_journal (hobby_name, status, checkpoint_id, doctor_passed, summary, seen_by_user) VALUES (?, ?, ?, ?, ?, 0)", (hobby_name, status, checkpoint_id, 1 if doctor_passed else 0, summary))
+            cur = self.conn.execute(
+                "INSERT INTO autonomy_journal (entry_name, entry_kind, status, checkpoint_id, doctor_passed, summary, seen_by_user) VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (entry_name, entry_kind, status, checkpoint_id, 1 if doctor_passed else 0, redact_secrets(summary)),
+            )
             self.conn.commit()
             return int(cur.lastrowid)
 
-    def get_hobby_journal(self, unseen_only: bool = False, mark_seen: bool = False, limit: int = 20) -> List[Dict[str, Any]]:
-        sql = "SELECT id, hobby_name, status, checkpoint_id, doctor_passed, summary, seen_by_user, created_at FROM hobby_journal" + (" WHERE seen_by_user = 0" if unseen_only else "") + " ORDER BY id DESC LIMIT ?"
-        cols = ["id", "hobby_name", "status", "checkpoint_id", "doctor_passed", "summary", "seen_by_user", "created_at"]
+    def get_autonomy_journal(self, unseen_only: bool = False, mark_seen: bool = False, limit: int = 20) -> List[Dict[str, Any]]:
+        sql = "SELECT id, entry_name, entry_kind, status, checkpoint_id, doctor_passed, summary, seen_by_user, created_at FROM autonomy_journal" + (" WHERE seen_by_user = 0" if unseen_only else "") + " ORDER BY id DESC LIMIT ?"
+        cols = ["id", "entry_name", "entry_kind", "status", "checkpoint_id", "doctor_passed", "summary", "seen_by_user", "created_at"]
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute(sql, (limit,))
             rows = [dict(zip(cols, r)) for r in cursor.fetchall()]
             if mark_seen and rows:
                 ids = [r["id"] for r in rows]
-                self.conn.execute(f"UPDATE hobby_journal SET seen_by_user = 1 WHERE id IN ({','.join('?' for _ in ids)})", tuple(ids))
+                self.conn.execute(f"UPDATE autonomy_journal SET seen_by_user = 1 WHERE id IN ({','.join('?' for _ in ids)})", tuple(ids))
                 self.conn.commit()
             return rows
 
@@ -423,18 +480,16 @@ class MemoryStore:
             return self._hydrate_workflow_row(cursor.fetchone())
 
     def get_resumable_workflow(self, project_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Return the active workflow, or the latest non-recipe incomplete workflow (`superseded`/`aborted`) with saved state."""
         pid = _eff_pid(project_id)
         active = self.get_active_workflow(project_id=pid)
-        if active and not str(active.get("workflow_type", "")).startswith("recipe:"):
+        if active and not str(active.get("workflow_type", "")).startswith("dag:"):
             return active
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT id, workflow_type, goal, current_state, acceptance_criteria, checkpoint_id, metadata_json, status, created_at, updated_at FROM workflow_runs WHERE project_id = ? AND status IN ('active', 'superseded', 'aborted') AND workflow_type NOT LIKE 'recipe:%' AND current_state NOT IN ('COMPLETE', 'IDLE') ORDER BY id DESC LIMIT 1", (pid,))
+            cursor.execute("SELECT id, workflow_type, goal, current_state, acceptance_criteria, checkpoint_id, metadata_json, status, created_at, updated_at FROM workflow_runs WHERE project_id = ? AND status IN ('active', 'superseded', 'aborted') AND workflow_type NOT LIKE 'dag:%' AND current_state NOT IN ('COMPLETE', 'IDLE') ORDER BY id DESC LIMIT 1", (pid,))
             return self._hydrate_workflow_row(cursor.fetchone())
 
     def update_workflow_metadata(self, workflow_id: int, updates: Dict[str, Any]) -> None:
-        """Persist lossless phase handoffs or task progress into `workflow_runs.metadata_json`."""
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute("SELECT metadata_json FROM workflow_runs WHERE id = ?", (workflow_id,))
@@ -461,20 +516,19 @@ class MemoryStore:
             self.conn.commit()
 
     def restore_superseded_workflow(self, workflow_id: int) -> None:
-        """Restore a temporarily superseded parent workflow back to `active` after a nested/recipe run."""
         with self._lock:
             self.conn.execute("UPDATE workflow_runs SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'superseded'", (int(workflow_id),))
             self.conn.commit()
 
     def rebind_workflow_project(self, workflow_id: int, project_id: str, task_ids: Optional[List[int]] = None, checkpoint_id: Optional[str] = None) -> None:
-        """Migrate an active workflow run (and its planned tasks) to a newly switched `WorkspaceContext`."""
         pid = _eff_pid(project_id)
         with self._lock:
+            self._ensure_project_record(pid)
             self.conn.execute("UPDATE workflow_runs SET status = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE status = 'active' AND project_id = ? AND id != ?", (pid, int(workflow_id)))
             self.conn.execute("UPDATE workflow_runs SET project_id = ?, checkpoint_id = COALESCE(?, checkpoint_id), updated_at = CURRENT_TIMESTAMP WHERE id = ?", (pid, checkpoint_id, int(workflow_id)))
-            self.conn.execute("UPDATE tasks SET project_id = ? WHERE workflow_id = ?", (pid, int(workflow_id)))
+            self.conn.execute("UPDATE work_items SET project_id = ? WHERE workflow_id = ?", (pid, int(workflow_id)))
             if task_ids:
-                self.conn.execute(f"UPDATE tasks SET project_id = ? WHERE id IN ({','.join('?' for _ in task_ids)})", (pid, *(int(t) for t in task_ids)))
+                self.conn.execute(f"UPDATE work_items SET project_id = ? WHERE id IN ({','.join('?' for _ in task_ids)})", (pid, *(int(t) for t in task_ids)))
             self.conn.commit()
 
     def get_workflow_transitions(self, workflow_id: int) -> List[Dict[str, Any]]:
@@ -482,7 +536,6 @@ class MemoryStore:
         return self._fetch_dicts(cols, "SELECT id, from_state, to_state, summary, verification_passed, created_at FROM workflow_transitions WHERE workflow_id = ? ORDER BY id ASC", (workflow_id,))
 
     def sync_memory_md(self, target_path: Optional[Path] = None) -> Path:
-        """Render the authoritative SQLite memory state into a clean, structured MEMORY.md."""
         default_md = settings.memory_md_path if self.db_path.resolve() == settings.db_path.resolve() else (self.db_path.parent / "MEMORY.md")
         out_path = target_path or default_md
         profile, adrs, active_wf = self.get_user_profile(), self.get_adrs(), self.get_active_workflow()
@@ -494,31 +547,33 @@ class MemoryStore:
         else:
             lines.append("- **Current State**: `IDLE` (Ready for new engineering or companion workflow)")
         lines.extend(["", "## 3. Architecture Decision Records (ADRs)", *[f"- **{a['title']}** [{a['status']}]: {a['decision']} *(Outcome: {a['consequences']})*" for a in adrs if a.get("status", "accepted") == "accepted"][-20:]])
-        lines.extend(["", "## 4. Active Tasks", *([f"- `[Task #{tid} | P{prio} | {st}]` {desc}" for tid, desc, st, prio in pending_tasks] if pending_tasks else ["- No pending immediate tasks."])])
-        lines.extend(["", "## 5. Engineering Backlog", *([f"- [{'x' if st == 'completed' else ' '}] `[Backlog #{bid} | {cat} | {st}]` {desc}" for bid, desc, cat, st in backlog_items] if backlog_items else ["- Backlog is currently empty."])])
+        lines.extend(["", "## 4. Active Work Items", *([f"- `[Item #{tid} | P{prio} | {st}]` {desc}" for tid, desc, st, prio in pending_tasks] if pending_tasks else ["- No pending immediate work items."])])
+        lines.extend(["", "## 5. Backlog Items", *([f"- [{'x' if st in ('completed', 'done') else ' '}] `[Backlog #{bid} | {cat} | {st}]` {desc}" for bid, desc, cat, st in backlog_items] if backlog_items else ["- Backlog is currently empty."])])
         lines.extend(["", "## 6. System Notes & Lessons Learned", *([f"- **[{cat}]** {note_text}" for note_text, cat, _ in notes] if notes else ["- Always use `run_python` for multiline Python execution on Windows."]), ""])
         out_path.write_text("\n".join(lines), encoding="utf-8")
         return out_path
 
     def export_state_snapshot(self, project_id: Optional[str] = None) -> Dict[str, Any]:
-        """Export reversible state tables scoped by `project_id` for checkpointing."""
         pid = _eff_pid(project_id)
         out: Dict[str, Any] = {"project_id": pid}
-        scoped = (("tasks", " WHERE project_id = ?", (pid,)), ("knowledge_facts", " WHERE project_id = ?", (pid,)))
-        global_tbls = (("backlog", "", ()), ("architecture_decisions", "", ())) if pid == SELF_PROJECT_ID else ()
+        scoped = (
+            ("work_items", " WHERE project_id = ? ORDER BY id ASC", (pid,)),
+            ("milestones", " WHERE project_id = ? ORDER BY sort_order ASC", (pid,)),
+            ("knowledge_facts", " WHERE project_id = ? ORDER BY id ASC", (pid,)),
+        )
+        global_tbls = (("architecture_decisions", " ORDER BY id ASC", ()),) if pid == SELF_PROJECT_ID else ()
         with self._lock:
             cur = self.conn.cursor()
             for tbl, where_sql, params in (*scoped, *global_tbls):
-                cur.execute(f"SELECT * FROM {tbl}{where_sql} ORDER BY id ASC", params)
+                cur.execute(f"SELECT * FROM {tbl}{where_sql}", params)
                 cols = [d[0] for d in cur.description]
                 out[tbl] = [dict(zip(cols, row)) for row in cur.fetchall()]
         return out
 
     def restore_state_snapshot(self, snapshot: Dict[str, Any], rollback_reason: str = "", project_id: Optional[str] = None) -> None:
-        """Rewind scoped tasks/facts (and self backlog/ADRs) to a checkpoint snapshot while logging a rollback lesson."""
         pid = str(snapshot.get("project_id") or _eff_pid(project_id))
-        scoped = (("tasks", " WHERE project_id = ?", (pid,)), ("knowledge_facts", " WHERE project_id = ?", (pid,)))
-        global_tbls = (("backlog", "", ()), ("architecture_decisions", "", ())) if pid == SELF_PROJECT_ID else ()
+        scoped = (("work_items", " WHERE project_id = ?", (pid,)), ("milestones", " WHERE project_id = ?", (pid,)), ("knowledge_facts", " WHERE project_id = ?", (pid,)))
+        global_tbls = (("architecture_decisions", "", ()),) if pid == SELF_PROJECT_ID else ()
         with self._lock:
             cur = self.conn.cursor()
             for tbl, where_sql, params in (*scoped, *global_tbls):

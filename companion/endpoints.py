@@ -121,10 +121,11 @@ class EndpointManager:
         verify_tls: bool = True,
         tags: Optional[List[str]] = None,
         actor: str = "user",
+        confirmed: bool = False,
     ) -> Dict[str, Any]:
         """Register or update a remote endpoint using a symbolic Vault `credential_ref` (never raw secrets)."""
-        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
-            return {"ok": False, "error": "ENDPOINT GUARD REJECTED: Only the user can register or modify remote endpoints."}
+        if (actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn()) and not confirmed:
+            return {"ok": False, "error": "ENDPOINT GUARD REJECTED: Only the user can register remote endpoints directly; call `propose` to enqueue an approval request."}
         eid = _slug_id(endpoint_id or label or host)
         proto = (protocol or "").strip().lower()
         clean_host = (host or "").strip()
@@ -181,6 +182,63 @@ class EndpointManager:
             self.store.conn.commit()
         disp_addr = clean_host if "://" in clean_host else f"{clean_host}:{eff_port}"
         return {"ok": True, "endpoint": self.get_endpoint(eid), "summary": f"Registered `{proto}` endpoint `{eid}` -> `{disp_addr}` (credential_ref=`{cred_slug or 'none'}`)."}
+
+    def propose_endpoint(
+        self,
+        endpoint_id: str,
+        protocol: str,
+        host: str,
+        label: str = "",
+        port: int = 0,
+        username: str = "",
+        auth_mode: str = "",
+        credential_ref: str = "",
+        auth_header: str = "X-API-Key",
+        os_hint: str = "",
+        verify_tls: bool = True,
+        tags: Optional[List[str]] = None,
+        actor: str = "companion",
+    ) -> Dict[str, Any]:
+        """Stage an SSRF-validated remote endpoint + symbolic Vault placeholder into `ApprovalQueue` (`actor='companion'` safe)."""
+        eid = _slug_id(endpoint_id or label or host)
+        proto = (protocol or "").strip().lower()
+        clean_host = (host or "").strip()
+        if not eid or proto not in VALID_PROTOCOLS or not clean_host:
+            return {"ok": False, "error": f"`endpoint_id`, `host`, and `protocol` ({', '.join(VALID_PROTOCOLS)}) are required."}
+        ssrf_err = _check_metadata_ssrf(clean_host)
+        if ssrf_err:
+            return {"ok": False, "error": ssrf_err}
+        if credential_ref and _LooksLikeRawSecret(credential_ref):
+            return {"ok": False, "error": "VAULT GUARD REJECTED: `credential_ref` must be a symbolic Vault name, NEVER a raw secret."}
+        cred_slug = normalize_secret_name(credential_ref) if credential_ref else ""
+        if cred_slug:
+            get_vault_manager(store=self.store).declare_placeholder(
+                cred_slug, cred_type="api_key", description=f"Proposed credential for endpoint `{eid}`", allow_list=[f"endpoint:{eid}"], actor=actor,
+            )
+        payload = {
+            "endpoint_id": eid, "protocol": proto, "host": clean_host, "label": label.strip() or eid,
+            "port": int(port or 0), "username": username.strip(), "auth_mode": auth_mode.strip(),
+            "credential_ref": cred_slug, "auth_header": auth_header.strip() or "X-API-Key",
+            "os_hint": os_hint.strip(), "verify_tls": bool(verify_tls), "tags": list(tags or []),
+        }
+        _allowed, apr = get_approval_queue(self.store).check_or_enqueue(
+            category="endpoint_register",
+            action_name="register_endpoint",
+            target=eid,
+            summary=f"Register `{proto}` endpoint `{label.strip() or eid}` (`{clean_host}`, credential_ref=`{cred_slug or 'none'}`).",
+            payload=payload,
+            requester=actor,
+            confirmed=False,
+            always_require_in_autonomous=True,
+        )
+        return {
+            "ok": True,
+            "awaiting_approval": True,
+            "approval_id": apr["approval_id"],
+            "endpoint_id": eid,
+            "credential_ref": cred_slug,
+            "summary": f"Staged endpoint `{eid}` (`{proto}` -> `{clean_host}`) for 1-click user approval (`{apr['approval_id']}`).",
+        }
 
     def get_endpoint(self, endpoint_id: str) -> Optional[Dict[str, Any]]:
         cols = [

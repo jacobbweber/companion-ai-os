@@ -14,7 +14,6 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from companion.agile_boards import sync_workflow_to_agile_board
 from companion.autonomy import resolve_goal_engines, run_autonomous_goal, run_phase_turn
 from companion.compaction import build_lossless_phase_handoff
 from companion.config import settings
@@ -22,6 +21,7 @@ from companion.disciplines import resolve_workspace_contract
 from companion.grounding import get_knowledge_port
 from companion.llm import chat, model_gate
 from companion.memory_store import MemoryStore, get_memory_store
+from companion.project_graph import sync_workflow_to_project_graph
 from companion.safety import CheckpointManager
 from companion.telemetry import telemetry
 from companion.workflow_dag import GoalPlan, build_goal_plan_from_tasks
@@ -191,7 +191,7 @@ def _revise_existing_blueprint(
             "design_handoff": design_handoff, "plan_handoff": plan_handoff, "goal_dag": dag_dict,
             "awaiting_plan_approval": True, "pause_reason": "", "last_revision": combined_feedback, "alignment_notes": alignment_notes,
         })
-        sync_workflow_to_agile_board(mem, wf_id, goal, "PLAN")
+        sync_workflow_to_project_graph(mem, wf_id, goal, "PLAN")
 
     card = format_blueprint_card(wf_id, goal, cp_id, design_handoff, plan_handoff, mem.get_pending_tasks(), revised=True, goal_dag=dag_dict)
     telemetry.log("INFO", "blueprint", f"Revised Blueprint for Workflow #{wf_id}: {feedback[:80]}")

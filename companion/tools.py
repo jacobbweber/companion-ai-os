@@ -1,4 +1,4 @@
-"""Comprehensive, Self-Guarded Tool Registry (A-Frame Application Layer, 26 tools)."""
+"""Comprehensive, Self-Guarded Tool Registry (A-Frame Application Layer, 25 tools)."""
 
 import json
 import os
@@ -22,7 +22,7 @@ from companion.hygiene import extract_python_symbol
 from companion.llm_wire import check_url_ssrf, urlopen_safe
 from companion.memory_store import get_memory_store
 from companion.os_tools import (
-    tool_checkpoint_manage, tool_hobby_manage, tool_memory_manage, tool_project_manage,
+    tool_checkpoint_manage, tool_memory_manage, tool_project_manage,
     tool_sdd_manage, tool_system_doctor, tool_task_manage, tool_telemetry_manage, tool_workflow_manage,
 )
 from companion.safety import (
@@ -39,7 +39,7 @@ from companion.tool_schemas import (
 __all__ = [
     "PHASE_ALLOWED_TOOLS", "TOOLS", "TOOL_IMPLS", "check_phase_tool_permission", "current_workflow_phase", "dispatch",
     "filter_tools_for_phase", "phase_tool_context", "r3_approval_context", "resolve", "tool_agile_manage", "tool_calendar_manage",
-    "tool_checkpoint_manage", "tool_edit_file", "tool_education_manage", "tool_endpoint_manage", "tool_hobby_manage",
+    "tool_checkpoint_manage", "tool_edit_file", "tool_education_manage", "tool_endpoint_manage",
     "tool_job_manage", "tool_list_dir", "tool_mcp_manage", "tool_memory_manage", "tool_project_manage", "tool_read_file",
     "tool_routine_manage", "tool_run_python", "tool_run_shell", "tool_sdd_manage", "tool_search", "tool_system_doctor",
     "tool_task_manage", "tool_telemetry_manage", "tool_vault_manage", "tool_web_fetch", "tool_wiki_manage", "tool_workflow_manage", "tool_write_file",
@@ -386,7 +386,7 @@ TOOL_IMPLS: Dict[str, Callable[[Dict[str, Any]], str]] = {
     "list_dir": tool_list_dir, "search": tool_search, "run_python": tool_run_python,
     "run_shell": tool_run_shell, "web_fetch": tool_web_fetch, "memory_manage": tool_memory_manage,
     "task_manage": tool_task_manage, "workflow_manage": tool_workflow_manage, "checkpoint_manage": tool_checkpoint_manage,
-    "sdd_manage": tool_sdd_manage, "hobby_manage": tool_hobby_manage, "project_manage": tool_project_manage,
+    "sdd_manage": tool_sdd_manage, "project_manage": tool_project_manage,
     "system_doctor": tool_system_doctor, "telemetry_manage": tool_telemetry_manage,
     "job_manage": tool_job_manage, "wiki_manage": tool_wiki_manage, "vault_manage": tool_vault_manage,
     "endpoint_manage": tool_endpoint_manage, "mcp_manage": tool_mcp_manage, "routine_manage": tool_routine_manage,

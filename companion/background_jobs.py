@@ -213,19 +213,23 @@ class BackgroundJobManager:
         run_in_background: bool = True,
         recipe_name: str = "",
         recipe_params: Optional[Dict[str, Any]] = None,
+        dag_name: str = "",
+        dag_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Enqueue and start a background job, returning immediately (`queued`/`running`) or synchronously when `run_in_background=False`."""
         clean_goal = redact_secrets((goal or "").strip())
-        if not clean_goal and not recipe_name:
-            return {"ok": False, "error": "Job `goal` (or `recipe_name`) is required."}
-        eff_title = (title.strip() or (f"Recipe: {recipe_name}" if recipe_name else clean_goal.splitlines()[0]))[:110]
-        eff_kind = kind if kind in ("worker", "recipe", "routine", "mcp_inbound") else "worker"
+        eff_dag = (dag_name or recipe_name).strip()
+        eff_params = dag_params if dag_params is not None else (recipe_params or {})
+        if not clean_goal and not eff_dag:
+            return {"ok": False, "error": "Job `goal` (or `dag_name`) is required."}
+        eff_title = (title.strip() or (f"DAG: {eff_dag}" if eff_dag else clean_goal.splitlines()[0]))[:110]
+        eff_kind = "dag" if kind in ("dag", "recipe") and eff_dag else (kind if kind in ("worker", "dag", "routine", "mcp_inbound") else "worker")
         eff_tier = (tier or "fast").strip().lower()
         paired_tools = resolve_paired_worker_tools(allowed_tools)
         job_id = f"bgj_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
         pid = settings.get_workspace().project_id
 
-        meta_goal = json.dumps({"recipe": recipe_name, "params": recipe_params or {}, "goal": clean_goal}) if eff_kind == "recipe" and recipe_name else clean_goal
+        meta_goal = json.dumps({"dag": eff_dag, "params": eff_params, "goal": clean_goal}) if eff_kind == "dag" and eff_dag else clean_goal
         with self.store._lock:
             self.store.conn.execute(
                 """INSERT INTO background_jobs
@@ -345,13 +349,22 @@ class BackgroundJobManager:
         tid = telemetry.start_trace("background_job", f"{job_id}:{job['title'][:60]}") if mem.db_path.resolve() == settings.db_path.resolve() else None
         try:
             with memory_store_context(mem), tier_context(job.get("tier") or "fast"), model_gate.background_context(abort_check=lambda: self.is_cancel_requested(job_id)):
-                if job["kind"] == "recipe" and str(job["goal"]).startswith("{"):
+                if job["kind"] in ("dag", "recipe") and str(job["goal"]).startswith("{"):
                     spec = json.loads(job["goal"])
-                    from companion.workflow_graph import workflow_engine
+                    from companion import dag_runtime
 
-                    rec_res = workflow_engine.run_workflow_recipe(str(spec.get("recipe") or ""), params=spec.get("params") or {}, tool_fn=self._dispatch_tool)
-                    rec_ok = rec_res.get("status") == "COMPLETE" and bool(rec_res.get("valid", True))
-                    st, raw_out, meta_err = ("done" if rec_ok else "failed"), str(rec_res.get("summary") or ""), ("" if rec_ok else str(rec_res.get("summary") or "Recipe aborted")[:300])
+                    dag_target = str(spec.get("dag") or spec.get("recipe") or "")
+                    dag_res = dag_runtime.execute_dag_by_name(
+                        dag_target,
+                        params=spec.get("params") or {},
+                        store=mem,
+                        bindings=dag_runtime.DAGRuntimeBindings(tool_fn=self._dispatch_tool),
+                    )
+                    if dag_res.get("status") == "waiting_approval":
+                        st, raw_out, meta_err = "waiting_approval", str(dag_res.get("summary") or ""), str(dag_res.get("approval_id") or "")
+                    else:
+                        dag_ok = bool(dag_res.get("ok"))
+                        st, raw_out, meta_err = ("done" if dag_ok else "failed"), str(dag_res.get("summary") or ""), ("" if dag_ok else str(dag_res.get("error") or dag_res.get("summary") or "DAG aborted")[:300])
                 else:
                     st, raw_out, meta_err = self._run_zero_identity_worker(job, deadline)
         except InterruptedError:

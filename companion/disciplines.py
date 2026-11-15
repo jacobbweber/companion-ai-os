@@ -46,9 +46,9 @@ class ArchitectureLayer(Enum):
     """The core architectural layers in the Companion A-Frame Architecture."""
 
     INFRASTRUCTURE = "infrastructure"  # Left Leg Base: Config (.env), Waterfall Telemetry, Multi-Tier LLM HTTP
-    DOMAIN = "domain"                  # Right Leg Base: Checkpoints, Safety, SQLite, Disciplines, Grounding, Hygiene, SDD
-    WORKFLOW = "workflow"              # A-Frame Crossbar: State-Machine Graph (`workflow_graph`) & GoalPlan/Recipe DAGs (`workflow_dag`)
-    APPLICATION = "application"        # Upper A-Frame: Intake, Skill Forge, Compaction, Tools, Context, Hobbies, Autonomy, Blueprint, Eval, Agent
+    DOMAIN = "domain"                  # Right Leg Base: Checkpoints, Safety, SQLite, TriggerPolicy, ProjectGraph, Disciplines, Grounding, Hygiene, SDD
+    WORKFLOW = "workflow"              # A-Frame Crossbar: State-Machine Graph (`workflow_graph`), GoalPlan (`workflow_dag`) & Code-Controlled DAG Runtime (`dag_runtime`)
+    APPLICATION = "application"        # Upper A-Frame: Intake, Skill Forge, Compaction, Tools, Context, Routines, Autonomy, Blueprint, Eval, Agent
     PRESENTATION = "presentation"      # A-Frame Apex: CLI/REPL Entrypoint (harness.py) & Stdlib LAN Web UI (surfaces/)
     UTILITY = "utility"                # Cross-cutting stdlib helpers & test suite
 
@@ -76,11 +76,13 @@ MODULE_LAYER_MAP: Dict[str, ArchitectureLayer] = {
     "companion.archive_and_approvals": ArchitectureLayer.DOMAIN, "companion.vault": ArchitectureLayer.DOMAIN,
     "companion.wiki_templates": ArchitectureLayer.DOMAIN, "companion.wiki_engine": ArchitectureLayer.DOMAIN,
     "companion.wiki_curation": ArchitectureLayer.DOMAIN, "companion.wiki_maintenance": ArchitectureLayer.DOMAIN,
-    "companion.attachments": ArchitectureLayer.DOMAIN, "companion.agile_boards": ArchitectureLayer.DOMAIN,
+    "companion.attachments": ArchitectureLayer.DOMAIN, "companion.trigger_policy": ArchitectureLayer.DOMAIN,
+    "companion.project_graph": ArchitectureLayer.DOMAIN,
     "companion.education_engine": ArchitectureLayer.DOMAIN, "companion.model_registry": ArchitectureLayer.DOMAIN,
     "companion.workflow_graph": ArchitectureLayer.WORKFLOW, "companion.workflow_dag": ArchitectureLayer.WORKFLOW,
+    "companion.dag_runtime": ArchitectureLayer.WORKFLOW,
     "companion.compaction": ArchitectureLayer.APPLICATION, "companion.tool_schemas": ArchitectureLayer.APPLICATION,
-    "companion.hobbies": ArchitectureLayer.APPLICATION, "companion.intake": ArchitectureLayer.APPLICATION,
+    "companion.intake": ArchitectureLayer.APPLICATION,
     "companion.autonomy": ArchitectureLayer.APPLICATION, "companion.blueprint": ArchitectureLayer.APPLICATION,
     "companion.skill_forge": ArchitectureLayer.APPLICATION, "companion.eval_harness": ArchitectureLayer.APPLICATION,
     "companion.background_jobs": ArchitectureLayer.APPLICATION, "companion.endpoints": ArchitectureLayer.APPLICATION,
@@ -494,13 +496,13 @@ _R0_ACTIONS: Dict[str, FrozenSet[str]] = {
     "task_manage": frozenset({"list_tasks", "list_backlog", "list_all"}),
     "sdd_manage": frozenset({"", "verify", "status", "read_spec", "get_adrs"}),
     "project_manage": frozenset({"", "status", "current", "list"}),
-    "hobby_manage": frozenset({"", "status", "morning", "journal"}),
     "job_manage": frozenset({"", "list", "status"}),
     "wiki_manage": frozenset({"", "list", "read", "search", "graph", "list_templates", "read_template", "tag_authority", "inspect_graduation", "validate_curation", "curation_history"}),
     "vault_manage": frozenset({"", "list", "check_secret", "list_missing", "audit"}),
     "endpoint_manage": frozenset({"", "list", "test", "inspect_host", "ssh_read_file"}),
     "mcp_manage": frozenset({"", "list", "discover", "list_partners", "handshake_partner", "check_partner_job"}),
-    "routine_manage": frozenset({"", "list", "list_approvals", "sandbox_list", "sandbox_diff", "prompt_list"}),
+    "routine_manage": frozenset({"", "list", "autonomy_status", "morning", "list_approvals", "sandbox_list", "sandbox_diff", "prompt_list"}),
+    "agile_manage": frozenset({"", "board_view", "roadmap", "list_boards", "list_epics", "list_sprints", "capacity"}),
 }
 
 
@@ -512,14 +514,16 @@ def classify_action_risk(tool_name: str, args: Optional[Dict[str, Any]] = None) 
     if tool_name == "telemetry_manage":
         return ActionRiskTier.R0_READ_ONLY if action != "log_event" else ActionRiskTier.R1_LOCAL_REVERSIBLE
     if tool_name == "workflow_manage":
-        return ActionRiskTier.R0_READ_ONLY if action in ("", "status", "list_recipes", "http_smoke", "check_skill") else (ActionRiskTier.R2_CAPABILITY_PROMOTION if action == "bootstrap_skill" else ActionRiskTier.R1_LOCAL_REVERSIBLE)
+        return ActionRiskTier.R0_READ_ONLY if action in ("", "status", "list_dags", "list_recipes", "http_smoke", "check_skill") else (ActionRiskTier.R2_CAPABILITY_PROMOTION if action == "bootstrap_skill" else ActionRiskTier.R1_LOCAL_REVERSIBLE)
     if tool_name == "endpoint_manage":
-        if action in ("ssh_exec", "winrm_exec", "register", "remove"):
+        if action in ("ssh_exec", "winrm_exec", "propose", "register", "remove"):
             return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
         if action == "api_request" and str(payload.get("method") or "GET").strip().upper() not in ("GET", "HEAD"):
             return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
-    if tool_name == "mcp_manage" and action in ("call_tool", "delegate_partner", "register", "remove", "register_partner", "remove_partner"):
+    if tool_name == "mcp_manage" and action in ("call_tool", "delegate_partner", "propose_server", "register_server", "register", "remove", "register_partner", "remove_partner"):
         return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+    if tool_name == "mcp_manage" and action == "harvest_skill":
+        return ActionRiskTier.R2_CAPABILITY_PROMOTION
     if tool_name == "run_shell" and _R3_SHELL_RE.search(str(payload.get("command") or "")):
         return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
     if tool_name == "run_python":

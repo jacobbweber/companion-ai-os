@@ -9,9 +9,8 @@ from unittest.mock import patch
 from companion.archive_and_approvals import set_trust_mode
 from companion.background_jobs import marshal_job_envelope
 from companion.core_actions import execute_core_action, handle_harvest_slash
-from companion.hobbies import HOBBY_ROTATION
 from companion.memory_store import MemoryStore
-from companion.routines import RoutineManager
+from companion.routines import BUILTIN_IDLE_ROUTINES, RoutineManager
 from companion.tool_schemas import check_phase_tool_permission
 from companion.wiki_curation import pending_curation_nudge
 from companion.wiki_engine import WikiEngine
@@ -485,7 +484,7 @@ class TestWikiV3TemplatesAndCuration(unittest.TestCase):
         self.assertIsNone(check_phase_tool_permission("wiki_manage", "PLAN", {"action": "validate_curation"}))
         self.assertIsNotNone(check_phase_tool_permission("wiki_manage", "PLAN", {"action": "commit_curation"}))
 
-        self.assertTrue(any(h.name == "wiki_gardener" and h.preferred_tier == "reasoning" for h in HOBBY_ROTATION))
+        self.assertTrue(any(r["routine_id"] == "wiki_gardener" for r in BUILTIN_IDLE_ROUTINES))
         rm = RoutineManager(store=self.store)
         r_save = rm.create_or_update_routine("nightly-wiki-curate", "daily 02:00", "wiki_deep_curate", actor="user")
         self.assertTrue(r_save["ok"])

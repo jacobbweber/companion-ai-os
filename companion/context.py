@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from companion.agile_boards import format_agile_hud
 from companion.archive_and_approvals import get_trust_mode
 from companion.compaction import (
     KeyTokens, build_lossless_phase_handoff, compact_messages_if_needed as _compact_messages_impl,
@@ -20,6 +19,7 @@ from companion.grounding import build_epistemic_grounding, build_workspace_radar
 from companion.llm import format_model_tiers_status
 from companion.mcp_hub import format_connected_partners_hud
 from companion.memory_store import MemoryStore, get_memory_store
+from companion.project_graph import format_project_graph_hud
 from companion.workflow_graph import WorkflowEngine, workflow_engine
 
 __all__ = [
@@ -304,19 +304,19 @@ def format_skills_catalog(skill_name: Optional[str] = None, root: Optional[Path]
                 cand_p = Path(s["path"])
                 full_p = cand_p if cand_p.is_absolute() else (target_root / cand_p)
                 if full_p.is_file():
-                    res_lines = [f"- `{k}`: {s[k]}" for k in ("references", "workflows", "scripts") if s.get(k)]
+                    res_lines = [f"- `{k}`: {s[k]}" for k in ("references", "dags", "scripts") if s.get(k)]
                     res_block = ("\n## Bundled Tier-3 Resources\n" + "\n".join(res_lines) + "\n") if res_lines else ""
                     return f"# Skill Runbook: `{s['name']}` ({s['path']})\n\n" + full_p.read_text(encoding="utf-8", errors="replace") + res_block
         return f"Skill '{skill_name}' not found. Available skills: {', '.join(s['name'] for s in skills)}"
 
     lines = [
         f"=== Companion Progressive-Disclosure Skill Registry ({len(skills)} Runbooks in `skills/`) ===",
-        "Architecture: Tools (`companion/tools.py`) are L1 atomic primitives; Skills (`skills/<name>/`) are L2/L3 3-Tier packs (`SKILL.md`, `references/`, `workflows/`, `scripts/`).",
+        "Architecture: Tools (`companion/tools.py`) are L1 atomic primitives; Skills (`skills/<name>/`) are L2/L3 3-Tier Capability Packs (`SKILL.md`, `references/`, `dags/`, `scripts/`).",
         "",
     ]
     for s in skills:
         req = f"  [Tools: {s['required_tools']}]" if s.get("required_tools") else ""
-        tier3 = [f"{k}=[{s[k]}]" for k in ("references", "workflows", "scripts") if s.get(k)]
+        tier3 = [f"{k}=[{s[k]}]" for k in ("references", "dags", "scripts") if s.get(k)]
         t3_str = f"\n    Tier-3 Resources: {' | '.join(tier3)}" if tier3 else ""
         lines.append(f"  * `{s['name']}` (`{s['path']}`)\n    {s['description']}{req}{t3_str}")
     lines.append("\n(Use `/skills <name>` or `read_file` on a skill's `SKILL.md` path to view its full procedural runbook.)")
@@ -359,11 +359,11 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
         if ws.is_self_project
         else f"EXTERNAL PROJECT MODE (`{ws.self_root}` is MECHANICALLY LOCKED READ-ONLY per ADR-007)"
     )
-    repo_radar, hud, hobby_on = build_workspace_radar(ws.project_root), wf.render_hud(), mem.is_hobby_mode_enabled()
+    repo_radar, hud, bg_on = build_workspace_radar(ws.project_root), wf.render_hud(), mem.is_background_autonomy_enabled()
     self_dev_lock = f" [{settings.self_dev_lock_reason()}]" if settings.is_self_dev_locked_by_env() else ""
     trust_mode, partners_hud = get_trust_mode(store=mem), format_connected_partners_hud(store=mem)
     partners_section = f"\n{partners_hud}\n" if partners_hud else ""
-    agile_hud, edu_hud = format_agile_hud(store=mem), format_education_hud(store=mem)
+    agile_hud, edu_hud = format_project_graph_hud(store=mem), format_education_hud(store=mem)
     active_mode = prof.get("active_model_tier", "auto").strip().lower() or "auto"
     fast_cfg, code_cfg, reas_cfg = settings.resolve_tier("fast"), settings.resolve_tier("coding"), settings.resolve_tier("reasoning")
     code_hud = f" | coding=`{code_cfg.model}` (temp={code_cfg.temperature})" if code_cfg.is_dedicated else ""
@@ -392,11 +392,11 @@ Companion Core : {settings.root} (Entry: `harness.py` | Specs: `specs/` | Skills
 Memory & DB    : {settings.memory_md_path} | {mem.db_path}
 Trust Mode     : `{trust_mode}` (Blind Vault Zero-Reveal Active | Approvals Queue: `/approvals`)
 Model Routing  : mode=`{active_mode}` | privacy=`{settings.effective_privacy_mode()}` | fast=`{fast_cfg.model}` (temp={fast_cfg.temperature}){code_hud} | reasoning=`{reas_cfg.model}` (temp={reas_cfg.temperature})
-Operating Modes: Self-Dev=`{'ON (Core Editable)' if self_dev_on else 'OFF (Core Read-Only)'}`{self_dev_lock} | Hobby Mode=`{'ON (Personal+Self-Dev Idle)' if (hobby_on and self_dev_on) else ('ON (Personal Track Idle Only)' if hobby_on else 'OFF')}`
+Operating Modes: Self-Dev=`{'ON (Core Editable)' if self_dev_on else 'OFF (Core Read-Only)'}`{self_dev_lock} | Background Autonomy=`{'ON (Personal+Self-Dev Idle)' if (bg_on and self_dev_on) else ('ON (Personal & Goal Slices Idle)' if bg_on else 'OFF')}`
 {partners_section}
 [MULTI-TIER MODEL ROUTING & OODA LOOP (ALWAYS-ON RULES)]
 1. Organic Deep Thinking (`tier="reasoning"`): When the User asks a strategic, architectural, or multi-option tradeoff question, call `workflow_manage(action="subagent", tier="reasoning", skill="deep-thinking", goal="...")` in 1 hop.
-2. OODA Troubleshooting (`Observe -> Orient -> Decide -> Act`): When diagnosing bugs, test failures, or system issues, follow `skills/ooda-troubleshooting/SKILL.md` or run `workflow_manage(action="run_recipe", recipe="ooda-diagnose")`.
+2. OODA Troubleshooting (`Observe -> Orient -> Decide -> Act`): When diagnosing bugs, test failures, or system issues, follow `skills/ooda-troubleshooting/SKILL.md` or run `workflow_manage(action="run_dag", dag="ooda-diagnose")`.
 3. Second Opinion When Stuck: Any time 2 consecutive tool calls or verification checks fail, consult `tier="reasoning"` before making another edit.
 
 [STATE MACHINE WORKFLOW STATUS]

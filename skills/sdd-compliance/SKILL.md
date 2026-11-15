@@ -19,7 +19,7 @@ Use this runbook before completing any code or architectural change, when diagno
    - Zero unused imports across the repository and zero unreferenced top-level functions/classes in `companion/`.
    - Every module must stay `<= 700` lines (`COMPANION_MAX_MODULE_LINES`) and every function `<= 100` lines (`COMPANION_MAX_FUNCTION_LINES`), with zero semicolon-chained statements (`stmt1; stmt2`).
 4. **Downward-Only A-Frame Layer Flow**:
-   - `Presentation (harness.py, surfaces/)` -> `Application (agent, autonomy, blueprint, intake, skill_forge, eval_harness, context, compaction, background_jobs, endpoints, mcp_hub, routines, calendar_engine, core_actions, harvest_tools, tools, os_tools, tool_schemas, hobbies)` -> `Workflow (workflow_graph, workflow_dag)` -> `Domain (checkpoints, safety, sdd, hygiene, disciplines, grounding, archive_and_approvals, vault, model_registry, wiki_templates, wiki_engine, wiki_curation, wiki_maintenance, attachments, agile_boards, education_engine, semantic_memory, memory_store, configs/architecture, memory/chat_memory)` -> `Infrastructure (config, telemetry, streaming, llm_wire, llm)`.
+   - `Presentation (harness.py, surfaces/)` -> `Application (agent, autonomy, blueprint, intake, skill_forge, eval_harness, context, compaction, background_jobs, endpoints, mcp_hub, routines, calendar_engine, core_actions, harvest_tools, tools, os_tools, tool_schemas)` -> `Workflow (workflow_graph, workflow_dag, dag_runtime)` -> `Domain (checkpoints, safety, sdd, hygiene, disciplines, grounding, trigger_policy, project_graph, archive_and_approvals, vault, model_registry, wiki_templates, wiki_engine, wiki_curation, wiki_maintenance, attachments, education_engine, semantic_memory, memory_store, configs/architecture, memory/chat_memory)` -> `Infrastructure (config, telemetry, streaming, llm_wire, llm)`.
 
 ## Step-by-Step Procedure
 1. **Run SDD & Hygiene Verification**:
@@ -28,5 +28,5 @@ Use this runbook before completing any code or architectural change, when diagno
    - **Unused Import / Dead Definition**: Use `read_file` around the reported line number and remove or wire the symbol via `edit_file`.
    - **Undocumented Module / Contract Drift**: Update `specs/ARCHITECTURE.md` and `specs/CONTRACTS.md` via `edit_file`.
    - **ADR Sync**: Call `sdd_manage(action="sync")` to synchronize and compact `specs/DECISIONS.md` and `MEMORY.md`.
-3. **Final Verification Gate (or Automated Recipe)**:
-   - Call `system_doctor(run_tests=True)` and confirm all 7 stages report `[PASS]`, OR run the bundled Tier-3 workflow recipe (`workflows/full-audit.json`) via `workflow_manage(action="run_recipe", recipe="full-audit")`.
+3. **Final Verification Gate (or Automated Python DAG)**:
+   - Call `system_doctor(run_tests=True)` and confirm all 7 stages report `[PASS]`, OR run the bundled Tier-3 Python DAG (`dags/full_audit.py`) via `workflow_manage(action="run_dag", dag="full-audit")`.

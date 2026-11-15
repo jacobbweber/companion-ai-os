@@ -8,25 +8,27 @@
 
 ```text
       [ APEX (PRESENTATION): harness.py, surfaces/web_server.py & web_assets.py ]
-        CLI/REPL, Disconnect-Proof LAN Web UI & Non-Blocking Idle Watcher
+        CLI/REPL, Disconnect-Proof LAN Web UI & Preemptible IdleAutonomyWatcher
                                     /    \
                                    /      \
   [ UPPER A-FRAME (APPLICATION): agent.py, autonomy.py, blueprint.py, intake.py,      ]
   [   skill_forge.py, eval_harness.py, context.py, compaction.py, tools.py,           ]
-  [   os_tools.py, tool_schemas.py, hobbies.py                                        ]
-     Intent & Tier Router, Blueprint Gate, Skill Forge, Phase-Gated Tools (17), Eval
+  [   os_tools.py, harvest_tools.py, tool_schemas.py, routines.py, core_actions.py    ]
+     Cognitive Triage, Blueprint Gate, Skill/DAG Forge, Phase-Gated Tools (25), Eval
                                /              \
                               /================\
                              /     CROSSBAR     \
-                  [ workflow_graph.py & workflow_dag.py ]
-             Persistent State-Machine Graph & Dynamic GoalPlan / Recipe DAGs
+              [ workflow_graph.py, workflow_dag.py & dag_runtime.py ]
+       State-Machine Graph, Pluggable VerificationSpec & Code-Controlled Python DAGs
                            /                      \
                           /                        \
        [ LEFT LEG: INFRASTRUCTURE ]        [ RIGHT LEG: DOMAIN & SDD ]
        - companion/config.py               - companion/checkpoints.py
        - companion/telemetry.py            - companion/safety.py
        - companion/streaming.py            - companion/semantic_memory.py
-       - companion/llm.py                  - companion/memory_store.py
+       - companion/llm_wire.py             - companion/memory_store.py
+       - companion/llm.py                  - companion/trigger_policy.py
+                                           - companion/project_graph.py
                                            - companion/disciplines.py
                                            - companion/grounding.py
                                            - companion/hygiene.py
@@ -51,9 +53,11 @@ Every module in the system has a single cohesive responsibility and is subject t
 | `companion/checkpoints.py` | `Domain` | `WorkspaceContext`-bound atomic file backups, full snapshot checkpoints, `snapshot_readonly_tree`/`enforce_readonly_tree` guards, local Git save-points, and post-exec syntax healing | `SPEC-04` |
 | `companion/safety.py` | `Domain` | `ADR-007` path & `.env` read/write confinement, `<5ms` inline post-edit micro-linter (`lint_single_file_edit`), `LoopGuard`, and `run_system_doctor` | `SPEC-04` |
 | `companion/hygiene.py` | `Domain` | Import-qualified AST dead-code & unused-private-method scanner across `companion/`, `surfaces/`, and `configs/`, `<15ms` AST Repo Headroom Map, and symbol slicer | `SPEC-04`, `SPEC-06` |
-| `companion/sdd.py` | `Domain` | 4-File Canonical SDD verifier, PEP 723 `parse_pep723_dependencies` + 3-Tier Skill & JSON Recipe Linter, Wiki provenance guard, and ADR compactor | `SPEC-04` |
+| `companion/sdd.py` | `Domain` | 4-File Canonical SDD verifier, PEP 723 `parse_pep723_dependencies` + 3-Tier Capability Pack & Python DAG Linter, Wiki provenance guard, and ADR compactor | `SPEC-04` |
 | `companion/semantic_memory.py` | `Domain` | Zero-swap morphological stemmer, bidirectional everyday-to-technical concept clusters, sparse cosine similarity, optional float32 vectors, and `hybrid_rrf_rank` | `SPEC-02`, `SPEC-04` |
-| `companion/memory_store.py` | `Domain` | Thread-safe (`RLock`) SQLite persistence for chats, hybrid FTS5 + semantic RRF recall, project-scoped `tasks` & `workflow_runs`, `knowledge_facts`, backlog, ADRs, and hobby journal | `SPEC-02` |
+| `companion/memory_store.py` | `Domain` | Thread-safe (`RLock`) SQLite persistence for chats, hybrid FTS5 + semantic RRF recall, Universal Project & Goal Graph tables (`projects`, `milestones`, `project_timeboxes`, `work_items`), `knowledge_facts`, ADRs (`ADR-001`..`ADR-020`), and `autonomy_journal` | `SPEC-02`, `SPEC-08` |
+| `companion/trigger_policy.py` | `Domain` | Unified `TriggerPolicy` (`manual`, `scheduled`, `on_idle`), overnight wrap-around `allowed_window` + weekday math, 5-field cron/interval evaluator, and `<5ms` zero-token `PRECHECK_REGISTRY` | `SPEC-05`, `SPEC-07` |
+| `companion/project_graph.py` | `Domain` | Domain-blind Universal Project & Goal Graph (`ProjectGraphManager`, `owner` `companion`\|`human`\|`collaborative`, `depends_on` auto-unblocking, DIKW `stage_kind`, `TriggerPolicy` idle Goal eligibility, and Kanban/Sprint/Roadmap projections) | `SPEC-05`, `SPEC-08` |
 | `companion/disciplines.py` | `Domain` | Engineering discipline playbooks, `MODULE_LAYER_MAP`, `ActionRiskTier` (`R0`..`R3`), `WorkspaceContract`, and AST syntax verifier | `SPEC-03`, `SPEC-04` |
 | `companion/grounding.py` | `Domain` | Pluggable `KnowledgePort` (`LocalKnowledgeAdapter` bridged to live `WikiEngine` + external adapter hook), `<10ms` `build_epistemic_grounding`, Top-K skill ranking, and `ExecutionTarget` (`LocalWorkspaceTarget`) | `SPEC-04`, `SPEC-06`, `SPEC-07` |
 | `companion/archive_and_approvals.py` | `Domain` | 3-Tier `TRUST_MODES`, fingerprint-verified `ApprovalQueue`, Hot (`<=90d`) / Cold (`>90d`) Forever-Chat Archive (`conversations_cold` + FTS5 + Hybrid RRF), session-scoped quiet nudges, and `saved_prompts` library | `SPEC-02`, `SPEC-07` |
@@ -64,35 +68,34 @@ Every module in the system has a single cohesive responsibility and is subject t
 | `companion/wiki_curation.py` | `Domain` | Deliberate Multi-Turn Wiki Curation Engine (`inspect_graduation` -> mandatory full-read gate -> `CREATE_NEW`/`MERGE_AND_REFINE`/`SPLIT_MULTI`/`KEEP_SEPARATE` -> `validate_curation_plan` -> `commit_curation_plan`) with Never-Delete `04_archive/` lineage and 1-click `revert_curation` | `SPEC-02`, `SPEC-07` |
 | `companion/wiki_maintenance.py` | `Domain` | Wiki 3.1 Unified & Side-by-Side lineage/approval diffs (`compute_wiki_diff`), governed `alias -> canonical` ontology consolidation (`consolidate_ontology`), `90d/180d/365d` freshness cadences (`verify_note_freshness`, `list_stale_notes`), Obsidian-compatible inline diagrams (`03_resources/assets/`), and 1-click Forever Chat `stage_chat_turn_to_inbox` | `SPEC-02`, `SPEC-07` |
 | `companion/attachments.py` | `Domain` | Multimodal Forever Chat image & document attachment engine (`.png`/`.jpg`/`.webp`/`.gif`, `.pdf`, `.docx`/`.xlsx`/`.pptx`, `.md`/`.csv`/`.json`/code), Vault scrubbing, and `03_resources/` Wiki auto-filing | `SPEC-06`, `SPEC-07` |
-| `companion/agile_boards.py` | `Domain` | Universal Multi-Board Kanban, Master Active Sprint (`all-active-sprint`), auto-deduplicated spanning Epics (`start_date`/`target_date`/`delete_epic`), interactive Card Checklists (`checklist_json`), Weekday/Weekend slot capacity math, dependency guard, Aging Radar, `slice_unblocker_card`, and live `/plan`/`/goal` workflow-to-board sync | `SPEC-08` |
 | `companion/education_engine.py` | `Domain` | Headless Education courses, 4-stage Socratic pedagogy (`priming`..`mastered`), SM-2 spaced repetition (`education_mastery`), Wiki study curation, and fenced `companion-flashcards` Chat decks | `SPEC-08` |
-| `companion/workflow_dag.py` | `Workflow` | Dynamic `GoalPlan` & `GoalStep` DAG, `VerificationSpec` (`evidence_file`, `check_command`, `script_validator`, `assertion`, `human_gate`), `ExecutorBindings`, and JSON recipe runner | `SPEC-03` |
-| `companion/workflow_graph.py` | `Workflow` | Persistent directed-graph state machine (`INTAKE` .. `COMPLETE` + `RECOVER`), phase gates, and recipe facade | `SPEC-03` |
-| `companion/intake.py` | `Application` | Domain-neutral `assess_turn_readiness`, `classify_turn_intent`, uncompromised `select_turn_step_tier` across single/multi-GPU endpoints, and `run_http_smoke_probe` | `SPEC-06` |
-| `companion/skill_forge.py` | `Application` | `check_make_vs_borrow`, transactional `stage_and_promote_skill` (`--self-test` + checkpoint), `run_skill_script`, and `distill_workflow_reflection` | `SPEC-04`, `SPEC-06` |
+| `companion/dag_runtime.py` | `Workflow` | Pure-stdlib code-controlled Python `DAGSpec` runtime (`python_step`, `tool_or_script_step`, `mcp_step`, `bounded_llm_step`, `human_gate`), typed I/O validation, `foreach` fan-out/fan-in joins, retries/timeouts, SQLite `dag_runs`/`dag_node_runs` checkpoints, and mid-DAG `R3`/`human_gate` pause/resume | `SPEC-03` |
+| `companion/workflow_dag.py` | `Workflow` | Dynamic `GoalPlan` & `GoalStep` DAG, pluggable `VerificationSpec` (`evidence_file`, `check_command`, `script_validator`, `domain_validator`, `assertion`, `human_gate`), and `ExecutorBindings` | `SPEC-03` |
+| `companion/workflow_graph.py` | `Workflow` | Persistent directed-graph state machine (`INTAKE` .. `COMPLETE` + `RECOVER`), phase gates, and code-controlled DAG facade | `SPEC-03` |
+| `companion/intake.py` | `Application` | 2-stage Cognitive Triage Gate (`triage_turn`: `DIRECT_TURN`, `EXECUTE_VERIFIED_DAG`, `GOAL_ALIGN_PLAN`, `ADVANCE_ACTIVE_GOAL`), `assess_turn_readiness`, `select_turn_step_tier`, and `run_http_smoke_probe` | `SPEC-06` |
+| `companion/skill_forge.py` | `Application` | `check_make_vs_borrow`, transactional `stage_and_promote_skill` (`scripts/*.py` + `dags/*.py` `dry_run_dag`/`self_test_dag` + checkpoint), `run_skill_script`, and `distill_workflow_reflection` | `SPEC-03`, `SPEC-04`, `SPEC-06` |
 | `companion/compaction.py` | `Application` | `KeyTokens` extractor, lossless phase handoffs, workflow task carry-forward ledger (`format_task_carry_forward`, `classify_task_autoskip`), and spam-free 2-stage conversation compactor | `SPEC-06` |
-| `companion/tool_schemas.py` | `Application` | 26 rich OpenAI tool schemas with per-parameter descriptions and fine-grained `(tool, action)` `PHASE_ALLOWED_TOOLS` gating | `SPEC-06`, `SPEC-07`, `SPEC-08` |
-| `companion/hobbies.py` | `Application` | Two-Lever Operating Architecture (`Hobby Mode` × `Self-Dev Mode`), 2-Track `personal`/`self_dev` hobbies, `WebIdleHobbyWatcher`, and Morning Briefing (`ADR-006`, `ADR-019`) | `SPEC-05` |
-| `companion/background_jobs.py` | `Application` | SQLite-backed `BackgroundJobManager`, crash-interrupt recovery, Zero-Identity Workers under `ModelGate.background_context()`, and `<=200`-token Wiki Inbox overflow marshalling | `SPEC-07` |
-| `companion/endpoints.py` | `Application` | Symbolic-only `EndpointManager` (`ssh`, `winrm`, `http_api`) with JIT Blind Vault injection, SSRF & command safety gates, and remote CPU/RAM/GPU profiling | `SPEC-07` |
-| `companion/mcp_hub.py` | `Application` | Outbound `stdio`/HTTP MCP Client (`tools_fingerprint` approval), token-authenticated Inbound "Order Counter" MCP Server, and Partner-Aware Federation HUD (`[CONNECTED FEDERATED PARTNERS]`) | `SPEC-07` |
-| `companion/routines.py` | `Application` | Hardware-gated `RoutineManager` (cron/interval schedules, downtime missed-run reconciliation, overlap skip) and isolated Clone-Based Self-Development Sandboxes | `SPEC-07` |
-| `companion/calendar_engine.py` | `Application` | Unified Month/Week/Agenda Calendar merging `calendar_events`, active sprints, card `planned_date`/`due_date`, projected `RoutineManager` schedules, and daily due SRS study counts | `SPEC-08` |
-| `companion/core_actions.py` | `Application` | Unified actor-aware `CORE_ACTIONS` registry, `execute_core_action`, and `handle_harvest_slash` shared across CLI, REPL, Web API, and LLM tools | `SPEC-07`, `SPEC-08` |
+| `companion/tool_schemas.py` | `Application` | 25 rich OpenAI tool schemas with per-parameter descriptions and fine-grained `(tool, action)` `PHASE_ALLOWED_TOOLS` gating | `SPEC-06`, `SPEC-07`, `SPEC-08` |
+| `companion/background_jobs.py` | `Application` | SQLite-backed `BackgroundJobManager` (`dag_name`/`dag_params` + Zero-Identity Workers under `ModelGate.background_context()`), crash recovery, and `<=200`-token Wiki Inbox overflow marshalling | `SPEC-07` |
+| `companion/endpoints.py` | `Application` | Symbolic-only `EndpointManager` (`ssh`, `winrm`, `http_api`) with approval-staged `propose_endpoint`, JIT Blind Vault injection, SSRF & command safety gates, and remote CPU/RAM/GPU profiling | `SPEC-07` |
+| `companion/mcp_hub.py` | `Application` | Outbound `stdio`/HTTP MCP Client (`tools_fingerprint` approval, `propose_server`), MCP-to-Capability-Pack Harvester (`harvest_mcp_capability_pack`), Inbound "Order Counter" MCP Server, and Partner-Aware Federation HUD | `SPEC-07` |
+| `companion/routines.py` | `Application` | Unified `TriggerPolicy` `RoutineManager` (`manual`, `scheduled`, `on_idle` with built-in maintenance routines, retiring `hobbies`), `IdleAutonomyWatcher`, Morning Briefing, and Clone-Based Self-Dev Sandboxes | `SPEC-05`, `SPEC-07` |
+| `companion/calendar_engine.py` | `Application` | Unified Month/Week/Agenda Calendar merging `calendar_events`, active timeboxes, work-item `planned_date`/`due_date`, projected `scheduled` routines, and daily due SRS study counts | `SPEC-08` |
+| `companion/core_actions.py` | `Application` | Unified actor-aware `CORE_ACTIONS` registry (including 1-click `endpoint_register`, `register_mcp_server`, and `dag_gate` `resume_dag_run` execution), `execute_core_action`, and `handle_harvest_slash` | `SPEC-03`, `SPEC-07`, `SPEC-08` |
 | `companion/harvest_tools.py` | `Application` | Thin `actor="companion"` tool adapters (`job_manage`, `wiki_manage`, `vault_manage`, `endpoint_manage`, `mcp_manage`, `routine_manage`, `agile_manage`, `calendar_manage`, `education_manage`) | `SPEC-07`, `SPEC-08` |
-| `companion/os_tools.py` | `Application` | Companion OS state, Hot+Cold memory/KnowledgePort, task, workflow/Skill Forge, checkpoint, SDD, hobby, project, telemetry, and doctor tool handlers | `SPEC-06`, `SPEC-07` |
-| `companion/tools.py` | `Application` | 26 `WorkspaceContext`-bound, phase- and `R3`-risk-gated tools with `ExecutionTarget` isolation, AST symbol reading, and inline linting | `SPEC-06`, `SPEC-07`, `SPEC-08` |
-| `companion/context.py` | `Application` | Dynamic System Prompt HUD with `<10ms` Epistemic Grounding, `[CONNECTED FEDERATED PARTNERS]` HUD, Trust Mode, Workspace Radar, and Skill catalog | `SPEC-06`, `SPEC-07` |
-| `companion/agent.py` | `Application` | Executive loop with Step-0 Intent & Tier Router, quiet turn-boundary session nudges, stateful Blueprint Q&A/approval routing, `<think>` scratchpad continuity, and `/slash` handler | `SPEC-06`, `SPEC-07` |
-| `companion/autonomy.py` | `Application` | Multi-phase `GoalPlan` DAG driver (`/goal`, `pause_at_plan`, `/goal resume`, `human_gate`/`R3` mid-run pauses, `WorkspaceContract` verification, `REFLECT` distillation) | `SPEC-03`, `SPEC-06` |
-| `companion/blueprint.py` | `Application` | Interactive `Plan -> Align -> Approve -> Build` Blueprint gate (`create_or_revise_blueprint`, `handle_blueprint_conversation_turn`, `approve_blueprint_and_build`) | `SPEC-03`, `SPEC-06` |
+| `companion/os_tools.py` | `Application` | Companion OS state, Hot+Cold memory/KnowledgePort, task, workflow/DAG/Skill Forge, checkpoint, SDD, project, telemetry, and doctor tool handlers | `SPEC-06`, `SPEC-07` |
+| `companion/tools.py` | `Application` | 25 `WorkspaceContext`-bound, phase- and `R3`-risk-gated tools with `ExecutionTarget` isolation, AST symbol reading, and inline linting | `SPEC-06`, `SPEC-07`, `SPEC-08` |
+| `companion/context.py` | `Application` | Dynamic System Prompt HUD with `<10ms` Epistemic Grounding, Project Graph HUD, `[CONNECTED FEDERATED PARTNERS]` HUD, Trust Mode, Workspace Radar, and Skill catalog | `SPEC-06`, `SPEC-07`, `SPEC-08` |
+| `companion/agent.py` | `Application` | Executive loop with Step-0 Cognitive Triage Gate, quiet turn-boundary session nudges, stateful Blueprint Q&A/approval routing, `<think>` scratchpad continuity, and `/slash` handler | `SPEC-06`, `SPEC-07` |
+| `companion/autonomy.py` | `Application` | Multi-phase `GoalPlan` DAG driver (`/goal`, `run_autonomous_goal_slice` windowed `on_idle` slices, DIKW milestone seeding, `human_gate`/`R3` pauses, `WorkspaceContract` verification, `REFLECT` distillation) | `SPEC-03`, `SPEC-05`, `SPEC-06`, `SPEC-08` |
+| `companion/blueprint.py` | `Application` | Interactive `Plan -> Align -> Approve -> Build` Blueprint gate (`create_or_revise_blueprint`, `handle_blueprint_conversation_turn`, `approve_blueprint_and_build`) synced to `ProjectGraphManager` | `SPEC-03`, `SPEC-06`, `SPEC-08` |
 | `companion/eval_harness.py` | `Application` | Isolated multi-flight live behavioral evaluation suite (`quick`, `full`, `general`, `all`) & head-to-head `coding` model benchmark (`run_live_flight_eval`, `run_coding_model_comparison`) | `SPEC-06` |
-| `harness.py` | `Presentation` | Self-recovering CLI/REPL entry point, `--jobs`/`--wiki`/`--vault`/`--endpoints`/`--mcp`/`--partners`/`--routines` flags, startup routine reconciliation, and Windows idle watcher | `SPEC-05`, `SPEC-06`, `SPEC-07` |
+| `harness.py` | `Presentation` | Self-recovering CLI/REPL entry point, `--autonomy`/`--jobs`/`--wiki`/`--vault`/`--endpoints`/`--mcp`/`--partners`/`--routines` flags, startup routine reconciliation, and `IdleAutonomyWatcher` | `SPEC-05`, `SPEC-06`, `SPEC-07` |
 | `surfaces/web_assets.py` | `Presentation` | Static asset loader (`surfaces/static/index.html`, `styles.css`, `app.js` compiled from `frontend/`), safe `<\/script` escaping, mtime caching, and zero-login CSRF meta-tag injection | `SPEC-06`, `SPEC-07` |
-| `surfaces/api_extensions.py` | `Presentation` | Headless `GET/POST /api/actions` CoreActions adapter, `POST /api/reload` live service reload coordinator (`build_reload_command`, `spawn_companion_reload`), `GET /api/status` Harvest + `session_nudges` enrichments, and Bearer-token `POST /api/mcp` Order Counter adapter | `SPEC-06`, `SPEC-07` |
+| `surfaces/api_extensions.py` | `Presentation` | Headless `GET/POST /api/actions` CoreActions adapter, `POST /api/reload` live service reload coordinator, `GET /api/status` Autonomy + Project Graph enrichments, `IdleAutonomyWatcher` factory, and Bearer-token `POST /api/mcp` Order Counter adapter | `SPEC-05`, `SPEC-06`, `SPEC-07` |
 | `surfaces/web_server.py` | `Presentation` | Stdlib `ThreadingHTTPServer` web server (`127.0.0.1` default + `COMPANION_WEB_TOKEN` non-loopback LAN/Tailscale auth) with `Host`/`Origin`/`Sec-Fetch-Site`/unconditional `X-Companion-CSRF`, live SSE (`GET /api/jobs/<id>/stream`), CoreActions, Hosted MCP, and WAL reads | `SPEC-06`, `SPEC-07` |
 | `surfaces/windows_tray.py` | `Presentation` | Zero-dependency Win32 `ctypes` System Tray controller (`--tray`, including 1-click `Reload Companion`), single-instance `/api/health` detection, user `data/` folder opener, and graceful port-conflict diagnostics | `SPEC-06` |
-| `configs/architecture.py` | `Domain` | Executable A-Frame component registry (49 core components), unregistered-module detector, dependency name validator, and downward layer dependency verifier | `SPEC-01`, `SPEC-03`, `SPEC-07`, `SPEC-08` |
+| `configs/architecture.py` | `Domain` | Executable A-Frame component registry (51 core components), unregistered-module detector, dependency name validator, and downward layer dependency verifier | `SPEC-01`, `SPEC-03`, `SPEC-07`, `SPEC-08` |
 | `memory/chat_memory.py` | `Domain` | Backward-compatible `ChatMemory` facade over `companion/memory_store.py` | `SPEC-02` |
 
 ---

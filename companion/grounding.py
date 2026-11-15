@@ -261,7 +261,7 @@ def discover_skills(root: Optional[Path] = None) -> List[Dict[str, str]]:
     if not skill_map:
         return []
     skill_mds = [skill_map[k] for k in sorted(skill_map)]
-    tier3_assets = [a for smd in skill_mds for a in (*smd.parent.glob("scripts/*.py"), *smd.parent.glob("workflows/*.json"), *smd.parent.glob("references/*.md"))]
+    tier3_assets = [a for smd in skill_mds for a in (*smd.parent.glob("scripts/*.py"), *smd.parent.glob("dags/*.py"), *smd.parent.glob("references/*.md"))]
     max_ns = max((int(p.stat().st_mtime_ns) for p in (*skill_mds, *tier3_assets)), default=0)
     ck = (f"{target_root}::{dirs[-1]}", len(skill_mds), len(tier3_assets), max_ns)
     if ck in _SKILLS_CACHE:
@@ -274,14 +274,14 @@ def discover_skills(root: Optional[Path] = None) -> List[Dict[str, str]]:
             continue
         sdir = skill_md.parent
         refs = [p.name for p in sorted((sdir / "references").glob("*.md"))] if (sdir / "references").is_dir() else []
-        wfs = [p.name for p in sorted((sdir / "workflows").glob("*.json"))] if (sdir / "workflows").is_dir() else []
+        dags = [p.name for p in sorted((sdir / "dags").glob("*.py"))] if (sdir / "dags").is_dir() else []
         scripts = [p.name for p in sorted((sdir / "scripts").glob("*.py"))] if (sdir / "scripts").is_dir() else []
         rel_p = str(skill_md.relative_to(target_root)).replace("\\", "/") if skill_md.is_relative_to(target_root) else str(skill_md)
         scope = "core" if sdir.parent.resolve() == (target_root / "skills").resolve() else "user"
         meta: Dict[str, str] = {
             "name": sdir.name, "description": "Operational runbook skill.", "required_tools": "",
             "path": rel_p, "scope": scope, "references": ", ".join(refs),
-            "workflows": ", ".join(wfs), "scripts": ", ".join(scripts),
+            "dags": ", ".join(dags), "scripts": ", ".join(scripts),
         }
         if text.startswith("---\n"):
             end_idx = text.find("\n---\n", 4)
@@ -306,7 +306,7 @@ def rank_relevant_skills(query: str, skills: List[Dict[str, str]], top_k: int = 
         return skills[:top_k]
     scored: List[Tuple[int, str, Dict[str, str]]] = []
     for s in skills:
-        hay = f"{s.get('name', '')} {s.get('description', '')} {s.get('workflows', '')} {s.get('scripts', '')}".lower()
+        hay = f"{s.get('name', '')} {s.get('description', '')} {s.get('dags', '')} {s.get('scripts', '')}".lower()
         hits = sum(2 if tok in s.get("name", "").lower() else (1 if tok in hay else 0) for tok in tokens)
         if hits > 0:
             scored.append((hits, s.get("name", ""), s))

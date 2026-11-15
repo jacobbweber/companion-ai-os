@@ -86,8 +86,11 @@ def tool_mcp_manage(args: Dict[str, Any]) -> str:
 
 
 def tool_routine_manage(args: Dict[str, Any]) -> str:
-    """Manage Respectful Routines, isolated self-dev sandbox clones, saved prompt templates, and pending approvals."""
+    """Manage Unified `TriggerPolicy` Routines, Background Autonomy, isolated self-dev sandbox clones, saved prompts, and pending approvals."""
     sub = str(args.get("action") or "list").strip().lower()
+    if sub in ("autonomy_status", "autonomy_on", "autonomy_off", "morning"):
+        auto_sub = sub.removeprefix("autonomy_")
+        return _format_tool_result(execute_core_action("autonomy", _clean_agent_params(args, auto_sub), actor="companion"))
     if sub.startswith("sandbox_"):
         return _format_tool_result(execute_core_action("sandbox", _clean_agent_params(args, sub.removeprefix("sandbox_")), actor="companion"))
     if sub.startswith("prompt_"):

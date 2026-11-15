@@ -15,7 +15,7 @@ Use this runbook whenever:
 
 ## The OODA Loop Architecture (`fast` + `reasoning`)
 Never guess or blindly retry a failing edit or command. Execute the four stages of Boyd's **OODA Loop** in strict order, pairing deterministic evidence collection (`tier="fast"`) with root-cause orientation (`tier="reasoning"`):
-- **Automated Recipe**: Run `skills/ooda-troubleshooting/workflows/ooda-diagnose.json` via `workflow_manage(action="run_recipe", recipe="ooda-diagnose", params={"issue": "..."})`.
+- **Automated Python DAG**: Run `skills/ooda-troubleshooting/dags/ooda_diagnose.py` via `workflow_manage(action="run_dag", dag="ooda-diagnose", params={"issue": "..."})`.
 
 ## Step-by-Step Procedure
 1. **OBSERVE (`tier="fast"` — Gather Raw Evidence, Zero Guessing)**:

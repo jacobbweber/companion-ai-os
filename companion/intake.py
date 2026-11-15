@@ -1,15 +1,16 @@
 """
-Readiness-Aware Intake, Uncompromised Model Tier Router & HTTP Smoke Probe
+Cognitive Triage Gate, Uncompromised Model Tier Router & HTTP Smoke Probe
 (`companion/intake.py` — A-Frame Application Layer).
 
-Provides:
-1. Domain-neutral `assess_turn_readiness` & `classify_turn_intent` (`CHAT_DIRECT`,
-   `DEEP_CONSULT`, `GUIDED_CHANGE`, `AUTONOMOUS_BUILD`) without domain-specific hardcoding.
-2. Uncompromised `select_turn_step_tier`: routes `DEEP_CONSULT`, `DESIGN`, `PLAN`, `RECOVER`,
-   and `consecutive_errors >= 2` to `reasoning` on BOTH multi-endpoint and single-endpoint
-   hardware, while keeping escalated `reasoning` sticky within a turn on shared endpoints
-   to prevent mid-turn model-swap ping-ponging.
-3. Ephemeral stdlib `run_http_smoke_probe` for clean zero-zombie endpoint verification.
+Replaces brittle keyword-spotting regexes with a 2-stage Cognitive Triage Gate:
+1. `<5ms` Deterministic Grounding, Blast-Radius (`R0..R3`), Verified Python `DAGSpec` Matching,
+   and Active Project & Goal Graph Readiness Scan.
+2. Schema-constrained JSON Cognitive Triage (when an optional fast triage model callable is bound)
+   paired with a deterministic structural classifier routing across:
+   - `DIRECT_TURN` (`CHAT_DIRECT`, `GUIDED_CHANGE`, `DEEP_CONSULT`)
+   - `EXECUTE_VERIFIED_DAG` (`matched_dag` bound to a verified `skills/*/dags/*.py` graph)
+   - `GOAL_ALIGN_PLAN` (`DISCOVER -> DESIGN -> PLAN` Blueprint or autonomous build)
+   - `ADVANCE_ACTIVE_GOAL` (next ready `companion`/`collaborative` slice on `ProjectGraphManager`)
 """
 
 import contextlib
@@ -21,12 +22,14 @@ import threading
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.config import settings
+from companion.dag_runtime import discover_dags
 from companion.disciplines import ActionRiskTier, classify_action_risk
 from companion.grounding import EpistemicGrounding, build_epistemic_grounding
 from companion.memory_store import MemoryStore, has_memory_store_override
+from companion.project_graph import get_project_graph
 from companion.streaming import get_active_wire_images
 from companion.telemetry import telemetry
 
@@ -34,12 +37,23 @@ __all__ = [
     "IntentDecision",
     "PHASE_TIERS",
     "ReadinessAssessment",
+    "TRIAGE_ROUTES",
+    "TriageDecision",
     "assess_turn_readiness",
     "classify_turn_intent",
+    "match_verified_dag",
     "resolve_workflow_phase_tier",
     "run_http_smoke_probe",
     "select_turn_step_tier",
+    "triage_turn",
 ]
+
+TRIAGE_ROUTES: Tuple[str, ...] = (
+    "DIRECT_TURN",
+    "EXECUTE_VERIFIED_DAG",
+    "GOAL_ALIGN_PLAN",
+    "ADVANCE_ACTIVE_GOAL",
+)
 
 PHASE_TIERS: Dict[str, str] = {
     "INTAKE": "fast",
@@ -52,74 +66,42 @@ PHASE_TIERS: Dict[str, str] = {
     "REFLECT": "fast",
 }
 
-_CONSULT_CUE_RE = re.compile(
-    r"\b(?:360\s+(?:architecture|review|audit)|architecture\s+review|design\s+review|compare\s+tradeoffs|"
-    r"trade-?offs?\s+between|evaluate\s+the\s+core|root-?cause\s+analysis|strategic\s+options|"
-    r"what\s+is\s+fundamentally\s+missing|pros\s+and\s+cons|design\s+a\s+strategy|how\s+should\s+we\s+architect|"
-    r"evaluate\s+options|open-?ended\s+design)\b",
+_ARTIFACT_PATH_RE = re.compile(
+    r"\b[a-zA-Z0-9_./-]+\.(?:py|json|toml|md|ya?ml|html?|js|ts|css|sql|sh|ps1)\b",
     re.I,
 )
-_CONSULT_GUARD_RE = re.compile(
-    r"^\s*(?:can\s+you\s+review|before\s+we\s+do\s+that|what\s+do\s+you\s+think|explain\s+why|how\s+does|help\s+me\s+think)\b",
-    re.I,
-)
-_BUILD_VERB_RE = re.compile(
-    r"\b(?:build|create|implement|develop|wire\s+up|architect\s+and\s+build|upgrade\s+all|automate|assemble|author|scaffold)\b",
-    re.I,
-)
-_MULTI_SCOPE_RE = re.compile(
-    r"\b(?:end-to-end|full-?stack|web\s+(?:ui|front\s*-?\s*end|interface|dashboard|server)|"
-    r"unit\s+tests?\s+and\s+specs?|all\s+\d+\s+upgrades|multi-?phase|rest\s+api|complete\s+application|"
-    r"multi-?step\s+(?:pipeline|workflow|system)|with\s+verification\s+and\s+tests|reusable\s+skill\s+pack|"
-    r"across\s+multiple\s+(?:files|modules)|from\s+scratch\s+with\s+tests|plus\s+automated\s+tests)\b",
-    re.I,
-)
-_EXPLICIT_FILE_DELIVERABLE_RE = re.compile(
-    r"\b[a-zA-Z0-9_./-]+\.(?:py|json|toml|md|ya?ml|html?|js|ts|css|sql)\b",
-    re.I,
-)
-_GUIDED_EDIT_RE = re.compile(
-    r"\b(?:edit|fix|patch|update|refactor|rename|configure|generate|validate|add\s+a\s+(?:helper|function|test|method|script|check))\b",
-    re.I,
-)
-_AMBIGUITY_CUE_RE = re.compile(
-    r"\b(?:not\s+sure\s+(?:how|what|which)|whatever\s+you\s+think|figure\s+out\s+what\s+we\s+need|"
-    r"ask\s+me\s+questions\s+first|align\s+with\s+me\s+first|help\s+me\s+scope)\b",
-    re.I,
-)
-_HIGH_BLAST_CUE_RE = re.compile(
-    r"\b(?:production\s+cutover|migrate\s+live|push\s+to\s+remote|overwrite\s+external|delete\s+all\s+records|deploy\s+live)\b",
-    re.I,
-)
-_PERSONAL_COACH_RE = re.compile(
-    r"\b(?:flashcards?|quiz\s+me|tutor(?:\s+me)?|teach\s+me|study\s+(?:course|plan|guide|session|notes?)|"
-    r"syllabus|spaced\s+repetition|active\s+recall|(?:my|our)\s+(?:sprint|week|calendar|backlog|boards?|epics?|roadmap|chores?)|"
-    r"my\s+(?:personal\s+)?goals?|long[- ]running\s+goals?|"
-    r"weekly\s+sprint|slice\s+an?\s+unblocker|unblocker|procrastinat\w*|appointment)\b",
-    re.I,
-)
-_CODE_DELIVERABLE_CUE_RE = re.compile(
-    r"\b(?:unit\s+tests?|specs?|rest\s+api|web\s+(?:ui|front\s*-?\s*end|interface|dashboard|server)|full-?stack)\b",
-    re.I,
-)
-_ARTIFACT_EXT_RE = re.compile(r"\.(?:py|json|toml|md|ya?ml|html?|js|ts|css|sql|sh|ps1|bat|txt|csv|ini|cfg|conf|xml)$", re.I)
+_NUMBERED_SPEC_RE = re.compile(r"(?:^|\n)\s*(?:\d+[.)]|[-*])\s+\S+", re.M)
 _GENERIC_TECH_TERMS = frozenset({
     "adr", "api", "ast", "back-end", "cli", "command-line", "cross-project", "css", "csv", "dag",
     "domain-neutral", "end-to-end", "front-end", "full-stack", "html", "http", "https", "in-memory",
-    "json", "key-value", "multi-phase", "multi-step", "open-ended", "read-only", "real-time", "rest",
-    "sdd", "self-test", "single-file", "sql", "sqlite", "state-machine", "toml", "url", "utf", "utf-8",
-    "xml", "yaml", "zero-dependency",
+    "json", "key-value", "mcp", "multi-phase", "multi-step", "open-ended", "read-only", "real-time",
+    "rest", "sdd", "self-test", "single-file", "sql", "sqlite", "state-machine", "toml", "url",
+    "utf", "utf-8", "xml", "yaml", "zero-dependency",
 })
+
+_DESTRUCTIVE_VERBS = frozenset({"cutover", "migrate", "overwrite", "wipe", "destroy", "drop", "purge"})
+_PRODUCTION_NOUNS = frozenset({"production", "prod", "live", "remote", "cluster", "database"})
+_MUTATION_VERBS = frozenset({
+    "build", "create", "implement", "develop", "refactor", "rewrite", "edit", "fix",
+    "patch", "update", "generate", "scaffold", "wire", "automate", "assemble", "author",
+    "configure", "setup", "deploy", "install", "sync",
+})
+_ADVANCE_VERBS = frozenset({"advance", "continue", "proceed", "resume", "tackle"})
+_GOAL_NOUNS = frozenset({"goal", "slice", "milestone", "project", "work"})
+
+
+def _tokenize_words(text: str) -> List[str]:
+    return [w.lower() for w in re.findall(r"[A-Za-z0-9_-]+", text or "")]
 
 
 def _filter_external_unknown_targets(clean_text: str, raw_unknowns: List[str]) -> Tuple[str, ...]:
-    """Retain genuine unverified system/component identifiers while ignoring new artifact filenames and plain prose."""
+    """Retain genuine unverified system/component identifiers while ignoring artifact filenames and prose."""
     first_word = clean_text.split()[0].strip(".,:;!?()[]{}\"'") if clean_text.split() else ""
     filtered: List[str] = []
     for tok in raw_unknowns:
         norm = tok.strip(".,:;!?()[]{}\"'")
         low = norm.lower().strip("./-")
-        if not low or low in _GENERIC_TECH_TERMS or _ARTIFACT_EXT_RE.search(norm):
+        if not low or low in _GENERIC_TECH_TERMS or "." in norm and _ARTIFACT_PATH_RE.search(norm):
             continue
         has_internal_cap_or_digit = any(c.isupper() for c in norm[1:]) or any(c.isdigit() for c in norm)
         has_struct_sep = any(ch in norm for ch in ("_", "/", ".")) or ("-" in norm and low not in _GENERIC_TECH_TERMS)
@@ -131,7 +113,7 @@ def _filter_external_unknown_targets(clean_text: str, raw_unknowns: List[str]) -
 
 @dataclass(frozen=True)
 class ReadinessAssessment:
-    """Pre-execution readiness & blast-radius evaluation for an incoming user objective."""
+    """Deterministic `<5ms` blast-radius and epistemic grounding evaluation."""
 
     status: str
     reasons: Tuple[str, ...] = ()
@@ -140,8 +122,8 @@ class ReadinessAssessment:
 
 
 @dataclass(frozen=True)
-class IntentDecision:
-    """Step-0 deterministic turn intent and readiness classification result."""
+class TriageDecision:
+    """Cognitive Triage decision unifying `route` (`TRIAGE_ROUTES`) with turn `mode` and tier metadata."""
 
     mode: str
     suggested_tier: str
@@ -149,6 +131,30 @@ class IntentDecision:
     readiness: str = "READY"
     ambiguity_notes: Tuple[str, ...] = ()
     needs_blueprint: bool = False
+    route: str = "DIRECT_TURN"
+    matched_dag: str = ""
+    target_project_id: str = ""
+    risk_tier: str = "R0"
+
+
+IntentDecision = TriageDecision
+
+
+def match_verified_dag(user_text: str, root: Optional[Path] = None) -> str:
+    """Return a verified Python `DAGSpec` name when `user_text` explicitly requests running that DAG."""
+    clean = (user_text or "").strip().lower()
+    if not clean or clean.endswith("?"):
+        return ""
+    tokens = set(_tokenize_words(clean))
+    run_cues = {"run", "execute", "trigger", "invoke", "launch", "audit", "verify", "diagnose", "check"}
+    if not (tokens & run_cues):
+        return ""
+    for d in discover_dags(root=root):
+        name = str(d.get("name") or "").lower()
+        alt = name.replace("-", " ")
+        if name and (f"dag {name}" in clean or f"`{name}`" in clean or (len(name) >= 6 and (name in tokens or alt in clean) and "dag" in tokens)):
+            return str(d["name"])
+    return ""
 
 
 def assess_turn_readiness(
@@ -157,23 +163,36 @@ def assess_turn_readiness(
     store: Optional[Any] = None,
     root: Optional[Any] = None,
 ) -> ReadinessAssessment:
-    """Evaluate whether a prompt is ready for direct execution or warrants alignment/reasoning first."""
+    """Evaluate `<5ms` blast-radius (`R0..R3`) and epistemic grounding before routing a turn."""
     clean = (user_text or "").strip()
     if not clean or clean.startswith(("/", ".")):
         return ReadinessAssessment("READY")
+
     eff_grounding = grounding or (build_epistemic_grounding(clean, store=store, root=root) if (store is not None or root is not None) else None)
+    words = set(_tokenize_words(clean))
     reasons: List[str] = []
-    risk = ActionRiskTier.R1_LOCAL_REVERSIBLE if (_BUILD_VERB_RE.search(clean) or _GUIDED_EDIT_RE.search(clean)) else ActionRiskTier.R0_READ_ONLY
-    if _HIGH_BLAST_CUE_RE.search(clean) or classify_action_risk("run_shell", {"command": clean}) == ActionRiskTier.R3_HIGH_IMPACT_MUTATION:
+    has_mutation = bool(words & _MUTATION_VERBS)
+    risk = ActionRiskTier.R1_LOCAL_REVERSIBLE if has_mutation else ActionRiskTier.R0_READ_ONLY
+
+    high_blast = bool((words & _DESTRUCTIVE_VERBS) and (words & _PRODUCTION_NOUNS))
+    if high_blast or classify_action_risk("run_shell", {"command": clean}) == ActionRiskTier.R3_HIGH_IMPACT_MUTATION:
         risk = ActionRiskTier.R3_HIGH_IMPACT_MUTATION
-        reasons.append("high-impact external/stateful operation detected (`R3`)")
-    if _AMBIGUITY_CUE_RE.search(clean):
-        reasons.append("explicit alignment or scoping request detected")
+        reasons.append("high-impact stateful or external operation detected (`R3`)")
+
+    low = clean.lower()
+    if any(p in low for p in ("align with me first", "ask me questions first", "help me scope", "not sure how", "not sure which", "before we build")):
+        reasons.append("explicit alignment or scoping request")
+
     unknowns = _filter_external_unknown_targets(clean, list(eff_grounding.unknown_terms)) if eff_grounding else ()
-    if len(unknowns) >= 2 and (_BUILD_VERB_RE.search(clean) or _GUIDED_EDIT_RE.search(clean)):
-        reasons.append(f"multiple unverified domain targets ({', '.join(unknowns[:3])})")
-    status = "NEEDS_ALIGNMENT" if reasons else "READY"
-    return ReadinessAssessment(status=status, reasons=tuple(reasons), unknown_terms=unknowns, risk_tier=risk)
+    if len(unknowns) >= 2 and has_mutation:
+        reasons.append(f"multiple unverified external targets ({', '.join(unknowns[:3])})")
+
+    return ReadinessAssessment(
+        status="NEEDS_ALIGNMENT" if reasons else "READY",
+        reasons=tuple(reasons),
+        unknown_terms=unknowns,
+        risk_tier=risk,
+    )
 
 
 def _resolve_active_media_tier() -> Optional[str]:
@@ -184,50 +203,114 @@ def _resolve_active_media_tier() -> Optional[str]:
     return slot if settings.resolve_tier(slot).is_dedicated else "reasoning"
 
 
+def _parse_llm_triage_json(raw: Dict[str, Any], valid_dags: List[str]) -> Optional[Dict[str, Any]]:
+    """Validate structured JSON output from an optional fast Cognitive Triage callable."""
+    route = str(raw.get("route") or "").strip().upper()
+    if route not in TRIAGE_ROUTES:
+        return None
+    dag = str(raw.get("matched_dag") or "").strip()
+    if route == "EXECUTE_VERIFIED_DAG" and dag not in valid_dags:
+        return None
+    tier = str(raw.get("tier") or "fast").strip().lower()
+    if tier not in ("fast", "coding", "reasoning"):
+        tier = "fast"
+    return {
+        "route": route,
+        "tier": tier,
+        "needs_blueprint": bool(raw.get("needs_blueprint", False)),
+        "matched_dag": dag,
+        "reason": str(raw.get("reason") or "structured cognitive triage")[:160],
+    }
+
+
+def _triage_via_llm(
+    clean: str, readiness: ReadinessAssessment, risk_code: str, eff_root: Path,
+    triage_llm_fn: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+) -> Optional[TriageDecision]:
+    dags = [str(d["name"]) for d in discover_dags(root=eff_root)]
+    ctx_payload = {"risk_tier": risk_code, "readiness": readiness.status, "reasons": list(readiness.reasons), "available_dags": dags}
+    try:
+        parsed = _parse_llm_triage_json(triage_llm_fn(clean, ctx_payload), dags)
+    except Exception:
+        return None
+    if parsed is None:
+        return None
+    rt = parsed["route"]
+    needs_bp = parsed["needs_blueprint"] or readiness.risk_tier == ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+    mode_map = {
+        "DIRECT_TURN": "DEEP_CONSULT" if parsed["tier"] == "reasoning" else "CHAT_DIRECT",
+        "EXECUTE_VERIFIED_DAG": "GUIDED_CHANGE",
+        "GOAL_ALIGN_PLAN": "DEEP_CONSULT" if needs_bp else "AUTONOMOUS_BUILD",
+        "ADVANCE_ACTIVE_GOAL": "GUIDED_CHANGE",
+    }
+    return TriageDecision(
+        mode=mode_map[rt], suggested_tier="reasoning" if needs_bp else parsed["tier"],
+        reason=parsed["reason"], readiness=readiness.status, ambiguity_notes=readiness.reasons,
+        needs_blueprint=needs_bp and rt == "GOAL_ALIGN_PLAN", route=rt, matched_dag=parsed["matched_dag"], risk_tier=risk_code,
+    )
+
+
+def triage_turn(
+    user_text: str, grounding: Optional[EpistemicGrounding] = None, store: Optional[Any] = None,
+    root: Optional[Any] = None, triage_llm_fn: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+) -> TriageDecision:
+    """Run the 2-stage Cognitive Triage Gate (`<5ms` grounding + optional JSON triage / structural classifier)."""
+    clean = (user_text or "").strip()
+    if not clean or clean.startswith(("/", ".", "[AUTONOMOUS WORKFLOW PHASE:", "[ISOLATED SUBAGENT WORKER TASK]")):
+        return TriageDecision("CHAT_DIRECT", "fast", "slash or internal system framing", route="DIRECT_TURN")
+    m_tier = _resolve_active_media_tier()
+    if m_tier:
+        return TriageDecision("CHAT_DIRECT", m_tier, f"multimodal {m_tier} attachment turn", route="DIRECT_TURN")
+
+    eff_root = Path(root).resolve() if root else settings.active_project_root
+    readiness = assess_turn_readiness(clean, grounding=grounding, store=store, root=eff_root)
+    risk_code = readiness.risk_tier.name.split("_", 1)[0]
+
+    dag_hit = match_verified_dag(clean, root=eff_root)
+    if dag_hit and readiness.risk_tier != ActionRiskTier.R3_HIGH_IMPACT_MUTATION:
+        return TriageDecision("GUIDED_CHANGE", "fast", f"matched verified Python DAG `{dag_hit}`", readiness.status, readiness.reasons, route="EXECUTE_VERIFIED_DAG", matched_dag=dag_hit, risk_tier=risk_code)
+
+    words_list = _tokenize_words(clean)
+    word_set = set(words_list)
+    if store is not None and (word_set & _ADVANCE_VERBS) and (word_set & _GOAL_NOUNS) and len(words_list) <= 14:
+        ready_items = get_project_graph(store).next_ready_companion_items(limit=1)
+        if ready_items:
+            pid = str(ready_items[0]["project_id"])
+            return TriageDecision("GUIDED_CHANGE", "fast", f"advance ready work item `{ready_items[0]['item_id']}` in `{pid}`", "READY", route="ADVANCE_ACTIVE_GOAL", target_project_id=pid, risk_tier=risk_code)
+
+    if triage_llm_fn is not None:
+        llm_dec = _triage_via_llm(clean, readiness, risk_code, eff_root, triage_llm_fn)
+        if llm_dec is not None:
+            return llm_dec
+
+    has_mutation = bool(word_set & _MUTATION_VERBS)
+    consult_cues = {"architecture", "tradeoffs", "tradeoff", "design", "strategy", "compare", "evaluate", "root"}
+    is_question = clean.endswith("?") or (bool(words_list) and words_list[0] in {"why", "how", "what", "compare", "explain", "evaluate"})
+    artifact_refs = {m.lower() for m in _ARTIFACT_PATH_RE.findall(clean)}
+    multi_deliverable = len(artifact_refs) >= 3 or len(_NUMBERED_SPEC_RE.findall(clean)) >= 3 or ("end-to-end" in clean.lower() and bool({"test", "tests"} & word_set) and has_mutation)
+
+    if readiness.status == "NEEDS_ALIGNMENT" and (readiness.risk_tier == ActionRiskTier.R3_HIGH_IMPACT_MUTATION or has_mutation):
+        return TriageDecision("DEEP_CONSULT", "reasoning", "high-impact or underspecified goal routed to Blueprint alignment", readiness.status, readiness.reasons, needs_blueprint=True, route="GOAL_ALIGN_PLAN", risk_tier=risk_code)
+    if (is_question or (not has_mutation and bool(word_set & consult_cues))) and not multi_deliverable:
+        is_deep = len(words_list) >= 14 or bool(word_set & consult_cues)
+        return TriageDecision("DEEP_CONSULT" if is_deep else "CHAT_DIRECT", "reasoning" if is_deep else "fast", "analytical consultation" if is_deep else "direct question", readiness.status, readiness.reasons, route="DIRECT_TURN", risk_tier=risk_code)
+
+    tier_hint = "reasoning" if readiness.status == "NEEDS_ALIGNMENT" else "fast"
+    if has_mutation and multi_deliverable and len(words_list) >= 8:
+        return TriageDecision("AUTONOMOUS_BUILD", tier_hint, "multi-deliverable objective routed to goal execution", readiness.status, readiness.reasons, route="GOAL_ALIGN_PLAN", risk_tier=risk_code)
+    if has_mutation and len(words_list) >= 4:
+        return TriageDecision("GUIDED_CHANGE", tier_hint, "scoped single-objective task", readiness.status, readiness.reasons, route="DIRECT_TURN", risk_tier=risk_code)
+    return TriageDecision("CHAT_DIRECT", tier_hint, "conversational turn", readiness.status, readiness.reasons, route="DIRECT_TURN", risk_tier=risk_code)
+
+
 def classify_turn_intent(
     user_text: str,
     grounding: Optional[EpistemicGrounding] = None,
     store: Optional[Any] = None,
     root: Optional[Any] = None,
-) -> IntentDecision:
-    """Classify an incoming user prompt into `CHAT_DIRECT`, `DEEP_CONSULT`, `GUIDED_CHANGE`, or `AUTONOMOUS_BUILD`."""
-    clean = (user_text or "").strip()
-    words = clean.split()
-    if not clean or clean.startswith(("/", ".", "[AUTONOMOUS WORKFLOW PHASE:", "[ISOLATED SUBAGENT WORKER TASK]")):
-        return IntentDecision("CHAT_DIRECT", "fast", "slash or internal system framing")
-    m_tier = _resolve_active_media_tier()
-    if m_tier:
-        return IntentDecision("CHAT_DIRECT", m_tier, f"multimodal {m_tier} attachment turn")
-
-    readiness = assess_turn_readiness(clean, grounding=grounding, store=store, root=root)
-    has_consult = bool(_CONSULT_CUE_RE.search(clean))
-    has_consult_guard = bool(_CONSULT_GUARD_RE.search(clean))
-    has_build_verb = bool(_BUILD_VERB_RE.search(clean))
-    has_action_verb = bool(has_build_verb or _GUIDED_EDIT_RE.search(clean))
-    distinct_files = {m.lower() for m in _EXPLICIT_FILE_DELIVERABLE_RE.findall(clean)}
-    has_multi_scope = bool(_MULTI_SCOPE_RE.search(clean) or (has_build_verb and len(distinct_files) >= 3))
-    is_personal_coach = bool(_PERSONAL_COACH_RE.search(clean) and not distinct_files and not _CODE_DELIVERABLE_CUE_RE.search(clean))
-    if is_personal_coach and readiness.risk_tier != ActionRiskTier.R3_HIGH_IMPACT_MUTATION:
-        coach_tier = "reasoning" if (_AMBIGUITY_CUE_RE.search(clean) or has_consult) else "fast"
-        return IntentDecision("GUIDED_CHANGE", coach_tier, "conversational agile, calendar, or education coaching turn", "READY", ())
-
-    if readiness.status == "NEEDS_ALIGNMENT" and (_AMBIGUITY_CUE_RE.search(clean) or readiness.risk_tier == ActionRiskTier.R3_HIGH_IMPACT_MUTATION):
-        return IntentDecision(
-            "DEEP_CONSULT",
-            "reasoning",
-            "underspecified or high-impact goal requiring reasoning alignment",
-            readiness.status,
-            readiness.reasons,
-            needs_blueprint=has_action_verb,
-        )
-    if has_consult and (has_consult_guard or not has_multi_scope):
-        return IntentDecision("DEEP_CONSULT", "reasoning", "architectural review or multi-option tradeoff consultation", readiness.status, readiness.reasons)
-    tier_hint = "reasoning" if readiness.status == "NEEDS_ALIGNMENT" else "fast"
-    if has_build_verb and has_multi_scope and not has_consult_guard and (len(words) >= 8 or len(distinct_files) >= 3):
-        return IntentDecision("AUTONOMOUS_BUILD", tier_hint, "multi-deliverable end-to-end objective", readiness.status, readiness.reasons)
-    if has_action_verb and len(words) >= 4:
-        return IntentDecision("GUIDED_CHANGE", tier_hint, "scoped modification, validation, or capability task", readiness.status, readiness.reasons)
-    return IntentDecision("CHAT_DIRECT", tier_hint, "conversational turn or quick status query", readiness.status, readiness.reasons)
+) -> TriageDecision:
+    """Classify turn intent via the Cognitive Triage Gate (`triage_turn`)."""
+    return triage_turn(user_text, grounding=grounding, store=store, root=root)
 
 
 def resolve_workflow_phase_tier(state: Optional[str]) -> str:
@@ -306,7 +389,7 @@ def run_http_smoke_probe(
             clean_ep = ep if ep.startswith("/") else f"/{ep}"
             url = f"http://127.0.0.1:{port}{clean_ep}"
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "companion-smoke-probe/2.3"})
+                req = urllib.request.Request(url, headers={"User-Agent": "companion-smoke-probe/3.5"})
                 with direct_opener.open(req, timeout=timeout) as resp:
                     body = resp.read().decode("utf-8", errors="replace")
                     code = int(resp.status)

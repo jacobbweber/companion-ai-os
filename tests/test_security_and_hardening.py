@@ -23,7 +23,6 @@ from companion.llm_wire import urlopen_safe
 from companion.memory_store import MemoryStore
 from companion.safety import LoopGuard, check_command_safety, check_path_safety
 from companion.vault import VaultManager, restore_snapshot_backup
-from companion.workflow_graph import workflow_engine
 from surfaces.web_server import (
     create_web_server,
     dispatch_raw_http,
@@ -275,15 +274,14 @@ class TestSecurityAndHardening(unittest.TestCase):
         self.assertFalse(self.store.conn.in_transaction)
 
         jm = BackgroundJobManager(store=self.store)
-        with patch.object(
-            workflow_engine,
-            "run_workflow_recipe",
-            return_value={"status": "ABORTED", "valid": False, "summary": "gate failed"},
+        with patch(
+            "companion.dag_runtime.execute_dag_by_name",
+            return_value={"ok": False, "status": "failed", "error": "gate failed"},
         ):
             dispatched = jm.dispatch_job(
                 goal="check release",
-                title="Failing Recipe Check",
-                kind="recipe",
+                title="Failing DAG Check",
+                kind="dag",
                 recipe_name="release-check",
                 run_in_background=False,
             )

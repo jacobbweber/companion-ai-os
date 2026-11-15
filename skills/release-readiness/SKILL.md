@@ -30,5 +30,5 @@ Use this runbook when you need to confirm that a Companion release is ready to b
    - If any check fails, list the specific failures and recommend remediation steps.
 
 5. **Optional: Automated Recipe or Commit & Tag**  
-   - You can execute steps 1–3 deterministically in a single zero-token DAG using the bundled workflow recipe `workflows/release-check.json` (`workflow_manage(action="run_recipe", recipe="release-check")`).  
+   - You can execute steps 1–3 deterministically in a single zero-token Python DAG using `dags/release_check.py` (`workflow_manage(action="run_dag", dag="release-check")`).  
    - When all checks pass, you may safely `git add .gitignore` and `git commit -m "Release readiness checks"` followed by `git tag -a vX.Y.Z -m "Release X.Y.Z readiness verified"`.

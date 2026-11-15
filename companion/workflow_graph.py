@@ -1,9 +1,9 @@
 """
-Deterministic State-Machine Graph Engine (A-Frame Crossbar Layer).
+Deterministic State-Machine Graph Engine (`companion/workflow_graph.py` — Crossbar Layer).
 
 Guarantees structured, Spec-Driven execution across Product Analysis, Discovery,
 Architecture, Planning, Implementation, Verification, Recovery, and Reflection,
-delegating recipe & dynamic `GoalPlan` DAG execution to `companion/workflow_dag.py`.
+delegating code-controlled Python `DAGSpec` discovery and execution to `companion/dag_runtime.py`.
 
 Graph Topology:
   [INTAKE] -> [DISCOVER] -> [DESIGN] -> [PLAN] -> [IMPLEMENT] -> [VERIFY] -> [REFLECT] -> [COMPLETE]
@@ -19,16 +19,16 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.config import settings
+from companion.dag_runtime import (
+    DAGRuntimeBindings,
+    discover_dags,
+    execute_dag_by_name,
+    register_dag_runtime_bindings,
+)
 from companion.disciplines import DISCIPLINES, DisciplineSpec, verify_repository_syntax
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.safety import CheckpointManager, get_active_checkpoint_manager, run_unit_tests
-from companion.workflow_dag import (
-    ExecutorBindings,
-    discover_workflow_recipes as _discover_recipes,
-    execute_workflow_recipe,
-    format_recipes_catalog as _format_catalog,
-    is_node_output_passed as _is_node_output_passed,
-)
+from companion.workflow_dag import ExecutorBindings, is_node_output_passed as _is_node_output_passed
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
@@ -37,6 +37,7 @@ __all__ = [
     "WorkflowEngine",
     "WorkflowState",
     "_is_node_output_passed",
+    "format_dags_catalog",
     "workflow_engine",
 ]
 
@@ -97,8 +98,19 @@ class TransitionResult:
     checkpoint_id: Optional[str] = None
 
 
+def format_dags_catalog(root: Optional[Path] = None) -> str:
+    """Format discovered code-controlled Python `DAGSpec` graphs across `skills/*/dags/*.py`."""
+    dags = discover_dags(root=root)
+    if not dags:
+        return "No verified Python DAGs found in `skills/*/dags/*.py`."
+    lines = [f"=== Verified Code-Controlled Python DAGs ({len(dags)}) ==="]
+    for d in dags:
+        lines.append(f"  * `{d['name']}` (pack: `{d['skill']}`) — {d['description']}\n    Nodes: {' -> '.join(d['nodes'])} | Path: `{d['path']}`")
+    return "\n".join(lines)
+
+
 class WorkflowEngine:
-    """Persistent, gate-enforced State Machine & Declarative JSON Recipe DAG Engine."""
+    """Persistent, gate-enforced State Machine & Code-Controlled Python DAG Engine."""
 
     def __init__(self, store: Optional[MemoryStore] = None, cp_manager: Optional[CheckpointManager] = None, root: Optional[Path] = None):
         self._store = store
@@ -131,10 +143,11 @@ class WorkflowEngine:
     def root(self) -> Path:
         return self._root or self.cp_manager.root
 
-    def bind_executors(self, tool_fn: Callable[[str, Dict[str, Any]], str], subagent_fn: Optional[Callable[..., str]] = None) -> None:
-        """Bind application-layer tool and subagent executors globally and on this instance via Dependency Inversion."""
+    def bind_executors(self, tool_fn: Callable[[str, Dict[str, Any]], str], subagent_fn: Optional[Callable[..., str]] = None, llm_fn: Optional[Callable[[str, str, str], str]] = None) -> None:
+        """Bind application-layer tool, subagent, and bounded-LLM executors via Dependency Inversion."""
         self._tool_fn, self._subagent_fn = tool_fn, subagent_fn
         ExecutorBindings.bind(tool_fn, subagent_fn)
+        register_dag_runtime_bindings(tool_fn=tool_fn, llm_fn=llm_fn)
 
     def start_workflow(self, goal: str, workflow_type: str = "engineering_feature", acceptance_criteria: str = "", create_initial_checkpoint: bool = True) -> TransitionResult:
         """Start a new deterministic workflow run in the state machine."""
@@ -147,7 +160,6 @@ class WorkflowEngine:
         return TransitionResult(True, wf_id, WorkflowState.IDLE.value, initial_state.value, f"Workflow #{wf_id} ({workflow_type}) started in state `{initial_state.value}`.{f' Active Discipline: {disc.name} — {disc.purpose}' if disc else ''}", checkpoint_id=cp_id or None)
 
     def _run_verification_gate(self) -> Tuple[bool, str]:
-        """Run deterministic verification checks (syntax across repo + unit test suite when present)."""
         syntax_ok, syntax_results = verify_repository_syntax(self.root)
         bad_syntax = [f"{r.path}: {r.syntax_error}" for r in syntax_results if not r.valid_syntax]
         if not syntax_ok:
@@ -175,7 +187,7 @@ class WorkflowEngine:
 
         wf_id, raw_from = int(active["id"]), str(active["current_state"])
         if raw_from not in WorkflowState._value2member_map_:
-            return TransitionResult(False, wf_id, raw_from, to_state_str, f"Active workflow #{wf_id} (`{active.get('workflow_type')}`) is managed automatically by the recipe DAG engine.")
+            return TransitionResult(False, wf_id, raw_from, to_state_str, f"Active workflow #{wf_id} (`{active.get('workflow_type')}`) is managed automatically by the DAG runtime.")
         from_state = WorkflowState(raw_from)
         try:
             target_state = WorkflowState(to_state_str.strip().upper())
@@ -184,18 +196,13 @@ class WorkflowEngine:
 
         allowed = ALLOWED_TRANSITIONS.get(from_state, ())
         if target_state not in allowed:
-            return TransitionResult(
-                False, wf_id, from_state.value, target_state.value,
-                f"GATE BLOCKED: Transition `{from_state.value} -> {target_state.value}` is not permitted. Allowed transitions from `{from_state.value}`: {[s.value for s in allowed]}.",
-            )
+            return TransitionResult(False, wf_id, from_state.value, target_state.value, f"GATE BLOCKED: Transition `{from_state.value} -> {target_state.value}` is not permitted. Allowed transitions from `{from_state.value}`: {[s.value for s in allowed]}.")
 
         cp_id = active.get("checkpoint_id") or ""
         gate_details: Optional[str] = None
         meta_updates: Dict[str, Any] = {}
-
         if target_state == WorkflowState.IMPLEMENT and not cp_id:
-            cp = self.cp_manager.create_checkpoint(label=f"wf{wf_id}_pre_implement")
-            cp_id = cp["checkpoint_id"]
+            cp_id = self.cp_manager.create_checkpoint(label=f"wf{wf_id}_pre_implement")["checkpoint_id"]
             gate_details = f"Created automatic pre-implementation safety checkpoint `{cp_id}`."
 
         if target_state in (WorkflowState.VERIFY, WorkflowState.REFLECT, WorkflowState.COMPLETE) and run_tests_on_verify:
@@ -203,43 +210,23 @@ class WorkflowEngine:
             gate_details = details
             meta_updates.update({"verified": passed, "last_verification": details})
             if not passed:
-                self.store.update_workflow_state(
-                    wf_id, from_state.value, WorkflowState.RECOVER.value,
-                    f"Auto-routed to RECOVER due to verification gate failure: {details[:300]}",
-                    status="active", checkpoint_id=cp_id, verification_passed=False,
-                    metadata_updates=meta_updates, acceptance_criteria=acceptance_criteria,
-                )
+                self.store.update_workflow_state(wf_id, from_state.value, WorkflowState.RECOVER.value, f"Auto-routed to RECOVER due to verification gate failure: {details[:300]}", status="active", checkpoint_id=cp_id, verification_passed=False, metadata_updates=meta_updates, acceptance_criteria=acceptance_criteria)
                 self.store.sync_memory_md()
-                return TransitionResult(
-                    False, wf_id, from_state.value, WorkflowState.RECOVER.value,
-                    f"VERIFICATION GATE FAILED: Cannot transition to `{target_state.value}` while syntax or unit tests fail. Automatically transitioned workflow #{wf_id} to `RECOVER`.\nDiagnostics:\n{details}",
-                    gate_details=details, checkpoint_id=cp_id,
-                )
+                return TransitionResult(False, wf_id, from_state.value, WorkflowState.RECOVER.value, f"VERIFICATION GATE FAILED: Cannot transition to `{target_state.value}` while syntax or unit tests fail. Automatically transitioned workflow #{wf_id} to `RECOVER`.\nDiagnostics:\n{details}", gate_details=details, checkpoint_id=cp_id)
 
         new_status = "completed" if target_state == WorkflowState.COMPLETE else ("aborted" if target_state == WorkflowState.ABORTED else "active")
-        self.store.update_workflow_state(
-            wf_id, from_state.value, target_state.value, summary,
-            status=new_status, checkpoint_id=cp_id,
-            verification_passed=meta_updates.get("verified", True),
-            metadata_updates=meta_updates, acceptance_criteria=acceptance_criteria,
-        )
+        self.store.update_workflow_state(wf_id, from_state.value, target_state.value, summary, status=new_status, checkpoint_id=cp_id, verification_passed=meta_updates.get("verified", True), metadata_updates=meta_updates, acceptance_criteria=acceptance_criteria)
         self.store.sync_memory_md()
         disc_msg = self._format_discipline_guidance(target_state.value)
-        return TransitionResult(
-            True, wf_id, from_state.value, target_state.value,
-            f"Workflow #{wf_id} transitioned `{from_state.value} -> {target_state.value}`. {gate_details or ''}{disc_msg}".strip(),
-            gate_details=gate_details, checkpoint_id=cp_id or None,
-        )
+        return TransitionResult(True, wf_id, from_state.value, target_state.value, f"Workflow #{wf_id} transitioned `{from_state.value} -> {target_state.value}`. {gate_details or ''}{disc_msg}".strip(), gate_details=gate_details, checkpoint_id=cp_id or None)
 
     def recover(self, reason: str, rollback: bool = False) -> TransitionResult:
-        """Enter RECOVER state and optionally rollback to the workflow's safety checkpoint."""
         active = self.store.get_active_workflow()
         if not active:
             if rollback:
                 rb = self.cp_manager.rollback_checkpoint()
                 return TransitionResult(bool(rb.get("restored")), None, WorkflowState.IDLE.value, WorkflowState.IDLE.value, f"Emergency rollback executed: {rb}")
             return TransitionResult(False, None, WorkflowState.IDLE.value, WorkflowState.RECOVER.value, "No active workflow to recover.")
-
         wf_id, from_state, cp_id = int(active["id"]), active["current_state"], active.get("checkpoint_id") or ""
         rb_msg = ""
         if rollback and cp_id:
@@ -251,17 +238,17 @@ class WorkflowEngine:
         return TransitionResult(True, wf_id, from_state, WorkflowState.RECOVER.value, f"Workflow #{wf_id} entered `RECOVER` state.{rb_msg} Inspect the issue, adjust your plan, and transition to `PLAN` or `IMPLEMENT`.", checkpoint_id=cp_id or None)
 
     def render_hud(self) -> str:
-        """Render a concise State-Machine Graph HUD for the System Prompt and CLI."""
         active = self.store.get_active_workflow()
         if not active:
             return (
                 "State Machine: `IDLE` (No active software engineering workflow).\n"
-                "  - SOFTWARE / CODEBASE BUILDS ONLY: Start `workflow_manage(action='start', workflow_type='self_evolution'|'engineering_feature'|'bug_fix', ...)` strictly for multi-step code/script builds in an editable workspace.\n"
-                "  - PERSONAL, HOME, OR WORK GOALS: NEVER start or link `workflow_manage` for real-world chores, renovations, or career goals — use `agile_manage(action='save_epic')` + `save_card(..., epic_id=...)`!"
+                "  - Multi-step builds: `workflow_manage(action='start', ...)` or `/plan` / `/goal`.\n"
+                "  - Verified Python DAGs: `workflow_manage(action='run_dag', dag='<name>')`.\n"
+                "  - Project & Goal Graph items: `agile_manage` (`companion` | `human` | `collaborative`)."
             )
         wf_id, wf_type, raw_state = active["id"], active["workflow_type"], str(active["current_state"])
         if raw_state not in WorkflowState._value2member_map_:
-            return f"Active Recipe Workflow #{wf_id} (`{wf_type}`): {active['goal']}\n  Current DAG Node: `{raw_state}`"
+            return f"Active DAG Workflow #{wf_id} (`{wf_type}`): {active['goal']}\n  Current Node: `{raw_state}`"
         curr = WorkflowState(raw_state)
         tmpl = WORKFLOW_TEMPLATES.get(wf_type, WORKFLOW_TEMPLATES["engineering_feature"])
         graph_parts = [f"**[{n.value}]**" if n == curr else n.value for n in tmpl["recommended_path"]]
@@ -283,32 +270,22 @@ class WorkflowEngine:
             lines.append(f"  Phase Deliverable  : {disc.deliverable}")
         return "\n".join(lines)
 
-    def discover_workflow_recipes(self) -> List[Dict[str, Any]]:
-        return _discover_recipes(self.root)
+    def discover_dags(self) -> List[Dict[str, Any]]:
+        return discover_dags(root=self.root)
 
-    def format_recipes_catalog(self) -> str:
-        return _format_catalog(self.root)
+    def format_dags_catalog(self) -> str:
+        return format_dags_catalog(root=self.root)
 
-    def run_workflow_recipe(
+    def run_dag(
         self,
-        recipe_name_or_path: str,
+        dag_name: str,
         params: Optional[Dict[str, Any]] = None,
         tool_fn: Optional[Callable[[str, Dict[str, Any]], str]] = None,
-        subagent_fn: Optional[Callable[..., str]] = None,
-        max_steps: int = 20,
-        _depth: int = 0,
+        llm_fn: Optional[Callable[[str, str, str], str]] = None,
     ) -> Dict[str, Any]:
-        return execute_workflow_recipe(
-            root=self.root,
-            store=self.store,
-            cp_mgr=self.cp_manager,
-            recipe_name_or_path=recipe_name_or_path,
-            params=params,
-            tool_fn=tool_fn or self._tool_fn,
-            subagent_fn=subagent_fn or self._subagent_fn,
-            max_steps=max_steps,
-            _depth=_depth,
-        )
+        tool_cb, _ = ExecutorBindings.resolve(tool_fn or self._tool_fn, self._subagent_fn)
+        bindings = DAGRuntimeBindings(tool_fn=tool_cb, llm_fn=llm_fn) if (tool_cb or llm_fn) else None
+        return execute_dag_by_name(dag_name, params=params, store=self.store, bindings=bindings, root=self.root)
 
 
 workflow_engine = WorkflowEngine()

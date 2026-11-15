@@ -106,7 +106,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
             try:
                 result = check_in(store=store)
                 self.assertIsInstance(result, str)
-                self.assertIn("Hobby Mode", result)
+                self.assertIn("Autonomy Levers", result)
                 self.assertIn("Workflow State", result)
                 self.assertIn("Pending Tasks", result)
                 self.assertIn("Pending Backlog", result)
@@ -267,7 +267,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
             store = MemoryStore(db_path=db_file)
             try:
                 self.assertTrue(db_file.is_file())
-                self.assertEqual(len(store.get_adrs()), 19)
+                self.assertEqual(len(store.get_adrs()), 20)
 
                 prompt = build_system_prompt(store=store)
                 self.assertIn("[COMPANION SOUL & USER IDENTITY]", prompt)
@@ -297,7 +297,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
                 self.assertIn("skill-creator", str(catalog_out))
 
                 runbook_out = handle_slash_command("/skills skill-creator", [], store=store)
-                self.assertIn("# Skill Creator & 3-Tier Progressive Disclosure Guide", str(runbook_out))
+                self.assertIn("# Skill Creator & Capability Pack Forge Guide", str(runbook_out))
                 wiki_out = handle_slash_command("/skills knowledge-wiki", [], store=store)
                 self.assertIn("agentic-patterns.md", str(wiki_out))
             finally:

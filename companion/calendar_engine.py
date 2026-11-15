@@ -4,7 +4,7 @@ Unified Multi-Source Calendar & Time-Horizon Engine
 
 Aggregates four live sources into one normalized Month / Week / Agenda timeline:
 1. Explicit Appointments, Focus Blocks & Milestones (`calendar_events`).
-2. Active Sprint Windows, Planned Task Days (`planned_date`) & Hard Deadlines (`due_date`) from `agile_boards`.
+2. Active Timeboxes, Planned Work-Item Days (`planned_date`) & Hard Deadlines (`due_date`) from `project_graph`.
 3. Scheduled Companion Routines (`routines.py`) projected cleanly across the calendar window.
 4. Due Spaced-Repetition Study Reviews (`education_engine.py`).
 """
@@ -14,9 +14,9 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from companion.agile_boards import get_agile_manager
 from companion.education_engine import get_education_engine
 from companion.memory_store import MemoryStore, get_memory_store
+from companion.project_graph import get_project_graph
 from companion.routines import compute_next_run_utc, get_routine_manager
 
 __all__ = [
@@ -137,7 +137,12 @@ class CalendarManager:
         for rt in rm.list_routines():
             if not rt.get("enabled"):
                 continue
-            expr = str(rt.get("schedule_expr") or "")
+            tp = rt.get("trigger_policy") or {}
+            if tp.get("mode", "scheduled") != "scheduled":
+                continue
+            expr = str(tp.get("schedule_expr") or rt.get("schedule_expr") or "").strip()
+            if not expr:
+                continue
             seen_days: Dict[str, Tuple[str, int]] = {}
             cursor = start_dt - timedelta(minutes=1)
             for _ in range(400):
@@ -155,14 +160,14 @@ class CalendarManager:
                     seen_days[d_key] = (seen_days[d_key][0], seen_days[d_key][1] + 1)
                 cursor = nxt if nxt > cursor else (cursor + timedelta(minutes=1))
             for d_key, (first_hhmm, cnt) in seen_days.items():
-                freq_note = f" ({expr})" if cnt > 1 else f" @ {first_hhmm} UTC"
+                freq_prefix = f"[Routine {cnt}x/day] " if cnt > 1 else "[Routine] "
                 projected.append({
                     "id": f"rt_{rt['routine_id']}_{d_key}",
                     "date": d_key,
                     "time": "" if cnt > 1 else first_hhmm,
                     "source_type": "routine",
                     "kind": rt["target_kind"],
-                    "title": f"Routine: {rt['title']}{freq_note}",
+                    "title": f"{freq_prefix}{rt['title']}",
                     "routine_id": rt["routine_id"],
                     "schedule_expr": expr,
                     "all_day": cnt > 1,
@@ -193,35 +198,36 @@ class CalendarManager:
                 "board_id": ev["board_id"], "card_id": ev["card_id"], "notes": ev["notes"], "end_at": ev["end_at"],
             })
 
-        agile = get_agile_manager(store=self.store)
-        sprints = [sp for sp in agile.list_sprints(24) if sp["start_date"] <= e_ymd and sp["end_date"] >= s_ymd]
-        board_view = agile.get_board_view(board_id or "all-active-sprint")
-        hz_days = {"now": 30, "next": 90, "later": 180, "someday": 365}
+        pg = get_project_graph(store=self.store)
+        pid_filter = pg.resolve_project_id(board_id) if board_id else None
+        sprints = [sp for sp in pg.list_timeboxes(project_id=pid_filter) if sp["start_date"] <= e_ymd and sp["end_date"] >= s_ymd]
+        active_sprint = pg.get_active_timebox(pid_filter)
+        milestones = pg.list_milestones(pid_filter) if pid_filter else [ms for p in pg.list_projects() for ms in pg.list_milestones(p["project_id"])]
         epics: List[Dict[str, Any]] = []
-        for ep in agile.list_epics(board_id=board_id):
-            eff_s = _norm_date_prefix(ep.get("start_date") or "") or _norm_date_prefix(ep.get("created_at") or "") or today_s
+        for ep in milestones:
+            eff_s = _norm_date_prefix(ep.get("created_at") or "") or today_s
             t_ymd = _norm_date_prefix(ep.get("target_date") or "")
             s_obj = _parse_ymd(eff_s) or now_dt
-            proj_end = t_ymd or (s_obj + timedelta(days=hz_days.get(ep.get("horizon") or "later", 90))).strftime("%Y-%m-%d")
-            epics.append({**ep, "effective_start_date": eff_s, "roadmap_end_date": max(eff_s, proj_end)})
+            proj_end = t_ymd or (s_obj + timedelta(days=30)).strftime("%Y-%m-%d")
+            epics.append({**ep, "board_id": ep["project_id"], "effective_start_date": eff_s, "roadmap_end_date": max(eff_s, proj_end)})
             if t_ymd and s_ymd <= t_ymd <= e_ymd:
                 items.append({
-                    "id": f"epic_{ep['epic_id']}", "date": t_ymd, "time": "", "source_type": "epic_milestone",
-                    "kind": ep["horizon"], "title": f"Epic Target: {ep['title']}", "all_day": True,
-                    "board_id": ep["board_id"], "epic_id": ep["epic_id"],
+                    "id": f"ms_{ep['milestone_id']}", "date": t_ymd, "time": "", "source_type": "epic_milestone",
+                    "kind": ep.get("stage_kind", "milestone"), "title": f"Milestone Target: {ep['title']}", "all_day": True,
+                    "board_id": ep["project_id"], "epic_id": ep["milestone_id"],
                 })
-        for c in agile.list_dated_cards(board_id=board_id):
+        for c in pg.list_dated_items(s_ymd, e_ymd, project_id=pid_filter):
             if c["planned_date"] and s_ymd <= c["planned_date"] <= e_ymd:
                 items.append({
-                    "id": f"plan_{c['card_id']}", "date": c["planned_date"], "time": "", "source_type": "sprint_task",
-                    "kind": c["day_slot"], "title": c["title"], "all_day": True, "board_id": c["board_id"],
-                    "card_id": c["card_id"], "epic_id": c.get("epic_id", ""), "status": c["status"], "effort_size": c["effort_size"],
+                    "id": f"plan_{c['item_id']}", "date": c["planned_date"], "time": "", "source_type": "sprint_task",
+                    "kind": c["owner"], "title": c["title"], "all_day": True, "board_id": c["project_id"],
+                    "card_id": c["item_id"], "epic_id": c.get("milestone_id", ""), "status": c["status"],
                 })
             if c["due_date"] and s_ymd <= c["due_date"] <= e_ymd:
                 items.append({
-                    "id": f"due_{c['card_id']}", "date": c["due_date"], "time": "", "source_type": "deadline",
-                    "kind": "due_date", "title": f"Due: {c['title']}", "all_day": True, "board_id": c["board_id"],
-                    "card_id": c["card_id"], "epic_id": c.get("epic_id", ""), "status": c["status"], "effort_size": c["effort_size"],
+                    "id": f"due_{c['item_id']}", "date": c["due_date"], "time": "", "source_type": "deadline",
+                    "kind": "due_date", "title": f"Due: {c['title']}", "all_day": True, "board_id": c["project_id"],
+                    "card_id": c["item_id"], "epic_id": c.get("milestone_id", ""), "status": c["status"],
                 })
 
         if not board_id:
@@ -250,9 +256,9 @@ class CalendarManager:
 
         return {
             "ok": True, "today": today_s, "start_date": s_ymd, "end_date": e_ymd,
-            "sprints": sprints, "epics": epics, "active_sprint": board_view.get("active_sprint"),
+            "sprints": sprints, "epics": epics, "active_sprint": active_sprint,
             "items": items, "by_date": by_date,
-            "summary": f"Calendar `{s_ymd}` .. `{e_ymd}`: {len(items)} item(s), {len(sprints)} sprint window(s), {len(epics)} epic(s).",
+            "summary": f"Calendar `{s_ymd}` .. `{e_ymd}`: {len(items)} item(s), {len(sprints)} timebox(es), {len(epics)} milestone(s).",
         }
 
 

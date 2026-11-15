@@ -12,8 +12,8 @@ from companion.autonomy import run_autonomous_goal, run_http_smoke_probe
 from companion.blueprint import approve_blueprint_and_build, create_or_revise_blueprint
 from companion.config import settings
 from companion.context import manage_active_project
+from companion.dag_runtime import resume_dag_run
 from companion.grounding import get_execution_target, get_knowledge_port
-from companion.hobbies import hobby_engine
 from companion.hygiene import analyze_workspace_hygiene
 from companion.memory_store import get_memory_store
 from companion.safety import get_active_checkpoint_manager, run_system_doctor
@@ -160,12 +160,13 @@ def _handle_skill_forge_action(action: str, args: Dict[str, Any]) -> str:
         q = str_arg(args, "goal") or str_arg(args, "skill")
         return "error: goal or skill query is required for check_skill" if not q else str(check_make_vs_borrow(q)["summary"])
     if action == "bootstrap_skill":
+        raw_dags = args.get("dags") if isinstance(args.get("dags"), dict) else (args.get("workflows") if isinstance(args.get("workflows"), dict) else None)
         return str(
             stage_and_promote_skill(
                 name=str_arg(args, "skill"),
                 skill_md=str(args.get("skill_md") or ""),
                 scripts=args.get("scripts") if isinstance(args.get("scripts"), dict) else None,
-                workflows=args.get("workflows") if isinstance(args.get("workflows"), dict) else None,
+                dags=raw_dags,
                 references=args.get("references") if isinstance(args.get("references"), dict) else None,
                 overwrite=bool_arg(args, "overwrite", False),
                 scope=str_arg(args, "scope", "core") or "core",
@@ -222,7 +223,7 @@ def _handle_workflow_state_action(action: str, args: Dict[str, Any]) -> str:
 
 
 def tool_workflow_manage(args: Dict[str, Any]) -> str:
-    """Drive the deterministic State Machine, Isolated Subagent Workers, and JSON Workflow Recipes."""
+    """Drive the deterministic State Machine, Isolated Subagent Workers, and Code-Controlled Python DAGs."""
     action = str_arg(args, "action", "status").lower()
     if current_workflow_phase() and action in ("start", "transition", "abort", "complete", "recover", "autonomy", "blueprint", "approve"):
         return (
@@ -240,24 +241,27 @@ def tool_workflow_manage(args: Dict[str, Any]) -> str:
         skill = (str_arg(args, "skill") or str_arg(args, "skill_name")) or None
         tier = str_arg(args, "tier") or None
         return f"=== Subagent Worker Result (`{skill or 'worker'}` | tier=`{tier or 'fast'}`) ===\n{run_subagent(goal=goal, skill_name=skill, max_iters=int_arg(args, 'max_iters', 8), verbose=False, tier=tier)}"
-    if action == "list_recipes":
-        return workflow_engine.format_recipes_catalog()
+    if action in ("list_dags", "list_recipes"):
+        return workflow_engine.format_dags_catalog()
     if action in ("check_skill", "bootstrap_skill", "run_script"):
         return _handle_skill_forge_action(action, args)
-    if action == "run_recipe":
-        recipe_name = str_arg(args, "recipe") or str_arg(args, "recipe_name") or str_arg(args, "goal")
-        if not recipe_name:
-            return "error: recipe is required for run_recipe"
-        from companion.agent import run_subagent
-        from companion.tools import dispatch
+    if action in ("run_dag", "run_recipe"):
+        dag_name = str_arg(args, "dag") or str_arg(args, "recipe") or str_arg(args, "recipe_name") or str_arg(args, "goal")
+        if not dag_name:
+            return "error: dag is required for run_dag"
+        from companion.agent import ensure_dag_runtime_bound
 
+        ensure_dag_runtime_bound()
         raw_params = args.get("params") or args.get("recipe_inputs") or args.get("inputs")
-        return workflow_engine.run_workflow_recipe(
-            recipe_name,
-            params=raw_params if isinstance(raw_params, dict) else {},
-            tool_fn=dispatch,
-            subagent_fn=lambda g, s, m: run_subagent(goal=g, skill_name=s, max_iters=m, verbose=False),
-        )["summary"]
+        return str(workflow_engine.run_dag(dag_name, params=raw_params if isinstance(raw_params, dict) else {})["summary"])
+    if action == "resume_dag":
+        run_id = str_arg(args, "run_id") or str_arg(args, "goal")
+        if not run_id:
+            return "error: run_id is required for resume_dag"
+        from companion.agent import ensure_dag_runtime_bound
+
+        ensure_dag_runtime_bound()
+        return str(resume_dag_run(run_id, store=get_memory_store())["summary"])
     if action == "blueprint":
         return str(create_or_revise_blueprint(str_arg(args, "goal") or "status", workflow_type=str_arg(args, "workflow_type", "engineering_feature") or "engineering_feature", max_phase_iters=int_arg(args, "max_iters", 10), verbose=False)["summary"])
     if action == "approve":
@@ -328,23 +332,6 @@ def tool_sdd_manage(args: Dict[str, Any]) -> str:
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
         return f"# {p}  (lines 1-{len(lines)} of {len(lines)})\n" + "\n".join(f"{i:5d}|{ln}" for i, ln in enumerate(lines, 1))
     return f"error: unknown sdd_manage action '{action}'. Valid: verify, status, sync, read_spec, add_adr, get_adrs"
-
-
-def tool_hobby_manage(args: Dict[str, Any]) -> str:
-    """Manage Autonomous Agent Hobbies (status, on, off, run, morning briefing)."""
-    action = str_arg(args, "action", "status").lower()
-    if action == "status":
-        return hobby_engine.format_status()
-    if action in ("on", "enable", "off", "disable", "toggle"):
-        return hobby_engine.set_enabled(True if action in ("on", "enable") else (False if action in ("off", "disable") else (not hobby_engine.is_enabled())))
-    if action == "run":
-        res = hobby_engine.run_hobby_cycle(hobby_name=str_arg(args, "hobby_name") or None)
-        if res.get("status") == "refused_self_dev_off":
-            return str(res["summary"])
-        return f"Hobby `{res['hobby']}` finished ({res['status']} | doctor_passed={res['doctor_passed']}):\n{res['summary']}"
-    if action in ("morning", "journal"):
-        return hobby_engine.get_morning_briefing(mark_seen=True)
-    return f"error: unknown hobby_manage action '{action}'. Valid: status, on, off, toggle, run, morning"
 
 
 def tool_project_manage(args: Dict[str, Any]) -> str:

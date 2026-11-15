@@ -20,6 +20,6 @@ Use this runbook during `IMPLEMENT` and `VERIFY` phases before claiming any feat
 2. **Run Targeted Verification & Smoke Probes**:
    - For web changes, execute `workflow_manage(action="http_smoke", module="surfaces.web_server")`.
    - Run `sdd_manage(action="verify")` to catch unused imports, dead definitions, or undocumented modules immediately.
-3. **Execute Full 7-Stage Gate (`workflows/verify-feature.json`)**:
-   - Run `system_doctor(run_tests=True)` or `workflow_manage(action="run_recipe", recipe="verify-feature")`.
+3. **Execute Full 7-Stage Gate (`dags/verify_feature.py`)**:
+   - Run `system_doctor(run_tests=True)` or `workflow_manage(action="run_dag", dag="verify-feature")`.
    - If any check reports `[FAIL]`, transition to `RECOVER` (`tier="reasoning"`) and resolve every issue before transitioning to `COMPLETE`.

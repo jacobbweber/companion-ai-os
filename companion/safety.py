@@ -405,7 +405,7 @@ def run_unit_tests(root: Optional[Path] = None, timeout: int = 90, pattern: str 
     if not start_dir:
         return {"passed": True, "ran": 0, "output": "No tests/ directory found."}
 
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PYTHONPATH": str(target_root)}
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PYTHONPATH": str(target_root), "COMPANION_IN_DOCTOR_TESTS": "1"}
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "unittest", "discover", "-s", start_dir, "-p", pattern, "-v"],
@@ -497,17 +497,20 @@ def run_system_doctor(root: Optional[Path] = None, run_tests: bool = True) -> Di
 
     db_name, adr_cnt, profile = _inspect_doctor_db(target_root)
     checks.append({
-        "check": "6. SQLite Memory, ADRs & Hobby Store",
+        "check": "6. SQLite Memory, ADRs & Autonomy Store",
         "passed": adr_cnt > 0 and len(profile) > 0,
-        "details": f"DB healthy ({db_name}): {adr_cnt} ADRs, {len(profile)} profile keys, hobby_mode={profile.get('hobby_mode')}, self_dev_mode={profile.get('self_dev_mode', 'off')}.",
+        "details": f"DB healthy ({db_name}): {adr_cnt} ADRs, {len(profile)} profile keys, background_autonomy={profile.get('background_autonomy', profile.get('hobby_mode', 'off'))}, self_dev_mode={profile.get('self_dev_mode', 'off')}.",
     })
 
     if run_tests:
-        test_res = run_unit_tests(target_root)
-        test_out = str(test_res["output"])
-        ran_lines = [ln.strip() for ln in test_out.splitlines() if ln.strip().startswith("Ran ")]
-        details_str = (f"{ran_lines[-1]} — OK" if ran_lines else "All unit tests passed.") if test_res["passed"] else test_out
-        checks.append({"check": "7. Automated Unit Test Suite", "passed": bool(test_res["passed"]), "details": details_str})
+        if os.environ.get("COMPANION_IN_DOCTOR_TESTS") == "1":
+            checks.append({"check": "7. Automated Unit Test Suite", "passed": True, "details": "Nested test suite invocation skipped inside active unittest run."})
+        else:
+            test_res = run_unit_tests(target_root)
+            test_out = str(test_res["output"])
+            ran_lines = [ln.strip() for ln in test_out.splitlines() if ln.strip().startswith("Ran ")]
+            details_str = (f"{ran_lines[-1]} — OK" if ran_lines else "All unit tests passed.") if test_res["passed"] else test_out
+            checks.append({"check": "7. Automated Unit Test Suite", "passed": bool(test_res["passed"]), "details": details_str})
 
     all_passed = all(c["passed"] for c in checks)
     lines = [f"=== Companion System Doctor: {'HEALTHY (PASS)' if all_passed else 'ISSUES DETECTED (FAIL)'} ==="]

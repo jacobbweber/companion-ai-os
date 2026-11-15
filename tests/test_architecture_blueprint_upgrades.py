@@ -195,7 +195,7 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
         """Verify `(tool, action)` locks in `PLAN`/`VERIFY` and `R3` high-impact shell command gating."""
         self.assertIsNone(check_phase_tool_permission("checkpoint_manage", "PLAN", {"action": "list"}))
         self.assertIn("PHASE TOOL GATE REJECTED", check_phase_tool_permission("checkpoint_manage", "PLAN", {"action": "rollback"}) or "")
-        self.assertIn("PHASE TOOL GATE REJECTED", check_phase_tool_permission("workflow_manage", "PLAN", {"action": "run_recipe"}) or "")
+        self.assertIn("PHASE TOOL GATE REJECTED", check_phase_tool_permission("workflow_manage", "PLAN", {"action": "run_dag"}) or "")
         self.assertIn("PHASE TOOL GATE REJECTED", check_phase_tool_permission("workflow_manage", "PLAN", {"action": "bootstrap_skill"}) or "")
         self.assertIn("PHASE TOOL GATE REJECTED", check_phase_tool_permission("workflow_manage", "PLAN", {"action": "run_script"}) or "")
         self.assertIsNone(check_phase_tool_permission("workflow_manage", "VERIFY", {"action": "run_script"}))
@@ -310,9 +310,9 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
 
             try:
                 with workspace_context(ws, "dag-proj"), memory_store_context(st):
-                    # Fresh WorkflowEngine instance inherits class-level ExecutorBindings
-                    recipe_res = wf.run_workflow_recipe("proactive-checkin", params={"goal": "status check"})
-                    self.assertIn("status", recipe_res)
+                    from companion.dag_runtime import execute_dag_by_name
+                    dag_res = execute_dag_by_name("full-audit", params={"run_tests": False}, store=st)
+                    self.assertIn("status", dag_res)
 
                     start = wf.start_workflow("Roll out manifest.toml + human review + summary.json")
                     for s_name in ("DISCOVER", "DESIGN", "PLAN"):
