@@ -38,4 +38,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request, sys; r = urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3); sys.exit(0 if r.status == 200 else 1)"
 
 USER companion
-CMD ["python", "harness.py", "--web", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "harness.py", "--locked", "--web", "--host", "0.0.0.0", "--port", "8000"]

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from companion.agent import handle_slash_command, run_agent_turn
-from companion.memory_store import MemoryStore
+from companion.memory_store import MemoryStore, memory_store_context
 from companion.tools import (
     dispatch,
     tool_edit_file,
@@ -84,23 +84,34 @@ class TestToolsAndAgentLoop(unittest.TestCase):
             store.close()
 
     def test_slash_commands(self) -> None:
-        msgs: List[Dict[str, Any]] = []
-        help_out = handle_slash_command("/help", msgs)
-        self.assertIsNotNone(help_out)
-        self.assertIn("/workflow", str(help_out))
-        self.assertIn("/tone", str(help_out))
-        tone_out = handle_slash_command("/tone", msgs)
-        self.assertIn("Communication Tone:", str(tone_out))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(db_path=Path(tmp) / "slash.db")
+            try:
+                msgs: List[Dict[str, Any]] = []
+                help_out = handle_slash_command("/help", msgs, store=store)
+                self.assertIsNotNone(help_out)
+                self.assertIn("/workflow", str(help_out))
+                self.assertIn("/tone", str(help_out))
+                tone_out = handle_slash_command("/tone", msgs, store=store)
+                self.assertIn("Communication Tone:", str(tone_out))
+            finally:
+                store.close()
 
     def test_check_in_skill(self) -> None:
         """Test that check_in returns a friendly summary of system state."""
         from companion.agent import check_in
-        result = check_in()
-        self.assertIsInstance(result, str)
-        self.assertIn("Hobby Mode", result)
-        self.assertIn("Workflow State", result)
-        self.assertIn("Pending Tasks", result)
-        self.assertIn("Pending Backlog", result)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(db_path=Path(tmp) / "checkin.db")
+            try:
+                result = check_in(store=store)
+                self.assertIsInstance(result, str)
+                self.assertIn("Hobby Mode", result)
+                self.assertIn("Workflow State", result)
+                self.assertIn("Pending Tasks", result)
+                self.assertIn("Pending Backlog", result)
+            finally:
+                store.close()
 
     def test_null_args_read_spec_and_context_compaction(self) -> None:
         """Test tool resilience against None args, read_spec case handling, and user-boundary compaction."""
@@ -172,7 +183,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
                     "---\nname: custom-user-pack\ndescription: User-scoped custom capability pack.\nrequired_tools: [read_file]\n---\n\n"
                     "## When to Use This Skill\nWhen running a custom check.\n\n## Step-by-Step Procedure\n1. Read target file.\n"
                 )
-                with patch.object(settings, "data_dir", tmp_p / "data"):
+                with patch.object(settings, "data_dir", tmp_p / "data"), memory_store_context(store):
                     sk_res = stage_and_promote_skill(name="custom-user-pack", skill_md=user_sk_md, scope="user")
                     self.assertTrue(sk_res["promoted"], sk_res)
                     found = {s["name"]: s for s in discover_skills(settings.root)}
@@ -232,8 +243,13 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         self.assertIn("262,144 tokens", status_text)
         self.assertIn("65,536 tokens", status_text)
 
-        slash_compact = handle_slash_command("/compact status", msgs)
-        self.assertIn("Adaptive Context Window", str(slash_compact))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(db_path=Path(tmp) / "compact_slash.db")
+            try:
+                slash_compact = handle_slash_command("/compact status", msgs, store=store)
+                self.assertIn("Adaptive Context Window", str(slash_compact))
+            finally:
+                store.close()
 
     def test_fresh_clone_auto_bootstraps_db_memory_and_identity_files(self) -> None:
         """Simulate a fresh GitHub clone with no DB, MEMORY.md, or IDENTITY.md and verify auto-bootstrap."""
@@ -273,14 +289,19 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         self.assertIn("engineering-workflow", names)
         self.assertIn("skill-creator", names)
 
-        catalog_out = handle_slash_command("/skills", [])
-        self.assertIn("Progressive-Disclosure Skill Registry", str(catalog_out))
-        self.assertIn("skill-creator", str(catalog_out))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(db_path=Path(tmp) / "skills_slash.db")
+            try:
+                catalog_out = handle_slash_command("/skills", [], store=store)
+                self.assertIn("Progressive-Disclosure Skill Registry", str(catalog_out))
+                self.assertIn("skill-creator", str(catalog_out))
 
-        runbook_out = handle_slash_command("/skills skill-creator", [])
-        self.assertIn("# Skill Creator & 3-Tier Progressive Disclosure Guide", str(runbook_out))
-        wiki_out = handle_slash_command("/skills knowledge-wiki", [])
-        self.assertIn("agentic-patterns.md", str(wiki_out))
+                runbook_out = handle_slash_command("/skills skill-creator", [], store=store)
+                self.assertIn("# Skill Creator & 3-Tier Progressive Disclosure Guide", str(runbook_out))
+                wiki_out = handle_slash_command("/skills knowledge-wiki", [], store=store)
+                self.assertIn("agentic-patterns.md", str(wiki_out))
+            finally:
+                store.close()
 
     def test_isolated_subagent_worker_dispatch_and_skill_preloading(self) -> None:
         """Test that run_subagent isolates worker tool history, pre-loads SKILL.md, and restores parent trace."""
@@ -516,7 +537,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
             store = MemoryStore(db_path=Path(tmp) / "tier.db")
             try:
                 msgs: List[Dict[str, Any]] = []
-                status_out = handle_slash_command("/model status", msgs)
+                status_out = handle_slash_command("/model status", msgs, store=store)
                 self.assertIn("Companion Multi-Tier Model Router", str(status_out))
 
                 observed_sub_tiers: List[str] = []

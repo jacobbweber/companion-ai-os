@@ -7,7 +7,7 @@ services:
     container_name: companion-ai-os
     restart: unless-stopped
     ports:
-      - "${COMPANION_WEB_PORT:-8000}:8000"
+      - "${COMPANION_WEB_BIND:-127.0.0.1}:${COMPANION_WEB_PORT:-8000}:8000"
     volumes:
       - ./companion-data:/data
     extra_hosts:

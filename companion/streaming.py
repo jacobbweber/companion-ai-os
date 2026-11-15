@@ -142,22 +142,31 @@ class _ThinkTagStreamSplitter:
 
 
 def _merge_tool_call_deltas(acc: Dict[int, Dict[str, Any]], tc_deltas: List[Dict[str, Any]]) -> None:
-    """Merge streamed `delta.tool_calls` fragments by `index` into OpenAI `tool_calls` dicts."""
+    """Merge streamed `delta.tool_calls` fragments by `index` (or distinct `id`) into OpenAI `tool_calls` dicts."""
     for item in tc_deltas:
         if not isinstance(item, dict):
             continue
-        idx = int(item.get("index", 0) or 0)
+        raw_idx, tc_id = item.get("index"), str(item.get("id") or "")
+        if raw_idx is not None:
+            idx = int(raw_idx or 0)
+        elif tc_id and (hit := next((k for k, v in acc.items() if v.get("id") == tc_id), None)) is not None:
+            idx = hit
+        elif tc_id and 0 in acc and acc[0].get("id") not in ("", "call_0", tc_id):
+            idx = max(acc) + 1
+        else:
+            idx = max(acc) if acc else 0
         entry = acc.setdefault(idx, {"id": f"call_{idx}", "type": "function", "function": {"name": "", "arguments": ""}})
-        if item.get("id"):
-            entry["id"] = str(item["id"])
+        if tc_id:
+            entry["id"] = tc_id
         if isinstance(item.get("extra_content"), dict):
             entry["extra_content"] = item["extra_content"]
         fn = item.get("function")
         if isinstance(fn, dict):
             if fn.get("name"):
                 entry["function"]["name"] += str(fn["name"])
-            if fn.get("arguments"):
-                entry["function"]["arguments"] += str(fn["arguments"])
+            if "arguments" in fn and fn["arguments"] is not None:
+                arg_val = fn["arguments"]
+                entry["function"]["arguments"] += json.dumps(arg_val) if isinstance(arg_val, (dict, list)) else str(arg_val)
 
 
 ThinkTagStreamSplitter = _ThinkTagStreamSplitter
@@ -200,6 +209,10 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
             continue
         if not isinstance(chunk, dict):
             continue
+        if chunk.get("error"):
+            err_obj = chunk["error"]
+            err_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+            raise RuntimeError(f"SSE stream error: {err_msg or err_obj}")
         if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
             usage = chunk["usage"]
         choices = chunk.get("choices")

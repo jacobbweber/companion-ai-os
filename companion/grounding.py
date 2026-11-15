@@ -467,13 +467,40 @@ class LocalWorkspaceTarget:
     def list_dir(self, path: Path) -> List[str]:
         return [e.name + "/" if e.is_dir() else e.name for e in sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))]
 
-    def _guard_self_dev_db(self, store: MemoryStore, pre_val: str) -> Optional[str]:
-        if store.get_user_profile().get("self_dev_mode", "off") == pre_val:
-            return None
+    def _snapshot_priv_db(self, store: MemoryStore) -> Tuple[str, str, List[Tuple[str, str, str, str]]]:
+        prof = store.get_user_profile()
+        approvals: List[Tuple[str, str, str, str]] = []
         with store._lock:
-            store.conn.execute("UPDATE user_profile SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'self_dev_mode'", (pre_val,))
-            store.conn.commit()
-        return "SAFETY GUARD REJECTED subprocess privilege escalation: direct SQLite modification of `self_dev_mode` was blocked and reverted (`ADR-019`)."
+            has_apr = store.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_requests'").fetchone()
+            if has_apr:
+                approvals = [(str(r[0]), str(r[1]), str(r[2] or ""), str(r[3] or "")) for r in store.conn.execute("SELECT approval_id, status, decided_by, decided_at FROM approval_requests").fetchall()]
+        return prof.get("self_dev_mode", "off"), prof.get("trust_mode", "balanced"), approvals
+
+    def _guard_self_dev_db(self, store: MemoryStore, pre_state: Tuple[str, str, List[Tuple[str, str, str, str]]]) -> Optional[str]:
+        pre_sd, pre_tm, pre_apr = pre_state
+        prof = store.get_user_profile()
+        violated: List[str] = []
+        with store._lock:
+            if prof.get("self_dev_mode", "off") != pre_sd:
+                store.conn.execute("UPDATE user_profile SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'self_dev_mode'", (pre_sd,))
+                violated.append("self_dev_mode")
+            if prof.get("trust_mode", "balanced") != pre_tm:
+                store.conn.execute("UPDATE user_profile SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'trust_mode'", (pre_tm,))
+                violated.append("trust_mode")
+            has_apr = store.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_requests'").fetchone()
+            if has_apr:
+                cur_apr = [(str(r[0]), str(r[1]), str(r[2] or ""), str(r[3] or "")) for r in store.conn.execute("SELECT approval_id, status, decided_by, decided_at FROM approval_requests").fetchall()]
+                if cur_apr != pre_apr:
+                    pre_ids = {r[0] for r in pre_apr}
+                    store.conn.execute(f"DELETE FROM approval_requests WHERE approval_id NOT IN ({','.join('?' for _ in pre_ids)})" if pre_ids else "DELETE FROM approval_requests", tuple(pre_ids))
+                    for aid, st, db_by, d_at in pre_apr:
+                        store.conn.execute("UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ? WHERE approval_id = ?", (st, db_by, d_at or None, aid))
+                    violated.append("approval_requests")
+            if violated:
+                store.conn.commit()
+        if not violated:
+            return None
+        return f"SAFETY GUARD REJECTED subprocess privilege escalation: direct SQLite modification of `{', '.join(violated)}` was blocked and reverted (`ADR-019`)."
 
     def exec_command(
         self, cmd_or_args: Any, shell: bool = False, timeout: Optional[int] = None,
@@ -481,7 +508,7 @@ class LocalWorkspaceTarget:
     ) -> Tuple[int, str, str, Optional[str]]:
         active_cp, self_cp, store = self._cp_mgr(), get_self_checkpoint_manager(), get_memory_store()
         pre_snap = active_cp.snapshot_py_files()
-        pre_sd = store.get_user_profile().get("self_dev_mode", "off")
+        pre_priv = self._snapshot_priv_db(store)
         ro_snap = self_cp.snapshot_readonly_tree() if ((not self.is_self_project) or (not settings.is_self_dev_enabled())) else None
         env, cwd = self.exec_env_and_cwd()
         if extra_env:
@@ -494,11 +521,11 @@ class LocalWorkspaceTarget:
             )
         except subprocess.TimeoutExpired:
             active_cp.guard_py_files_after_exec(pre_snap)
-            self._guard_self_dev_db(store, pre_sd)
+            self._guard_self_dev_db(store, pre_priv)
             if ro_snap is not None:
                 self_cp.enforce_readonly_tree(ro_snap)
             return -1, "", "", f"timed out after {eff_timeout}s"
-        guard_err = self._guard_self_dev_db(store, pre_sd) or active_cp.guard_py_files_after_exec(pre_snap) or (
+        guard_err = self._guard_self_dev_db(store, pre_priv) or active_cp.guard_py_files_after_exec(pre_snap) or (
             self_cp.enforce_readonly_tree(ro_snap) if ro_snap is not None else None
         )
         return r.returncode, r.stdout or "", r.stderr or "", guard_err

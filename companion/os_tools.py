@@ -185,9 +185,17 @@ def _handle_workflow_state_action(action: str, args: Dict[str, Any]) -> str:
         goal = str_arg(args, "goal")
         if not goal:
             return "error: goal is required to start a workflow"
+        wf_type = str_arg(args, "workflow_type", "engineering_feature") or "engineering_feature"
+        if settings.get_workspace().is_self_project and not settings.is_self_dev_enabled():
+            return (
+                f"SAFETY GUARD REJECTED: `workflow_manage(action='start', workflow_type='{wf_type}')` is strictly for software/codebase engineering builds "
+                "and Companion core is read-only while `Self-Dev Mode = OFF` (`/selfdev on`). "
+                "For the user's personal, home, or career long-running goals/projects, use `agile_manage(action='save_epic')` and `agile_manage(action='save_card', epic_id=...)` on Boards instead "
+                "(or switch to an external coding workspace via `project_manage`)."
+            )
         res = workflow_engine.start_workflow(
             goal=goal,
-            workflow_type=str_arg(args, "workflow_type", "engineering_feature") or "engineering_feature",
+            workflow_type=wf_type,
             acceptance_criteria=str_arg(args, "acceptance_criteria"),
         )
         return f"{res.message}\n\n{workflow_engine.render_hud()}"

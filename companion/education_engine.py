@@ -101,10 +101,7 @@ class EducationEngine:
     @property
     def store(self) -> MemoryStore:
         mem = self._store or get_memory_store()
-        with mem._lock:
-            for ddl in EDUCATION_DDL:
-                mem.conn.execute(ddl)
-            mem.conn.commit()
+        mem.ensure_schema("education", lambda m: [m.conn.execute(ddl) for ddl in EDUCATION_DDL] and None)
         return mem
 
     def _hydrate_course(self, row: Dict[str, Any], now_iso: str) -> Dict[str, Any]:
@@ -367,9 +364,12 @@ class EducationEngine:
         )
         if not inbox_res.get("ok"):
             return inbox_res
+        from companion.config import is_in_agent_tool_turn
+
+        human_ok = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
         grad = wk.graduate_note(
             inbox_path=str(inbox_res["path"]), domain="education", topic=c_slug, new_slug=m_slug,
-            actor="user", confirmed=True, template="zettelkasten-atomic", summary=summary_txt, ontology=["knowledge-synthesis"],
+            actor=actor, confirmed=human_ok, template="zettelkasten-atomic", summary=summary_txt, ontology=["knowledge-synthesis"],
         )
         if not grad.get("ok"):
             return grad

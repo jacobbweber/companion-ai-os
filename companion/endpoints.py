@@ -11,7 +11,6 @@ Implements Pillar 3 of the Companion 3.0 Harvest Blueprint:
 """
 
 import base64
-import ipaddress
 import json
 import os
 import re
@@ -25,13 +24,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.archive_and_approvals import get_approval_queue, get_trust_mode
-from companion.config import settings
+from companion.config import is_in_agent_tool_turn, settings
+from companion.llm_wire import check_url_ssrf, urlopen_safe
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.safety import check_command_safety
-from companion.vault import get_vault_manager, normalize_secret_name
+from companion.vault import _lock_windows_owner_dacl, get_vault_manager, normalize_secret_name
 
 __all__ = [
     "VALID_AUTH_MODES",
@@ -45,8 +46,10 @@ VALID_AUTH_MODES = ("none", "ssh_key", "ssh_agent", "basic_auth", "bearer_token"
 _DEFAULT_PORTS = {"ssh": 22, "winrm": 5985, "http_api": 80}
 _BLOCKED_META_HOSTS = {"metadata.google.internal", "metadata", "instance-data", "169.254.169.254"}
 _REMOTE_MUTATION_RE = re.compile(
-    r"\b(?:apt|apt-get|yum|dnf|pacman|systemctl\s+(?:restart|stop|start|enable|disable)|"
-    r"docker\s+(?:rm|stop|restart|kill|compose\s+down|run)|reboot|Restart-Service|Stop-Service|Stop-Process|Remove-Item)\b",
+    r"(?:\b(?:apt|apt-get|yum|dnf|pacman|systemctl\s+(?:restart|stop|start|enable|disable)|"
+    r"docker\s+(?:rm|stop|restart|kill|compose\s+down|run)|reboot|rm|mv|cp|chmod|chown|dd|tee|"
+    r"curl|wget|python3?|bash|sh|zsh|pwsh|powershell|Restart-Service|Stop-Service|Stop-Process|"
+    r"Remove-Item|Set-Content|Add-Content|Out-File|Invoke-Expression|Invoke-WebRequest|iex|iwr)\b|[>|`])",
     re.I,
 )
 
@@ -88,13 +91,7 @@ def _check_metadata_ssrf(host_or_url: str) -> Optional[str]:
         return "Endpoint `host` is empty."
     if host in _BLOCKED_META_HOSTS:
         return f"SAFETY GUARD REJECTED: cloud metadata endpoint `{host}` is blocked."
-    try:
-        ip_obj = ipaddress.ip_address(host)
-        if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
-            return f"SAFETY GUARD REJECTED: link-local/metadata IP `{ip_obj}` is blocked."
-    except ValueError:
-        pass
-    return None
+    return check_url_ssrf(raw, allow_private_lan=True)
 
 
 class EndpointManager:
@@ -106,10 +103,7 @@ class EndpointManager:
     @property
     def store(self) -> MemoryStore:
         mem = self._store or get_memory_store()
-        with mem._lock:
-            for ddl in ENDPOINTS_DDL:
-                mem.conn.execute(ddl)
-            mem.conn.commit()
+        mem.ensure_schema("endpoints", lambda m: [m.conn.execute(ddl) for ddl in ENDPOINTS_DDL] and None)
         return mem
 
     def register_endpoint(
@@ -126,13 +120,25 @@ class EndpointManager:
         os_hint: str = "",
         verify_tls: bool = True,
         tags: Optional[List[str]] = None,
+        actor: str = "user",
     ) -> Dict[str, Any]:
         """Register or update a remote endpoint using a symbolic Vault `credential_ref` (never raw secrets)."""
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
+            return {"ok": False, "error": "ENDPOINT GUARD REJECTED: Only the user can register or modify remote endpoints."}
         eid = _slug_id(endpoint_id or label or host)
         proto = (protocol or "").strip().lower()
         clean_host = (host or "").strip()
+        clean_user = (username or "").strip()
         if not eid or proto not in VALID_PROTOCOLS or not clean_host:
             return {"ok": False, "error": f"`endpoint_id`, `host`, and `protocol` ({', '.join(VALID_PROTOCOLS)}) are required."}
+        host_only_chk = (urllib.parse.urlsplit(clean_host).hostname if "://" in clean_host else clean_host.split(":")[0]).strip()
+        if (
+            host_only_chk.startswith("-")
+            or clean_user.startswith("-")
+            or any(c.isspace() or ord(c) < 32 for c in clean_host)
+            or any(c.isspace() or ord(c) < 32 for c in clean_user)
+        ):
+            return {"ok": False, "error": "SAFETY GUARD REJECTED: `host` and `username` must not start with `-` or contain whitespace/control characters."}
         ssrf_err = _check_metadata_ssrf(clean_host)
         if ssrf_err:
             return {"ok": False, "error": ssrf_err}
@@ -153,7 +159,7 @@ class EndpointManager:
         if cred_slug:
             ctype = "ssh_key" if eff_auth == "ssh_key" else ("basic_auth" if eff_auth == "basic_auth" else ("bearer_token" if eff_auth == "bearer_token" else "api_key"))
             get_vault_manager(store=self.store).declare_placeholder(
-                cred_slug, cred_type=ctype, description=f"Credential for endpoint `{eid}`", allow_list=[f"endpoint:{eid}"],
+                cred_slug, cred_type=ctype, description=f"Credential for endpoint `{eid}`", allow_list=[f"endpoint:{eid}"], actor=actor,
             )
 
         with self.store._lock:
@@ -205,7 +211,9 @@ class EndpointManager:
             r["host_profile"] = json.loads(r.pop("host_profile_json") or "{}")
         return rows
 
-    def remove_endpoint(self, endpoint_id: str) -> Dict[str, Any]:
+    def remove_endpoint(self, endpoint_id: str, actor: str = "user") -> Dict[str, Any]:
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
+            return {"ok": False, "error": "ENDPOINT GUARD REJECTED: Only the user can remove remote endpoints."}
         eid = _slug_id(endpoint_id)
         with self.store._lock:
             cur = self.store.conn.execute("DELETE FROM remote_endpoints WHERE endpoint_id = ?", (eid,))
@@ -229,16 +237,21 @@ class EndpointManager:
             self.store.conn.commit()
 
     def _resolve_ssh_host_port(self, ep: Dict[str, Any]) -> Tuple[str, int]:
-        host_only = urllib.parse.urlsplit(ep["host"]).hostname or ep["host"]
+        host_only = str(urllib.parse.urlsplit(ep["host"]).hostname or ep["host"]).strip()
         port = int(ep["port"])
+        uname = str(ep.get("username") or "").strip()
+        if host_only.startswith("-") or uname.startswith("-"):
+            return host_only, port
         ssh_bin = shutil.which("ssh")
         if ep["protocol"] == "ssh" and ssh_bin:
-            dest = f"{ep['username']}@{host_only}" if ep.get("username") else host_only
+            dest = f"{uname}@{host_only}" if uname else host_only
             try:
-                proc = subprocess.run([ssh_bin, "-G", "-p", str(port), dest], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3)
+                proc = subprocess.run([ssh_bin, "-G", "-p", str(port), "--", dest], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3)
                 if proc.returncode == 0:
                     cfg = dict(ln.strip().split(" ", 1) for ln in proc.stdout.splitlines() if " " in ln.strip())
-                    host_only = cfg.get("hostname", host_only)
+                    cand_host = cfg.get("hostname", host_only)
+                    if not _check_metadata_ssrf(cand_host):
+                        host_only = cand_host
                     port = int(cfg.get("port", port))
             except Exception:
                 pass
@@ -276,7 +289,8 @@ class EndpointManager:
         safety_err = check_command_safety(command)
         if safety_err:
             return {"ok": False, "error": safety_err}
-        if actor.strip().lower() in ("user", "cli", "web") or confirmed:
+        human_ok = (actor.strip().lower() in ("user", "cli", "web") or confirmed) and not is_in_agent_tool_turn()
+        if human_ok:
             return None
         trust = get_trust_mode(store=self.store)
         needs_gate = trust == "strict" or bool(_REMOTE_MUTATION_RE.search(command or ""))
@@ -289,7 +303,7 @@ class EndpointManager:
             summary=f"Execute `{command[:100]}` on remote `{ep['protocol']}` host `{ep['label']}` (`{ep['host']}`).",
             payload={"endpoint_id": ep["endpoint_id"], "command": command[:300]},
             requester=actor,
-            confirmed=confirmed,
+            confirmed=human_ok,
         )
         if not allowed:
             return {"ok": False, "awaiting_approval": True, "approval_id": apr["approval_id"], "error": f"REMOTE EXEC APPROVAL REQUIRED (`{apr['approval_id']}`): Command on `{ep['endpoint_id']}` awaits approval."}
@@ -302,6 +316,9 @@ class EndpointManager:
             return {"ok": False, "error": f"SSH endpoint `{endpoint_id}` not found."}
         if not (command or "").strip():
             return {"ok": False, "error": "Non-empty `command` is required."}
+        host_s, user_s = str(ep.get("host") or "").strip(), str(ep.get("username") or "").strip()
+        if host_s.startswith("-") or user_s.startswith("-") or any(c.isspace() or ord(c) < 32 for c in host_s + user_s):
+            return {"ok": False, "error": "SAFETY GUARD REJECTED: SSH host/username must not start with `-` or contain whitespace."}
         gate_block = self._gate_remote_exec(ep, command, actor=actor, confirmed=confirmed)
         if gate_block:
             return gate_block
@@ -326,10 +343,11 @@ class EndpointManager:
                     os.chmod(tmp_key_path, 0o600)
                 except OSError:
                     pass
+                _lock_windows_owner_dacl(Path(tmp_key_path))
                 ssh_args.extend(["-i", tmp_key_path])
 
-            dest = f"{ep['username']}@{ep['host']}" if ep.get("username") else str(ep["host"])
-            proc = subprocess.run([*ssh_args, dest, command], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(5, int(timeout)))
+            dest = f"{user_s}@{host_s}" if user_s else host_s
+            proc = subprocess.run([*ssh_args, "--", dest, command], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(5, int(timeout)))
             out = vault.scrub_output((proc.stdout or "").strip(), extra_secrets=extra_secrets)
             err = vault.scrub_output((proc.stderr or "").strip(), extra_secrets=extra_secrets)
             combined = (out + (f"\n[stderr]\n{err}" if err else "")).strip() or "(no output)"
@@ -343,14 +361,14 @@ class EndpointManager:
                 except OSError:
                     pass
 
-    def ssh_read_file(self, endpoint_id: str, remote_path: str, max_lines: int = 200) -> Dict[str, Any]:
+    def ssh_read_file(self, endpoint_id: str, remote_path: str, max_lines: int = 200, actor: str = "user", confirmed: bool = False) -> Dict[str, Any]:
         """Safely read bounded lines from a file on a remote SSH host without shell injection."""
         clean_p = (remote_path or "").strip()
         if not clean_p:
             return {"ok": False, "error": "`remote_path` is required."}
         cap = max(1, min(int(max_lines or 200), 800))
         safe_cmd = f"sed -n '1,{cap}p' -- {shlex.quote(clean_p)}"
-        return self.ssh_exec(endpoint_id, safe_cmd, actor="user", confirmed=True)
+        return self.ssh_exec(endpoint_id, safe_cmd, actor=actor, confirmed=confirmed)
 
     def winrm_exec(self, endpoint_id: str, command: str, timeout: int = 30, actor: str = "companion", confirmed: bool = False) -> Dict[str, Any]:
         """Execute a safety-checked PowerShell command on a Windows WinRM host with env-isolated Vault credentials."""
@@ -381,14 +399,15 @@ class EndpointManager:
         env["_COMP_WINRM_PORT"] = str(ep["port"])
         env["_COMP_WINRM_CMD"] = command
         ssl_flag = "-UseSSL" if int(ep["port"]) == 5986 else ""
+        sess_opt = "-SessionOption (New-PSSessionOption -SkipCACheck -SkipCNCheck)" if not ep.get("verify_tls", True) else ""
         ps_driver = (
             "$ErrorActionPreference = 'Stop'; "
             "if ($env:_COMP_WINRM_PASS) { "
             "  $sec = ConvertTo-SecureString $env:_COMP_WINRM_PASS -AsPlainText -Force; "
             "  $cred = New-Object System.Management.Automation.PSCredential($env:_COMP_WINRM_USER, $sec); "
-            f"  Invoke-Command -ComputerName $env:_COMP_WINRM_HOST -Port ([int]$env:_COMP_WINRM_PORT) {ssl_flag} -Credential $cred -ScriptBlock ([ScriptBlock]::Create($env:_COMP_WINRM_CMD)) "
+            f"  Invoke-Command -ComputerName $env:_COMP_WINRM_HOST -Port ([int]$env:_COMP_WINRM_PORT) {ssl_flag} {sess_opt} -Credential $cred -ScriptBlock ([ScriptBlock]::Create($env:_COMP_WINRM_CMD)) "
             "} else { "
-            f"  Invoke-Command -ComputerName $env:_COMP_WINRM_HOST -Port ([int]$env:_COMP_WINRM_PORT) {ssl_flag} -ScriptBlock ([ScriptBlock]::Create($env:_COMP_WINRM_CMD)) "
+            f"  Invoke-Command -ComputerName $env:_COMP_WINRM_HOST -Port ([int]$env:_COMP_WINRM_PORT) {ssl_flag} {sess_opt} -ScriptBlock ([ScriptBlock]::Create($env:_COMP_WINRM_CMD)) "
             "}"
         )
         try:
@@ -412,12 +431,13 @@ class EndpointManager:
         verb = (method or "GET").strip().upper()
         if verb not in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"):
             return {"ok": False, "error": f"Unsupported HTTP method `{verb}`."}
-        if verb in ("POST", "PUT", "PATCH", "DELETE") and actor.strip().lower() not in ("user", "cli", "web") and not confirmed:
+        human_ok = (actor.strip().lower() in ("user", "cli", "web") or confirmed) and not is_in_agent_tool_turn()
+        if verb in ("POST", "PUT", "PATCH", "DELETE") and not human_ok:
             if get_trust_mode(store=self.store) == "strict" or verb == "DELETE":
                 allowed, apr = get_approval_queue(self.store).check_or_enqueue(
                     category="endpoint_exec", action_name=f"http_{verb.lower()}", target=f"{ep['endpoint_id']}:{path}",
                     summary=f"Send `{verb} {path}` to HTTP endpoint `{ep['label']}`.",
-                    payload={"endpoint_id": ep["endpoint_id"], "method": verb, "path": path}, requester=actor, confirmed=confirmed,
+                    payload={"endpoint_id": ep["endpoint_id"], "method": verb, "path": path}, requester=actor, confirmed=human_ok,
                 )
                 if not allowed:
                     return {"ok": False, "awaiting_approval": True, "approval_id": apr["approval_id"], "error": f"HTTP `{verb}` requires approval (`{apr['approval_id']}`)."}
@@ -454,7 +474,7 @@ class EndpointManager:
         ctx = None if ep.get("verify_tls", True) else ssl._create_unverified_context()
         try:
             req = urllib.request.Request(full_url, data=data_bytes, method=verb, headers=req_headers)
-            with urllib.request.urlopen(req, timeout=max(2.0, float(timeout)), context=ctx) as resp:
+            with urlopen_safe(req, timeout=max(2.0, float(timeout)), context=ctx, allow_private_lan=True, allow_redirects=False) as resp:
                 raw_body = resp.read(524_288).decode("utf-8", errors="replace")
                 status_code = int(resp.status)
             scrubbed = vault.scrub_output(raw_body, extra_secrets=extra_secrets)
@@ -466,7 +486,7 @@ class EndpointManager:
         except Exception as exc:
             return {"ok": False, "error": vault.scrub_output(f"{type(exc).__name__}: {exc}", extra_secrets=extra_secrets)}
 
-    def inspect_host(self, endpoint_id: str) -> Dict[str, Any]:
+    def inspect_host(self, endpoint_id: str, actor: str = "user", confirmed: bool = False) -> Dict[str, Any]:
         """Collect OS, CPU, RAM, and GPU/VRAM hardware telemetry for an `ssh` or `winrm` endpoint."""
         ep = self.get_endpoint(endpoint_id)
         if not ep:
@@ -478,10 +498,10 @@ class EndpointManager:
                 "(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null "
                 "|| lspci 2>/dev/null | grep -iE 'vga|3d|display' | sed 's/^[^:]*: //') || echo no-gpu"
             )
-            res = self.ssh_exec(ep["endpoint_id"], probe_cmd, actor="user", confirmed=True)
+            res = self.ssh_exec(ep["endpoint_id"], probe_cmd, actor=actor, confirmed=confirmed)
             if not res.get("ok") or "'uname'" in str(res.get("output") or "").lower():
                 win_ssh_cmd = 'powershell -NoProfile -Command "$o=Get-CimInstance Win32_OperatingSystem;$g=(Get-CimInstance Win32_VideoController|Select-Object -ExpandProperty Name)-join \'; \';@{os_kernel=$o.Caption;hostname=$env:COMPUTERNAME;cpu_cores=$env:NUMBER_OF_PROCESSORS;ram_total=([string][math]::Round($o.TotalVisibleMemorySize/1MB,1)+\'Gi\');gpu_summary=$g}|ConvertTo-Json -Compress"'
-                wres = self.ssh_exec(ep["endpoint_id"], win_ssh_cmd, actor="user", confirmed=True)
+                wres = self.ssh_exec(ep["endpoint_id"], win_ssh_cmd, actor=actor, confirmed=confirmed)
                 if wres.get("ok"):
                     try:
                         prof = json.loads(str(wres.get("output") or "{}"))
@@ -504,7 +524,7 @@ class EndpointManager:
                 "$os = Get-CimInstance Win32_OperatingSystem; $gpu = (Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join '; '; "
                 "@{hostname=$env:COMPUTERNAME; os=$os.Caption; ram_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,1); gpu_summary=$gpu} | ConvertTo-Json -Compress"
             )
-            res = self.winrm_exec(ep["endpoint_id"], ps_probe, actor="user", confirmed=True)
+            res = self.winrm_exec(ep["endpoint_id"], ps_probe, actor=actor, confirmed=confirmed)
             if not res.get("ok"):
                 return res
             try:

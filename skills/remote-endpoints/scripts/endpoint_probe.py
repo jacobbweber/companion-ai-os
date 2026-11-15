@@ -5,6 +5,7 @@ Pure Python 3.12 stdlib TCP/HTTP banner probe with `--self-test` verification.
 """
 
 import argparse
+import ipaddress
 import json
 import socket
 import sys
@@ -12,9 +13,21 @@ import threading
 import time
 from typing import Any, Dict
 
+_BLOCKED_HOSTS = {"metadata.google.internal", "metadata", "instance-data", "169.254.169.254"}
+
 
 def probe_tcp_endpoint(host: str, port: int, timeout: float = 3.0) -> Dict[str, Any]:
     """Measure TCP handshake latency and optional greeting banner without leaking credentials."""
+    clean_h = (host or "").strip().lower()
+    if not clean_h or clean_h in _BLOCKED_HOSTS:
+        return {"ok": False, "host": host, "port": int(port), "latency_ms": 0.0, "error": f"SAFETY GUARD REJECTED: blocked metadata host `{host}`"}
+    try:
+        ip_obj = ipaddress.ip_address(clean_h.strip("[]"))
+        ip_eff = getattr(ip_obj, "ipv4_mapped", None) or ip_obj
+        if ip_eff.is_link_local or ip_eff.is_multicast or ip_eff.is_unspecified:
+            return {"ok": False, "host": host, "port": int(port), "latency_ms": 0.0, "error": f"SAFETY GUARD REJECTED: blocked link-local/metadata IP `{ip_eff}`"}
+    except ValueError:
+        pass
     t0 = time.perf_counter()
     try:
         with socket.create_connection((host, int(port)), timeout=timeout) as sock:

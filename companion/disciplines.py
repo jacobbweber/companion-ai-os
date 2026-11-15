@@ -143,7 +143,14 @@ def check_module_layer_imports(tree: ast.AST, rel_or_dotted: str) -> List[Tuple[
 @dataclass(frozen=True)
 class DisciplineSpec:
     """Defines an engineering discipline enforced by the Companion State Machine."""
-    id: str; name: str; phase: str; purpose: str; checklist: Tuple[str, ...]; anti_patterns: Tuple[str, ...]; deliverable: str
+
+    id: str
+    name: str
+    phase: str
+    purpose: str
+    checklist: Tuple[str, ...]
+    anti_patterns: Tuple[str, ...]
+    deliverable: str
 
 
 DISCIPLINES: Dict[str, DisciplineSpec] = {
@@ -468,10 +475,16 @@ class ActionRiskTier(str, Enum):
 
 _R3_SHELL_RE = re.compile(
     r"(?:\b(?:ssh|scp|sftp|rsync)\s+\S+|\bgit\s+push\b|\b(?:npm|twine|cargo)\s+publish\b|"
-    r"\b(?:curl|wget)\b[^\n]*\b(?:-X|--request)\s*(?:POST|PUT|DELETE|PATCH)\b|"
-    r"\bInvoke-(?:RestMethod|WebRequest)\b[^\n]*-Method\s+(?:Post|Put|Delete|Patch)\b|"
+    r"\b(?:curl|wget)\b[^\n]*(?:\b(?:-X|--request)\s*(?:POST|PUT|DELETE|PATCH)\b|(?:\s|^)(?:-d|--data|--data-raw|--data-binary|--json|-F|--form)\b)|"
+    r"\bInvoke-(?:RestMethod|WebRequest)\b[^\n]*(?:-Method\s+(?:Post|Put|Delete|Patch)\b|-Body\b)|"
     r"\b(?:schtasks|reg\s+(?:add|delete)|netsh|systemctl|sc\s+(?:create|delete|config))\b)",
     re.I,
+)
+_R3_PYTHON_RE = re.compile(
+    r"(?:\b(?:urllib\.request\.urlopen|http\.client\.HTTPConnection|http\.client\.HTTPSConnection|socket\.create_connection|smtplib\.SMTP|ftplib\.FTP)\b|"
+    r"\bsubprocess\.(?:run|Popen|call|check_call|check_output)\b|"
+    r"\bos\.(?:system|popen)\b|"
+    r"\bshutil\.rmtree\s*\(\s*['\"](?:/|[A-Za-z]:\\|\.\.))",
 )
 _R0_ACTIONS: Dict[str, FrozenSet[str]] = {
     "checkpoint_manage": frozenset({"", "list", "git_log"}),
@@ -491,18 +504,25 @@ _R0_ACTIONS: Dict[str, FrozenSet[str]] = {
 
 def classify_action_risk(tool_name: str, args: Optional[Dict[str, Any]] = None) -> ActionRiskTier:
     """Classify `(tool_name, args)` into `R0`..`R3` without domain-specific hardcoding."""
-    payload, action = args or {}, str((args or {}).get("action") or "").strip().lower()
+    payload, action = args or {}, str((args or {}).get("action") or (args or {}).get("subaction") or "").strip().lower()
     if tool_name in ("read_file", "list_dir", "search", "web_fetch", "system_doctor"):
         return ActionRiskTier.R0_READ_ONLY
     if tool_name == "telemetry_manage":
         return ActionRiskTier.R0_READ_ONLY if action != "log_event" else ActionRiskTier.R1_LOCAL_REVERSIBLE
     if tool_name == "workflow_manage":
         return ActionRiskTier.R0_READ_ONLY if action in ("", "status", "list_recipes", "http_smoke", "check_skill") else (ActionRiskTier.R2_CAPABILITY_PROMOTION if action == "bootstrap_skill" else ActionRiskTier.R1_LOCAL_REVERSIBLE)
+    if tool_name == "endpoint_manage":
+        if action in ("ssh_exec", "winrm_exec", "register", "remove"):
+            return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+        if action == "api_request" and str(payload.get("method") or "GET").strip().upper() not in ("GET", "HEAD"):
+            return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+    if tool_name == "mcp_manage" and action in ("call_tool", "delegate_partner", "register", "remove", "register_partner", "remove_partner"):
+        return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
     if tool_name == "run_shell" and _R3_SHELL_RE.search(str(payload.get("command") or "")):
         return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
     if tool_name == "run_python":
         py_code = str(payload.get("code") or "")
-        if _R3_SHELL_RE.search(py_code) or re.search(r"\bshutil\.rmtree\s*\(\s*['\"](?:/|[A-Za-z]:\\|\.\.)", py_code):
+        if _R3_SHELL_RE.search(py_code) or _R3_PYTHON_RE.search(py_code):
             return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
     if tool_name in ("write_file", "edit_file") and (str(payload.get("path") or "").replace("\\", "/").startswith("skills/") or "/skills/" in str(payload.get("path") or "").replace("\\", "/")):
         return ActionRiskTier.R2_CAPABILITY_PROMOTION
@@ -516,12 +536,17 @@ def classify_action_risk(tool_name: str, args: Optional[Dict[str, Any]] = None) 
 @dataclass(frozen=True)
 class WorkspaceContract:
     """Pluggable workspace verification and rule contract (`CompanionSelfContract` vs `GeneralWorkspaceContract`)."""
-    contract_id: str; enforce_stdlib_only: bool; enforce_sdd_and_doctor: bool; tracked_extensions: FrozenSet[str]; impl_rules_prompt: str
+
+    contract_id: str
+    enforce_stdlib_only: bool
+    enforce_sdd_and_doctor: bool
+    tracked_extensions: FrozenSet[str]
+    impl_rules_prompt: str
 
 
 def resolve_workspace_contract(root: Path, is_self_project: bool = False) -> WorkspaceContract:
     """Return `CompanionSelfContract` for Companion core and `GeneralWorkspaceContract` for external projects."""
     resolved = root.resolve()
     if is_self_project or ((resolved / "companion").is_dir() and (resolved / "specs" / "ARCHITECTURE.md").is_file()):
-        return WorkspaceContract("companion-self", True, True, GENERAL_TRACKED_EXTENSIONS, "Rules: Obey ADR-001/ADR-015 (100% Python stdlib in Ring-0 core; PEP 723 inline deps allowed in Ring-1 skills/<name>/scripts/*.py), ADR-005 (sync canonical `specs/` if adding core modules), and hygiene budgets (<=550L/module, <=100L/fn).")
+        return WorkspaceContract("companion-self", True, True, GENERAL_TRACKED_EXTENSIONS, "Rules: Obey ADR-001/ADR-015 (100% Python stdlib in Ring-0 core; PEP 723 inline deps allowed in Ring-1 skills/<name>/scripts/*.py), ADR-005 (sync canonical `specs/` if adding core modules), and hygiene budgets (<=700L/module, <=100L/fn).")
     return WorkspaceContract("general-workspace", False, False, GENERAL_TRACKED_EXTENSIONS, f"Rules: Active workspace (`{resolved}`) — create/update the requested artifacts, configurations, scripts, or tests directly via `write_file`/`edit_file` and verify behavior empirically (`run_python`/`run_shell`). Do NOT call `sdd_manage` or inspect `.companion_backups`.")

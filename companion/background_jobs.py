@@ -162,10 +162,7 @@ class BackgroundJobManager:
     def store(self) -> MemoryStore:
         mem = self._store or get_memory_store()
         db_key = str(mem.db_path.resolve())
-        with mem._lock:
-            for ddl in JOBS_DDL:
-                mem.conn.execute(ddl)
-            mem.conn.commit()
+        mem.ensure_schema("background_jobs", lambda m: [m.conn.execute(ddl) for ddl in JOBS_DDL] and None)
         if db_key not in _RECOVERED_DBS:
             with _JOBS_LOCK:
                 if db_key not in _RECOVERED_DBS:
@@ -353,7 +350,8 @@ class BackgroundJobManager:
                     from companion.workflow_graph import workflow_engine
 
                     rec_res = workflow_engine.run_workflow_recipe(str(spec.get("recipe") or ""), params=spec.get("params") or {}, tool_fn=self._dispatch_tool)
-                    st, raw_out, meta_err = ("done" if rec_res.get("passed", True) else "failed"), str(rec_res.get("summary") or ""), ""
+                    rec_ok = rec_res.get("status") == "COMPLETE" and bool(rec_res.get("valid", True))
+                    st, raw_out, meta_err = ("done" if rec_ok else "failed"), str(rec_res.get("summary") or ""), ("" if rec_ok else str(rec_res.get("summary") or "Recipe aborted")[:300])
                 else:
                     st, raw_out, meta_err = self._run_zero_identity_worker(job, deadline)
         except InterruptedError:

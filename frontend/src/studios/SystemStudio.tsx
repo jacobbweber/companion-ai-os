@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Cpu, Globe, KeyRound, Settings2, Sparkles, UserCheck } from 'lucide-react';
+import { Cpu, Globe, KeyRound, RotateCw, Settings2, Sparkles, UserCheck } from 'lucide-react';
+import { reloadCompanionService } from '../api';
 import type { WebStatus } from '../types';
 import { AutonomyHobbiesStudio } from './AutonomyHobbiesStudio';
 import { FederationMcpStudio } from './FederationMcpStudio';
@@ -26,12 +27,27 @@ export const SystemStudio: React.FC<SystemStudioProps> = ({
   onToast,
 }) => {
   const [subTab, setSubTab] = useState<SystemSubTab>(initialTab);
+  const [reloading, setReloading] = useState(false);
 
   useEffect(() => {
     if (tabNonce > 0) {
       setSubTab(initialTab);
     }
   }, [initialTab, tabNonce]);
+
+  const handleReloadService = async () => {
+    if (reloading) return;
+    setReloading(true);
+    onToast('Reloading Companion backend & refreshing Studio...');
+    const res = await reloadCompanionService();
+    if (!res.ok) {
+      setReloading(false);
+      onToast(res.error || 'Could not reload service.');
+      return;
+    }
+    onToast(res.summary || 'Companion reloaded!');
+    window.setTimeout(() => window.location.reload(), 250);
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
@@ -89,6 +105,17 @@ export const SystemStudio: React.FC<SystemStudioProps> = ({
           onClick={() => setSubTab('ops')}
         >
           <Settings2 size={13} /> Backups, Sandboxes &amp; Doctor
+        </button>
+        <button
+          type="button"
+          data-testid="system-reload-service-btn"
+          className="btn"
+          style={{ marginLeft: 'auto' }}
+          disabled={reloading}
+          title="Restart Companion Python service & reload UI with latest code changes"
+          onClick={() => void handleReloadService()}
+        >
+          <RotateCw size={13} /> {reloading ? 'Reloading...' : 'Reload Service'}
         </button>
       </div>
 

@@ -10,6 +10,7 @@ Provides deterministic Python AST analysis for:
 
 import ast
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -44,6 +45,7 @@ class HygieneReport:
     oversized_modules: List[str] = field(default_factory=list)
     oversized_functions: List[str] = field(default_factory=list)
     orphan_files: List[str] = field(default_factory=list)
+    semicolon_chains: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -55,6 +57,7 @@ class HygieneReport:
             "oversized_modules": self.oversized_modules,
             "oversized_functions": self.oversized_functions,
             "orphan_files": self.orphan_files,
+            "semicolon_chains": self.semicolon_chains,
         }
 
     def format_summary(self) -> str:
@@ -78,6 +81,7 @@ class HygieneReport:
             ("Oversized Modules", self.oversized_modules),
             ("Oversized Functions", self.oversized_functions),
             ("Orphan Files", self.orphan_files),
+            ("Semicolon-Chained Lines", self.semicolon_chains),
         ]
         for title, items in sections:
             if items:
@@ -190,7 +194,7 @@ def _record_module_imports_and_refs(
 ) -> None:
     """Populate intra-file symbol references, attribute references, and cross-file module-qualified bindings."""
     pkg = rel_path.rsplit("/", 1)[0].replace("/", ".") if "/" in rel_path else ""
-    file_intra = _collect_all_exports(tree)
+    file_intra: Set[str] = set()
     file_attrs: Set[str] = set()
     mod_aliases: Dict[str, str] = {}
 
@@ -211,7 +215,10 @@ def _record_module_imports_and_refs(
             elif isinstance(node, ast.ImportFrom):
                 base_mod = node.module or ""
                 if node.level and pkg:
-                    base_mod = f"{pkg}.{base_mod}".rstrip(".") if base_mod else pkg
+                    pkg_parts = [p for p in pkg.split(".") if p]
+                    up = max(0, node.level - 1)
+                    parent_pkg = ".".join(pkg_parts[: max(0, len(pkg_parts) - up)])
+                    base_mod = f"{parent_pkg}.{base_mod}".strip(".") if base_mod else parent_pkg
                 for alias in node.names:
                     if base_mod in GOVERNED_SYMBOL_DIRS:
                         mod_aliases[alias.asname or alias.name] = f"{base_mod}.{alias.name}"
@@ -230,6 +237,22 @@ def _record_module_imports_and_refs(
 
     intra_refs[rel_path] = file_intra
     attr_refs[rel_path] = file_attrs
+
+
+def find_semicolon_chains(tree: ast.AST, rel_path: str) -> List[str]:
+    """Detect semicolon-chained multi-statement lines (`stmt1; stmt2`) used to game line budgets."""
+    found: List[str] = []
+    seen_lines: Set[int] = set()
+    for node in ast.walk(tree):
+        for attr in ("body", "orelse", "finalbody"):
+            block = getattr(node, attr, None)
+            if isinstance(block, list):
+                for idx in range(len(block) - 1):
+                    end_ln = getattr(block[idx], "end_lineno", block[idx].lineno)
+                    if end_ln == block[idx + 1].lineno and end_ln not in seen_lines:
+                        seen_lines.add(end_ln)
+                        found.append(f"{rel_path}:{end_ln} chains multiple statements with `;` on one line")
+    return found
 
 
 def analyze_workspace_hygiene(
@@ -274,6 +297,8 @@ def analyze_workspace_hygiene(
             report.oversized_modules.append(f"{rel_path} ({len(lines)} lines > budget {mod_limit})")
 
         _check_file_definitions(tree, rel_path, parts[0], fn_limit, report, defined_symbols, private_methods)
+        if parts[0] not in ("tests", "skills"):
+            report.semicolon_chains.extend(find_semicolon_chains(tree, rel_path))
         report.unused_imports.extend(find_unused_imports_in_source(tree, rel_path))
         _record_module_imports_and_refs(
             tree, rel_path, intra_refs, attr_refs, imported_from_mod, star_imported_mods, dynamic_getattr_names
@@ -304,6 +329,7 @@ def analyze_workspace_hygiene(
         or report.oversized_modules
         or report.oversized_functions
         or report.orphan_files
+        or report.semicolon_chains
     )
     return report
 
@@ -348,24 +374,28 @@ def extract_python_symbol(
 
 
 _REPO_MAP_CACHE: Dict[Tuple[str, int, int], str] = {}
+_REPO_MAP_LOCK = threading.RLock()
 
 
-def build_repo_headroom_map(root: Optional[Path] = None, max_files: int = 30) -> str:
+def build_repo_headroom_map(root: Optional[Path] = None, max_files: int = 64) -> str:
     """Build a fast (`<15ms`, mtime-cached) AST Repo & Line-Budget Headroom Map for Step-0 orientation."""
     target_root = (root or settings.active_project_root).resolve()
     mod_limit = settings.max_module_lines
+    is_companion_repo = (target_root / "companion").is_dir() and (target_root / "surfaces").is_dir()
+    skip_set = SKIP_DIRS | ({"tests", "skills"} if is_companion_repo else set())
     py_files: List[Path] = []
     if target_root.is_dir():
         for cur_r, dirs, fnames in os.walk(target_root):
-            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+            dirs[:] = sorted(d for d in dirs if d not in skip_set)
             py_files.extend(Path(cur_r) / fn for fn in sorted(fnames) if fn.endswith(".py") and fn != "__init__.py")
     if not py_files:
         return "  (No Python modules in active workspace yet)"
 
     max_mtime = max((int(p.stat().st_mtime_ns) for p in py_files), default=0)
     cache_key = (str(target_root), len(py_files), max_mtime)
-    if cache_key in _REPO_MAP_CACHE:
-        return _REPO_MAP_CACHE[cache_key]
+    with _REPO_MAP_LOCK:
+        if cache_key in _REPO_MAP_CACHE:
+            return _REPO_MAP_CACHE[cache_key]
 
     rows: List[str] = []
     for py_file in py_files[:max_files]:
@@ -393,7 +423,8 @@ def build_repo_headroom_map(root: Optional[Path] = None, max_files: int = 30) ->
     if len(py_files) > max_files:
         rows.append(f"  - ... (+{len(py_files) - max_files} additional `.py` files)")
     rendered = "\n".join(rows)
-    if len(_REPO_MAP_CACHE) > 8:
-        _REPO_MAP_CACHE.clear()
-    _REPO_MAP_CACHE[cache_key] = rendered
+    with _REPO_MAP_LOCK:
+        if len(_REPO_MAP_CACHE) > 8:
+            _REPO_MAP_CACHE.clear()
+        _REPO_MAP_CACHE[cache_key] = rendered
     return rendered

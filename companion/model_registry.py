@@ -15,7 +15,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion import memory_store as _ms_mod
-from companion.config import CAPABILITY_TIERS, MODEL_TIERS, TierConfig, settings
+from companion.config import CAPABILITY_TIERS, MODEL_TIERS, TierConfig, is_in_agent_tool_turn, settings
 from companion.llm import discover_provider_models, format_model_tiers_status
 from companion.llm_wire import VALID_DIALECTS, VALID_PRIVACY_MODES, VALID_REASONING_EFFORTS, is_local_or_lan_endpoint
 from companion.memory_store import MemoryStore, get_memory_store
@@ -79,15 +79,15 @@ def _slugify_provider_id(raw: str) -> str:
 
 
 def _ensure_schema_and_seed(store: MemoryStore) -> None:
-    with store._lock:
+    def _init(st: MemoryStore) -> None:
         for ddl in MODEL_REGISTRY_DDL:
-            store.conn.execute(ddl)
-        cur = store.conn.execute("SELECT COUNT(*) FROM llm_providers WHERE provider_id = 'local-default'").fetchone()
+            st.conn.execute(ddl)
+        cur = st.conn.execute("SELECT COUNT(*) FROM llm_providers WHERE provider_id = 'local-default'").fetchone()
         if not cur or int(cur[0]) == 0:
             def_cfg = settings.tiers["default"]
             def_lbl = "Local Default (Ollama)" if ":11434" in def_cfg.base_url else "Local Default (Primary .env)"
             def_models = json.dumps([{"id": def_cfg.model, "label": def_cfg.model, "loaded": False, "context_window": def_cfg.context_window_tokens}]) if def_cfg.model else "[]"
-            store.conn.execute(
+            st.conn.execute(
                 """INSERT OR IGNORE INTO llm_providers
                    (provider_id, label, preset, dialect, base_url, credential_ref, is_local, enabled, models_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)""",
@@ -103,13 +103,15 @@ def _ensure_schema_and_seed(store: MemoryStore) -> None:
                 pid = "ollama-lan" if is_oll else f"env-{t_name}"
                 lbl = f"Ollama LAN ({t_cfg.base_url})" if is_oll else f"Dedicated {t_name.title()} ({t_cfg.base_url})"
                 m_json = json.dumps([{"id": t_cfg.model, "label": t_cfg.model, "loaded": False, "context_window": t_cfg.context_window_tokens}])
-                store.conn.execute(
+                st.conn.execute(
                     """INSERT OR IGNORE INTO llm_providers
                        (provider_id, label, preset, dialect, base_url, credential_ref, is_local, enabled, models_json)
                        VALUES (?, ?, ?, ?, ?, '', ?, 1, ?)""",
                     (pid, lbl, "ollama" if is_oll else "vllm", t_cfg.dialect, t_cfg.base_url, 1 if is_local_or_lan_endpoint(t_cfg.base_url) else 0, m_json),
                 )
-        store.conn.commit()
+        st.conn.commit()
+
+    store.ensure_schema("model_registry", _init)
 
 
 def _resolve_provider_secret(store: MemoryStore, provider_id: str, cred_ref: str) -> str:
@@ -458,7 +460,8 @@ def execute_model_registry_action(params: Optional[Dict[str, Any]] = None, actor
     p = dict(params or {})
     mem = store or get_memory_store()
     sub = str(p.get("subaction") or p.get("action") or "status").strip().lower()
-    if sub in ("save_provider", "delete_provider", "set_privacy") and actor.strip().lower() not in ("user", "cli", "web"):
+    mutating_subs = ("save_provider", "delete_provider", "set_privacy", "save_tier", "reset_tier", "set_mode", "set_compaction", "save_compaction")
+    if sub in mutating_subs and (actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn()):
         return {"ok": False, "error": f"SECURITY GUARD: `{sub}` requires direct user/CLI/Web authorization."}
     if sub in ("status", "list", "matrix"):
         return get_model_matrix_snapshot(mem)
@@ -476,6 +479,7 @@ def execute_model_registry_action(params: Optional[Dict[str, Any]] = None, actor
         with mem._lock:
             mem.conn.execute("DELETE FROM llm_providers WHERE provider_id = ?", (pid,))
             mem.conn.execute("DELETE FROM llm_tier_routes WHERE provider_id = ?", (pid,))
+            mem.conn.execute("UPDATE llm_tier_routes SET fallback_provider_id = '', fallback_model = '' WHERE fallback_provider_id = ?", (pid,))
             mem.conn.commit()
         bump_model_registry_cache()
         return {**get_model_matrix_snapshot(mem), "summary": f"Removed provider `{pid}`."}

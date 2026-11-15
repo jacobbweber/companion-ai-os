@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from companion.config import settings
 from companion.disciplines import DISCIPLINES, DisciplineSpec, verify_repository_syntax
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.safety import CheckpointManager, get_active_checkpoint_manager, run_unit_tests
@@ -112,7 +113,19 @@ class WorkflowEngine:
 
     @property
     def cp_manager(self) -> CheckpointManager:
-        return self._cp_manager or get_active_checkpoint_manager()
+        if self._cp_manager is not None:
+            return self._cp_manager
+        if self._root is not None:
+            self._cp_manager = CheckpointManager(root=self._root, backup_dir=self._root / ".companion_backups", store=self._store)
+            return self._cp_manager
+        mem = self.store
+        if mem.db_path.resolve() != settings.db_path.resolve():
+            iso_root = mem.db_path.parent
+            cp = CheckpointManager(root=iso_root, backup_dir=iso_root / ".companion_backups", store=mem)
+            if self._store is not None:
+                self._cp_manager = cp
+            return cp
+        return get_active_checkpoint_manager()
 
     @property
     def root(self) -> Path:
@@ -189,7 +202,7 @@ class WorkflowEngine:
             passed, details = self._run_verification_gate()
             gate_details = details
             meta_updates.update({"verified": passed, "last_verification": details})
-            if not passed and target_state in (WorkflowState.REFLECT, WorkflowState.COMPLETE):
+            if not passed:
                 self.store.update_workflow_state(
                     wf_id, from_state.value, WorkflowState.RECOVER.value,
                     f"Auto-routed to RECOVER due to verification gate failure: {details[:300]}",
@@ -242,9 +255,9 @@ class WorkflowEngine:
         active = self.store.get_active_workflow()
         if not active:
             return (
-                "State Machine: `IDLE` (No active multi-step workflow).\n"
-                "  - For non-trivial engineering, SDD, or multi-step goals, start a deterministic workflow:\n"
-                "    `workflow_manage(action='start', workflow_type='self_evolution'|'engineering_feature'|'bug_fix', goal='...', acceptance_criteria='...')`"
+                "State Machine: `IDLE` (No active software engineering workflow).\n"
+                "  - SOFTWARE / CODEBASE BUILDS ONLY: Start `workflow_manage(action='start', workflow_type='self_evolution'|'engineering_feature'|'bug_fix', ...)` strictly for multi-step code/script builds in an editable workspace.\n"
+                "  - PERSONAL, HOME, OR WORK GOALS: NEVER start or link `workflow_manage` for real-world chores, renovations, or career goals — use `agile_manage(action='save_epic')` + `save_card(..., epic_id=...)`!"
             )
         wf_id, wf_type, raw_state = active["id"], active["workflow_type"], str(active["current_state"])
         if raw_state not in WorkflowState._value2member_map_:

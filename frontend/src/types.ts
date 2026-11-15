@@ -563,15 +563,30 @@ export interface AgileBoard {
   open_cards: number;
 }
 
+export interface AgileChecklistItem {
+  id: string;
+  text: string;
+  done: boolean;
+}
+
 export interface AgileEpic {
   epic_id: string;
   board_id: string;
+  board_title?: string;
   title: string;
   horizon: 'now' | 'next' | 'later' | 'someday' | string;
   status: string;
+  start_date: string;
   target_date: string;
   wiki_path: string;
   summary: string;
+  card_count?: number;
+  done_card_count?: number;
+  progress_pct?: number;
+  effective_start_date?: string;
+  roadmap_end_date?: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface AgileSprint {
@@ -591,6 +606,7 @@ export interface AgileCard {
   board_id: string;
   board_title: string;
   epic_id: string;
+  epic_title: string;
   sprint_id: string;
   title: string;
   description: string;
@@ -606,6 +622,9 @@ export interface AgileCard {
   depends_on: string[];
   unresolved_deps: Array<{ card_id: string; title: string }>;
   tags: string[];
+  checklist: AgileChecklistItem[];
+  checklist_done: number;
+  checklist_total: number;
   rollover_count: number;
   age_days: number;
   untouched_days: number;
@@ -637,6 +656,8 @@ export interface AgileBoardView {
   active_sprint: AgileSprint | null;
   capacity: AgileCapacity;
   cards: AgileCard[];
+  all_cards: AgileCard[];
+  backlog_cards: AgileCard[];
   columns: Record<string, AgileCard[]>;
   horizons: Record<string, AgileCard[]>;
   aging_cards: AgileCard[];
@@ -647,12 +668,13 @@ export interface CalendarItem {
   id: string;
   date: string;
   time: string;
-  source_type: 'event' | 'sprint_task' | 'deadline' | 'routine' | 'study_review' | string;
+  source_type: 'event' | 'sprint_task' | 'deadline' | 'routine' | 'study_review' | 'epic_milestone' | string;
   kind: string;
   title: string;
   all_day: boolean;
   board_id?: string;
   card_id?: string;
+  epic_id?: string;
   status?: string;
   effort_size?: string;
   routine_id?: string;
@@ -668,6 +690,7 @@ export interface CalendarWindow {
   end_date: string;
   sprints: AgileSprint[];
   active_sprint: AgileSprint | null;
+  epics?: AgileEpic[];
   items: CalendarItem[];
   by_date: Record<string, CalendarItem[]>;
 }

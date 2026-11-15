@@ -30,6 +30,18 @@ if ((-not (Test-Path $EnvTarget)) -and (Test-Path $EnvTemplate)) {
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $ExistingPids = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -gt 0 })
 if ($ExistingPids.Count -gt 0 -and $StopExisting) {
+    $VerifiedCompanion = $false
+    try {
+        $Health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -Method Get -TimeoutSec 2 -ErrorAction Stop
+        if ($Health -and $Health.service -like "companion-web*") {
+            $VerifiedCompanion = $true
+        }
+    } catch {
+        $VerifiedCompanion = $false
+    }
+    if (-not $VerifiedCompanion) {
+        throw "Refusing to stop PID(s) $($ExistingPids -join ', ') on port $Port because /api/health did not identify a Companion Web server."
+    }
     foreach ($PidToStop in $ExistingPids) {
         Write-Host "Stopping existing Companion server on port $Port (PID $PidToStop)..." -ForegroundColor Yellow
         Stop-Process -Id $PidToStop -Force -ErrorAction SilentlyContinue
@@ -38,7 +50,7 @@ if ($ExistingPids.Count -gt 0 -and $StopExisting) {
     $ExistingPids = @()
 }
 
-$Flag = if ($Mode -eq "tray") { "--tray --no-browser --port $Port" } else { "--web --port $Port" }
+$Flag = if ($Mode -eq "tray") { "--locked --tray --no-browser --host 127.0.0.1 --port $Port" } else { "--locked --web --host 127.0.0.1 --port $Port" }
 $ArgsStr = "`"$RepoRoot\harness.py`" --data-dir `"$DataDir`" $Flag"
 
 $Action = New-ScheduledTaskAction -Execute $PythonExe -Argument $ArgsStr -WorkingDirectory $RepoRoot

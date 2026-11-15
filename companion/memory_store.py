@@ -3,7 +3,7 @@
 import contextlib, contextvars, json, os, re, sqlite3, sys, threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from companion import __version__
 from companion.config import SELF_PROJECT_ID, is_in_agent_tool_turn, settings
@@ -62,7 +62,7 @@ DEFAULT_USER_PROFILE: Dict[str, str] = {
 }
 
 FOUNDATIONAL_ADRS: List[Tuple[str, str, str, str]] = [
-    ("ADR-001: Zero-Dependency Python Stdlib Foundation", "External dependencies in core agent loops cause environment fragility when self-evolving.", "Keep Ring-0 core (`harness.py`, `companion/`, `surfaces/`, `configs/`) 100% Python 3.12 stdlib while allowing Ring-1 `skills/*/scripts/*.py` to declare isolated PEP 723 `uv run` dependencies.", "Unbrickable zero-dependency core brain paired with an extensible, isolated skill toolbox."),
+    ("ADR-001: Zero-Dependency Python Stdlib Foundation", "External dependencies in core agent loops cause environment fragility when self-evolving.", "Keep Ring-0 core (`harness.py`, `companion/`, `surfaces/`, `configs/`, `memory/`) 100% Python 3.12 stdlib while allowing Ring-1 `skills/*/scripts/*.py` to declare isolated PEP 723 `uv run` dependencies.", "Unbrickable zero-dependency core brain paired with an extensible, isolated skill toolbox."),
     ("ADR-002: A-Frame Layered Modular Architecture", "A single script becomes brittle at scale, while unlinked files create dead code.", "Organize Companion into an A-Frame Architecture: Infrastructure -> Domain -> Workflow Crossbar -> Application -> Presentation Apex.", "Clear separation of concerns, SOLID compliance, and backward compatibility via harness.py."),
     ("ADR-003: Deterministic State-Machine Graph for Engineering & Self-Evolution", "Unstructured tool loops hit MAX_TOOL_ITERS or skip design/testing on multi-step tasks.", "Enforce a persistent directed-graph state machine (INTAKE -> DISCOVER -> DESIGN -> PLAN -> IMPLEMENT -> VERIFY -> REFLECT -> COMPLETE).", "Deterministic execution, automatic recovery via RECOVER state, and persistent state across restarts."),
     ("ADR-004: Self-Preservation via AST Syntax Guard & Workspace Checkpoints", "A self-modifying agent can break its own source code if it writes invalid syntax.", "Every write_file/edit_file on a .py file backs up the original and validates AST syntax before saving.", "Companion cannot brick itself with syntax errors and can rollback entire workflows."),
@@ -71,15 +71,15 @@ FOUNDATIONAL_ADRS: List[Tuple[str, str, str, str]] = [
     ("ADR-007: Active Project Registry & Rollback Lesson Memory", "Companion needs to remember why rollbacks occurred without leaving tasks falsely completed, and must support working on external projects via a mechanical toggle rather than AI memory.", "Snapshot/rewind tasks, backlog, and ADRs inside checkpoints while recording rollback_lesson notes; enforce WorkspaceContext so tools bind to active_project_root and lock Companion core read-only when working on external projects.", "Companion never relies on LLM memory to stay in the right project folder - path and read-only rules are mechanically enforced."),
     ("ADR-008: Spine-Level Waterfall Telemetry & Headless Core UI Boundary", "Companion needs step-by-step waterfall and KPI telemetry decoupled from any Frontend Web UI.", "Build thread-safe TelemetryEngine directly into llm.chat, tools.dispatch, and agent.run_agent_turn persisting traces, spans, and logs in SQLite while enforcing a Headless Core vs. Presentation UI boundary.", "Automatic SQLite waterfall observability across CLI and Web UI surfaces."),
     ("ADR-009: Two-Tier Progressive Disclosure Skills vs. Primitive Tools", "Hardcoding domain runbooks into Python modules or the system prompt causes bloat.", "Separate L1 atomic tools from L2/L3 declarative skill packs (skills/<name>/SKILL.md) loaded progressively on demand.", "Horizontal scalability for new skills and workflows with minimal prompt overhead."),
-    ("ADR-010: Stdlib LAN Web Surface (surfaces/) & Multi-Phase Autonomous Goal Driver", "Single-turn loops and external web frameworks caused unverified stub code during self-development.", "Serve zero-dependency ThreadingHTTPServer LAN web interfaces in surfaces/ with disconnect-proof async job streaming, and drive multi-step builds via companion/autonomy.py with mechanical tier routing and System Doctor gates.", "Mobile/desktop LAN browser access with zero external dependencies and non-hallucinative feature delivery."),
+    ("ADR-010: Stdlib LAN Web Surface (surfaces/) & Multi-Phase Autonomous Goal Driver", "Single-turn loops and external web frameworks caused unverified stub code during self-development.", "Serve zero-dependency ThreadingHTTPServer web interfaces in surfaces/ (defaulting to 127.0.0.1) with disconnect-proof async job streaming, and drive multi-step builds via companion/autonomy.py with mechanical tier routing and System Doctor gates.", "Mobile/desktop browser access with zero external dependencies and non-hallucinative feature delivery."),
     ("ADR-011: Mechanical Cognitive Grounding, Phase Tool Gates & Inline Post-Edit Micro-Linting", "Local open-weight models suffer reasoning amnesia between tool steps, waste turns exploring blindly, or make premature out-of-budget edits.", "Carry rolling 1-step <think> scratchpads, rescue text <tool_call> blocks, inject deterministic AST Repo & Line-Budget Maps, enforce phase-scoped AllowedTools, run inline post-edit AST/hygiene/layer micro-linters, and persist lossless resumable phase handoffs.", "Frontier-grade reliability on local models through deterministic Python harness mechanics."),
     ("ADR-012: Interactive Blueprint Approval Gate, Dedicated Coding Tier & Live Flight Eval", "Non-technical product partners need plain-English design/plan review before code edits, while local coding specialists benefit from dedicated IMPLEMENT routing and empirical flight benchmarks.", "Add pause-at-PLAN Blueprint approval/revision (`companion/blueprint.py`), dedicated `coding` tier routing + task carry-forward auto-skip (`companion/compaction.py`, `companion/autonomy.py`), local Git save-points, and isolated 3-flight behavioral eval (`companion/eval_harness.py`).", "Safe human-in-the-loop steering, higher first-pass implementation quality, and reproducible model benchmarking."),
-    ("ADR-013: Web UI Conversation Search & Git Save-Points Surface", "Mobile and desktop LAN browser users need direct access to FTS5 conversation search and recent Git save-points without dropping to CLI commands.", "Expose read-only `GET /api/search?q=<query>&limit=<n>` backed by `MemoryStore.search_conversations()` and include `recent_savepoints` in `GET /api/status` rendered in the Chat and Workflow & Doctor tabs (`surfaces/web_server.py`, `surfaces/web_assets.py`).", "Zero-dependency browser search and save-point visibility with non-blocking WAL reads."),
+    ("ADR-013: Web UI Conversation Search & Git Save-Points Surface", "Mobile and desktop browser users need direct access to FTS5 conversation search and recent Git save-points without dropping to CLI commands.", "Expose read-only `GET /api/search?q=<query>&limit=<n>` backed by `MemoryStore.search_conversations()` and include mtime-cached `recent_savepoints` in `GET /api/status` (`surfaces/web_server.py`, `surfaces/web_assets.py`).", "Zero-dependency browser search and save-point visibility with non-blocking WAL reads."),
     ("ADR-014: Domain-Neutral Cognitive Architecture, KnowledgePort, Dynamic GoalPlan DAGs & Skill Forge", "Complex open-ended goals across diverse workspaces require epistemic grounding, uncompromised reasoning routing, action-level risk gates, evidence-verified GoalPlan DAGs, and safe transactional skill promotion without hardcoding domain-specific tools.", "Introduce `KnowledgePort` & `ExecutionTarget` (`companion/grounding.py`), readiness-aware uncompromised reasoning routing (`companion/intake.py`), dynamic `GoalPlan` DAGs (`companion/workflow_dag.py`), and staged capability promotion + `REFLECT` distillation (`companion/skill_forge.py`).", "General-purpose reliability across any domain, clean external Wiki/Sandbox ports, and compounding verified capabilities."),
-    ("ADR-015: Live SSE Token Streaming, Hybrid Semantic RRF Memory & Zero-Login Home LAN Security", "Home LAN desktop/mobile users expect real-time token/phase streaming, conceptual memory recall without GPU swaps, and invisible browser protection without login screens.", "Add ContextVar SSE streaming (`companion/streaming.py`, `GET /api/jobs/<id>/stream`), zero-swap hybrid BM25 + semantic RRF retrieval (`companion/semantic_memory.py`), static Web UI assets (`surfaces/static/`), and Host/Origin/Sec-Fetch-Site/CSRF LAN guards (`surfaces/web_server.py`).", "Responsive Antigravity/Claude-grade live UX, meaning-based memory recall in <5ms, and zero-login LAN safety."),
+    ("ADR-015: Live SSE Token Streaming, Hybrid Semantic RRF Memory & Loopback/Token-Gated LAN Security", "Desktop/mobile users expect real-time token/phase streaming, conceptual memory recall without GPU swaps, zero-login convenience on localhost, and strict authentication when exposed on LAN/Tailscale.", "Add ContextVar SSE streaming (`companion/streaming.py`, `GET /api/jobs/<id>/stream`), zero-swap hybrid BM25 + semantic RRF retrieval (`companion/semantic_memory.py`), static Web UI assets (`surfaces/static/`), and loopback-default binding (`127.0.0.1`) with `COMPANION_WEB_TOKEN` non-loopback auth plus unconditional `Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF` guards (`surfaces/web_server.py`).", "Responsive live UX, meaning-based memory recall in <5ms, zero-login localhost ergonomics, and authenticated LAN/Tailscale safety."),
     ("ADR-016: Companion 3.0 Harvest Backend — Shared CoreActions, Forever-Chat Jobs, Co-Owned Wiki 2.0, Blind Vault, Universal Endpoints, Partner-Aware Federated MCP & Respectful Routines", "Extracting capabilities from legacy homelab/agent systems risked mixing UI/core concerns, leaking secrets in a zero-login LAN environment, cluttering primary chat, or causing downtime cron storms.", "Introduce `CORE_ACTIONS` (`companion/core_actions.py`), Zero-Identity Background Jobs with <=200-token Wiki Inbox overflow (`companion/background_jobs.py`), 4-folder Dual-Author Knowledge Wiki (`companion/wiki_engine.py`), write-only Zero-Reveal `secrets.env` Vault + secret-free backups (`companion/vault.py`), SSH/WinRM/HTTP Connectors (`companion/endpoints.py`), Outbound + Inbound 'Order Counter' MCP Hub with Partner-Aware Federation (`companion/mcp_hub.py`), and Hardware-Gated Routines + Clone Sandboxes (`companion/routines.py`).", "Complete headless multi-machine & knowledge operating system honoring strict downward A-Frame boundaries and zero-reveal LAN security."),
     ("ADR-017: Stage 6 Multi-Studio React + TypeScript Frontend (`frontend/`) Compiling into Zero-Node Stdlib `surfaces/static/`", "Surfacing all 6 Companion 3.0 Harvest studios (Forever Chat, Wiki & 2D Canvas Mind Map, Jobs & Approvals, Blind Vault & Endpoints, Federation & MCP, Routines & Ops) in raw vanilla JS strings would cause unmaintainable UI sprawl, while adding a runtime Node server would violate `ADR-001`.", "Author a modular React 19 + TypeScript + Vite frontend in `frontend/` with a Matte Brutalist Sci-Fi / Obsidian 4-preset theme system (`obsidian`, `orbital`, `graphite`, `daylight` + 1-click Light/Dark toggle) that compiles deterministically (`iife`) into `surfaces/static/{index.html,styles.css,app.js}` served directly by stdlib `surfaces/web_server.py` (`python harness.py --web`).", "Typed, self-maintainable 6-Studio AI workstation UI with zero runtime Node dependency, 100% offline LAN execution, and strict Ring-0 Python stdlib purity."),
-    ("ADR-018: Multi-Provider LLM Registry, Pure-Stdlib Wire Dialects, Blind Vault Key Binding & Mechanical LAN Privacy Lock", "Supporting both local LAN servers (Ollama, vLLM, LM Studio, llama.cpp) and frontier cloud APIs (Gemini, Anthropic Claude, OpenAI, xAI Grok, OpenRouter, DeepSeek, Groq) via static `.env` edits forced restarts, risked API key leakage, and lost provider-native reasoning/multimodal capabilities (`thoughtSignature`, Extended Thinking signatures, native audio/video).", "Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`/`hybrid`/`cloud_allowed` outbound privacy lock).", "Instant hot-reload routing across local LAN and frontier models from Web UI (`System -> Models, Tiers & Context`) and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy."),
+    ("ADR-018: Multi-Provider LLM Registry, Pure-Stdlib Wire Dialects, Blind Vault Key Binding & Mechanical LAN Privacy Lock", "Supporting both local LAN servers (Ollama, vLLM, LM Studio, llama.cpp) and frontier cloud APIs (Gemini, Anthropic Claude, OpenAI, xAI Grok, OpenRouter, DeepSeek, Groq) via static `.env` edits forced restarts, risked API key leakage, and lost provider-native reasoning/multimodal capabilities (`thoughtSignature`, Extended Thinking signatures, native audio/video).", "Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`-by-default/`hybrid`/`cloud_allowed` outbound privacy lock).", "Instant hot-reload routing across local LAN and frontier models from Web UI (`System -> Models, Tiers & Context`) and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy."),
     ("ADR-019: Independent Two-Lever Operating Architecture (`Hobby Mode` x `Self-Dev Mode`), Mechanical Read-Only Core Lock & 2-Track Hobby Split", "Running a daily-driver Companion release with background hobbies risked unrequested code mutations, while coupling hobbies to self-evolution prevented quiet personal knowledge/study maintenance on stable builds or isolated Lab/VM self-evolution.", "Maintain `Hobby Mode` (`on`/`off`) and `Self-Dev Mode` (`on`/`off`, seedable/lockable via `COMPANION_SELF_DEV`, `COMPANION_SELF_DEV_LOCKED`, `COMPANION_IMMUTABLE_CORE`) as two independent levers; mechanically lock Companion core files read-only (`safety.py`, `checkpoints.py`, `grounding.py`, `skill_forge.py`) while keeping `data/` and external `/project` workspaces writable when `Self-Dev Mode = OFF`; forbid LLM tool turns or subprocesses from enabling `Self-Dev Mode`; and split hobbies into `personal` vs `self_dev` tracks with CLI + Web UI `System` Studio + Web idle parity.", "Safe stable daily-driver operation with personal/ops hobbies (`wiki_gardener`, `memory_curator`, `trace_reviewer`, `life_study_organizer`) alongside deliberate or full Lab/VM self-evolution when `Self-Dev Mode` is explicitly enabled by the human partner."),
 ]
 
@@ -110,6 +110,7 @@ class MemoryStore:
 
     def __init__(self, db_path: Optional[Path] = None):
         self._lock = threading.RLock()
+        self._initialized_schemas: set[str] = set()
         self.db_path = Path(db_path or settings.db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
@@ -118,6 +119,16 @@ class MemoryStore:
             self.conn.execute("PRAGMA busy_timeout=15000")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self._init_and_migrate_db()
+
+    def ensure_schema(self, key: str, init_fn: Callable[["MemoryStore"], None]) -> None:
+        """Run a subsystem DDL initializer at most once per `MemoryStore` instance under `self._lock`."""
+        if key in self._initialized_schemas:
+            return
+        with self._lock:
+            if key not in self._initialized_schemas:
+                init_fn(self)
+                self.conn.commit()
+                self._initialized_schemas.add(key)
 
     def _table_columns(self, table_name: str) -> set[str]:
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
@@ -138,10 +149,13 @@ class MemoryStore:
         for ddl in SCHEMA_SQL:
             cursor.execute(ddl)
         cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(content)")
-        cursor.execute(
-            "INSERT INTO conversations_fts(rowid, content) "
-            "SELECT id, content FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts)"
-        )
+        if cursor.execute(
+            "SELECT 1 FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts) LIMIT 1"
+        ).fetchone():
+            cursor.execute(
+                "INSERT INTO conversations_fts(rowid, content) "
+                "SELECT id, content FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts)"
+            )
         self._ensure_column("tasks", "acceptance_criteria", "TEXT")
         self._ensure_column("tasks", "verification_result", "TEXT")
         self._ensure_column("tasks", "workflow_id", "INTEGER")
@@ -162,6 +176,7 @@ class MemoryStore:
         cursor = self.conn.cursor()
         existing_map = dict(cursor.execute("SELECT key, value FROM user_profile").fetchall())
         prev_ver = existing_map.get("app_version", "")
+        dirty = False
         if existing_map and prev_ver != __version__:
             bdir = self.db_path.parent / ".companion_backups"
             bdir.mkdir(parents=True, exist_ok=True)
@@ -171,14 +186,25 @@ class MemoryStore:
             if key not in existing_map:
                 seed_val = ("on" if settings.self_dev_default else "off") if key == "self_dev_mode" else val
                 cursor.execute("INSERT INTO user_profile (key, value) VALUES (?, ?)", (key, seed_val))
-        cursor.execute("INSERT OR REPLACE INTO user_profile (key, value) VALUES ('app_version', ?)", (__version__,))
-        existing_adrs = {r[0]: r[1:] for r in cursor.execute("SELECT title, context, decision, consequences, status FROM architecture_decisions").fetchall()}
+                dirty = True
+        if prev_ver != __version__:
+            cursor.execute("INSERT OR REPLACE INTO user_profile (key, value) VALUES ('app_version', ?)", (__version__,))
+            dirty = True
+        existing_by_code = {
+            r[0].split(":", 1)[0].strip(): r
+            for r in cursor.execute("SELECT title, context, decision, consequences, status FROM architecture_decisions").fetchall()
+        }
         for title, context, decision, consequences in FOUNDATIONAL_ADRS:
-            if title not in existing_adrs:
+            code = title.split(":", 1)[0].strip()
+            prev_row = existing_by_code.get(code)
+            if prev_row is None:
                 cursor.execute("INSERT INTO architecture_decisions (title, context, decision, consequences, status) VALUES (?, ?, ?, ?, 'accepted')", (title, context, decision, consequences))
-            elif existing_adrs[title][3] == "accepted" and existing_adrs[title][:3] != (context, decision, consequences):
-                cursor.execute("UPDATE architecture_decisions SET context = ?, decision = ?, consequences = ? WHERE title = ?", (context, decision, consequences, title))
-        self.conn.commit()
+                dirty = True
+            elif prev_row[4] == "accepted" and prev_row[:4] != (title, context, decision, consequences):
+                cursor.execute("UPDATE architecture_decisions SET title = ?, context = ?, decision = ?, consequences = ? WHERE title = ?", (title, context, decision, consequences, prev_row[0]))
+                dirty = True
+        if dirty:
+            self.conn.commit()
 
     def log_message(self, role: str, content: str, tool_call_id: Optional[str] = None, session_tag: Optional[str] = None) -> int:
         safe_text = redact_secrets(str(content))
@@ -529,6 +555,11 @@ def memory_store_context(store: Optional[MemoryStore]) -> Iterator[Optional[Memo
             yield store
     finally:
         _STORE_OVERRIDE.reset(tok)
+
+
+def has_memory_store_override() -> bool:
+    """Return True when a scoped `memory_store_context` override is currently active."""
+    return _STORE_OVERRIDE.get() is not None
 
 
 def get_memory_store(db_path: Optional[Path] = None) -> MemoryStore:

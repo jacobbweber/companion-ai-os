@@ -425,7 +425,7 @@ export const ModelsTiersStudio: React.FC<ModelsTiersStudioProps> = ({
             <span
               className={`hud-chip mono ${matrix?.privacy_mode === 'local_only' ? 'ok' : 'accent'}`}
             >
-              {(matrix?.privacy_mode || 'hybrid').toUpperCase()}
+              {(matrix?.privacy_mode || 'local_only').toUpperCase()}
             </span>
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>

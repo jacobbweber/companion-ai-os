@@ -21,6 +21,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from companion.config import is_in_agent_tool_turn
 from companion.memory_store import MemoryStore, get_memory_store, parse_time_window
 from companion.semantic_memory import hybrid_rrf_rank
 from companion.telemetry import redact_secrets
@@ -105,11 +106,13 @@ ARCHIVE_APPROVALS_DDL: Tuple[str, ...] = (
 
 
 def _ensure_tables(mem: MemoryStore) -> None:
-    with mem._lock:
-        cur = mem.conn.cursor()
+    def _init(m: MemoryStore) -> None:
+        cur = m.conn.cursor()
         for ddl in ARCHIVE_APPROVALS_DDL:
             cur.execute(ddl)
-        mem.conn.commit()
+        m.conn.commit()
+
+    mem.ensure_schema("archive_approvals", _init)
 
 
 def get_trust_mode(store: Optional[MemoryStore] = None) -> str:
@@ -126,7 +129,8 @@ def set_trust_mode(mode: str, actor: str = "user", store: Optional[MemoryStore] 
     if clean not in TRUST_MODES:
         return {"ok": False, "error": f"Invalid trust mode '{mode}'. Choose from: {', '.join(TRUST_MODES)}."}
     curr = get_trust_mode(store=mem)
-    if actor.strip().lower() not in ("user", "cli", "web") and _TRUST_RANK[clean] > _TRUST_RANK[curr]:
+    is_human = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
+    if not is_human and _TRUST_RANK[clean] > _TRUST_RANK[curr]:
         return {
             "ok": False,
             "error": f"TRUST GUARD REJECTED: `{actor}` cannot escalate trust mode from `{curr}` to `{clean}`. Only the user can raise autonomy.",
@@ -159,8 +163,25 @@ class ApprovalQueue:
         return mem
 
     def is_fingerprint_approved(self, fingerprint: str) -> Optional[Dict[str, Any]]:
-        rows = self.list_requests(status="approved", limit=100)
-        return next((r for r in rows if r["fingerprint"] == fingerprint), None)
+        cols = [
+            "approval_id", "category", "action_name", "target", "summary", "fingerprint",
+            "payload_json", "requester", "session_id", "status", "decided_by", "decision_note", "created_at", "decided_at",
+        ]
+        rows = self.store._fetch_dicts(
+            cols,
+            f"SELECT {', '.join(cols)} FROM approval_requests WHERE status = 'approved' AND fingerprint = ? "
+            "AND (decided_at IS NULL OR decided_at >= datetime('now', '-15 minutes')) ORDER BY rowid DESC LIMIT 1",
+            (fingerprint,),
+        )
+        return rows[0] if rows else None
+
+    def mark_executed(self, approval_id: str) -> None:
+        clean_id = (approval_id or "").strip()
+        if not clean_id:
+            return
+        with self.store._lock:
+            self.store.conn.execute("UPDATE approval_requests SET status = 'executed' WHERE approval_id = ? AND status = 'approved'", (clean_id,))
+            self.store.conn.commit()
 
     def check_or_enqueue(
         self,
@@ -181,6 +202,7 @@ class ApprovalQueue:
             return True, {"status": "approved", "fingerprint": fp, "decided_by": "confirmed_flag"}
         existing_ok = self.is_fingerprint_approved(fp)
         if existing_ok is not None:
+            self.mark_executed(str(existing_ok.get("approval_id") or ""))
             return True, existing_ok
         trust = get_trust_mode(store=mem)
         if trust == "autonomous" and not always_require_in_autonomous:
@@ -225,7 +247,7 @@ class ApprovalQueue:
 
     def resolve(self, approval_id: str, decision: str, actor: str = "user", note: str = "") -> Dict[str, Any]:
         """Approve or reject a pending request; mechanically forbid Companion from approving its own requests."""
-        if actor.strip().lower() not in ("user", "cli", "web"):
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
             return {"ok": False, "error": "APPROVAL GUARD REJECTED: Companion cannot approve or deny pending human approval requests."}
         dec = decision.strip().lower()
         if dec in ("approve", "approved", "yes", "allow"):
@@ -298,12 +320,13 @@ def peek_session_nudges(session_id: str = "main", store: Optional[MemoryStore] =
     """Inspect unseen nudges for `session_id` (auto-clearing resolved approval nudges) without consuming active ones."""
     mem = store or get_memory_store()
     _ensure_tables(mem)
+    stale_where = (
+        "seen = 0 AND category = 'approval' AND ref_id != '' "
+        "AND ref_id NOT IN (SELECT approval_id FROM approval_requests WHERE status = 'waiting')"
+    )
     with mem._lock:
-        cur = mem.conn.execute(
-            "UPDATE session_nudges SET seen = 1 WHERE seen = 0 AND category = 'approval' AND ref_id != '' "
-            "AND ref_id NOT IN (SELECT approval_id FROM approval_requests WHERE status = 'waiting')"
-        )
-        if cur.rowcount:
+        if mem.conn.execute(f"SELECT 1 FROM session_nudges WHERE {stale_where} LIMIT 1").fetchone():
+            mem.conn.execute(f"UPDATE session_nudges SET seen = 1 WHERE {stale_where}")
             mem.conn.commit()
     cols = ["id", "session_id", "category", "ref_id", "message", "created_at"]
     return mem._fetch_dicts(

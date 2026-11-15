@@ -103,7 +103,14 @@ def resolve_goal_engines(
 ) -> Tuple[MemoryStore, Path, CheckpointManager, WorkflowEngine]:
     """Resolve scoped `(MemoryStore, target_root, CheckpointManager, WorkflowEngine)` for autonomous or blueprint runs."""
     mem, target_root = store or get_memory_store(), (root or settings.active_project_root).resolve()
-    eff_cp = cp_mgr or (get_active_checkpoint_manager() if target_root == settings.active_project_root.resolve() else CheckpointManager(root=target_root, backup_dir=target_root / ".companion_backups", store=mem))
+    if cp_mgr is not None:
+        eff_cp = cp_mgr
+    elif target_root == settings.active_project_root.resolve() and mem.db_path.resolve() != settings.db_path.resolve() and settings.get_workspace().is_self_project:
+        eff_cp = CheckpointManager(root=target_root, backup_dir=mem.db_path.parent / ".companion_backups", store=mem)
+    elif target_root == settings.active_project_root.resolve():
+        eff_cp = get_active_checkpoint_manager()
+    else:
+        eff_cp = CheckpointManager(root=target_root, backup_dir=target_root / ".companion_backups", store=mem)
     wf = WorkflowEngine(store=mem, cp_manager=eff_cp, root=target_root) if (store is not None or cp_mgr is not None or root is not None or not settings.get_workspace().is_self_project) else workflow_engine
     return mem, target_root, eff_cp, wf
 

@@ -53,7 +53,9 @@ def manage_companion_tone(tone: Optional[str] = None, store: Optional[MemoryStor
     if req:
         if req not in VALID_TONES:
             return f"Invalid tone '{tone}'. Valid options: {', '.join(VALID_TONES)}."
-        mem.set_user_profile("companion_tone", req); sync_identity_md(store=mem); mem.sync_memory_md()
+        mem.set_user_profile("companion_tone", req)
+        sync_identity_md(store=mem)
+        mem.sync_memory_md()
     curr = _resolve_tone(mem.get_user_profile())
     return f"Communication Tone: `{curr}` — {VALID_TONES[curr]} (Options: `/tone concise|balanced|elaborate`)"
 
@@ -67,7 +69,8 @@ def manage_model_tier(tier_or_action: Optional[str] = None, store: Optional[Memo
     valid_modes = ("auto", *MODEL_TIERS)
     if req not in valid_modes:
         return f"Invalid model tier '{tier_or_action}'. Valid options: {', '.join(valid_modes)}, status, check."
-    mem.set_user_profile("active_model_tier", req); mem.sync_memory_md()
+    mem.set_user_profile("active_model_tier", req)
+    mem.sync_memory_md()
     return f"Active model routing mode set to `{req}`.\n\n" + format_model_tiers_status(active_mode=req)
 
 
@@ -127,7 +130,8 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
         target = _resolve_external_target(rest, known)
         if target != settings.root.resolve() and target.is_relative_to(settings.root.resolve()):
             return f"error: external project `{target}` must live outside Companion core (`{settings.root.resolve()}`)."
-        target.mkdir(parents=True, exist_ok=True); (target / "tests").mkdir(exist_ok=True)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "tests").mkdir(exist_ok=True)
         readme = target / "README.md"
         if not readme.exists():
             readme.write_text(f"# {target.name}\n\nManaged by Companion AI OS (`ADR-007` Workspace Isolation).\n", encoding="utf-8")
@@ -196,20 +200,29 @@ def bootstrap_identity(companion_name: str = "", companion_soul: str = "", user_
     u_prof = (user_profile.strip() or prof.get("user_profile") or DEFAULT_SOUL_AND_USER["user_profile"])[:300]
     for k, v in (("companion_name", c_name), ("companion_soul", c_soul), ("user_name", u_name), ("user_profile", u_prof), ("onboarded", "true")):
         mem.set_user_profile(k, v)
-    sync_identity_md(store=mem); mem.sync_memory_md()
+    sync_identity_md(store=mem)
+    mem.sync_memory_md()
     return format_identity_summary(store=mem)
 
 
 def is_identity_bootstrapped(store: Optional[MemoryStore] = None) -> bool:
-    """Check if first-boot identity bootstrap is complete (or auto-bootstrap from .env if configured)."""
+    """Check if first-boot identity bootstrap is complete (or auto-bootstrap from .env once if unbootstrapped)."""
     mem = store or get_memory_store()
-    if any((settings.companion_name, settings.companion_soul, settings.user_name, settings.user_profile)):
-        bootstrap_identity(settings.companion_name, settings.companion_soul, settings.user_name, settings.user_profile, store=mem)
+    prof = mem.get_user_profile()
+    onboarded = prof.get("onboarded", "false").strip().lower() in ("true", "1", "yes")
+    if not onboarded and any((settings.companion_name, settings.companion_soul, settings.user_name, settings.user_profile)):
+        bootstrap_identity(
+            prof.get("companion_name") or settings.companion_name,
+            prof.get("companion_soul") or settings.companion_soul,
+            prof.get("user_name") or settings.user_name,
+            prof.get("user_profile") or settings.user_profile,
+            store=mem,
+        )
         return True
     default_id = settings.identity_md_path if mem.db_path.resolve() == settings.db_path.resolve() else (mem.db_path.parent / "IDENTITY.md")
     if not default_id.is_file():
         sync_identity_md(store=mem, path=default_id)
-    return mem.get_user_profile().get("onboarded", "false").strip().lower() in ("true", "1", "yes")
+    return onboarded
 
 
 def _build_identity_snapshot(mem: MemoryStore, summary: Optional[str] = None) -> Dict[str, Any]:

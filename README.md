@@ -75,7 +75,7 @@ docker compose up -d
   # Remove anytime (preserves your user data):
   powershell -ExecutionPolicy Bypass -File deploy\windows\uninstall-startup-service.ps1
   ```
-- **Build a standalone `CompanionSetup-v1.0.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
+- **Build a standalone `CompanionSetup-v3.4.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
   ```powershell
   powershell -ExecutionPolicy Bypass -File deploy\windows\build-installer.ps1
   ```
@@ -99,9 +99,10 @@ bash deploy/linux/uninstall-service.sh --user   # or: sudo bash deploy/linux/uni
 ## Safety & Privacy Architecture
 
 1. **Mechanical `local_only` Privacy Lock (Default)**: Out of the box, Companion blocks outbound cloud LLM/embedding requests at the wire layer unless you explicitly switch `System -> Models & Tiers` to `hybrid` or `cloud_allowed`.
-2. **Read-Only Application Core by Default (`Self-Dev Mode = OFF`)**: By default (`ADR-019`), Companion can freely manage your `data/` Wiki, Boards, Calendar, Custom User Skills (`data/skills/`), and external `/project` folders, while its own core source code is mechanically locked read-only. Only a human can enable `Self-Dev Mode` (`System -> Autonomy & Hobbies` or `/selfdev on`), and container/service deployments lock it off via `COMPANION_SELF_DEV_LOCKED=1`.
-3. **Zero-Reveal Blind Credential Vault**: API keys, SSH keys, and tokens entered in `System -> Vault & Endpoints` are sealed in `data/secrets.env`, never returned to the browser or LLM context, injected just-in-time into approved connectors, and scrubbed from tool outputs.
-4. **7-Stage System Doctor**: Run `python harness.py --doctor` anytime to verify configuration, Python & JS AST syntax, A-Frame layer boundaries, 4-file Spec-Driven Development (`specs/`), dead-code/line-ceiling hygiene (`<=550` lines/module), SQLite WAL integrity, and the full automated test suite.
+2. **Loopback-Default Web Studio + Token-Gated LAN/Tailscale**: By default, `COMPANION_WEB_HOST` binds strictly to `127.0.0.1` (`localhost`) with unconditional `Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF` enforcement. When bound to a LAN/Tailnet IP (`--host 0.0.0.0`), non-loopback requests require `COMPANION_WEB_TOKEN` (`Authorization: Bearer`, cookie, or `?token=` pairing).
+3. **Read-Only Application Core by Default (`Self-Dev Mode = OFF`)**: By default (`ADR-019`), Companion can freely manage your `data/` Wiki, Boards, Calendar, Custom User Skills (`data/skills/`), and external `/project` folders, while its own core source code is mechanically locked read-only. Only a human can enable `Self-Dev Mode` (`System -> Autonomy & Hobbies` or `/selfdev on`), and container/service deployments lock it off via `COMPANION_SELF_DEV_LOCKED=1`.
+4. **Zero-Reveal Blind Credential Vault**: API keys, SSH keys, and tokens entered in `System -> Vault & Endpoints` are sealed in `data/secrets.env`, never returned to the browser or LLM context, injected just-in-time into approved connectors, and scrubbed from tool outputs.
+5. **7-Stage System Doctor**: Run `python harness.py --doctor` anytime to verify configuration, Python & JS AST syntax, A-Frame layer boundaries, 4-file Spec-Driven Development (`specs/`), dead-code/line-ceiling hygiene (`<=700` lines/module, `<=100` lines/function), SQLite WAL integrity, and the full automated test suite.
 
 ---
 
@@ -153,7 +154,7 @@ Companion/
 │   ├── CONTRACTS.md             # 3. Bounded Subsystem Contracts (SPEC-01..SPEC-08) & Test Map
 │   └── DECISIONS.md             # 4. Self-Compacting Architecture Decision Records (ADRs)
 ├── skills/                      # Built-in 3-Tier Progressive-Disclosure Skill Packs (`skills/<name>/SKILL.md`)
-├── companion/                   # Headless Core A-Frame Engine (44 modules; `<=550L/module`, `<=100L/function`)
+├── companion/                   # Headless Core A-Frame Engine (44 modules; `<=700L/module`, `<=100L/function`)
 │   ├── config.py, telemetry.py, streaming.py, llm_wire.py, llm.py
 │   ├── checkpoints.py, safety.py, semantic_memory.py, memory_store.py, disciplines.py, grounding.py
 │   ├── archive_and_approvals.py, vault.py, model_registry.py, wiki_templates.py, wiki_engine.py

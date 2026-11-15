@@ -3,26 +3,28 @@ Living Canonical Spec-Driven Development (SDD) Engine (A-Frame Domain Layer).
 
 Solves the "Spec Sprawl & ADR Pile-Up" problem of traditional SDD frameworks by
 enforcing a strict 4-Document Living Spec Pyramid in `specs/`:
-  1. specs/PRODUCT.md      — Vision, User Persona, Capability Matrix & Product Invariants
+   1. specs/PRODUCT.md      — Vision, User Persona, Capability Matrix & Product Invariants
   2. specs/ARCHITECTURE.md — A-Frame Layers, Authoritative Module Registry & Budgets
-  3. specs/CONTRACTS.md    — Bounded Subsystem Contracts (SPEC-01..SPEC-06) & Test Links
+  3. specs/CONTRACTS.md    — Bounded Subsystem Contracts (SPEC-01..SPEC-08) & Test Links
   4. specs/DECISIONS.md    — Self-Compacting Architecture Decision Records (ADRs)
 
 Provides bidirectional Spec <-> Code drift verification and anti-sprawl enforcement.
 """
 
 import ast
+import contextlib
 import json
 import re
+import sqlite3
 import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from companion.config import MODEL_TIERS, settings
+from companion.config import CAPABILITY_TIERS, settings
 from companion.disciplines import FORBIDDEN_EXTERNAL_IMPORTS, iter_ast_import_targets
-from companion.memory_store import MemoryStore, get_memory_store
+from companion.memory_store import FOUNDATIONAL_ADRS, MemoryStore, get_memory_store
 
 _STDLIB_OR_LOCAL_IMPORTS = {m.lower() for m in sys.stdlib_module_names} | {
     "companion", "surfaces", "configs", "memory", "harness", "__future__"
@@ -125,10 +127,16 @@ def sync_decisions_md(store: Optional[MemoryStore] = None, root: Optional[Path] 
     active_adrs = [a for a in adrs if a.get("status", "accepted") == "accepted"]
     superseded_adrs = [a for a in adrs if a.get("status") != "accepted"]
 
-    # If active ADRs exceed MAX_ACTIVE_ADRS, compact oldest beyond limit into historical summary
+    # If active ADRs exceed MAX_ACTIVE_ADRS, compact oldest beyond limit into historical summary and persist status
     if len(active_adrs) > MAX_ACTIVE_ADRS:
         overflow = active_adrs[:-MAX_ACTIVE_ADRS]
         active_adrs = active_adrs[-MAX_ACTIVE_ADRS:]
+        with mem._lock:
+            for old_adr in overflow:
+                old_adr["status"] = "superseded"
+                if old_adr.get("id") is not None:
+                    mem.conn.execute("UPDATE architecture_decisions SET status = 'superseded' WHERE id = ?", (int(old_adr["id"]),))
+            mem.conn.commit()
         superseded_adrs = overflow + superseded_adrs
 
     lines = [
@@ -231,8 +239,8 @@ def validate_workflow_recipe_json(content: str, expected_name: Optional[str] = N
         if ntype in ("subagent", "llm") and not str(node.get("prompt") or "").strip():
             return f"Node `{nid}` (`{ntype}`) must specify a non-empty `prompt`."
         ntier = str(node.get("tier") or "").strip().lower()
-        if ntier and ntier not in MODEL_TIERS:
-            return f"Node `{nid}` has invalid `tier: {ntier}` (must be one of {list(MODEL_TIERS)})."
+        if ntier and ntier not in CAPABILITY_TIERS:
+            return f"Node `{nid}` has invalid `tier: {ntier}` (must be one of {list(CAPABILITY_TIERS)})."
     edges = data.get("edges")
     if not isinstance(edges, list) or not edges:
         return "Workflow recipe must include a non-empty `edges` list."
@@ -385,6 +393,11 @@ def verify_skills_directory(root: Optional[Path] = None) -> List[str]:
                         wf_err = validate_workflow_recipe_json(wf_file.read_text(encoding="utf-8", errors="replace"), expected_name=wf_file.stem)
                         if wf_err:
                             issues.append(f"`skills/{entry.name}/workflows/{wf_file.name}`: {wf_err}")
+                elif sub.name == "scripts":
+                    for sc_file in sorted(sub.glob("*.py")):
+                        sc_err = validate_skill_or_recipe_path(sc_file, sc_file.read_text(encoding="utf-8", errors="replace"))
+                        if sc_err:
+                            issues.append(f"`skills/{entry.name}/scripts/{sc_file.name}`: {sc_err.splitlines()[1].strip() if len(sc_err.splitlines()) > 1 else sc_err}")
             else:
                 issues.append(f"Unexpected root file `skills/{entry.name}/{sub.name}` (place in `references/`, `workflows/`, or `scripts/`).")
 
@@ -396,6 +409,21 @@ def verify_skills_directory(root: Optional[Path] = None) -> List[str]:
             if md_file.name != "INDEX.md" and md_file.name not in idx_text:
                 issues.append(f"Unindexed Knowledge Wiki article `skills/knowledge-wiki/references/{md_file.name}` (add to `INDEX.md`).")
     return issues
+
+
+def _count_active_adrs(target_root: Path, store: Optional[MemoryStore] = None) -> int:
+    if store is not None:
+        return sum(1 for a in store.get_adrs() if a.get("status", "accepted") == "accepted")
+    db_file = settings.db_path if target_root == settings.root.resolve() else (target_root / "data" / "conversations.db")
+    if db_file.is_file():
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True)) as ro_conn:
+                row = ro_conn.execute("SELECT COUNT(*) FROM architecture_decisions WHERE status = 'accepted'").fetchone()
+                if row is not None:
+                    return int(row[0])
+        except Exception:
+            pass
+    return len(FOUNDATIONAL_ADRS)
 
 
 def verify_sdd(root: Optional[Path] = None, store: Optional[MemoryStore] = None) -> SDDVerificationReport:
@@ -463,9 +491,7 @@ def verify_sdd(root: Optional[Path] = None, store: Optional[MemoryStore] = None)
                     report.undocumented_modules.append(rel)
 
     # 3. Check ADR budget and 3-Tier Skill Pack integrity
-    mem = store or get_memory_store()
-    active_adrs = [a for a in mem.get_adrs() if a.get("status", "accepted") == "accepted"]
-    report.active_adr_count = len(active_adrs)
+    report.active_adr_count = _count_active_adrs(target_root, store)
     if report.active_adr_count > MAX_ACTIVE_ADRS:
         report.contract_issues.append(
             f"Active ADR count ({report.active_adr_count}) exceeds MAX_ACTIVE_ADRS ({MAX_ACTIVE_ADRS}); run sync_decisions_md to compact."

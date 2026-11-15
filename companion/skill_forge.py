@@ -34,7 +34,7 @@ from companion.grounding import (
     rank_relevant_skills,
 )
 from companion.hygiene import find_unused_imports_in_source
-from companion.memory_store import MemoryStore
+from companion.memory_store import MemoryStore, has_memory_store_override
 from companion.safety import validate_python_syntax
 from companion.sdd import (
     check_wiki_author_guard,
@@ -44,7 +44,8 @@ from companion.sdd import (
     validate_workflow_recipe_json,
     verify_skills_directory,
 )
-from companion.telemetry import telemetry
+from companion.telemetry import redact_secrets, telemetry
+from companion.vault import get_vault_manager
 
 __all__ = [
     "build_skill_script_command",
@@ -265,13 +266,15 @@ def stage_and_promote_skill(
         invalidate_skills_cache()
 
     rel_lbl = f"{'data/skills' if is_user_scope else 'skills'}/{clean_name}"
-    get_knowledge_port().propose_update(
-        key=f"skill:{clean_name}",
-        value=f"Promoted verified 3-Tier skill `{rel_lbl}/SKILL.md` (scripts={list((scripts or {}).keys())}, workflows={list((workflows or {}).keys())}).",
-        project_id="global",
-        source="skill_forge",
-        confidence=1.0,
-    )
+    if root is None or target_root == settings.root.resolve():
+        if "unittest" not in sys.modules or has_memory_store_override():
+            get_knowledge_port().propose_update(
+                key=f"skill:{clean_name}",
+                value=f"Promoted verified 3-Tier skill `{rel_lbl}/SKILL.md` (scripts={list((scripts or {}).keys())}, workflows={list((workflows or {}).keys())}).",
+                project_id="global",
+                source="skill_forge",
+                confidence=1.0,
+            )
     telemetry.log("INFO", "skill_forge", f"Promoted verified skill `{rel_lbl}` (cp={cp['checkpoint_id']})")
     summary = (
         f"Promoted verified skill `{rel_lbl}/` (checkpoint `{cp['checkpoint_id']}`; "
@@ -325,8 +328,11 @@ def run_skill_script(
     if rc == -1 and guard_err:
         return f"error: skill script `{s_clean}/{f_clean}` {guard_err}"
     if guard_err:
-        return f"exit=1\n{guard_err}"
-    out = (stdout + (("\n[stderr]\n" + stderr) if stderr else "")).strip() or "(no output)"
+        return f"exit=1\n{redact_secrets(guard_err)}"
+    raw_out = (stdout + (("\n[stderr]\n" + stderr) if stderr else "")).strip() or "(no output)"
+    out = redact_secrets(raw_out)
+    if "unittest" not in sys.modules or has_memory_store_override():
+        out = get_vault_manager().scrub_output(out)
     return f"exit={rc}\n{out[: settings.out_limit] + chr(10) + '... [truncated]' if len(out) > settings.out_limit else out}"
 
 

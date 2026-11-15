@@ -12,16 +12,21 @@ Provides:
 3. Ephemeral stdlib `run_http_smoke_probe` for clean zero-zombie endpoint verification.
 """
 
+import contextlib
 import importlib
+import inspect
 import re
+import tempfile
 import threading
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.config import settings
 from companion.disciplines import ActionRiskTier, classify_action_risk
 from companion.grounding import EpistemicGrounding, build_epistemic_grounding
+from companion.memory_store import MemoryStore, has_memory_store_override
 from companion.streaming import get_active_wire_images
 from companion.telemetry import telemetry
 
@@ -88,7 +93,8 @@ _HIGH_BLAST_CUE_RE = re.compile(
 )
 _PERSONAL_COACH_RE = re.compile(
     r"\b(?:flashcards?|quiz\s+me|tutor(?:\s+me)?|teach\s+me|study\s+(?:course|plan|guide|session|notes?)|"
-    r"syllabus|spaced\s+repetition|active\s+recall|my\s+(?:sprint|week|calendar|backlog|board|chores?)|"
+    r"syllabus|spaced\s+repetition|active\s+recall|(?:my|our)\s+(?:sprint|week|calendar|backlog|boards?|epics?|roadmap|chores?)|"
+    r"my\s+(?:personal\s+)?goals?|long[- ]running\s+goals?|"
     r"weekly\s+sprint|slice\s+an?\s+unblocker|unblocker|procrastinat\w*|appointment)\b",
     re.I,
 )
@@ -272,17 +278,27 @@ def run_http_smoke_probe(
 ) -> Dict[str, Any]:
     """Spin up an ephemeral stdlib HTTP server on port 0, probe endpoints, and guarantee clean shutdown."""
     probe_paths = endpoints or ["/", "/api/health", "/api/status"]
+    tmp_ctx = tempfile.TemporaryDirectory()
+    iso_store: Optional[MemoryStore] = None
     try:
         mod = importlib.import_module(module_name)
         factory = getattr(mod, factory_name)
-        server, _ = factory(host="127.0.0.1", port=0)
+        kwargs: Dict[str, Any] = {"host": "127.0.0.1", "port": 0}
+        if "store" in inspect.signature(factory).parameters and not has_memory_store_override():
+            iso_store = MemoryStore(db_path=Path(tmp_ctx.name) / "smoke.db")
+            kwargs["store"] = iso_store
+        server, _ = factory(**kwargs)
     except Exception as exc:
+        if iso_store is not None:
+            iso_store.close()
+        tmp_ctx.cleanup()
         msg = f"HTTP smoke probe failed to initialize `{module_name}.{factory_name}`: {type(exc).__name__}: {exc}"
         return {"passed": False, "port": 0, "results": [], "summary": msg}
 
     port = int(server.server_address[1])
     worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
     worker.start()
+    direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     results: List[Dict[str, Any]] = []
     all_ok = True
     try:
@@ -291,7 +307,7 @@ def run_http_smoke_probe(
             url = f"http://127.0.0.1:{port}{clean_ep}"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "companion-smoke-probe/2.3"})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with direct_opener.open(req, timeout=timeout) as resp:
                     body = resp.read().decode("utf-8", errors="replace")
                     code = int(resp.status)
                 ok = 200 <= code < 300 and len(body.strip()) > 0
@@ -311,6 +327,10 @@ def run_http_smoke_probe(
         server.shutdown()
         server.server_close()
         worker.join(timeout=2.0)
+        if iso_store is not None:
+            iso_store.close()
+        with contextlib.suppress(Exception):
+            tmp_ctx.cleanup()
 
     badge = "PASS" if all_ok else "FAIL"
     lines = [f"=== HTTP Smoke Probe (`{module_name}` @ 127.0.0.1:{port}): {badge} ==="]

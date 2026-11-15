@@ -30,6 +30,15 @@
       "skill": "sdd-compliance",
       "max_iters": 6,
       "prompt": "Diagnose and repair the following SDD/hygiene or System Doctor failure:\n{{last_output}}"
+    },
+    {
+      "id": "reverify_after_repair",
+      "type": "tool",
+      "tier": "fast",
+      "tool": "system_doctor",
+      "args": {
+        "run_tests": "{{run_tests}}"
+      }
     }
   ],
   "edges": [
@@ -55,11 +64,21 @@
     },
     {
       "from": "subagent_repair",
-      "to": "COMPLETE",
+      "to": "reverify_after_repair",
       "condition": "passed"
     },
     {
       "from": "subagent_repair",
+      "to": "ABORTED",
+      "condition": "failed"
+    },
+    {
+      "from": "reverify_after_repair",
+      "to": "COMPLETE",
+      "condition": "passed"
+    },
+    {
+      "from": "reverify_after_repair",
       "to": "ABORTED",
       "condition": "failed"
     }

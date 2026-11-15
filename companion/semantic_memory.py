@@ -16,7 +16,7 @@ from array import array
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 from companion.config import settings
-from companion.llm_wire import build_openai_resource_url, is_local_or_lan_endpoint
+from companion.llm_wire import build_openai_resource_url, is_local_or_lan_endpoint, urlopen_safe
 
 __all__ = [
     "cosine_f32_bytes",
@@ -236,13 +236,13 @@ def fetch_optional_embedding(text: str, timeout: float = 3.0) -> Optional[bytes]
             m_id = model.removeprefix("models/")
             payload = json.dumps({"model": f"models/{m_id}", "content": {"parts": [{"text": (text or "")[:4000]}]}}).encode("utf-8")
             hdrs = {"Content-Type": "application/json", **({"x-goog-api-key": api_key} if api_key else {})}
-            with urllib.request.urlopen(urllib.request.Request(f"{g_base}/models/{m_id}:embedContent", data=payload, headers=hdrs, method="POST"), timeout=timeout) as resp:
+            with urlopen_safe(urllib.request.Request(f"{g_base}/models/{m_id}:embedContent", data=payload, headers=hdrs, method="POST"), timeout=timeout, allow_private_lan=True, allow_redirects=False) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
             emb = (data.get("embedding") or {}).get("values")
         else:
             payload = json.dumps({"model": model, "input": (text or "")[:4000]}).encode("utf-8")
             hdrs = {"Content-Type": "application/json", **({"Authorization": f"Bearer {api_key}"} if api_key else {})}
-            with urllib.request.urlopen(urllib.request.Request(build_openai_resource_url(base, "embeddings"), data=payload, headers=hdrs, method="POST"), timeout=timeout) as resp:
+            with urlopen_safe(urllib.request.Request(build_openai_resource_url(base, "embeddings"), data=payload, headers=hdrs, method="POST"), timeout=timeout, allow_private_lan=True, allow_redirects=False) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
             emb = ((data.get("data") or [{}])[0]).get("embedding")
         return pack_f32_vector(emb) if isinstance(emb, list) and emb else None

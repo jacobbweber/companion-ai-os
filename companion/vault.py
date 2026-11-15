@@ -17,15 +17,17 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.archive_and_approvals import get_approval_queue
-from companion.config import parse_env_file, settings
+from companion.config import is_in_agent_tool_turn, parse_env_file, settings
 from companion.disciplines import walk_pruned_files
-from companion.memory_store import MemoryStore, get_memory_store
+from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
 from companion.telemetry import redact_secrets, secret_redactor
 
 __all__ = [
@@ -42,6 +44,26 @@ VAULT_DDL: Tuple[str, ...] = (
 )
 
 _SECRET_ENV_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASS", "_PAT")
+_SECRETS_FILE_LOCK = threading.RLock()
+
+
+def _lock_windows_owner_dacl(target: Path) -> None:
+    """Restrict a sensitive credential file to the current Windows user only via `icacls` (best-effort)."""
+    if os.name != "nt":
+        return
+    user = os.environ.get("USERNAME", "").strip()
+    domain = os.environ.get("USERDOMAIN", "").strip()
+    principal = f"{domain}\\{user}" if domain and user else user
+    if not principal:
+        return
+    try:
+        subprocess.run(
+            ["icacls", str(target), "/inheritance:r", "/grant:r", f"{principal}:F"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
 
 
 def normalize_secret_name(raw: str) -> str:
@@ -89,17 +111,14 @@ class VaultManager:
     @property
     def store(self) -> MemoryStore:
         mem = self._store or get_memory_store()
-        with mem._lock:
-            for ddl in VAULT_DDL:
-                mem.conn.execute(ddl)
-            mem.conn.commit()
+        mem.ensure_schema("vault", lambda m: ([m.conn.execute(d) for d in VAULT_DDL], m.conn.commit()) and None)
         return mem
 
     @property
     def secrets_path(self) -> Path:
         if self._secrets_path is not None:
             return Path(self._secrets_path).resolve()
-        mem = self._store
+        mem = self._store or (get_memory_store() if has_memory_store_override() else None)
         if mem is not None and mem.db_path.resolve() != settings.db_path.resolve():
             return (mem.db_path.parent / "secrets.env").resolve()
         return settings.secrets_env_path.resolve()
@@ -131,6 +150,7 @@ class VaultManager:
                 os.chmod(target, 0o600)
             except OSError:
                 pass
+            _lock_windows_owner_dacl(target)
         finally:
             if os.path.exists(tmp_name):
                 try:
@@ -145,8 +165,8 @@ class VaultManager:
             if len(s) >= 8 and not s.startswith("-----"):
                 candidates.append(s)
         for cand in candidates:
-            if len(cand) >= 6 and cand not in secret_redactor._extra:
-                secret_redactor._extra.append(cand)
+            if len(cand) >= 6:
+                secret_redactor.register_secret(cand)
 
     def _audit(self, secret_name: str, caller_scope: str, outcome: str, detail: str = "") -> None:
         with self.store._lock:
@@ -157,9 +177,9 @@ class VaultManager:
             self.store.conn.commit()
 
     def declare_placeholder(
-        self, name: str, cred_type: str = "api_key", description: str = "", allow_list: Optional[List[str]] = None,
+        self, name: str, cred_type: str = "api_key", description: str = "", allow_list: Optional[List[str]] = None, actor: str = "user",
     ) -> Dict[str, Any]:
-        """Register symbolic secret metadata (without any value) so endpoints/MCP can declare required credentials."""
+        """Register symbolic secret metadata (without any value) without ever widening an existing secret's scope."""
         slug = normalize_secret_name(name)
         ctype = (cred_type or "api_key").strip().lower()
         if not slug:
@@ -167,17 +187,19 @@ class VaultManager:
         if ctype not in VALID_CREDENTIAL_TYPES:
             ctype = "custom"
         existing = self._get_entry_row(slug)
-        merged_allow = sorted(set((existing["allow_list"] if existing else []) + [str(s).strip() for s in (allow_list or []) if str(s).strip()]))
+        clean_desc = redact_secrets(description.strip())[:240]
+        if existing is not None:
+            if clean_desc and not existing.get("description"):
+                with self.store._lock:
+                    self.store.conn.execute("UPDATE vault_entries SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?", (clean_desc, slug))
+                    self.store.conn.commit()
+            return {"ok": True, "entry": self.get_metadata(slug)}
+        is_human = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
+        init_allow = sorted({str(s).strip() for s in (allow_list or []) if str(s).strip() and (is_human or str(s).strip() != "*")})
         with self.store._lock:
             self.store.conn.execute(
-                """INSERT INTO vault_entries (name, cred_type, description, allow_list_json, updated_at)
-                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                   ON CONFLICT(name) DO UPDATE SET
-                     cred_type = COALESCE(NULLIF(excluded.cred_type, ''), vault_entries.cred_type),
-                     description = CASE WHEN excluded.description != '' THEN excluded.description ELSE vault_entries.description END,
-                     allow_list_json = excluded.allow_list_json,
-                     updated_at = CURRENT_TIMESTAMP""",
-                (slug, ctype, redact_secrets(description.strip())[:240], json.dumps(merged_allow)),
+                "INSERT OR IGNORE INTO vault_entries (name, cred_type, description, allow_list_json, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (slug, ctype, clean_desc, json.dumps(init_allow)),
             )
             self.store.conn.commit()
         return {"ok": True, "entry": self.get_metadata(slug)}
@@ -193,7 +215,7 @@ class VaultManager:
         actor: str = "user",
     ) -> Dict[str, Any]:
         """Write a secret into `secrets.env` (user/CLI/Web only — mechanically blocked for `companion`). Never echoes value."""
-        if actor.strip().lower() not in ("user", "cli", "web"):
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
             return {"ok": False, "error": "VAULT GUARD REJECTED: Secrets are write-only by the user; Companion cannot write raw secret values."}
         slug = normalize_secret_name(name)
         if not slug or not (raw_value or "").strip():
@@ -202,11 +224,12 @@ class VaultManager:
         if ctype not in VALID_CREDENTIAL_TYPES:
             return {"ok": False, "error": f"Invalid credential type '{cred_type}'. Valid: {', '.join(VALID_CREDENTIAL_TYPES)}."}
 
-        secret_clean = raw_value.strip("\r")
+        secret_clean = raw_value.replace("\r\n", "\n").strip("\r")
         self._register_redaction_values(secret_clean)
-        raw_map = self._read_raw_map()
-        raw_map[slug] = secret_clean
-        self._write_raw_map(raw_map)
+        with _SECRETS_FILE_LOCK:
+            raw_map = self._read_raw_map()
+            raw_map[slug] = secret_clean
+            self._write_raw_map(raw_map)
 
         existing = self._get_entry_row(slug)
         eff_allow = [str(s).strip() for s in allow_list if str(s).strip()] if allow_list is not None else (existing["allow_list"] if existing else ["*"])
@@ -229,14 +252,15 @@ class VaultManager:
 
     def delete_secret(self, name: str, remove_metadata: bool = False, actor: str = "user") -> Dict[str, Any]:
         """Remove a secret value from `secrets.env` (user/CLI/Web only)."""
-        if actor.strip().lower() not in ("user", "cli", "web"):
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
             return {"ok": False, "error": "VAULT GUARD REJECTED: Only the user can delete Vault secrets."}
         slug = normalize_secret_name(name)
-        raw_map = self._read_raw_map()
-        existed = slug in raw_map
-        if existed:
-            raw_map.pop(slug, None)
-            self._write_raw_map(raw_map)
+        with _SECRETS_FILE_LOCK:
+            raw_map = self._read_raw_map()
+            existed = slug in raw_map
+            if existed:
+                raw_map.pop(slug, None)
+                self._write_raw_map(raw_map)
         if remove_metadata:
             with self.store._lock:
                 self.store.conn.execute("DELETE FROM vault_entries WHERE name = ?", (slug,))
@@ -507,11 +531,14 @@ def restore_snapshot_backup(
     snapshots_dir: Optional[Path] = None, wiki_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Restore a snapshot backup and return the checklist of missing Vault secrets needing re-entry."""
-    if actor.strip().lower() not in ("user", "cli", "web"):
+    if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
         return {"ok": False, "error": "BACKUP GUARD REJECTED: Restoring a full snapshot requires direct user invocation."}
     snap_root = Path(snapshots_dir or settings.snapshots_dir).resolve()
-    src = snap_root / (snapshot_id or "").strip()
-    if not src.is_dir() or not (src / "manifest.json").is_file():
+    clean_id = (snapshot_id or "").strip()
+    if not clean_id:
+        return {"ok": False, "error": "Snapshot `snapshot_id` is required."}
+    src = (snap_root / clean_id).resolve()
+    if src == snap_root or not src.is_relative_to(snap_root) or not src.is_dir() or not (src / "manifest.json").is_file():
         return {"ok": False, "error": f"Snapshot `{snapshot_id}` not found in `{snap_root}`."}
 
     mem = store or get_memory_store()

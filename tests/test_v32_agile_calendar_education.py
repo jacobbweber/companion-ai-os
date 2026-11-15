@@ -337,6 +337,99 @@ class TestCompanionV32AgileCalendarEducation(unittest.TestCase):
         top_agile = [s["name"] for s in rank_relevant_skills("Plan my weekend kanban board and schedule mechanic appointment", skills, top_k=4)]
         self.assertIn("agile-coach", top_agile)
 
+    def test_epic_dedupe_roadmap_checklists_and_calendar_milestones(self) -> None:
+        mgr = get_agile_manager(store=self.store)
+        cal = get_calendar_manager(store=self.store)
+
+        # Duplicate save_epic calls for the same (board_id, title) merge cleanly instead of duplicating
+        ep1 = mgr.upsert_epic(
+            title="Barn cleaning winter project",
+            board_id="life-home",
+            horizon="later",
+            start_date="2026-11-14",
+        )
+        ep2 = mgr.upsert_epic(
+            title="barn cleaning winter project",
+            board_id="life-home",
+            horizon="next",
+            target_date="2026-12-20",
+            summary="Clean stalls, haul scrap, winterize equipment",
+        )
+        self.assertTrue(ep1["ok"] and ep2["ok"])
+        self.assertEqual(ep1["epic_id"], ep2["epic_id"])
+        epics = [e for e in mgr.list_epics(board_id="life-home") if "barn cleaning" in e["title"].lower()]
+        self.assertEqual(len(epics), 1)
+        epic_id = ep1["epic_id"]
+        self.assertEqual(epics[0]["horizon"], "next")
+        self.assertEqual(epics[0]["start_date"], "2026-11-14")
+        self.assertEqual(epics[0]["target_date"], "2026-12-20")
+
+        # Linked child cards + interactive checklists (markdown lines + dict updates)
+        c1 = mgr.upsert_card(
+            title="Clean each stall & winterize equipment",
+            board_id="life-home",
+            epic_id=epic_id,
+            status="sprint_todo",
+            checklist=["[x] Muck stall 1", "[ ] Haul scrap junk", "Swap trimmer carburetor"],
+        )
+        c2 = mgr.upsert_card(
+            title="Stack winter hay bales",
+            board_id="life-home",
+            epic_id=epic_id,
+            status="backlog",
+        )
+        self.assertTrue(c1["ok"] and c2["ok"])
+        self.assertEqual(c1["card"]["epic_title"], "Barn cleaning winter project")
+        self.assertEqual(c1["card"]["checklist_total"], 3)
+        self.assertEqual(c1["card"]["checklist_done"], 1)
+
+        # Toggle checklist item via CoreAction update_card
+        updated_cl = [
+            {"id": c1["card"]["checklist"][0]["id"], "text": "Muck stall 1", "done": True},
+            {"id": c1["card"]["checklist"][1]["id"], "text": "Haul scrap junk", "done": True},
+            {"id": c1["card"]["checklist"][2]["id"], "text": "Swap trimmer carburetor", "done": False},
+        ]
+        upd = execute_core_action(
+            "agile",
+            {"subaction": "update_card", "card_id": c1["card_id"], "checklist": updated_cl},
+            actor="web",
+            store=self.store,
+        )
+        self.assertEqual(upd["card"]["checklist_done"], 2)
+
+        # Moving an active sprint card back to backlog detaches sprint_id and surfaces in backlog_cards
+        mgr.upsert_sprint(title="Active Barn Sprint", weekday_capacity_slots=10, weekend_capacity_slots=6)
+        c3 = mgr.upsert_card(title="Order winter salt", board_id="life-home", status="sprint_todo", effort_size="half_day", day_slot="weekday")
+        self.assertNotEqual(c3["card"]["sprint_id"], "")
+        moved_bl = mgr.move_card(c3["card_id"], status="backlog")
+        self.assertTrue(moved_bl["ok"])
+        self.assertEqual(moved_bl["card"]["sprint_id"], "")
+        self.assertIn(c3["card_id"], [c["card_id"] for c in mgr.get_board_view(MASTER_SPRINT_BOARD_ID)["backlog_cards"]])
+
+        # Complete c1 and verify epic progress_pct (1 of 2 done = 50%) & board_view backlog_cards/all_cards
+        mgr.move_card(c1["card_id"], status="done")
+        view = mgr.get_board_view(MASTER_SPRINT_BOARD_ID)
+        ep_enriched = next(e for e in view["epics"] if e["epic_id"] == epic_id)
+        self.assertEqual(ep_enriched["card_count"], 2)
+        self.assertEqual(ep_enriched["done_card_count"], 1)
+        self.assertEqual(ep_enriched["progress_pct"], 50)
+        self.assertIn(c2["card_id"], [c["card_id"] for c in view["backlog_cards"]])
+        self.assertGreaterEqual(len(view["all_cards"]), 2)
+
+        # Calendar window returns roadmap epics + epic_milestone on target_date
+        win = cal.get_calendar_window(start_date="2026-11-01", end_date="2026-12-31")
+        self.assertTrue(any(e["epic_id"] == epic_id for e in win["epics"]))
+        milestones = [it for it in win["items"] if it["source_type"] == "epic_milestone" and it.get("epic_id") == epic_id]
+        self.assertEqual(len(milestones), 1)
+        self.assertEqual(milestones[0]["date"], "2026-12-20")
+
+        # Phase gate blocks delete_epic in PLAN; deleting epic unlinks child cards without deleting them
+        self.assertIsNotNone(check_phase_tool_permission("agile_manage", "PLAN", {"action": "delete_epic"}))
+        del_res = execute_core_action("agile", {"subaction": "delete_epic", "epic_id": epic_id}, actor="web", store=self.store)
+        self.assertTrue(del_res["ok"])
+        after_card = next(c for c in mgr.get_board_view("life-home")["all_cards"] if c["card_id"] == c2["card_id"])
+        self.assertEqual(after_card["epic_id"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

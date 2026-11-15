@@ -74,8 +74,17 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     void refreshStatus();
-    const timer = window.setInterval(() => void refreshStatus(), 4000);
-    return () => window.clearInterval(timer);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') void refreshStatus();
+    }, 4000);
+    const onVis = () => {
+      if (document.visibilityState === 'visible') void refreshStatus();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVis);
+    };
   }, []);
 
   const showToast = (msg: string) => {
@@ -168,7 +177,7 @@ export const App: React.FC = () => {
             <div className="brand-title">
               {status?.companion_name || 'Companion AI OS'}{' '}
               <span className="mono" style={{ color: 'var(--accent-primary)', fontSize: 11 }}>
-                v1.0
+                v3.4
               </span>
             </div>
             <div className="brand-sub mono desktop-only">
@@ -223,7 +232,7 @@ export const App: React.FC = () => {
             onClick={() => openSystemTab('models')}
             title="Open Models, Tiers & Outbound Privacy Lock"
           >
-            PRIVACY: {(status?.privacy_mode || 'hybrid').toUpperCase()}
+            PRIVACY: {(status?.privacy_mode || 'local_only').toUpperCase()}
           </button>
 
           {onlinePartners.length > 0 && (

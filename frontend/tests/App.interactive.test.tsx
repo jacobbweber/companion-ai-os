@@ -888,13 +888,19 @@ describe('Companion 3.0 Multi-Studio Interactive UI + Real Python Backend', () =
   it('exercises Companion 3.2 Universal Agile Boards, Unified Calendar, and Inline Chat Flashcard Grading', async () => {
     const todayIso = new Date().toISOString().slice(0, 10);
 
-    // 1. Navigate to Boards Studio, start a Weekly Sprint, add a Weekend card, and slice a 15m Unblocker
+    // 1. Navigate to Boards Studio: verify active-only Planner columns (no Backlog column clutter),
+    //    start a Weekly Sprint, add a Weekend card via "+ New", use Card Modal checklists & 15m Unblocker,
+    //    and create a Jira-style Epic with nested child tasks + Backlog triage.
     const boardsNav = Array.from(container.querySelectorAll('.nav-btn')).find((b) =>
       b.textContent?.includes('Boards')
     ) as HTMLButtonElement;
     expect(boardsNav).toBeTruthy();
     await act(async () => boardsNav.click());
     await flushUi(100);
+
+    // Active Board tab should show sprint_todo..done and NOT render backlog column
+    expect(container.querySelector('[data-testid="kanban-col-sprint_todo"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="kanban-col-backlog"]')).toBeNull();
 
     const startSprintBtn = Array.from(container.querySelectorAll('button')).find((b) =>
       b.textContent?.includes('Start Sprint')
@@ -906,8 +912,16 @@ describe('Companion 3.0 Multi-Studio Interactive UI + Real Python Backend', () =
     expect(container.textContent).toContain('WEEKDAY SLOTS:');
     expect(container.textContent).toContain('WEEKEND SLOTS:');
 
+    // Open "+ New" modal to create a full_day weekend card with planned_date
+    const newModalBtn = container.querySelector(
+      '[data-testid="boards-new-btn"]'
+    ) as HTMLButtonElement;
+    expect(newModalBtn).toBeTruthy();
+    await act(async () => newModalBtn.click());
+    await flushUi(40);
+
     const cardTitleIn = container.querySelector(
-      'input[placeholder*="Add task or backlog card"]'
+      'input[aria-label="New card title"]'
     ) as HTMLInputElement;
     const effortSel = container.querySelector('select[aria-label="Effort size"]') as HTMLSelectElement;
     const slotSel = container.querySelector('select[aria-label="Day slot"]') as HTMLSelectElement;
@@ -931,6 +945,37 @@ describe('Companion 3.0 Multi-Studio Interactive UI + Real Python Backend', () =
     expect(container.textContent).toContain('Fix truck brake inspection');
     expect(container.textContent).toContain('4 / 6');
 
+    // Click card to open Centered Planner Card Detail Modal -> add & check off a checklist item + slice 15m Unblocker
+    const editBrakeBtn = container.querySelector(
+      'button[aria-label="Edit Fix truck brake inspection"]'
+    ) as HTMLButtonElement;
+    expect(editBrakeBtn).toBeTruthy();
+    await act(async () => editBrakeBtn.click());
+    await flushUi(50);
+
+    const cardModal = container.querySelector('[data-testid="planner-card-modal"]');
+    expect(cardModal).toBeTruthy();
+
+    const chkIn = container.querySelector(
+      'input[aria-label="New checklist item"]'
+    ) as HTMLInputElement;
+    await act(async () => {
+      setInputValue(chkIn, 'Inspect rotor wear');
+    });
+    const addItemBtn = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent?.trim() === 'Add Item'
+    ) as HTMLButtonElement;
+    await act(async () => addItemBtn.click());
+    await flushUi(100);
+
+    const chkToggle = container.querySelector(
+      'input[aria-label="Toggle Inspect rotor wear"]'
+    ) as HTMLInputElement;
+    expect(chkToggle).toBeTruthy();
+    await act(async () => chkToggle.click());
+    await flushUi(100);
+    expect(container.textContent).toContain('Checklist (1/1)');
+
     const sliceBtn = Array.from(container.querySelectorAll('button')).find((b) =>
       b.textContent?.includes('Slice 15m Unblocker')
     ) as HTMLButtonElement;
@@ -938,10 +983,90 @@ describe('Companion 3.0 Multi-Studio Interactive UI + Real Python Backend', () =
     await act(async () => sliceBtn.click());
     await flushUi(120);
 
+    // Dependency guard immediately shows inside the open Card Modal!
     expect(container.textContent).toContain('Waiting on:');
+
+    // Close card modal: 15m unblocker is on active Board (1/10 WD), while parked parent moved to Backlog (1)!
+    const closeCardBtn = container.querySelector(
+      'button[aria-label="Close card dialog"]'
+    ) as HTMLButtonElement;
+    await act(async () => closeCardBtn.click());
+    await flushUi(50);
+
     expect(container.textContent).toContain('1 / 10');
 
-    // 2. Navigate to Unified Calendar Studio, schedule an explicit appointment, and verify merged items
+    // Switch to Backlog tab and verify parked parent card shows checklist 1/1 & Waiting on badge
+    const backlogTab = container.querySelector(
+      '[data-testid="boards-tab-backlog"]'
+    ) as HTMLButtonElement;
+    await act(async () => backlogTab.click());
+    await flushUi(60);
+    expect(container.textContent).toContain('☑ 1/1');
+    expect(container.textContent).toContain('Waiting on:');
+
+    // Switch to Epics & Roadmap tab -> create Jira-style Epic + nested child task
+    const epicsTab = container.querySelector(
+      '[data-testid="boards-tab-epics"]'
+    ) as HTMLButtonElement;
+    await act(async () => epicsTab.click());
+    await flushUi(60);
+
+    const quickEpicIn = container.querySelector(
+      'input[aria-label="Quick epic title"]'
+    ) as HTMLInputElement;
+    const quickEpicTarget = container.querySelector(
+      'input[aria-label="Epic target date"]'
+    ) as HTMLInputElement;
+    await act(async () => {
+      setInputValue(quickEpicIn, 'Barn cleaning winter project');
+      setInputValue(quickEpicTarget, todayIso);
+    });
+    const saveEpicBtn = Array.from(container.querySelectorAll('button')).find((b) =>
+      b.textContent?.includes('Save Epic')
+    ) as HTMLButtonElement;
+    await act(async () => saveEpicBtn.click());
+    await flushUi(120);
+
+    expect(container.textContent).toContain('Barn cleaning winter project');
+    const nestedTaskIn = container.querySelector(
+      'input[aria-label="Add task under Barn cleaning winter project"]'
+    ) as HTMLInputElement;
+    expect(nestedTaskIn).toBeTruthy();
+    await act(async () => {
+      setInputValue(nestedTaskIn, 'Clean each stall');
+    });
+    const addNestedTodoBtn = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent?.trim() === '+ To-Do'
+    ) as HTMLButtonElement;
+    await act(async () => addNestedTodoBtn.click());
+    await flushUi(120);
+    expect(container.textContent).toContain('0/1 tasks (0%)');
+
+    // Switch back to Board tab, move "Clean each stall" to Backlog via status dropdown, and verify it appears in Backlog!
+    const boardTab = container.querySelector(
+      '[data-testid="boards-tab-board"]'
+    ) as HTMLButtonElement;
+    await act(async () => boardTab.click());
+    await flushUi(60);
+
+    const stallStatusSel = container.querySelector(
+      'select[aria-label="Status for Clean each stall"]'
+    ) as HTMLSelectElement;
+    expect(stallStatusSel).toBeTruthy();
+    await act(async () => {
+      stallStatusSel.value = 'backlog';
+      stallStatusSel.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await flushUi(100);
+
+    await act(async () => backlogTab.click());
+    await flushUi(60);
+    expect(container.textContent).toContain('Clean each stall');
+
+    await act(async () => boardTab.click());
+    await flushUi(60);
+
+    // 2. Navigate to Unified Calendar Studio, verify Planned Task + Epic Target Milestone + Roadmap tab!
     const calNav = Array.from(container.querySelectorAll('.nav-btn')).find((b) =>
       b.textContent?.includes('Calendar')
     ) as HTMLButtonElement;
@@ -949,8 +1074,26 @@ describe('Companion 3.0 Multi-Studio Interactive UI + Real Python Backend', () =
     await act(async () => calNav.click());
     await flushUi(100);
 
-    // Planned task from Boards should already appear on today's cell!
+    // Planned task AND Epic milestone from Boards should already appear on today's cell!
     expect(container.textContent).toContain('Fix truck brake inspection');
+    expect(container.textContent).toContain('Epic Target: Barn cleaning winter project');
+
+    // Switch to Calendar Roadmap view and verify spanning Epic bar renders
+    const calRoadmapBtn = container.querySelector(
+      '[data-testid="calendar-tab-roadmap"]'
+    ) as HTMLButtonElement;
+    expect(calRoadmapBtn).toBeTruthy();
+    await act(async () => calRoadmapBtn.click());
+    await flushUi(100);
+    expect(container.querySelector('[data-testid="calendar-roadmap-panel"]')?.textContent).toContain(
+      'Barn cleaning winter project'
+    );
+
+    const monthBtn = Array.from(container.querySelectorAll('button')).find((b) =>
+      b.textContent?.includes('Month')
+    ) as HTMLButtonElement;
+    await act(async () => monthBtn.click());
+    await flushUi(80);
 
     const evTitleIn = container.querySelector(
       'input[placeholder*="Schedule appointment"]'

@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
+  resolve: {
+    preserveSymlinks: true,
+  },
   define:
     mode === 'test'
       ? {}

@@ -8,9 +8,11 @@ or getting trapped in repetitive tool loops.
 """
 
 import ast
+import contextlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,7 @@ from companion.hygiene import (
     ALLOWED_ROOT_FILES,
     ALLOWED_TOP_DIRS,
     analyze_workspace_hygiene,
+    find_semicolon_chains,
     find_unused_imports_in_source,
 )
 
@@ -53,7 +56,7 @@ __all__ = [
 ]
 
 _DESTRUCTIVE_CMD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?:^|[;&|]\s*)(?:sudo\s+)?rm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|--recursive)\s+(?:/|\*|~|\.\.)(?:\s|$)", re.I), "destructive recursive rm on root/home/parent"),
+    (re.compile(r"(?:^|[;&|]\s*)(?:sudo\s+)?rm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|--recursive)\s+['\"]?(?:/|\*|~|\.\.(?:/|\\|\s|$))", re.I), "destructive recursive rm on root/home/parent"),
     (re.compile(r"\bgit\s+push\b[^\n;&|]*(?:--force(?!-with-lease)|-f\b)", re.I), "force-pushing git history (`git push --force`)"),
     (re.compile(r"\bgit\s+reset\s+--hard\b", re.I), "destructive `git reset --hard` (use checkpoint_manage instead)"),
     (re.compile(r"\bgit\s+clean\s+-[a-zA-Z]*f", re.I), "destructive `git clean -f` untracked file wipe"),
@@ -61,8 +64,8 @@ _DESTRUCTIVE_CMD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bdd\s+[^\n;&|]*\bof=/dev/", re.I), "raw block device write (`dd of=/dev/...`)"),
     (re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", re.I), "shell fork bomb"),
     (re.compile(r"\b(?:shutdown|reboot|poweroff|halt|Stop-Computer|Restart-Computer)\b", re.I), "system power/reboot command"),
-    (re.compile(r"\b(?:del|erase|rd|rmdir)\s+[^\n;&|]*/s[^\n;&|]*/q\s+(?:[a-zA-Z]:\\|\*|\\)(?:\s|$)", re.I), "destructive Windows drive/wildcard wipe"),
-    (re.compile(r"\b(?:Remove-Item|ri|rm|del|rd|rmdir)\b[^\n;&|]*(?:-Recurse|-r\b)[^\n;&|]*(?:[a-zA-Z]:\\(?:\s|$)|/\s*$|\.\.|\*(?:\s|$))", re.I), "destructive recursive PowerShell item wipe on root/parent/wildcard"),
+    (re.compile(r"\b(?:del|erase|rd|rmdir)\s+[^\n;&|]*/s[^\n;&|]*/q\s+['\"]?(?:[a-zA-Z]:\\|\*|\\)", re.I), "destructive Windows drive/wildcard wipe"),
+    (re.compile(r"\b(?:Remove-Item|ri|rm|del|rd|rmdir)\b[^\n;&|]*(?:-Recurse|-r\b)[^\n;&|]*(?:[a-zA-Z]:\\|/(?:\s|$|[a-zA-Z])|~|\.\.(?:/|\\|\s|$)|\*(?:\s|$))", re.I), "destructive recursive PowerShell item wipe on root/home/parent/wildcard"),
     (re.compile(r"\b(?:DROP\s+TABLE|TRUNCATE\s+TABLE)\b", re.I), "destructive SQL table drop/truncate"),
     (re.compile(r"(?:UPDATE\s+user_profile|INSERT\s+[^\n;]*user_profile|REPLACE\s+INTO\s+user_profile|set_self_dev_mode)\b[^\n;]*self_dev_mode|self_dev_mode[^\n;]*(?:UPDATE\s+user_profile|INSERT\s+INTO\s+user_profile)", re.I), "privilege-escalation mutation of human-only `self_dev_mode`"),
 )
@@ -134,15 +137,27 @@ def check_path_safety(path: Path, write: bool = False, allowed_roots: Optional[L
             f"(`{roots[0]}`). Cross-directory traversal is blocked."
         )
     parts_lower = [pt.lower() for pt in resolved.parts]
-    if ".ssh" in parts_lower:
-        return f"SAFETY GUARD REJECTED path: access to SSH credentials (`{resolved}`) is blocked."
-    if resolved.name.lower() in (".env", "secrets.env"):
+    fname_lower = resolved.name.lower()
+    if ".ssh" in parts_lower or fname_lower.startswith((".comp_ssh_", ".secrets_")):
+        return f"SAFETY GUARD REJECTED path: access to SSH/Vault temporary credentials (`{resolved}`) is blocked."
+    is_env_secret = (
+        fname_lower in (".env", "secrets.env")
+        or resolved == settings.secrets_env_path.resolve()
+        or (fname_lower.startswith(".env.") and fname_lower not in (".env.example", ".env.sample", ".env.template"))
+    )
+    if is_env_secret:
         if write:
             return f"SAFETY GUARD REJECTED path: direct overwrite of secret file `{resolved.name}` is blocked."
         return f"SAFETY GUARD REJECTED path: reading secret file `{resolved.name}` via tools is blocked (inspect `.env.example` instead)."
     if write and ".git" in parts_lower:
         return f"SAFETY GUARD REJECTED path: direct modification of `.git` internals (`{resolved}`) is blocked."
     if write and allowed_roots is None:
+        wiki_roots = [(settings.effective_data_dir / "wiki").resolve(), (settings.root / "data" / "wiki").resolve()]
+        if any(resolved.is_relative_to(wr) for wr in wiki_roots):
+            return (
+                f"SAFETY GUARD REJECTED path: direct `write_file`/`edit_file` inside `{resolved.parent}` is blocked. "
+                "Use `wiki_manage` so Knowledge Wiki co-ownership and curation rules are enforced."
+            )
         ws_chk = settings.get_workspace()
         if ws_chk.is_self_project and not settings.is_self_dev_enabled() and resolved.is_relative_to(ws_chk.self_root):
             data_roots = [(ws_chk.self_root / "data").resolve(), settings.effective_data_dir.resolve()]
@@ -189,7 +204,10 @@ def _check_python_governed_rules(tree: ast.Module, lines: List[str], rel: str) -
                         return f"HYGIENE GUARD REJECTED `{rel}:{sub.lineno}`: `{node.name}.{sub.name}()` is {fn_len} lines (> budget {fn_cap})."
 
     if parts[0] not in ("tests", "skills"):
-        ring0_local = {"companion", "surfaces", "configs", "harness", "tests", "__future__", "msvcrt", "winreg", "winsound", "_winapi"}
+        semi = find_semicolon_chains(tree, rel)
+        if semi:
+            return f"HYGIENE GUARD REJECTED `{semi[0]}`: write one statement per line (do not chain statements with `;`)."
+        ring0_local = {"companion", "surfaces", "configs", "memory", "harness", "tests", "__future__", "msvcrt", "winreg", "winsound", "_winapi"}
         stdlib_lower = {m.lower() for m in getattr(sys, "stdlib_module_names", ())}
         for target, lineno in iter_ast_import_targets(tree):
             top_pkg = target.split(".")[0].lower()
@@ -241,6 +259,9 @@ def lint_single_file_edit(
             warnings.append(f"Unused import(s): {'; '.join(unused)} — remove before finishing so System Doctor Stage 5 passes.")
         if len(lines) >= int(settings.max_module_lines * 0.9):
             warnings.append(f"Module headroom low: {len(lines)}/{settings.max_module_lines} lines.")
+        long_lines = [idx for idx, ln in enumerate(lines, 1) if len(ln) > 160 and not ln.lstrip().startswith(("#", '"', "'"))]
+        if long_lines:
+            warnings.append(f"{len(long_lines)} code line(s) exceed 160 chars (e.g. L{long_lines[0]}) — wrap long expressions cleanly.")
 
     if resolved.suffix.lower() in {".js", ".html", ".htm"}:
         js_err = validate_embedded_scripts(content, rel)
@@ -341,9 +362,8 @@ class LoopGuard:
             "RISK GATE REJECTED",
             "SKILL FORGE REJECTED",
             "WIKI AUTHOR GUARD REJECTED",
-            "exit=1\n",
-            "exit=2\n",
-        ))
+            "PRIVILEGE GUARD REJECTED",
+        )) or bool(re.match(r"^exit=(?!0\b)-?\d+\n", result))
         self.consecutive_errors = (self.consecutive_errors + 1) if is_err else 0
         if self.consecutive_errors >= self.max_consecutive_errors:
             return (
@@ -383,6 +403,27 @@ def run_unit_tests(root: Optional[Path] = None, timeout: int = 90, pattern: str 
         return {"passed": proc.returncode == 0, "ran": ran_cnt, "returncode": proc.returncode, "output": out}
     except Exception as exc:
         return {"passed": False, "ran": 0, "returncode": -1, "output": f"Failed to run unit tests: {type(exc).__name__}: {exc}"}
+
+
+def _inspect_doctor_db(target_root: Path) -> Tuple[str, int, Dict[str, str]]:
+    """Inspect SQLite ADRs & profile read-only when DB exists so `run_system_doctor` never mutates live `data/`."""
+    db_file = settings.db_path if target_root == settings.root.resolve() else (target_root / "data" / "conversations.db")
+    if db_file.is_file():
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True)) as ro_conn:
+                adr_cnt = int(ro_conn.execute("SELECT COUNT(*) FROM architecture_decisions").fetchone()[0])
+                prof = dict(ro_conn.execute("SELECT key, value FROM user_profile").fetchall())
+                if adr_cnt > 0 and prof:
+                    return db_file.name, adr_cnt, prof
+        except Exception:
+            pass
+    from companion.memory_store import MemoryStore
+
+    mem = MemoryStore(db_path=db_file)
+    try:
+        return mem.db_path.name, len(mem.get_adrs()), mem.get_user_profile()
+    finally:
+        mem.conn.close()
 
 
 def run_system_doctor(root: Optional[Path] = None, run_tests: bool = True) -> Dict[str, Any]:
@@ -432,14 +473,11 @@ def run_system_doctor(root: Optional[Path] = None, run_tests: bool = True) -> Di
         else hygiene_rep.format_summary(),
     })
 
-    from companion.memory_store import get_memory_store
-
-    store = get_memory_store()
-    adrs, profile = store.get_adrs(), store.get_user_profile()
+    db_name, adr_cnt, profile = _inspect_doctor_db(target_root)
     checks.append({
         "check": "6. SQLite Memory, ADRs & Hobby Store",
-        "passed": len(adrs) > 0 and len(profile) > 0,
-        "details": f"DB healthy ({store.db_path.name}): {len(adrs)} ADRs, {len(profile)} profile keys, hobby_mode={profile.get('hobby_mode')}, self_dev_mode={profile.get('self_dev_mode', 'off')}.",
+        "passed": adr_cnt > 0 and len(profile) > 0,
+        "details": f"DB healthy ({db_name}): {adr_cnt} ADRs, {len(profile)} profile keys, hobby_mode={profile.get('hobby_mode')}, self_dev_mode={profile.get('self_dev_mode', 'off')}.",
     })
 
     if run_tests:

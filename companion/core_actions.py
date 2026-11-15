@@ -15,7 +15,7 @@ from companion.archive_and_approvals import (
 )
 from companion.background_jobs import get_job_manager
 from companion.calendar_engine import execute_calendar_action, parse_calendar_slash
-from companion.config import settings
+from companion.config import is_in_agent_tool_turn, settings
 from companion.context import execute_identity_action
 from companion.education_engine import execute_education_action, parse_education_slash
 from companion.endpoints import get_endpoint_manager
@@ -45,6 +45,11 @@ class ActionSpec:
 
 def _as_bool(val: Any, default: bool = False) -> bool:
     return val if isinstance(val, bool) else (default if val is None else str(val).strip().lower() in ("1", "true", "yes", "on"))
+
+
+def _human_confirmed(p: Dict[str, Any], actor: str) -> bool:
+    """Only honor `confirmed=True` when invoked directly by a human (`user`, `cli`, `web`) outside an LLM tool turn."""
+    return _as_bool(p.get("confirmed")) and actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
 
 
 def _as_list(val: Any) -> Optional[List[str]]:
@@ -87,9 +92,23 @@ def _apply_approved_request(req: Dict[str, Any], mem: MemoryStore) -> Optional[s
         if act == "trash_note" and payload.get("path"):
             r = wk.trash_note(str(payload["path"]), actor="user", confirmed=True)
             return r.get("summary") if r.get("ok") else None
-    if cat == "vault_scope" and act == "grant_scope" and payload.get("secret") and payload.get("caller_scope"):
-        r = get_vault_manager(store=mem).grant_scope(str(payload["secret"]), str(payload["caller_scope"]), actor="user", confirmed=True)
+    sec_name = str(payload.get("name") or payload.get("secret") or "")
+    if cat == "vault_scope" and act == "grant_scope" and sec_name and payload.get("caller_scope"):
+        r = get_vault_manager(store=mem).grant_scope(sec_name, str(payload["caller_scope"]), actor="user", confirmed=True)
         return r.get("summary") if r.get("ok") else None
+    if cat == "endpoint_exec" and payload.get("endpoint_id"):
+        em = get_endpoint_manager(store=mem)
+        eid = str(payload["endpoint_id"])
+        if act == "ssh_exec" and payload.get("command"):
+            r = em.ssh_exec(eid, str(payload["command"]), actor="user", confirmed=True)
+            return str(r.get("output") or r.get("summary") or "SSH command executed.") if r.get("ok") else None
+        if act == "winrm_exec" and payload.get("command"):
+            r = em.winrm_exec(eid, str(payload["command"]), actor="user", confirmed=True)
+            return str(r.get("output") or r.get("summary") or "WinRM command executed.") if r.get("ok") else None
+        if act.startswith("http_"):
+            verb = str(payload.get("method") or act.removeprefix("http_").upper())
+            r = em.api_request(eid, method=verb, path=str(payload.get("path") or "/"), json_body=payload.get("json_body") if isinstance(payload.get("json_body"), dict) else None, actor="user", confirmed=True)
+            return f"HTTP {r.get('status_code')}" if r.get("ok") else None
     if cat == "mcp_server":
         hub = get_mcp_hub(store=mem)
         if act == "approve_mcp_tools" and payload.get("server_id"):
@@ -122,6 +141,7 @@ def _act_approvals(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str,
             if _as_bool(p.get("apply_action"), True):
                 applied_msg = _apply_approved_request(res.get("approval") or {}, mem)
                 if applied_msg:
+                    aq.mark_executed(str((res.get("approval") or {}).get("approval_id") or p.get("approval_id") or ""))
                     res["applied_summary"] = applied_msg
                     res["summary"] = f"{res['summary']} -> Executed: {applied_msg}"
             if _as_bool(p.get("resume_job"), True):
@@ -198,11 +218,11 @@ def _act_wiki_templates_and_curation(wk: Any, sub: str, p: Dict[str, Any], actor
     if sub == "validate_curation":
         return validate_curation_plan(wk, str(p.get("curation_id") or ""), str(p.get("strategy") or "CREATE_NEW"), outputs=p.get("outputs") or p.get("outputs_json"), rationale=str(p.get("rationale") or ""), allow_condense=_as_bool(p.get("allow_condense")), fallback_fields=p)
     if sub == "commit_curation":
-        return commit_curation_plan(wk, str(p.get("curation_id") or ""), actor=actor, confirmed=_as_bool(p.get("confirmed")), plan_override=p.get("plan_override") if isinstance(p.get("plan_override"), dict) else None)
+        return commit_curation_plan(wk, str(p.get("curation_id") or ""), actor=actor, confirmed=_human_confirmed(p, actor), plan_override=p.get("plan_override") if isinstance(p.get("plan_override"), dict) else None)
     if sub == "curation_history":
         return list_curation_history(wk, limit=int(p.get("limit") or 25))
     if sub == "revert_curation":
-        return revert_curation(wk, str(p.get("tx_id") or p.get("path") or ""), actor=actor, confirmed=_as_bool(p.get("confirmed")))
+        return revert_curation(wk, str(p.get("tx_id") or p.get("path") or ""), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "create_proxy_note":
         return wk.create_proxy_note(asset_path=str(p.get("asset_path") or p.get("path") or ""), title=str(p.get("title") or ""), executive_summary=str(p.get("summary") or p.get("content") or ""), highlights=str(p.get("highlights") or ""), mime_type=str(p.get("mime_type") or ""), size_label=str(p.get("size_label") or ""), sha256=str(p.get("sha256") or ""), tags=_as_list(p.get("tags")), ontology=_as_list(p.get("ontology")), related_links=_as_list(p.get("related")), actor=actor)
     if sub == "deep_curate_job":
@@ -233,11 +253,11 @@ def _act_wiki(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]
             res["summary"] = f"`{res['path']}` (`author: {res['author']}`, tpl=`{res.get('template', '')}`, hash=`{res['content_hash']}`, ontology={res.get('ontology', [])}, backlinks={res['backlinks']})\n\n{res['raw']}"
         return res
     if sub in ("save", "update", "save_note"):
-        return wk.save_or_update_note(rel_path=str(p.get("path") or ""), content=str(p.get("content") or ""), title=str(p.get("title") or ""), tags=_as_list(p.get("tags")), actor=actor, expected_hash=str(p.get("expected_hash") or ""), confirmed=_as_bool(p.get("confirmed")), summary=str(p.get("summary") or ""), template=str(p.get("template") or ""), ontology=_as_list(p.get("ontology")), status=str(p.get("status") or ""))
+        return wk.save_or_update_note(rel_path=str(p.get("path") or ""), content=str(p.get("content") or ""), title=str(p.get("title") or ""), tags=_as_list(p.get("tags")), actor=actor, expected_hash=str(p.get("expected_hash") or ""), confirmed=_human_confirmed(p, actor), summary=str(p.get("summary") or ""), template=str(p.get("template") or ""), ontology=_as_list(p.get("ontology")), status=str(p.get("status") or ""))
     if sub == "graduate":
-        return wk.graduate_note(inbox_path=str(p.get("path") or ""), domain=str(p.get("domain") or ""), topic=str(p.get("topic") or ""), new_slug=str(p.get("new_slug") or ""), actor=actor, confirmed=_as_bool(p.get("confirmed")), template=str(p.get("template") or ""), summary=str(p.get("summary") or ""), ontology=_as_list(p.get("ontology")))
+        return wk.graduate_note(inbox_path=str(p.get("path") or ""), domain=str(p.get("domain") or ""), topic=str(p.get("topic") or ""), new_slug=str(p.get("new_slug") or ""), actor=actor, confirmed=_human_confirmed(p, actor), template=str(p.get("template") or ""), summary=str(p.get("summary") or ""), ontology=_as_list(p.get("ontology")))
     if sub == "trash":
-        return wk.trash_note(rel_path=str(p.get("path") or ""), actor=actor, confirmed=_as_bool(p.get("confirmed")))
+        return wk.trash_note(rel_path=str(p.get("path") or ""), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "restore":
         return wk.restore_note(str(p.get("path") or p.get("trash_id") or ""))
     if sub == "list_trash":
@@ -273,7 +293,7 @@ def _act_vault(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
     if sub == "delete":
         return vm.delete_secret(name=str(p.get("name") or ""), remove_metadata=_as_bool(p.get("remove_metadata")), actor=actor)
     if sub == "declare":
-        return vm.declare_placeholder(name=str(p.get("name") or ""), cred_type=str(p.get("cred_type") or "api_key"), description=str(p.get("description") or ""), allow_list=_as_list(p.get("allow_list")))
+        return vm.declare_placeholder(name=str(p.get("name") or ""), cred_type=str(p.get("cred_type") or "api_key"), description=str(p.get("description") or ""), allow_list=_as_list(p.get("allow_list")), actor=actor)
     if sub in ("check", "check_secret", "metadata"):
         meta = vm.get_metadata(str(p.get("name") or ""))
         if not meta:
@@ -283,7 +303,7 @@ def _act_vault(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         miss = vm.list_missing_secrets()
         return {"ok": True, "missing": miss, "summary": "Missing Vault secrets: " + (", ".join(f"`{m['name']}` ({m['needed_by']})" for m in miss) or "none")}
     if sub in ("grant_scope", "request_scope"):
-        return vm.grant_scope(name=str(p.get("name") or ""), caller_scope=str(p.get("caller_scope") or ""), actor=actor, confirmed=_as_bool(p.get("confirmed")))
+        return vm.grant_scope(name=str(p.get("name") or ""), caller_scope=str(p.get("caller_scope") or ""), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "audit":
         logs = vm.get_audit_log(limit=int(p.get("limit") or 20))
         lines = ["=== Vault Zero-Reveal Audit Log ==="] + [f"  * [{r['created_at']}] `{r['secret_name']}` -> {r['outcome']} ({r['caller_scope']}) {r['detail']}" for r in logs]
@@ -306,24 +326,24 @@ def _act_endpoints(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str,
     em = get_endpoint_manager(store=mem)
     sub = str(p.get("subaction") or "list").lower()
     if sub == "register":
-        return em.register_endpoint(endpoint_id=str(p.get("endpoint_id") or ""), protocol=str(p.get("protocol") or ""), host=str(p.get("host") or ""), label=str(p.get("label") or ""), port=int(p.get("port") or 0), username=str(p.get("username") or ""), auth_mode=str(p.get("auth_mode") or ""), credential_ref=str(p.get("credential_ref") or ""), auth_header=str(p.get("auth_header") or "X-API-Key"), os_hint=str(p.get("os_hint") or ""), verify_tls=_as_bool(p.get("verify_tls"), True), tags=_as_list(p.get("tags")))
+        return em.register_endpoint(endpoint_id=str(p.get("endpoint_id") or ""), protocol=str(p.get("protocol") or ""), host=str(p.get("host") or ""), label=str(p.get("label") or ""), port=int(p.get("port") or 0), username=str(p.get("username") or ""), auth_mode=str(p.get("auth_mode") or ""), credential_ref=str(p.get("credential_ref") or ""), auth_header=str(p.get("auth_header") or "X-API-Key"), os_hint=str(p.get("os_hint") or ""), verify_tls=_as_bool(p.get("verify_tls"), True), tags=_as_list(p.get("tags")), actor=actor)
     if sub == "remove":
-        return em.remove_endpoint(str(p.get("endpoint_id") or ""))
+        return em.remove_endpoint(str(p.get("endpoint_id") or ""), actor=actor)
     if sub == "test":
         return em.test_endpoint(str(p.get("endpoint_id") or ""), timeout=float(p.get("timeout") or 5.0))
     if sub == "inspect_host":
-        return em.inspect_host(str(p.get("endpoint_id") or ""))
+        return em.inspect_host(str(p.get("endpoint_id") or ""), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "ssh_exec":
-        return em.ssh_exec(str(p.get("endpoint_id") or ""), str(p.get("command") or ""), timeout=int(p.get("timeout") or 30), actor=actor, confirmed=_as_bool(p.get("confirmed")))
+        return em.ssh_exec(str(p.get("endpoint_id") or ""), str(p.get("command") or ""), timeout=int(p.get("timeout") or 30), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "ssh_read_file":
-        return em.ssh_read_file(str(p.get("endpoint_id") or ""), str(p.get("remote_path") or ""), max_lines=int(p.get("max_lines") or 200))
+        return em.ssh_read_file(str(p.get("endpoint_id") or ""), str(p.get("remote_path") or ""), max_lines=int(p.get("max_lines") or 200), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "winrm_exec":
-        return em.winrm_exec(str(p.get("endpoint_id") or ""), str(p.get("command") or ""), timeout=int(p.get("timeout") or 30), actor=actor, confirmed=_as_bool(p.get("confirmed")))
+        return em.winrm_exec(str(p.get("endpoint_id") or ""), str(p.get("command") or ""), timeout=int(p.get("timeout") or 30), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "api_request":
         body = p.get("json_body")
         if isinstance(body, str) and body.strip():
             body = json.loads(body)
-        return em.api_request(str(p.get("endpoint_id") or ""), method=str(p.get("method") or "GET"), path=str(p.get("path") or "/"), json_body=body if isinstance(body, dict) else None, actor=actor, confirmed=_as_bool(p.get("confirmed")))
+        return em.api_request(str(p.get("endpoint_id") or ""), method=str(p.get("method") or "GET"), path=str(p.get("path") or "/"), json_body=body if isinstance(body, dict) else None, actor=actor, confirmed=_human_confirmed(p, actor))
     return {"ok": True, "endpoints": em.list_endpoints(protocol=str(p.get("protocol") or "")), "summary": em.format_status()}
 
 
@@ -331,24 +351,24 @@ def _act_mcp(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
     hub = get_mcp_hub(store=mem)
     sub = str(p.get("subaction") or "list").lower()
     if sub == "register_server":
-        return hub.register_server(server_id=str(p.get("server_id") or ""), transport=str(p.get("transport") or "stdio"), label=str(p.get("label") or ""), command=str(p.get("command") or ""), args=_as_list(p.get("args")), url=str(p.get("url") or ""), credential_ref=str(p.get("credential_ref") or ""), allowed_tools=_as_list(p.get("allowed_tools")))
+        return hub.register_server(server_id=str(p.get("server_id") or ""), transport=str(p.get("transport") or "stdio"), label=str(p.get("label") or ""), command=str(p.get("command") or ""), args=_as_list(p.get("args")), url=str(p.get("url") or ""), credential_ref=str(p.get("credential_ref") or ""), allowed_tools=_as_list(p.get("allowed_tools")), actor=actor)
     if sub == "discover":
         return hub.discover_server(str(p.get("server_id") or ""), actor=actor)
     if sub == "approve_server":
         return hub.approve_server(str(p.get("server_id") or ""), actor=actor)
     if sub == "remove_server":
-        return hub.remove_server(str(p.get("server_id") or ""))
+        return hub.remove_server(str(p.get("server_id") or ""), actor=actor)
     if sub == "call_tool":
         args_in = p.get("arguments")
         if isinstance(args_in, str) and args_in.strip():
             args_in = json.loads(args_in)
-        return hub.call_mcp_tool(str(p.get("server_id") or ""), str(p.get("tool_name") or ""), arguments=args_in if isinstance(args_in, dict) else {}, actor=actor, confirmed=_as_bool(p.get("confirmed")))
+        return hub.call_mcp_tool(str(p.get("server_id") or ""), str(p.get("tool_name") or ""), arguments=args_in if isinstance(args_in, dict) else {}, actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "configure_hosted":
-        return hub.configure_hosted_mcp(enabled=_as_bool(p.get("enabled"), True), token_ref=str(p.get("token_ref") or "hosted-mcp-token"), allow_wiki_read=_as_bool(p.get("allow_wiki_read")), actor=actor, confirmed=_as_bool(p.get("confirmed")))
+        return hub.configure_hosted_mcp(enabled=_as_bool(p.get("enabled"), True), token_ref=str(p.get("token_ref") or "hosted-mcp-token"), allow_wiki_read=_as_bool(p.get("allow_wiki_read")), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "register_partner":
-        return hub.register_partner(partner_id=str(p.get("partner_id") or ""), url=str(p.get("url") or ""), label=str(p.get("label") or ""), credential_ref=str(p.get("credential_ref") or ""), enabled=_as_bool(p.get("enabled"), True))
+        return hub.register_partner(partner_id=str(p.get("partner_id") or ""), url=str(p.get("url") or ""), label=str(p.get("label") or ""), credential_ref=str(p.get("credential_ref") or ""), enabled=_as_bool(p.get("enabled"), True), actor=actor)
     if sub == "remove_partner":
-        return hub.remove_partner(str(p.get("partner_id") or ""))
+        return hub.remove_partner(str(p.get("partner_id") or ""), actor=actor)
     if sub == "handshake_partner":
         return hub.handshake_partner(str(p.get("partner_id") or ""))
     if sub == "delegate_partner":
@@ -390,7 +410,7 @@ def _act_routines(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, 
             target_kind=str(p.get("target_kind") or ""), title=str(p.get("title") or ""),
             target_name=str(p.get("target_name") or ""), inputs=p.get("inputs") if isinstance(p.get("inputs"), dict) else None,
             enabled=_as_bool(p.get("enabled"), True), catch_up=_as_bool(p.get("catch_up"), False),
-            actor=actor, confirmed=_as_bool(p.get("confirmed")),
+            actor=actor, confirmed=_human_confirmed(p, actor),
         )
     if sub == "delete":
         return rm.delete_routine(str(p.get("routine_id") or ""))

@@ -1,13 +1,9 @@
-"""
-100% Python Stdlib LAN Web Server (`surfaces/web_server.py` — A-Frame Presentation Layer).
-
-Exposes Companion AI OS over `http.server.ThreadingHTTPServer` (`0.0.0.0:<port>`) with:
-1. Zero-login Home LAN security (Host DNS-rebinding shield + Origin/Sec-Fetch-Site/CSRF header validation)
-2. Live SSE token/thinking/phase/tool streaming (`GET /api/jobs/<id>/stream`) + disconnect-proof `202` jobs
-3. Thread-isolated WAL status, conversation history, search, and live Waterfall telemetry APIs
+"""100% Python Stdlib Web Server (`surfaces/web_server.py` — A-Frame Presentation Layer).
+Exposes Companion AI OS over `ThreadingHTTPServer` (`127.0.0.1:<port>` default, token-gated on LAN) with CSRF, SSE streaming, and WAL status APIs.
 """
 
 import contextvars
+from http.cookies import SimpleCookie
 import io
 import ipaddress
 import json
@@ -38,11 +34,17 @@ from companion.workflow_graph import WorkflowEngine
 from surfaces.api_extensions import (
     create_session_idle_watcher, dispatch_chat_or_job_with_attachments, enrich_web_status,
     handle_extended_get, handle_extended_post, handle_extended_raw_get,
+    register_service_reload_handler, spawn_companion_reload, wait_for_port_release,
 )
 from surfaces.web_assets import read_static_asset, render_web_index_html
 
 _CARRIER_NAT_NET = ipaddress.ip_network("100.64.0.0/10")
-_LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".home.arpa")
+_LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".home.arpa", ".localdomain", ".ts.net")
+_LOCAL_HOSTNAME = socket.gethostname().strip().lower()
+_READONLY_SUBACTIONS = frozenset({
+    "list", "status", "get", "read", "search", "graph", "metadata", "check",
+    "check_secret", "list_missing", "audit", "window", "progress", "board_view", "matrix",
+})
 
 
 def detect_lan_ip() -> str:
@@ -68,24 +70,66 @@ def detect_lan_ip() -> str:
 
 
 def is_allowed_lan_host(host_header: str) -> bool:
-    """Allow loopback, RFC1918/Tailscale LAN IPs, and local mDNS/single-label hostnames; block DNS rebinding."""
+    """Allow loopback, RFC1918/Tailscale LAN IPs, and verified local mDNS/machine hostnames; block DNS rebinding."""
     raw = (host_header or "").strip().lower()
     if not raw:
-        return True
+        return False
     host = (urllib.parse.urlsplit(f"http://{raw}").hostname or "").strip().lower()
     if not host:
         return False
-    if host in ("localhost", "0.0.0.0") or "." not in host or host.endswith(_LAN_SUFFIXES):
+    if host in ("localhost", "0.0.0.0", "::1") or (bool(_LOCAL_HOSTNAME) and host == _LOCAL_HOSTNAME) or host.endswith(_LAN_SUFFIXES):
         return True
     try:
-        ip_obj = ipaddress.ip_address(host)
+        raw_ip = ipaddress.ip_address(host.strip("[]"))
+        ip_obj = getattr(raw_ip, "ipv4_mapped", None) or raw_ip
+        if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
+            return False
         return bool(ip_obj.is_loopback or ip_obj.is_private or (ip_obj.version == 4 and ip_obj in _CARRIER_NAT_NET))
     except ValueError:
         return False
 
 
+def _is_loopback_client(client_ip: str) -> bool:
+    raw = (client_ip or "").strip()
+    if not raw:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(raw.split("%")[0].strip("[]"))
+        return bool((getattr(ip_obj, "ipv4_mapped", None) or ip_obj).is_loopback)
+    except ValueError:
+        return raw in ("localhost", "127.0.0.1", "::1")
+
+
+def verify_lan_client_auth(headers: Any, client_ip: str, qs: Optional[Dict[str, List[str]]] = None) -> Tuple[bool, str]:
+    """Allow loopback clients directly; require `COMPANION_WEB_TOKEN` (Bearer, Cookie, or `?token=`) for non-loopback LAN clients."""
+    if _is_loopback_client(client_ip):
+        return True, ""
+    expected = settings.web_token.strip()
+    if not expected:
+        return False, ""
+    auth_hdr = str(headers.get("Authorization") or "").strip()
+    if auth_hdr.lower().startswith("bearer "):
+        cand = auth_hdr[7:].strip()
+        if cand and secrets.compare_digest(cand.encode("utf-8"), expected.encode("utf-8")):
+            return True, ""
+    raw_cookie = str(headers.get("Cookie") or "")
+    if raw_cookie:
+        jar = SimpleCookie()
+        try:
+            jar.load(raw_cookie)
+            morsel = jar.get("companion_token")
+            if morsel and morsel.value and secrets.compare_digest(morsel.value.encode("utf-8"), expected.encode("utf-8")):
+                return True, ""
+        except Exception:
+            pass
+    q_tok = str(((qs or {}).get("token") or [""])[0]).strip()
+    if q_tok and secrets.compare_digest(q_tok.encode("utf-8"), expected.encode("utf-8")):
+        return True, f"companion_token={q_tok}; HttpOnly; SameSite=Strict; Path=/"
+    return False, ""
+
+
 def verify_post_request_security(headers: Any, expected_csrf: str) -> Optional[str]:
-    """Enforce zero-login browser Origin/Sec-Fetch-Site/JSON Content-Type/CSRF checks on mutating POSTs."""
+    """Enforce JSON Content-Type, Origin/Sec-Fetch-Site checks, and unconditional `X-Companion-CSRF` on all POSTs."""
     if "application/json" not in str(headers.get("Content-Type") or "").lower():
         return "Browser security guard: Content-Type must be application/json"
     sec_site = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
@@ -101,10 +145,9 @@ def verify_post_request_security(headers: Any, expected_csrf: str) -> Optional[s
             return f"Cross-origin request blocked ({origin})"
         if host_hdr and parsed_orig.netloc.lower() != host_hdr.lower():
             return f"Origin mismatch ({parsed_orig.netloc} != {host_hdr})"
-    if origin or sec_site or headers.get("X-Companion-Client") or headers.get("X-Companion-CSRF"):
-        sent_token = str(headers.get("X-Companion-CSRF") or "").strip()
-        if not sent_token or not secrets.compare_digest(sent_token, expected_csrf):
-            return "csrf_mismatch"
+    sent_token = str(headers.get("X-Companion-CSRF") or "").strip()
+    if not sent_token or not secrets.compare_digest(sent_token, expected_csrf):
+        return "csrf_mismatch"
     return None
 
 
@@ -351,9 +394,20 @@ class CompanionWebSession:
             notes.append(manage_companion_tone(str(payload["tone"]), store=self.store))
         if payload.get("project"):
             notes.append(manage_active_project(str(payload["project"]), store=self.store))
-        if notes and self.messages and self.messages[0].get("role") == "system":
-            self.messages[0]["content"] = build_system_prompt(store=self.store)
+        if notes:
+            fresh_sys = build_system_prompt(store=self.store)
+            with self._turn_lock:
+                if self.messages and self.messages[0].get("role") == "system":
+                    self.messages[0]["content"] = fresh_sys
         return {"ok": True, "message": "\n".join(notes) or "No settings changed."}
+
+
+def _parse_int_qs(qs: Dict[str, List[str]], key: str, default: int) -> Optional[int]:
+    raw = str((qs.get(key) or [str(default)])[0] or default).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 class CompanionHTTPServer(ThreadingHTTPServer):
@@ -366,11 +420,20 @@ class CompanionHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, handler_cls)
         self.session = session
 
+    def server_close(self) -> None:
+        self.session.idle_watcher.stop()
+        super().server_close()
+
 
 class CompanionWebRequestHandler(BaseHTTPRequestHandler):
     """HTTP/1.1 handler serving Companion's zero-login LAN Web UI, SSE streams, and JSON REST APIs."""
 
     server: CompanionHTTPServer
+
+    def setup(self) -> None:
+        if hasattr(self.request, "settimeout"):
+            self.request.settimeout(30.0)
+        super().setup()
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
@@ -396,15 +459,25 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         self._send_json(403, {"ok": False, "error": "DNS rebinding guard: non-LAN Host header rejected"})
         return False
 
-    def _read_json_body(self, max_bytes: int = 1_048_576) -> Dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return {}
+    def _read_json_body(self, max_bytes: int = 1_048_576) -> Tuple[Optional[int], Dict[str, Any]]:
+        raw_cl = self.headers.get("Content-Length")
+        if raw_cl is None or str(raw_cl).strip() == "":
+            return None, {}
         try:
-            parsed = json.loads(self.rfile.read(min(length, max_bytes)).decode("utf-8", errors="replace"))
-            return parsed if isinstance(parsed, dict) else {}
+            length = int(str(raw_cl).strip())
+        except ValueError:
+            return 400, {"ok": False, "error": "Invalid Content-Length header"}
+        if length < 0:
+            return 400, {"ok": False, "error": "Negative Content-Length header"}
+        if length == 0:
+            return None, {}
+        if length > max_bytes:
+            return 413, {"ok": False, "error": f"Request payload exceeds {max_bytes} byte limit"}
+        try:
+            parsed = json.loads(self.rfile.read(length).decode("utf-8", errors="replace"))
+            return (None, parsed) if isinstance(parsed, dict) else (400, {"ok": False, "error": "JSON body must be an object"})
         except json.JSONDecodeError:
-            return {}
+            return 400, {"ok": False, "error": "Malformed JSON body"}
 
     def _stream_job_sse(self, job_id: str) -> None:
         sess = self.server.session
@@ -441,21 +514,35 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
         route, qs, sess = parsed.path, urllib.parse.parse_qs(parsed.query), self.server.session
+        client_ip = str(self.client_address[0]) if self.client_address else ""
+        auth_ok, set_cookie = verify_lan_client_auth(self.headers, client_ip, qs=qs)
+        extra_cookie = (("Set-Cookie", set_cookie),) if set_cookie else ()
+        if route == "/api/health":
+            payload: Dict[str, Any] = {"ok": True, "service": "companion-web-ui", "lan_url": sess.lan_url}
+            if auth_ok:
+                payload["csrf_token"] = sess.csrf_token
+            else:
+                payload["auth_required"] = True
+            self._send_json(200, payload)
+            return
+        if not auth_ok and route != "/api/mcp":
+            self._send_json(401, {"ok": False, "error": "LAN access requires a valid COMPANION_WEB_TOKEN (Bearer header, cookie, or ?token=)."})
+            return
         raw_ext = handle_extended_raw_get(route, sess.store)
         if raw_ext is not None:
-            self._send_bytes(raw_ext[0], raw_ext[1], raw_ext[2], raw_ext[3]); return
+            self._send_bytes(raw_ext[0], raw_ext[1], raw_ext[2], (*raw_ext[3], *extra_cookie))
+            return
         ext = handle_extended_get(route, sess.store)
         if ext is not None:
-            self._send_json(ext[0], ext[1]); return
+            self._send_json(ext[0], ext[1])
+            return
         if route in ("/", "/index.html"):
-            self._send_bytes(200, "text/html; charset=utf-8", render_web_index_html(csrf_token=sess.csrf_token).encode("utf-8"))
+            self._send_bytes(200, "text/html; charset=utf-8", render_web_index_html(csrf_token=sess.csrf_token).encode("utf-8"), extra_cookie)
         elif route.startswith("/static/"):
             asset = read_static_asset(route.split("/static/", 1)[1])
-            self._send_bytes(200, asset[0], asset[1]) if asset is not None else self._send_json(404, {"ok": False, "error": f"Unknown static asset: {route}"})
+            self._send_bytes(200, asset[0], asset[1], extra_cookie) if asset is not None else self._send_json(404, {"ok": False, "error": f"Unknown static asset: {route}"})
         elif route == "/favicon.ico":
             self._send_bytes(204, "image/x-icon", b"")
-        elif route == "/api/health":
-            self._send_json(200, {"ok": True, "service": "companion-web-ui", "lan_url": sess.lan_url, "csrf_token": sess.csrf_token})
         elif route == "/api/status":
             self._send_json(200, sess.get_status_payload())
         elif route.startswith("/api/jobs/") and route.endswith("/stream"):
@@ -463,11 +550,23 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         elif route == "/api/jobs" or route.startswith("/api/jobs/"):
             self._send_json(*sess.get_job_payload(route.split("/api/jobs/", 1)[1] if route.startswith("/api/jobs/") else ""))
         elif route == "/api/history":
-            self._send_json(200, sess.get_history_payload(limit=int((qs.get("limit") or ["60"])[0] or 60), include_tools=(qs.get("include_tools") or ["0"])[0] in ("1", "true", "yes")))
+            lim = _parse_int_qs(qs, "limit", 60)
+            if lim is None:
+                self._send_json(400, {"ok": False, "error": "Invalid integer `limit` parameter"})
+                return
+            self._send_json(200, sess.get_history_payload(limit=lim, include_tools=(qs.get("include_tools") or ["0"])[0] in ("1", "true", "yes")))
         elif route == "/api/telemetry":
-            self._send_json(200, sess.get_telemetry_payload(limit=int((qs.get("limit") or ["12"])[0] or 12), trace_id=str((qs.get("trace_id") or [""])[0])))
+            lim = _parse_int_qs(qs, "limit", 12)
+            if lim is None:
+                self._send_json(400, {"ok": False, "error": "Invalid integer `limit` parameter"})
+                return
+            self._send_json(200, sess.get_telemetry_payload(limit=lim, trace_id=str((qs.get("trace_id") or [""])[0])))
         elif route == "/api/search":
-            self._send_json(200, sess.get_search_payload(query=str((qs.get("q") or [""])[0]), limit=int((qs.get("limit") or ["20"])[0] or 20)))
+            lim = _parse_int_qs(qs, "limit", 20)
+            if lim is None:
+                self._send_json(400, {"ok": False, "error": "Invalid integer `limit` parameter"})
+                return
+            self._send_json(200, sess.get_search_payload(query=str((qs.get("q") or [""])[0]), limit=lim))
         else:
             self._send_json(404, {"ok": False, "error": f"Unknown endpoint: {route}"})
 
@@ -475,19 +574,42 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         if not self._check_host_guard():
             return
         route = urllib.parse.urlparse(self.path).path
-        sess, body = self.server.session, self._read_json_body(28_311_552 if route == "/api/attachments" else 1_048_576)
+        sess = self.server.session
+        client_ip = str(self.client_address[0]) if self.client_address else ""
+        if route != "/api/mcp":
+            auth_ok, _ = verify_lan_client_auth(self.headers, client_ip)
+            if not auth_ok:
+                self._send_json(401, {"ok": False, "error": "LAN access requires a valid COMPANION_WEB_TOKEN."})
+                return
+            sec_err = verify_post_request_security(self.headers, sess.csrf_token)
+            if sec_err:
+                self._send_json(403, {"ok": False, "error": sec_err})
+                return
+        body_err, body = self._read_json_body(28_311_552 if route == "/api/attachments" else 1_048_576)
+        if body_err is not None:
+            self._send_json(body_err, body)
+            return
         if route == "/api/mcp":
             ext_mcp = handle_extended_post(route, body, self.headers, sess.store)
-            self._send_json(ext_mcp[0], ext_mcp[1]) if ext_mcp else self._send_json(404, {"ok": False}); return
-        sec_err = verify_post_request_security(self.headers, sess.csrf_token)
-        if sec_err:
-            self._send_json(403, {"ok": False, "error": sec_err}); return
-        sess.idle_watcher.record_human_activity()
+            if ext_mcp is None:
+                self._send_json(404, {"ok": False})
+            elif ext_mcp[0] == 202 and not ext_mcp[1]:
+                self._send_bytes(202, "application/json; charset=utf-8", b"")
+            else:
+                self._send_json(ext_mcp[0], ext_mcp[1])
+            return
+        sub = str(body.get("subaction") or "").strip().lower()
+        if not (route.startswith("/api/actions/") and sub in _READONLY_SUBACTIONS):
+            sess.idle_watcher.record_human_activity()
         ext_act = handle_extended_post(route, body, self.headers, sess.store)
         if ext_act is not None:
-            if route == "/api/actions/hobbies" and sess.messages and sess.messages[0].get("role") == "system":
-                sess.messages[0]["content"] = build_system_prompt(store=sess.store)
-            self._send_json(ext_act[0], ext_act[1]); return
+            if route == "/api/actions/hobbies":
+                fresh_sys = build_system_prompt(store=sess.store)
+                with sess._turn_lock:
+                    if sess.messages and sess.messages[0].get("role") == "system":
+                        sess.messages[0]["content"] = fresh_sys
+            self._send_json(ext_act[0], ext_act[1])
+            return
         if route in ("/api/chat", "/api/jobs"):
             self._send_json(*dispatch_chat_or_job_with_attachments(sess, body, route == "/api/jobs" or bool(body.get("async"))))
         elif route == "/api/settings":
@@ -498,51 +620,75 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": f"Unknown POST endpoint: {route}"})
 
 
-def create_web_server(host: str = "0.0.0.0", port: int = 8000, store: Optional[MemoryStore] = None, chat_fn: Callable[..., Dict[str, Any]] = chat) -> Tuple[CompanionHTTPServer, CompanionWebSession]:
+def create_web_server(host: Optional[str] = None, port: int = 8000, store: Optional[MemoryStore] = None, chat_fn: Callable[..., Dict[str, Any]] = chat) -> Tuple[CompanionHTTPServer, CompanionWebSession]:
     """Instantiate a bound `CompanionHTTPServer` and `CompanionWebSession` (supports `port=0` for tests)."""
+    eff_host = (host or settings.web_host).strip() or "127.0.0.1"
     lan_ip = detect_lan_ip()
     sess = CompanionWebSession(store=store, chat_fn=chat_fn, lan_url=f"http://{lan_ip}:{port}")
-    srv = CompanionHTTPServer((host, int(port)), CompanionWebRequestHandler, session=sess)
+    srv = CompanionHTTPServer((eff_host, int(port)), CompanionWebRequestHandler, session=sess)
     sess.lan_url = f"http://{lan_ip}:{int(srv.server_address[1])}"
     return srv, sess
 
 
 class _InMemorySocket:
     """Minimal socket shim allowing `CompanionWebRequestHandler` execution when OS loopback sockets are sandboxed."""
-    def __init__(self, raw_request: bytes) -> None: self._rbuf, self.wbuf = io.BytesIO(raw_request), io.BytesIO()
-    def makefile(self, mode: str, *args: Any, **kwargs: Any) -> io.BytesIO: return self._rbuf if "r" in mode else self.wbuf
-    def sendall(self, data: bytes) -> None: self.wbuf.write(data)
 
-def dispatch_raw_http(server: CompanionHTTPServer, method: str = "GET", path: str = "/", body: Optional[bytes] = None, headers: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+    def __init__(self, raw_request: bytes) -> None:
+        self._rbuf, self.wbuf = io.BytesIO(raw_request), io.BytesIO()
+
+    def makefile(self, mode: str, *args: Any, **kwargs: Any) -> io.BytesIO:
+        return self._rbuf if "r" in mode else self.wbuf
+
+    def sendall(self, data: bytes) -> None:
+        self.wbuf.write(data)
+
+
+def dispatch_raw_http(
+    server: CompanionHTTPServer, method: str = "GET", path: str = "/",
+    body: Optional[bytes] = None, headers: Optional[Dict[str, str]] = None, client_ip: str = "127.0.0.1",
+) -> Tuple[int, str]:
     """Execute a real HTTP/1.1 request through `CompanionWebRequestHandler` in-memory and return `(status, body_str)`."""
     payload = body or b""
     req_headers: Dict[str, str] = {"Host": "127.0.0.1", "Connection": "close", **({"Content-Type": "application/json", "Content-Length": str(len(payload))} if payload else {}), **(headers or {})}
     hdr_lines = [f"{method.upper()} {path} HTTP/1.1"] + [f"{k}: {v}" for k, v in req_headers.items()]
     sock = _InMemorySocket(("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8") + payload)
-    CompanionWebRequestHandler(sock, ("127.0.0.1", 0), server)
+    CompanionWebRequestHandler(sock, (client_ip, 0), server)
     head_bytes, _, body_bytes = sock.wbuf.getvalue().partition(b"\r\n\r\n")
     parts = (head_bytes.decode("iso-8859-1", errors="replace").splitlines()[0] if head_bytes else "HTTP/1.1 500").split()
     return (int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 500), body_bytes.decode("utf-8", errors="replace")
 
 
-def start_web_server(host: str = "0.0.0.0", port: Optional[int] = None) -> None:
-    """Launch Companion's LAN-accessible Web UI server and block until interrupted."""
+def start_web_server(host: Optional[str] = None, port: Optional[int] = None) -> None:
+    """Launch Companion's Web UI server (`127.0.0.1` default) and block until interrupted (supports live `/api/reload`)."""
+    eff_host = (host or settings.web_host).strip() or "127.0.0.1"
     eff_port = int(port if port is not None else int(os.environ.get("COMPANION_WEB_PORT", "8000")))
+    if os.environ.pop("COMPANION_RELOADING", "") == "1":
+        wait_for_port_release(eff_host, eff_port, timeout=6.0)
     try:
-        srv, sess = create_web_server(host=host, port=eff_port)
+        srv, sess = create_web_server(host=eff_host, port=eff_port)
     except OSError as exc:
         from surfaces.windows_tray import format_port_conflict_error
-        print(f"error: {format_port_conflict_error(host, eff_port, exc)}", file=sys.stderr); sys.exit(1)
-    bound_port = int(srv.server_address[1])
-    telemetry.log("INFO", "web_ui", f"Started Companion Web UI on {host}:{bound_port} ({sess.lan_url})")
-    print(f"=== Companion AI OS — LAN Web UI Active ===\n  Local Desktop URL : http://127.0.0.1:{bound_port}\n  Mobile / LAN URL  : {sess.lan_url}\n  Press Ctrl+C to stop the Web UI server.\n")
-    sys.stdout.flush(); sess.idle_watcher.start()
+
+        print(f"error: {format_port_conflict_error(eff_host, eff_port, exc)}", file=sys.stderr)
+        sys.exit(1)
+    bound_port, do_reload = int(srv.server_address[1]), [False]
+    register_service_reload_handler(lambda: (do_reload.__setitem__(0, True), threading.Thread(target=srv.shutdown, daemon=True).start()) and None)
+    telemetry.log("INFO", "web_ui", f"Started Companion Web UI on {eff_host}:{bound_port} ({sess.lan_url})")
+    lan_note = f"  Mobile / LAN URL  : {sess.lan_url} (COMPANION_WEB_TOKEN required)\n" if eff_host not in ("127.0.0.1", "localhost", "::1") else ""
+    print(f"=== Companion AI OS — Web UI Active ===\n  Local Desktop URL : http://127.0.0.1:{bound_port}\n{lan_note}  Press Ctrl+C to stop the Web UI server.\n")
+    sys.stdout.flush()
+    sess.idle_watcher.start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down Companion Web UI server...")
     finally:
-        sess.idle_watcher.stop(); srv.shutdown(); srv.server_close()
+        register_service_reload_handler(None)
+        sess.idle_watcher.stop()
+        srv.shutdown()
+        srv.server_close()
+    if do_reload[0]:
+        spawn_companion_reload(port=bound_port)
 
 
 if __name__ == "__main__":

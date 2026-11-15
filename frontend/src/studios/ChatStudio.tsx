@@ -77,6 +77,7 @@ export const ChatStudio: React.FC<ChatStudioProps> = ({
 
   const streamEndRef = useRef<HTMLDivElement | null>(null);
   const unsubRef = useRef<(() => void) | null>(null);
+  const attachedJobIdRef = useRef<string>('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
 
@@ -125,6 +126,58 @@ export const ChatStudio: React.FC<ChatStudioProps> = ({
     if (typeof res.due_total === 'number') setDueTotal(res.due_total);
   };
 
+  const attachStreamToMessage = (jobId: string, targetMsgId: string) => {
+    attachedJobIdRef.current = jobId;
+    unsubRef.current?.();
+    unsubRef.current = subscribeJobStream(jobId, {
+      onTextDelta: (delta) => {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === targetMsgId ? { ...m, content: m.content + delta } : m))
+        );
+      },
+      onThinkingDelta: (delta) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === targetMsgId ? { ...m, thinking: (m.thinking || '') + delta } : m
+          )
+        );
+      },
+      onPhase: (phase) => {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === targetMsgId ? { ...m, activePhase: phase } : m))
+        );
+      },
+      onTool: (tool, active) => {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === targetMsgId ? { ...m, activeTool: active ? tool : '' } : m))
+        );
+      },
+      onDone: (done) => {
+        attachedJobIdRef.current = '';
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === targetMsgId
+              ? {
+                  ...m,
+                  content: done.response || m.content || done.error || '(Completed)',
+                  streaming: false,
+                  activeTool: '',
+                }
+              : m
+          )
+        );
+        setSending(false);
+        onRefreshStatus();
+      },
+      onError: () => {
+        attachedJobIdRef.current = '';
+        setSending(false);
+        void loadHistory();
+        onRefreshStatus();
+      },
+    });
+  };
+
   useEffect(() => {
     void loadHistory();
     void loadPrompts();
@@ -133,6 +186,45 @@ export const ChatStudio: React.FC<ChatStudioProps> = ({
       unsubRef.current?.();
     };
   }, []);
+
+  useEffect(() => {
+    const activeJob = status?.active_job;
+    if (
+      !activeJob ||
+      activeJob.status !== 'running' ||
+      !activeJob.job_id ||
+      attachedJobIdRef.current === activeJob.job_id
+    ) {
+      return;
+    }
+    const streamId = `reattach_${activeJob.job_id}`;
+    setSending(true);
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === streamId)) return prev;
+      const next = [...prev];
+      const last = next[next.length - 1];
+      if (activeJob.message && (!last || last.role !== 'user' || last.content !== activeJob.message)) {
+        next.push({
+          id: `u_${activeJob.job_id}`,
+          role: 'user',
+          content: activeJob.message,
+          timestamp: activeJob.created_at || new Date().toISOString(),
+        });
+      }
+      next.push({
+        id: streamId,
+        role: 'assistant',
+        content: '',
+        thinking: '',
+        activePhase: activeJob.active_phase || '',
+        activeTool: activeJob.active_tool || '',
+        timestamp: new Date().toISOString(),
+        streaming: true,
+      });
+      return next;
+    });
+    attachStreamToMessage(activeJob.job_id, streamId);
+  }, [status?.active_job?.job_id, status?.active_job?.status]);
 
   useEffect(() => {
     streamEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -257,54 +349,7 @@ export const ChatStudio: React.FC<ChatStudioProps> = ({
       }
 
       if (sub.job_id) {
-        unsubRef.current?.();
-        unsubRef.current = subscribeJobStream(sub.job_id, {
-          onTextDelta: (delta) => {
-            setMessages((prev) =>
-              prev.map((m) => (m.id === streamId ? { ...m, content: m.content + delta } : m))
-            );
-          },
-          onThinkingDelta: (delta) => {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === streamId ? { ...m, thinking: (m.thinking || '') + delta } : m
-              )
-            );
-          },
-          onPhase: (phase) => {
-            setMessages((prev) =>
-              prev.map((m) => (m.id === streamId ? { ...m, activePhase: phase } : m))
-            );
-          },
-          onTool: (tool, active) => {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === streamId ? { ...m, activeTool: active ? tool : '' } : m
-              )
-            );
-          },
-          onDone: (done) => {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === streamId
-                  ? {
-                      ...m,
-                      content: done.response || m.content || done.error || '(Completed)',
-                      streaming: false,
-                      activeTool: '',
-                    }
-                  : m
-              )
-            );
-            setSending(false);
-            onRefreshStatus();
-          },
-          onError: () => {
-            setSending(false);
-            void loadHistory();
-            onRefreshStatus();
-          },
-        });
+        attachStreamToMessage(sub.job_id, streamId);
       }
     } catch (err) {
       setMessages((prev) =>

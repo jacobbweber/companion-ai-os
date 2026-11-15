@@ -56,8 +56,38 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     lx: 0,
     ly: 0,
   });
+  const wakeRef = useRef<() => void>(() => {});
+  const hoveredRef = useRef<SimNode | null>(null);
+  const themeColorsRef = useRef({
+    grid: '#232833',
+    text: '#e7eaf0',
+    muted: '#667085',
+    accent: '#d99b43',
+  });
   const [hovered, setHovered] = useState<SimNode | null>(null);
   const [showOntology, setShowOntology] = useState(true);
+
+  useEffect(() => {
+    hoveredRef.current = hovered;
+    wakeRef.current();
+  }, [hovered]);
+
+  useEffect(() => {
+    const syncThemeColors = () => {
+      const styles = getComputedStyle(document.documentElement);
+      themeColorsRef.current = {
+        grid: styles.getPropertyValue('--border-hairline').trim() || '#232833',
+        text: styles.getPropertyValue('--text-primary').trim() || '#e7eaf0',
+        muted: styles.getPropertyValue('--text-muted').trim() || '#667085',
+        accent: styles.getPropertyValue('--accent-primary').trim() || '#d99b43',
+      };
+      wakeRef.current();
+    };
+    syncThemeColors();
+    const obs = new MutationObserver(syncThemeColors);
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    return () => obs.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!graph) return;
@@ -87,6 +117,16 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     const canvas = canvasRef.current;
     if (!canvas || !graph) return;
     let rafId = 0;
+    let disposed = false;
+    let ticks = 0;
+    const ontEdges = graph.ontology_edges || [];
+
+    const scheduleFrame = () => {
+      if (!disposed && rafId === 0) {
+        rafId = requestAnimationFrame(step);
+      }
+    };
+    wakeRef.current = scheduleFrame;
 
     const resize = () => {
       const parent = canvas.parentElement;
@@ -96,14 +136,12 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       canvas.height = parent.clientHeight * dpr;
       canvas.style.width = `${parent.clientWidth}px`;
       canvas.style.height = `${parent.clientHeight}px`;
+      scheduleFrame();
     };
-    resize();
-    window.addEventListener('resize', resize);
-
-    let ticks = 0;
-    const ontEdges = graph.ontology_edges || [];
 
     const step = () => {
+      rafId = 0;
+      if (disposed) return;
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       const dpr = window.devicePixelRatio || 1;
@@ -111,6 +149,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       const h = canvas.height / dpr;
       const nodes = nodesRef.current;
       const byId = new Map(nodes.map((n) => [n.id, n]));
+      const activeHovered = hoveredRef.current;
 
       if (ticks < 240 || dragRef.current.node) {
         ticks++;
@@ -174,11 +213,8 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         }
       }
 
-      const styles = getComputedStyle(document.documentElement);
-      const gridColor = styles.getPropertyValue('--border-hairline').trim() || '#232833';
-      const textColor = styles.getPropertyValue('--text-primary').trim() || '#e7eaf0';
-      const mutedColor = styles.getPropertyValue('--text-muted').trim() || '#667085';
-      const accentColor = styles.getPropertyValue('--accent-primary').trim() || '#d99b43';
+      const { grid: gridColor, text: textColor, muted: mutedColor, accent: accentColor } =
+        themeColorsRef.current;
 
       ctx.save();
       ctx.scale(dpr, dpr);
@@ -213,8 +249,8 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
           const t = byId.get(oe.target);
           if (!s || !t) continue;
           const activeBridge =
-            hovered?.id === s.id ||
-            hovered?.id === t.id ||
+            activeHovered?.id === s.id ||
+            activeHovered?.id === t.id ||
             selectedId === s.id ||
             selectedId === t.id;
           ctx.strokeStyle = activeBridge ? '#4cc9f0' : 'rgba(76, 201, 240, 0.36)';
@@ -243,7 +279,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         const t = byId.get(e.target);
         if (!s || !t) continue;
         ctx.strokeStyle =
-          hovered?.id === s.id || hovered?.id === t.id ? accentColor : mutedColor;
+          activeHovered?.id === s.id || activeHovered?.id === t.id ? accentColor : mutedColor;
         ctx.lineWidth = 1.35;
         ctx.beginPath();
         ctx.moveTo(s.x, s.y);
@@ -272,15 +308,21 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       }
 
       ctx.restore();
-      rafId = requestAnimationFrame(step);
+      if (ticks < 240 || dragRef.current.node || dragRef.current.panning) {
+        scheduleFrame();
+      }
     };
 
-    rafId = requestAnimationFrame(step);
+    resize();
+    window.addEventListener('resize', resize);
+    scheduleFrame();
     return () => {
-      cancelAnimationFrame(rafId);
+      disposed = true;
+      wakeRef.current = () => {};
+      if (rafId !== 0) cancelAnimationFrame(rafId);
       window.removeEventListener('resize', resize);
     };
-  }, [graph, selectedId, showOntology, hovered?.id]);
+  }, [graph, selectedId, showOntology]);
 
   const screenToWorld = (clientX: number, clientY: number) => {
     const canvas = canvasRef.current;
@@ -334,6 +376,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
             lx: e.clientX,
             ly: e.clientY,
           };
+          wakeRef.current();
         }}
         onMouseMove={(e) => {
           const hit = findHit(e.clientX, e.clientY);
@@ -342,11 +385,13 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
             const w = screenToWorld(e.clientX, e.clientY);
             dragRef.current.node.x = w.x;
             dragRef.current.node.y = w.y;
+            wakeRef.current();
           } else if (dragRef.current.panning) {
             viewRef.current.ox += e.clientX - dragRef.current.lx;
             viewRef.current.oy += e.clientY - dragRef.current.ly;
             dragRef.current.lx = e.clientX;
             dragRef.current.ly = e.clientY;
+            wakeRef.current();
           }
         }}
         onMouseUp={(e) => {
@@ -367,6 +412,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
             lx: t.clientX,
             ly: t.clientY,
           };
+          wakeRef.current();
         }}
         onTouchMove={(e) => {
           if (e.touches.length !== 1) return;
@@ -375,11 +421,13 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
             const w = screenToWorld(t.clientX, t.clientY);
             dragRef.current.node.x = w.x;
             dragRef.current.node.y = w.y;
+            wakeRef.current();
           } else if (dragRef.current.panning) {
             viewRef.current.ox += t.clientX - dragRef.current.lx;
             viewRef.current.oy += t.clientY - dragRef.current.ly;
             dragRef.current.lx = t.clientX;
             dragRef.current.ly = t.clientY;
+            wakeRef.current();
           }
         }}
         onTouchEnd={(e) => {
@@ -396,6 +444,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
           e.preventDefault();
           const factor = e.deltaY < 0 ? 1.1 : 0.9;
           viewRef.current.scale = Math.min(2.8, Math.max(0.35, viewRef.current.scale * factor));
+          wakeRef.current();
         }}
       />
     </div>

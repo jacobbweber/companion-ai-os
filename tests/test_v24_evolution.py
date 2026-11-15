@@ -167,7 +167,7 @@ class TestV24Evolution(unittest.TestCase):
                 srv = _make_stub_server(sess)
                 st, raw_job = dispatch_raw_http(
                     srv, "POST", "/api/jobs", json.dumps({"message": "Stream test"}).encode("utf-8"),
-                    headers={"Host": "localhost:8000", "Content-Type": "application/json"},
+                    headers={"Host": "localhost:8000", "Content-Type": "application/json", "X-Companion-CSRF": sess.csrf_token},
                 )
                 self.assertEqual(st, 202)
                 jid = json.loads(raw_job)["job_id"]

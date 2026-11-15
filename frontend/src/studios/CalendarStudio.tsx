@@ -4,14 +4,16 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  Compass,
   GraduationCap,
+  Layers,
   List,
   Plus,
   RefreshCw,
   Trash2,
 } from 'lucide-react';
 import { callAction } from '../api';
-import type { CalendarItem, CalendarWindow, StudioId } from '../types';
+import type { AgileEpic, CalendarItem, CalendarWindow, StudioId } from '../types';
 
 interface CalendarStudioProps {
   onNavigateStudio: (studio: StudioId) => void;
@@ -27,8 +29,15 @@ function shiftIsoDate(ymd: string, deltaDays: number): string {
   return dt.toISOString().slice(0, 10);
 }
 
+function dayDiff(startYmd: string, endYmd: string): number {
+  const a = Date.parse(`${startYmd}T00:00:00Z`);
+  const b = Date.parse(`${endYmd}T00:00:00Z`);
+  if (Number.isNaN(a) || Number.isNaN(b)) return 0;
+  return Math.round((b - a) / 86400000);
+}
+
 export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio, onToast }) => {
-  const [viewMode, setViewMode] = useState<'month' | 'week' | 'agenda'>('month');
+  const [viewMode, setViewMode] = useState<'month' | 'week' | 'agenda' | 'roadmap'>('month');
   const [anchorDate, setAnchorDate] = useState<string>('');
   const [cal, setCal] = useState<CalendarWindow | null>(null);
 
@@ -38,7 +47,8 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
   const [evKind, setEvKind] = useState('appointment');
   const [evAllDay, setEvAllDay] = useState(false);
 
-  const daysForMode = viewMode === 'month' ? 35 : viewMode === 'week' ? 7 : 21;
+  const daysForMode =
+    viewMode === 'roadmap' ? 90 : viewMode === 'month' ? 35 : viewMode === 'week' ? 7 : 21;
 
   const loadWindow = async (startOverride = anchorDate, span = daysForMode) => {
     const res = await callAction<CalendarWindow>('calendar', {
@@ -60,7 +70,7 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
 
   const stepWindow = (dir: -1 | 1) => {
     const base = cal?.start_date || new Date().toISOString().slice(0, 10);
-    const delta = (viewMode === 'month' ? 28 : 7) * dir;
+    const delta = (viewMode === 'roadmap' ? 30 : viewMode === 'month' ? 28 : 7) * dir;
     setAnchorDate(shiftIsoDate(base, delta));
   };
 
@@ -94,7 +104,11 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
   };
 
   const handleItemClick = (it: CalendarItem) => {
-    if (it.source_type === 'sprint_task' || it.source_type === 'deadline') {
+    if (
+      it.source_type === 'sprint_task' ||
+      it.source_type === 'deadline' ||
+      it.source_type === 'epic_milestone'
+    ) {
       onNavigateStudio('boards');
     } else if (it.source_type === 'study_review') {
       onNavigateStudio('chat');
@@ -107,13 +121,15 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
     const cls =
       it.source_type === 'deadline'
         ? 'danger'
-        : it.source_type === 'sprint_task'
-          ? 'accent'
-          : it.source_type === 'study_review'
-            ? 'warn'
-            : it.source_type === 'routine'
-              ? 'routine'
-              : 'event';
+        : it.source_type === 'epic_milestone'
+          ? 'epic'
+          : it.source_type === 'sprint_task'
+            ? 'accent'
+            : it.source_type === 'study_review'
+              ? 'warn'
+              : it.source_type === 'routine'
+                ? 'routine'
+                : 'event';
     return (
       <div key={it.id} className={`cal-pill ${cls}`} title={`${it.source_type}: ${it.title}`}>
         <button
@@ -123,6 +139,7 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
         >
           {it.time && <span className="mono">{it.time} </span>}
           {it.source_type === 'study_review' && <GraduationCap size={10} />}
+          {it.source_type === 'epic_milestone' && <Layers size={10} />}
           <span>{it.title}</span>
         </button>
         {it.source_type === 'event' && (
@@ -141,6 +158,27 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
 
   const dateKeys = Object.keys(cal?.by_date || {}).sort();
   const todayStr = cal?.today || '';
+  const winStart = cal?.start_date || todayStr;
+  const winEnd = cal?.end_date || todayStr;
+  const totalSpanDays = Math.max(1, dayDiff(winStart, winEnd) + 1);
+  const roadmapEpics: AgileEpic[] = cal?.epics || [];
+
+  // Weekly tick markers for the 90-day Roadmap view
+  const roadmapTicks: string[] = [];
+  for (let i = 0; i < dateKeys.length; i += 7) {
+    roadmapTicks.push(dateKeys[i]);
+  }
+
+  const computeBarGeom = (rawStart: string, rawEnd: string) => {
+    const s = rawStart && rawStart > winStart ? rawStart : winStart;
+    const e = rawEnd && rawEnd < winEnd ? rawEnd : winEnd;
+    if (e < winStart || s > winEnd) return null;
+    const leftDays = Math.max(0, dayDiff(winStart, s));
+    const widthDays = Math.max(2, dayDiff(s, e) + 1);
+    const leftPct = Math.min(96, (leftDays / totalSpanDays) * 100);
+    const widthPct = Math.min(100 - leftPct, Math.max(4, (widthDays / totalSpanDays) * 100));
+    return { leftPct, widthPct };
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -148,8 +186,8 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
         <div className="studio-title-group">
           <h1>Unified Multi-Source Calendar</h1>
           <p>
-            Appointments, Active Sprint Windows, Planned Task Days, Hard Deadlines, Routines &amp;
-            Due Spaced-Repetition Reviews
+            Appointments, Spanning Epics Roadmap, Sprints, Task Dates, Deadlines, Routines &amp;
+            Study Reviews
           </p>
         </div>
         <div className="studio-actions">
@@ -174,14 +212,18 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
           >
             <List size={13} /> Agenda
           </button>
+          <button
+            type="button"
+            data-testid="calendar-tab-roadmap"
+            className={`btn ${viewMode === 'roadmap' ? 'btn-primary' : ''}`}
+            onClick={() => setViewMode('roadmap')}
+          >
+            <Compass size={13} /> Roadmap
+          </button>
           <button type="button" className="btn" onClick={() => stepWindow(-1)} title="Previous">
             <ChevronLeft size={13} />
           </button>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => setAnchorDate('')}
-          >
+          <button type="button" className="btn" onClick={() => setAnchorDate('')}>
             Today
           </button>
           <button type="button" className="btn" onClick={() => stepWindow(1)} title="Next">
@@ -269,14 +311,125 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
               <span className="badge ok">Event / Focus</span>
               <span className="badge accent">Planned Task</span>
               <span className="badge danger">Hard Deadline</span>
+              <span className="badge epic">Epic Target</span>
               <span className="badge">Routine</span>
               <span className="badge warn">Study SRS</span>
             </div>
           </div>
         </div>
 
-        {/* Month or Week Grid */}
-        {viewMode !== 'agenda' ? (
+        {/* ===================================================================
+            ROADMAP TIMELINE VIEW (Spanning Epics & Sprints over 90 Days)
+            =================================================================== */}
+        {viewMode === 'roadmap' ? (
+          <div className="panel" data-testid="calendar-roadmap-panel">
+            <div className="panel-head">
+              <span className="panel-title">
+                <Compass size={13} /> Epics &amp; Sprint Timeline Roadmap ({winStart} &rarr;{' '}
+                {winEnd})
+              </span>
+              <button
+                type="button"
+                className="btn"
+                style={{ padding: '3px 9px', fontSize: 11.5 }}
+                onClick={() => onNavigateStudio('boards')}
+              >
+                <Layers size={12} /> Manage Epics in Boards
+              </button>
+            </div>
+
+            {/* Weekly Tick Header */}
+            <div className="cal-roadmap-scale mono">
+              <div className="cal-roadmap-label-col">EPIC / SPRINT</div>
+              <div className="cal-roadmap-ticks">
+                {roadmapTicks.map((t) => (
+                  <span key={t}>{t.slice(5)}</span>
+                ))}
+              </div>
+            </div>
+
+            {/* Active / Overlapping Sprints */}
+            {(cal?.sprints || []).map((sp) => {
+              const geom = computeBarGeom(sp.start_date, sp.end_date);
+              if (!geom) return null;
+              return (
+                <div key={sp.sprint_id} className="cal-roadmap-row">
+                  <div className="cal-roadmap-meta">
+                    <strong>{sp.title}</strong>
+                    <span className="badge ok mono">SPRINT</span>
+                  </div>
+                  <div className="cal-roadmap-lane">
+                    <div
+                      className="cal-roadmap-bar sprint"
+                      style={{ left: `${geom.leftPct}%`, width: `${geom.widthPct}%` }}
+                      onClick={() => onNavigateStudio('boards')}
+                    >
+                      <span className="mono">
+                        {sp.start_date.slice(5)}..{sp.end_date.slice(5)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+
+            {/* Spanning Epics */}
+            {roadmapEpics.length === 0 ? (
+              <div style={{ padding: '18px 4px', color: 'var(--text-muted)', fontSize: 12.5 }}>
+                No long-running Epics yet. Create an Epic in Boards &amp; Epics to visualize its
+                spanning timeline here!
+              </div>
+            ) : (
+              roadmapEpics.map((ep) => {
+                const effStart = ep.effective_start_date || ep.start_date || winStart;
+                const effEnd = ep.roadmap_end_date || ep.target_date || winEnd;
+                const geom = computeBarGeom(effStart, effEnd) || { leftPct: 0, widthPct: 100 };
+                const pct = ep.progress_pct || 0;
+                return (
+                  <div
+                    key={ep.epic_id}
+                    className="cal-roadmap-row"
+                    data-testid={`cal-roadmap-epic-${ep.epic_id}`}
+                  >
+                    <div className="cal-roadmap-meta">
+                      <button
+                        type="button"
+                        className="cal-roadmap-epic-link"
+                        onClick={() => onNavigateStudio('boards')}
+                      >
+                        <Layers size={12} /> <strong>{ep.title}</strong>
+                      </button>
+                      <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 2 }}>
+                        <span className="badge mono">{ep.board_title || ep.board_id}</span>
+                        <span className="badge accent mono">{ep.horizon.toUpperCase()}</span>
+                        <span className="mono" style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>
+                          {ep.done_card_count || 0}/{ep.card_count || 0} ({pct}%)
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="cal-roadmap-lane">
+                      <button
+                        type="button"
+                        className="cal-roadmap-bar epic"
+                        style={{ left: `${geom.leftPct}%`, width: `${geom.widthPct}%` }}
+                        title={`${ep.title}: ${effStart} -> ${effEnd} (${pct}% done)`}
+                        onClick={() => onNavigateStudio('boards')}
+                      >
+                        <div className="cal-roadmap-bar-fill" style={{ width: `${pct}%` }} />
+                        <span className="cal-roadmap-bar-text mono">
+                          {ep.title} ({pct}%)
+                          {ep.target_date ? ` • ★ ${ep.target_date}` : ''}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        ) : viewMode !== 'agenda' ? (
+          /* Month or Week Grid */
           <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
             <div className="cal-header-row mono">
               {WEEKDAY_HEADERS.map((wd) => (
@@ -298,7 +451,9 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
                   <div
                     key={dKey}
                     className={`cal-day-cell ${isToday ? 'today' : ''} ${inSprint ? 'in-sprint' : ''}`}
-                    style={isSelected && !isToday ? { outline: '1px solid var(--accent-primary)' } : undefined}
+                    style={
+                      isSelected && !isToday ? { outline: '1px solid var(--accent-primary)' } : undefined
+                    }
                     data-testid={`cal-day-${dKey}`}
                   >
                     <button
@@ -323,9 +478,7 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
                         <span className="badge">SELECTED</span>
                       ) : null}
                     </button>
-                    <div className="cal-day-items">
-                      {dayItems.map((it) => renderPill(it))}
-                    </div>
+                    <div className="cal-day-items">{dayItems.map((it) => renderPill(it))}</div>
                   </div>
                 );
               })}
@@ -339,8 +492,8 @@ export const CalendarStudio: React.FC<CalendarStudioProps> = ({ onNavigateStudio
             </div>
             {(cal?.items || []).length === 0 ? (
               <div style={{ color: 'var(--text-muted)', fontSize: 12.5 }}>
-                No scheduled events, task dates, deadlines, routines, or study reviews in this
-                window.
+                No scheduled events, task dates, deadlines, epic targets, routines, or study reviews
+                in this window.
               </div>
             ) : (
               dateKeys

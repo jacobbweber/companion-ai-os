@@ -32,14 +32,17 @@ def _http_call(srv, path: str, method: str = "GET", payload: Dict[str, Any] | No
     port = int(srv.server_address[1])
     url = f"http://127.0.0.1:{port}{path}"
     raw_body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    headers = {"Content-Type": "application/json"} if payload is not None else {}
+    headers: Dict[str, str] = {"Content-Type": "application/json"} if payload is not None else {}
+    if method.upper() == "POST" and hasattr(srv, "session"):
+        headers["X-Companion-CSRF"] = srv.session.csrf_token
     req = urllib.request.Request(url, data=raw_body, headers=headers, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
+        with opener.open(req, timeout=5.0) as resp:
             return int(resp.status), resp.read().decode("utf-8")
     except Exception as exc:
         if "10013" in str(exc) or "PermissionError" in str(exc) or "Errno 13" in str(exc):
-            return dispatch_raw_http(srv, method=method, path=path, body=raw_body)
+            return dispatch_raw_http(srv, method=method, path=path, body=raw_body, headers=headers)
         raise
 
 

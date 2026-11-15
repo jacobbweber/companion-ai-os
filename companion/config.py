@@ -10,7 +10,7 @@ import contextvars
 import os
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterator, Optional
 
@@ -124,8 +124,22 @@ def parse_env_file(env_path: Path) -> Dict[str, str]:
         key, val = key.strip(), val.strip()
         if not key:
             continue
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-            val = val[1:-1]
+        if val and val[0] in ('"', "'"):
+            q = val[0]
+            out_chars: list[str] = []
+            idx = 1
+            while idx < len(val):
+                ch = val[idx]
+                if ch == "\\" and idx + 1 < len(val) and q == '"':
+                    nxt = val[idx + 1]
+                    out_chars.append({"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}.get(nxt, nxt))
+                    idx += 2
+                    continue
+                if ch == q:
+                    break
+                out_chars.append(ch)
+                idx += 1
+            val = "".join(out_chars) if idx < len(val) else val[1:]
         elif " #" in val:
             val = val.split(" #", 1)[0].strip()
         values[key] = val
@@ -196,26 +210,43 @@ class Settings:
     idle_minutes: int = 120
     hobby_cooldown_minutes: int = 30
     hobby_max_iters: int = 20
-    max_module_lines: int = 550
+    max_module_lines: int = 700
     max_function_lines: int = 100
     auto_git_commit: bool = True
+    stream_tokens: bool = True
+    embedding_base_url: str = ""
+    embedding_model: str = ""
+    privacy_mode: str = "local_only"
+    web_host: str = "127.0.0.1"
+    web_token: str = ""
+    self_dev_default: bool = False
+    immutable_core: bool = False
+    self_dev_locked: bool = False
     companion_name: str = ""
     companion_soul: str = ""
     user_name: str = ""
     user_profile: str = ""
+    tiers: Dict[str, TierConfig] = field(default_factory=dict)
 
     def __init__(self, env_path: Optional[Path] = None, reload_env: bool = True):
-        if reload_env:
-            load_dotenv(env_path=env_path, override=(env_path is not None))
+        pre_env_keys = set(os.environ.keys())
+        if reload_env and env_path is not None:
+            load_dotenv(env_path=env_path, override=True)
+        elif reload_env:
+            load_dotenv(env_path=None, override=False)
         root_str = os.environ.get("COMPANION_ROOT", "").strip()
         self.root = Path(root_str).resolve() if root_str else DEFAULT_ROOT
         if reload_env and env_path is None and (self.root / ".env").is_file():
-            load_dotenv(env_path=self.root / ".env", override=False)
+            for k, v in parse_env_file(self.root / ".env").items():
+                if k not in pre_env_keys:
+                    os.environ[k] = v
         data_str = os.environ.get("COMPANION_DATA_DIR", "").strip()
         self.data_dir = (Path(data_str) if Path(data_str).is_absolute() else (self.root / data_str)).resolve() if data_str else None
         eff_env = (self.data_dir or (self.root / "data")) / ".env"
         if reload_env and env_path is None and eff_env.is_file():
-            load_dotenv(env_path=eff_env, override=False)
+            for k, v in parse_env_file(eff_env).items():
+                if k not in pre_env_keys:
+                    os.environ[k] = v
 
         self.base_url = os.environ.get("COMPANION_BASE_URL", "http://127.0.0.1:11434").strip()
         self.model = os.environ.get("COMPANION_MODEL", "qwen2.5:7b").strip()
@@ -230,7 +261,7 @@ class Settings:
         self.search_limit = max(10, _env_int("COMPANION_SEARCH_LIMIT", 200))
         self.context_window_tokens = max(4096, _env_int("COMPANION_CONTEXT_WINDOW", 262144))
         self.compact_trigger_pct = max(5.0, min(90.0, _env_float("COMPANION_COMPACT_TRIGGER_PCT", 25.0)))
-        self.compact_target_pct = max(3.0, min(self.compact_trigger_pct * 0.8, _env_float("COMPANION_COMPACT_TARGET_PCT", 10.0)))
+        self.compact_target_pct = max(3.0, min(self.compact_trigger_pct * 0.85, _env_float("COMPANION_COMPACT_TARGET_PCT", 10.0)))
         default_chars = int(self.context_window_tokens * (self.compact_trigger_pct / 100.0) * 4)
         self.max_context_chars = max(8000, _env_int("COMPANION_MAX_CONTEXT_CHARS", default_chars))
         self.keep_recent_messages = max(4, _env_int("COMPANION_KEEP_RECENT_MESSAGES", 16))
@@ -238,14 +269,17 @@ class Settings:
         self.idle_minutes = max(1, _env_int("COMPANION_IDLE_MINUTES", 120))
         self.hobby_cooldown_minutes = max(1, _env_int("COMPANION_HOBBY_COOLDOWN_MINUTES", 30))
         self.hobby_max_iters = max(3, _env_int("COMPANION_HOBBY_MAX_ITERS", 20))
-        self.max_module_lines = max(200, _env_int("COMPANION_MAX_MODULE_LINES", 550))
+        _raw_mod = _env_int("COMPANION_MAX_MODULE_LINES", 700)
+        self.max_module_lines = 700 if _raw_mod == 550 else max(200, _raw_mod)
         self.max_function_lines = max(40, _env_int("COMPANION_MAX_FUNCTION_LINES", 100))
         self.auto_git_commit = _env_bool("COMPANION_AUTO_GIT_COMMIT", True)
         self.stream_tokens = _env_bool("COMPANION_STREAM_TOKENS", True)
         self.embedding_base_url = os.environ.get("COMPANION_EMBEDDING_BASE_URL", "").strip().rstrip("/")
         self.embedding_model = os.environ.get("COMPANION_EMBEDDING_MODEL", "").strip()
-        raw_priv = os.environ.get("COMPANION_PRIVACY_MODE", "hybrid").strip().lower()
-        self.privacy_mode = raw_priv if raw_priv in ("hybrid", "local_only", "cloud_allowed") else "hybrid"
+        raw_priv = os.environ.get("COMPANION_PRIVACY_MODE", "local_only").strip().lower()
+        self.privacy_mode = raw_priv if raw_priv in ("hybrid", "local_only", "cloud_allowed") else "local_only"
+        self.web_host = os.environ.get("COMPANION_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        self.web_token = os.environ.get("COMPANION_WEB_TOKEN", "").strip()
         self.self_dev_default = _env_bool("COMPANION_SELF_DEV", False)
         self.immutable_core = _env_bool("COMPANION_IMMUTABLE_CORE", False)
         self.self_dev_locked = self.immutable_core or _env_bool("COMPANION_SELF_DEV_LOCKED", False)
@@ -341,9 +375,11 @@ class Settings:
 
     def update_compaction_watermarks(self, trigger_pct: float, target_pct: float) -> None:
         """Hot-reload global context compaction trigger/target percentages in memory."""
-        self.compact_trigger_pct = max(5.0, min(90.0, float(trigger_pct)))
-        self.compact_target_pct = max(3.0, min(self.compact_trigger_pct * 0.85, float(target_pct)))
-        self.max_context_chars = max(8000, int(self.context_window_tokens * (self.compact_trigger_pct / 100.0) * 4))
+        with self._ws_lock:
+            self.compact_trigger_pct = max(5.0, min(90.0, float(trigger_pct)))
+            self.compact_target_pct = max(3.0, min(self.compact_trigger_pct * 0.85, float(target_pct)))
+            def_ctx = self.tiers.get("default").context_window_tokens if "default" in self.tiers else self.context_window_tokens
+            self.max_context_chars = max(8000, int(def_ctx * (self.compact_trigger_pct / 100.0) * 4))
 
     def resolve_tier(self, tier: Optional[str] = None) -> TierConfig:
         """Resolve a logical model tier (`fast`, `coding`, `reasoning`, `audio`, `image`, `video`, `embedding`, `default`, or `auto`)."""
@@ -495,6 +531,8 @@ class Settings:
             "base_url": self.base_url,
             "model": self.model,
             "api_key_set": bool(self.api_key),
+            "web_host": self.web_host,
+            "web_token_set": bool(self.web_token),
             "privacy_mode": self.effective_privacy_mode(),
             "secrets_env_present": self.secrets_env_path.is_file(),
             "root": str(self.root),

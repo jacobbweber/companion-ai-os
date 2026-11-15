@@ -68,8 +68,17 @@ export const JobsApprovalsStudio: React.FC<JobsApprovalsStudioProps> = ({
 
   useEffect(() => {
     void loadAll();
-    const timer = window.setInterval(() => void loadAll(), 4000);
-    return () => window.clearInterval(timer);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') void loadAll();
+    }, 4000);
+    const onVis = () => {
+      if (document.visibilityState === 'visible') void loadAll();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVis);
+    };
   }, [approvalFilter]);
 
   const dispatchNewJob = async () => {

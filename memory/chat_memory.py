@@ -23,15 +23,9 @@ class ChatMemory(MemoryStore):
         super().__init__(db_path=db_path)
 
 
-_memory_instance: Optional[ChatMemory] = None
-
-
-def get_memory() -> ChatMemory:
-    """Get the global ChatMemory instance."""
-    global _memory_instance
-    if _memory_instance is None:
-        _memory_instance = ChatMemory()
-    return _memory_instance
+def get_memory() -> MemoryStore:
+    """Get the active MemoryStore instance (honoring `memory_store_context` overrides)."""
+    return get_memory_store()
 
 
 def log_user_message(content: str, tool_call_id: Optional[str] = None, session_tag: Optional[str] = None) -> int:

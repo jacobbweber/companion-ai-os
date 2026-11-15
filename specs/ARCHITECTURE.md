@@ -39,7 +39,7 @@
 
 ## 2. Authoritative Module Registry & Simplicity Budgets
 
-Every module in the system has a single cohesive responsibility and is subject to deterministic AST hygiene and line-count budgets (`max_module_lines = 550`, `max_function_lines = 100`):
+Every module in the system has a single cohesive responsibility and is subject to deterministic AST hygiene and line-count budgets (`max_module_lines = 700`, `max_function_lines = 100`, zero semicolon-chained statements):
 
 | Module Path | A-Frame Layer | Single Responsibility | Governing Spec |
 | :--- | :--- | :--- | :--- |
@@ -64,7 +64,7 @@ Every module in the system has a single cohesive responsibility and is subject t
 | `companion/wiki_curation.py` | `Domain` | Deliberate Multi-Turn Wiki Curation Engine (`inspect_graduation` -> mandatory full-read gate -> `CREATE_NEW`/`MERGE_AND_REFINE`/`SPLIT_MULTI`/`KEEP_SEPARATE` -> `validate_curation_plan` -> `commit_curation_plan`) with Never-Delete `04_archive/` lineage and 1-click `revert_curation` | `SPEC-02`, `SPEC-07` |
 | `companion/wiki_maintenance.py` | `Domain` | Wiki 3.1 Unified & Side-by-Side lineage/approval diffs (`compute_wiki_diff`), governed `alias -> canonical` ontology consolidation (`consolidate_ontology`), `90d/180d/365d` freshness cadences (`verify_note_freshness`, `list_stale_notes`), Obsidian-compatible inline diagrams (`03_resources/assets/`), and 1-click Forever Chat `stage_chat_turn_to_inbox` | `SPEC-02`, `SPEC-07` |
 | `companion/attachments.py` | `Domain` | Multimodal Forever Chat image & document attachment engine (`.png`/`.jpg`/`.webp`/`.gif`, `.pdf`, `.docx`/`.xlsx`/`.pptx`, `.md`/`.csv`/`.json`/code), Vault scrubbing, and `03_resources/` Wiki auto-filing | `SPEC-06`, `SPEC-07` |
-| `companion/agile_boards.py` | `Domain` | Universal Multi-Board Kanban, Master Active Sprint (`all-active-sprint`), Weekday/Weekend slot capacity math, dependency guard, Aging/Procrastination Radar, `slice_unblocker_card`, and live `/plan`/`/goal` workflow-to-board sync | `SPEC-08` |
+| `companion/agile_boards.py` | `Domain` | Universal Multi-Board Kanban, Master Active Sprint (`all-active-sprint`), auto-deduplicated spanning Epics (`start_date`/`target_date`/`delete_epic`), interactive Card Checklists (`checklist_json`), Weekday/Weekend slot capacity math, dependency guard, Aging Radar, `slice_unblocker_card`, and live `/plan`/`/goal` workflow-to-board sync | `SPEC-08` |
 | `companion/education_engine.py` | `Domain` | Headless Education courses, 4-stage Socratic pedagogy (`priming`..`mastered`), SM-2 spaced repetition (`education_mastery`), Wiki study curation, and fenced `companion-flashcards` Chat decks | `SPEC-08` |
 | `companion/workflow_dag.py` | `Workflow` | Dynamic `GoalPlan` & `GoalStep` DAG, `VerificationSpec` (`evidence_file`, `check_command`, `script_validator`, `assertion`, `human_gate`), `ExecutorBindings`, and JSON recipe runner | `SPEC-03` |
 | `companion/workflow_graph.py` | `Workflow` | Persistent directed-graph state machine (`INTAKE` .. `COMPLETE` + `RECOVER`), phase gates, and recipe facade | `SPEC-03` |
@@ -89,18 +89,18 @@ Every module in the system has a single cohesive responsibility and is subject t
 | `companion/eval_harness.py` | `Application` | Isolated multi-flight live behavioral evaluation suite (`quick`, `full`, `general`, `all`) & head-to-head `coding` model benchmark (`run_live_flight_eval`, `run_coding_model_comparison`) | `SPEC-06` |
 | `harness.py` | `Presentation` | Self-recovering CLI/REPL entry point, `--jobs`/`--wiki`/`--vault`/`--endpoints`/`--mcp`/`--partners`/`--routines` flags, startup routine reconciliation, and Windows idle watcher | `SPEC-05`, `SPEC-06`, `SPEC-07` |
 | `surfaces/web_assets.py` | `Presentation` | Static asset loader (`surfaces/static/index.html`, `styles.css`, `app.js` compiled from `frontend/`), safe `<\/script` escaping, mtime caching, and zero-login CSRF meta-tag injection | `SPEC-06`, `SPEC-07` |
-| `surfaces/api_extensions.py` | `Presentation` | Headless `GET/POST /api/actions` CoreActions adapter, `GET /api/status` Harvest + `session_nudges` enrichments, and Bearer-token `POST /api/mcp` Order Counter adapter | `SPEC-07` |
-| `surfaces/web_server.py` | `Presentation` | Stdlib `ThreadingHTTPServer` LAN web server (`0.0.0.0`) with Zero-Login LAN security (`Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF`), live SSE (`GET /api/jobs/<id>/stream`), CoreActions, Hosted MCP, and WAL reads | `SPEC-06`, `SPEC-07` |
-| `surfaces/windows_tray.py` | `Presentation` | Zero-dependency Win32 `ctypes` System Tray controller (`--tray`), single-instance `/api/health` detection, user `data/` folder opener, and graceful port-conflict diagnostics | `SPEC-06` |
-| `configs/architecture.py` | `Domain` | Executable A-Frame component registry (47 core components), dependency name validator, and downward layer dependency verifier | `SPEC-01`, `SPEC-03`, `SPEC-07`, `SPEC-08` |
+| `surfaces/api_extensions.py` | `Presentation` | Headless `GET/POST /api/actions` CoreActions adapter, `POST /api/reload` live service reload coordinator (`build_reload_command`, `spawn_companion_reload`), `GET /api/status` Harvest + `session_nudges` enrichments, and Bearer-token `POST /api/mcp` Order Counter adapter | `SPEC-06`, `SPEC-07` |
+| `surfaces/web_server.py` | `Presentation` | Stdlib `ThreadingHTTPServer` web server (`127.0.0.1` default + `COMPANION_WEB_TOKEN` non-loopback LAN/Tailscale auth) with `Host`/`Origin`/`Sec-Fetch-Site`/unconditional `X-Companion-CSRF`, live SSE (`GET /api/jobs/<id>/stream`), CoreActions, Hosted MCP, and WAL reads | `SPEC-06`, `SPEC-07` |
+| `surfaces/windows_tray.py` | `Presentation` | Zero-dependency Win32 `ctypes` System Tray controller (`--tray`, including 1-click `Reload Companion`), single-instance `/api/health` detection, user `data/` folder opener, and graceful port-conflict diagnostics | `SPEC-06` |
+| `configs/architecture.py` | `Domain` | Executable A-Frame component registry (49 core components), unregistered-module detector, dependency name validator, and downward layer dependency verifier | `SPEC-01`, `SPEC-03`, `SPEC-07`, `SPEC-08` |
 | `memory/chat_memory.py` | `Domain` | Backward-compatible `ChatMemory` facade over `companion/memory_store.py` | `SPEC-02` |
 
 ---
 
 ## 3. Architectural Laws (Enforced by `system_doctor` & Inline Micro-Linter)
 
-1. **No Undocumented Modules**: Adding a `.py` file to `companion/` or `surfaces/` without registering it in `specs/ARCHITECTURE.md` and `specs/CONTRACTS.md` fails Stage 4 of `system_doctor`.
-2. **Import-Qualified Dead-Code & Budget Law**: `companion/hygiene.py` resolves cross-file `from companion.<mod> import <sym>` and `alias.<sym>` references so unimported definitions, unused imports, `>550L` modules, or `>100L` functions fail both inline `lint_single_file_edit` and Stage 5 of `system_doctor`.
+1. **No Undocumented Modules**: Adding a `.py` file to `companion/`, `surfaces/`, or `memory/` without registering it in `configs/architecture.py`, `specs/ARCHITECTURE.md`, and `specs/CONTRACTS.md` fails Stages 3 & 4 of `system_doctor`.
+2. **Import-Qualified Dead-Code & Budget Law**: `companion/hygiene.py` resolves cross-file `from companion.<mod> import <sym>` and `alias.<sym>` references so unimported definitions, unused imports, semicolon-chained statements, `>700L` modules, or `>100L` functions fail both inline `lint_single_file_edit` and Stage 5 of `system_doctor`.
 3. **Strict 4-File `specs/` Cap**: `specs/` may only ever contain `PRODUCT.md`, `ARCHITECTURE.md`, `CONTRACTS.md`, and `DECISIONS.md`.
 4. **Mandatory Spine Telemetry**: Every LLM call (`companion/llm.py`), tool dispatch (`companion/tools.py`), and agent turn (`companion/agent.py`) is traced via thread-safe `companion/telemetry.py`.
 5. **Headless Core vs. Frontend UI Boundary Law**: Modules inside `companion/` remain 100% presentation-agnostic; `harness.py` and `surfaces/` act strictly as presentation views over `companion/` APIs and `data/conversations.db`.

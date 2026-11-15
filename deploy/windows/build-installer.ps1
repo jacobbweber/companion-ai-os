@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Builds a self-contained Windows Desktop Installer (`dist\CompanionSetup-v1.0.0.exe`).
+Builds a self-contained Windows Desktop Installer (`dist\CompanionSetup-v3.4.0.exe`).
 Downloads the official Python 3.12 Windows Embeddable Runtime (zero pip packages needed!),
 stages the clean Companion app tree + silent Win32 tray launchers, and compiles `companion.iss`
 if Inno Setup 6 (`ISCC.exe`) is installed.
@@ -69,8 +69,8 @@ $IsccCandidates = @(
 if ($IsccCandidates.Count -gt 0) {
     $Iscc = $IsccCandidates[0]
     & $Iscc (Join-Path $PSScriptRoot "companion.iss")
-    Write-Host "Built installer: $RepoRoot\dist\CompanionSetup-v1.0.0.exe" -ForegroundColor Green
+    Write-Host "Built installer: $RepoRoot\dist\CompanionSetup-v3.4.0.exe" -ForegroundColor Green
 } else {
     Write-Host "Portable bundle staged at: $StageDir" -ForegroundColor Yellow
-    Write-Host "Install Inno Setup 6 (https://jrsoftware.org/isinfo.php) and re-run this script to compile CompanionSetup-v1.0.0.exe."
+    Write-Host "Install Inno Setup 6 (https://jrsoftware.org/isinfo.php) and re-run this script to compile CompanionSetup-v3.4.0.exe."
 }

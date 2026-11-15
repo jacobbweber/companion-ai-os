@@ -26,7 +26,7 @@ Use this runbook whenever a request or engineering decision involves:
      `workflow_manage(action="subagent", tier="reasoning", skill="deep-thinking", goal="<problem + constraints>")`.
    - Decompose the problem into:
      1. **Core Invariants & Hard Constraints** (what must never break)
-     2. **Candidate Approaches (Option A vs. Option B)** with explicit pros, cons, and line-budget impact
+     2. **Candidate Approaches (Option A vs. Option B)** with explicit pros, cons, and line-budget impact (`<= 700` lines/module, `<= 100` lines/function)
      3. **Second-Order Risks & Edge Cases** (concurrency, failure recovery, config fallback)
      4. **Recommended Architecture & Verification Plan**
 3. **Persist Architectural Decisions**:

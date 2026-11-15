@@ -55,6 +55,10 @@ def main(argv: List[str]) -> int:
         print(json.dumps({"ok": False, "error": "Usage: extract_pdf.py <pdf_path>"}))
         return 1
     target = Path(argv[1]).resolve()
+    parts_low = [p.lower() for p in target.parts]
+    if ".ssh" in parts_low or target.name.lower() in (".env", "secrets.env") or target.suffix.lower() != ".pdf":
+        print(json.dumps({"ok": False, "error": f"SAFETY GUARD REJECTED: invalid or restricted PDF target `{target.name}`"}))
+        return 1
     if not target.is_file():
         print(json.dumps({"ok": False, "error": f"File not found: {target}"}))
         return 1

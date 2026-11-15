@@ -13,6 +13,7 @@ Implements the plain-Markdown 4-Folder Knowledge Warehouse (`01_inbox/`, `02_kno
 import json
 import re
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -73,6 +74,10 @@ def compute_note_staleness(folder: str, tpl: str, verified_at: str, fallback_ts:
     return age_days, eff_days, (folder == "02_knowledge" and age_days >= eff_days)
 
 
+_INDEXED_WIKI_ROOTS: set[Tuple[int, str]] = set()
+_WIKI_FS_LOCK = threading.RLock()
+
+
 class WikiEngine:
     """Co-owned Markdown Knowledge Warehouse with Dual-Author provenance, 11 templates & Ontology graph."""
 
@@ -83,14 +88,16 @@ class WikiEngine:
     @property
     def store(self) -> MemoryStore:
         mem = self._store or get_memory_store()
-        with mem._lock:
+
+        def _init_wiki(m: MemoryStore) -> None:
             for ddl in WIKI_DDL:
-                mem.conn.execute(ddl)
-            existing = {str(r[1]) for r in mem.conn.execute("PRAGMA table_info(wiki_notes_index)").fetchall()}
+                m.conn.execute(ddl)
+            existing = {str(r[1]) for r in m.conn.execute("PRAGMA table_info(wiki_notes_index)").fetchall()}
             for col_name, col_def in _EXTRA_INDEX_COLS:
                 if col_name not in existing:
-                    mem.conn.execute(f"ALTER TABLE wiki_notes_index ADD COLUMN {col_name} {col_def}")
-            mem.conn.commit()
+                    m.conn.execute(f"ALTER TABLE wiki_notes_index ADD COLUMN {col_name} {col_def}")
+
+        mem.ensure_schema("wiki", _init_wiki)
         return mem
 
     @property
@@ -104,9 +111,10 @@ class WikiEngine:
 
     def ensure_warehouse(self) -> Path:
         base = self.root
-        for sub in (*WIKI_FOLDERS, "03_resources/templates", "03_resources/assets", "04_archive/inbox_origins", "04_archive/revisions", "04_archive/reverted", "trash"):
-            (base / sub).mkdir(parents=True, exist_ok=True)
-        seed_templates_and_authority(base)
+        with _WIKI_FS_LOCK:
+            for sub in (*WIKI_FOLDERS, "03_resources/templates", "03_resources/assets", "04_archive/inbox_origins", "04_archive/revisions", "04_archive/reverted", "trash"):
+                (base / sub).mkdir(parents=True, exist_ok=True)
+            seed_templates_and_authority(base)
         return base
 
     def _validate_rel_note_path(self, rel_path: str, allow_archive: bool = False) -> Tuple[Optional[Path], Optional[str]]:
@@ -194,21 +202,35 @@ class WikiEngine:
 
     def rebuild_index(self) -> Dict[str, Any]:
         base = self.ensure_warehouse()
+        mem = self.store
+        _INDEXED_WIKI_ROOTS.add((id(mem), str(base)))
         md_files = [p for f in WIKI_FOLDERS if (base / f).is_dir() for p in walk_pruned_files(base / f) if p.suffix.lower() == ".md" and not _is_system_wiki_file(str(p.relative_to(base)))]
-        with self.store._lock:
+        if not md_files and not mem._fetch_rows("SELECT 1 FROM wiki_notes_index LIMIT 1"):
+            return {"ok": True, "indexed_notes": 0, "indexed_links": 0, "summary": "Reindexed 0 Wiki note(s) and 0 wikilink(s)."}
+        with mem._lock:
             for tbl in ("wiki_notes_index", "wiki_fts", "wiki_links_index"):
-                self.store.conn.execute(f"DELETE FROM {tbl}")
-            self.store.conn.commit()
+                mem.conn.execute(f"DELETE FROM {tbl}")
+            mem.conn.commit()
         for f in md_files:
             self._index_single_file(f)
-        with self.store._lock:
-            cur = self.store.conn.cursor()
+        with mem._lock:
+            cur = mem.conn.cursor()
             for src_p, tgt_ref in cur.execute("SELECT source_path, target_ref FROM wiki_links_index WHERE resolved_path = ''").fetchall():
                 if res := self._resolve_wikilink_target(cur, str(tgt_ref)):
                     cur.execute("UPDATE wiki_links_index SET resolved_path = ? WHERE source_path = ? AND target_ref = ?", (res, src_p, tgt_ref))
             link_cnt = int((cur.execute("SELECT COUNT(*) FROM wiki_links_index").fetchone() or (0,))[0])
-            self.store.conn.commit()
+            mem.conn.commit()
         return {"ok": True, "indexed_notes": len(md_files), "indexed_links": link_cnt, "summary": f"Reindexed {len(md_files)} Wiki note(s) and {link_cnt} wikilink(s)."}
+
+    def _ensure_initial_index(self) -> None:
+        base = self.ensure_warehouse()
+        mem = self.store
+        key = (id(mem), str(base))
+        with _WIKI_FS_LOCK:
+            if key not in _INDEXED_WIKI_ROOTS and not mem._fetch_rows("SELECT 1 FROM wiki_notes_index LIMIT 1"):
+                self.rebuild_index()
+            else:
+                _INDEXED_WIKI_ROOTS.add(key)
 
     def _record_sqlite_read(self, rel: str) -> int:
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -301,13 +323,13 @@ class WikiEngine:
         rel = str(full.relative_to(self.root)).replace("\\", "/")
         clean_body_raw = redact_secrets(content or "")
         in_meta, in_body = parse_frontmatter(clean_body_raw)
-        existed, old_meta = full.is_file(), {}
+        existed, old_meta, old_body = full.is_file(), {}, ""
         if existed:
             disk_bytes = full.read_bytes()
             disk_hash = sha16_bytes(disk_bytes)
             if expected_hash and expected_hash.strip() != disk_hash:
                 return {"ok": False, "conflict": True, "current_hash": disk_hash, "error": f"CONCURRENCY CONFLICT on `{rel}`: expected hash `{expected_hash}`, found `{disk_hash}`. Re-read the note before saving."}
-            old_meta, _ = parse_frontmatter(disk_bytes.decode("utf-8", errors="replace"))
+            old_meta, old_body = parse_frontmatter(disk_bytes.decode("utf-8", errors="replace"))
             if not is_user and str(old_meta.get("author") or "companion").strip().lower() in ("user", "human", "partner"):
                 allowed, apr = get_approval_queue(self.store).check_or_enqueue("wiki_edit", "edit_user_note", rel, f"Companion requests permission to update your user-authored Wiki note `{rel}`.", payload={"path": rel, "content": clean_body_raw, "title": title, "tags": tags, "summary": summary, "template": template, "ontology": ontology, "content_sha": sha16_bytes(clean_body_raw.encode("utf-8"))}, requester=actor, confirmed=confirmed, always_require_in_autonomous=True)
                 if not allowed:
@@ -321,7 +343,8 @@ class WikiEngine:
         eff_tpl = slugify_wiki(template or str(in_meta.get("template") or old_meta.get("template") or ("standard-note" if parts[0] == "02_knowledge" else "inbox-raw")), "standard-note")
         eff_status = status.strip() or str(in_meta.get("status") or old_meta.get("status") or ("inbox" if parts[0] == "01_inbox" else "active"))
         merged_meta = hydrate_note_meta({**old_meta, **in_meta}, eff_title, in_body, eff_author, eff_status, eff_tpl, eff_domain, eff_topic, as_slug_list(tags if tags is not None else (in_meta.get("tags") or old_meta.get("tags") or [])), canonicalize_ontology(self.root, ontology if ontology is not None else (in_meta.get("ontology") or old_meta.get("ontology") or [])), now_iso, summary=summary)
-        if parts[0] == "02_knowledge" and (bool(template.strip()) or bool(in_meta.get("template"))):
+        prior_governed = existed and not is_user and not validate_curated_note(self.root, old_meta, old_body, existing_domain_notes=0)
+        if parts[0] == "02_knowledge" and (prior_governed or bool(template.strip()) or bool(in_meta.get("template"))):
             errs = validate_curated_note(self.root, merged_meta, in_body, existing_domain_notes=self._count_other_domain_notes(eff_domain, rel))
             if errs:
                 return {"ok": False, "validation_errors": errs, "error": "WIKI SCHEMA GUARD REJECTED:\n- " + "\n- ".join(errs)}
@@ -411,9 +434,7 @@ class WikiEngine:
         return {"ok": True, "path": orig_rel, "summary": f"Restored `{orig_rel}` from `trash/`."}
 
     def list_notes(self, folder: str = "", limit: int = 100) -> List[Dict[str, Any]]:
-        self.ensure_warehouse()
-        if not self.store._fetch_rows("SELECT 1 FROM wiki_notes_index LIMIT 1"):
-            self.rebuild_index()
+        self._ensure_initial_index()
         clean_f, sel = (folder or "").strip().replace("\\", "/").strip("/"), ", ".join(_SUMMARY_COLS)
         if clean_f and "/" in clean_f:
             rows = self.store._fetch_dicts(_SUMMARY_COLS, f"SELECT {sel} FROM wiki_notes_index WHERE rel_path LIKE ? ORDER BY updated_at DESC, rel_path ASC LIMIT ?", (f"{clean_f}/%", max(1, int(limit))))
@@ -446,9 +467,7 @@ class WikiEngine:
         return [item[1] for item in scored[:limit]]
 
     def search_notes(self, query: str, limit: int = 12, include_archive: bool = False, include_ontology_bridges: bool = True) -> List[Dict[str, Any]]:
-        self.ensure_warehouse()
-        if not self.store._fetch_rows("SELECT 1 FROM wiki_notes_index LIMIT 1"):
-            self.rebuild_index()
+        self._ensure_initial_index()
         clean_q = (query or "").strip()
         if not clean_q:
             return self.list_notes(limit=limit)
@@ -457,12 +476,20 @@ class WikiEngine:
         tokens = [t for t in re.findall(r"[a-zA-Z0-9_-]+", clean_q) if t.lower() not in ("and", "or")]
         lex_paths: List[str] = []
         if tokens:
+            hit_paths: List[str] = []
             with self.store._lock:
                 for joiner in (" AND ", " OR "):
                     hits = self.store.conn.execute("SELECT rel_path FROM wiki_fts WHERE wiki_fts MATCH ? ORDER BY rank LIMIT ?", (joiner.join(f'"{t}"*' for t in tokens), max(limit * 2, 20))).fetchall()
                     if hits:
-                        lex_paths = [str(h[0]) for h in hits if str(h[0]) in by_path]
+                        hit_paths = [str(h[0]) for h in hits]
                         break
+            missing = [p for p in hit_paths if p not in by_path]
+            if missing:
+                ph = ", ".join("?" for _ in missing)
+                arch_cond = "" if include_archive else " AND folder != '04_archive'"
+                for r in self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM wiki_notes_index WHERE rel_path IN ({ph}){arch_cond}", tuple(missing)):
+                    by_path[str(r["rel_path"])] = r
+            lex_paths = [p for p in hit_paths if p in by_path]
         ranked = hybrid_rrf_rank(clean_q, [(p, f"{r['title']} {r['summary']} {r['tags_json']} {r['ontology_json']} {r['body_text'][:1200]}") for p, r in by_path.items()], lexical_ids=lex_paths, limit=limit)
         out: List[Dict[str, Any]] = []
         seed_ont: List[str] = []

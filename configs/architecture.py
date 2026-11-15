@@ -124,6 +124,13 @@ CORE_COMPONENTS: List[ComponentSpec] = [
         dependencies=["Configuration & .env Loader"],
     ),
     ComponentSpec(
+        name="Backward-Compatible ChatMemory Facade",
+        layer=ArchitectureLayer.DOMAIN,
+        module_path="memory/chat_memory.py",
+        description="Backward-compatible ChatMemory facade over companion/memory_store.py",
+        dependencies=["Persistent Memory, ADR & Hobby Store"],
+    ),
+    ComponentSpec(
         name="Engineering Disciplines & Validators",
         layer=ArchitectureLayer.DOMAIN,
         module_path="companion/disciplines.py",
@@ -404,7 +411,7 @@ CORE_COMPONENTS: List[ComponentSpec] = [
         name="Stdlib LAN HTTP Server & Session Controller",
         layer=ArchitectureLayer.PRESENTATION,
         module_path="surfaces/web_server.py",
-        description="Threaded Python stdlib HTTP server binding 0.0.0.0 with WAL-isolated status/history/telemetry APIs and foreground chat/goal execution",
+        description="Threaded Python stdlib HTTP server binding 127.0.0.1 by default (or token-gated LAN) with WAL-isolated status/history/telemetry APIs and foreground chat/goal execution",
         dependencies=[
             "Executive Agent Loop",
             "Multi-Phase Autonomous Engineering Driver",
@@ -462,6 +469,7 @@ def verify_architecture(root: Optional[Path] = None) -> Dict[str, object]:
     missing_files: List[str] = []
     present_files: List[str] = []
     known_names = {c.name for c in CORE_COMPONENTS}
+    registered_paths = {c.module_path for c in CORE_COMPONENTS}
 
     for comp in CORE_COMPONENTS:
         full_path = root / comp.module_path
@@ -475,6 +483,16 @@ def verify_architecture(root: Optional[Path] = None) -> Dict[str, object]:
         for dep_name in comp.dependencies:
             if dep_name not in known_names:
                 missing_files.append(f"unknown_dep:{comp.name}->{dep_name}")
+
+    for pkg_name in ("companion", "surfaces", "memory"):
+        pkg_dir = root / pkg_name
+        if pkg_dir.is_dir():
+            for py_mod in sorted(pkg_dir.glob("*.py")):
+                if py_mod.name == "__init__.py":
+                    continue
+                rel = f"{pkg_name}/{py_mod.name}"
+                if rel not in registered_paths:
+                    missing_files.append(f"unregistered:{rel}")
 
     layer_violations = _check_layer_dependencies(root)
     syntax_ok, syntax_results = verify_repository_syntax(root)

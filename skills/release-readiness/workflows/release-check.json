@@ -14,6 +14,14 @@
       }
     },
     {
+      "id": "verify_no_tracked_leaks",
+      "type": "tool",
+      "tool": "run_python",
+      "args": {
+        "code": "import subprocess, sys\ntracked = subprocess.check_output(['git', 'ls-files'], text=True).splitlines()\nbad = [f for f in tracked if f in {'.env', 'secrets.env', 'MEMORY.md', 'IDENTITY.md'} or f.startswith(('data/', 'companion-data/', '.companion_backups/')) or f.endswith(('.db', '.sqlite', '.exe'))]\nif bad:\n    print('FAIL: tracked private files:', bad)\n    sys.exit(1)\nprint('PASS: zero tracked private/secret files across', len(tracked), 'files')"
+      }
+    },
+    {
       "id": "verify_specs_and_hygiene",
       "type": "tool",
       "tool": "sdd_manage",
@@ -33,13 +41,23 @@
   "edges": [
     {
       "from": "check_gitignore_shield",
-      "to": "verify_specs_and_hygiene",
+      "to": "verify_no_tracked_leaks",
       "condition": "contains:MEMORY.md"
     },
     {
       "from": "check_gitignore_shield",
       "to": "ABORTED",
       "condition": "always"
+    },
+    {
+      "from": "verify_no_tracked_leaks",
+      "to": "verify_specs_and_hygiene",
+      "condition": "passed"
+    },
+    {
+      "from": "verify_no_tracked_leaks",
+      "to": "ABORTED",
+      "condition": "failed"
     },
     {
       "from": "verify_specs_and_hygiene",

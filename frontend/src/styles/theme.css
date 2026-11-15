@@ -26,6 +26,10 @@ html[data-theme='obsidian'] {
   --status-info: #5b9bd5;
   --code-bg: #090a0d;
   --shadow-panel: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --border-subtle: var(--border-hairline);
+  --bg-surface: var(--bg-panel);
+  --accent-warn: var(--status-warn);
+  --radius-sm: 0px;
   color-scheme: dark;
 }
 
@@ -610,7 +614,8 @@ html[data-theme='daylight'] .btn-primary {
   min-width: 0;
 }
 
-.panel-head {
+.panel-head,
+.panel-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -619,6 +624,17 @@ html[data-theme='daylight'] .btn-primary {
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border-hairline);
   flex-wrap: wrap;
+}
+
+.panel-body {
+  min-width: 0;
+}
+
+.studio-split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 14px;
+  align-items: start;
 }
 
 .panel-title {
@@ -1401,14 +1417,40 @@ html[data-theme='daylight'] .chat-drop-overlay {
   margin-bottom: 10px;
 }
 
+.board-context-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-panel);
+}
+
+.board-switcher-pills {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.sprint-capsule {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
 .slot-meter {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 9px;
+  padding: 3px 8px;
   border: 1px solid var(--border-strong);
   background: var(--bg-elevated);
-  font-size: 11.5px;
+  font-size: 11px;
 }
 
 .sprint-warning-strip {
@@ -1430,6 +1472,11 @@ html[data-theme='daylight'] .chat-drop-overlay {
   overflow-x: auto;
   padding-bottom: 8px;
   align-items: start;
+}
+
+.kanban-grid.active-only {
+  grid-template-columns: repeat(5, minmax(230px, 1fr));
+  gap: 12px;
 }
 
 .horizon-grid {
@@ -1462,6 +1509,19 @@ html[data-theme='daylight'] .chat-drop-overlay {
   text-transform: uppercase;
 }
 
+.planner-quick-add {
+  display: flex;
+  gap: 5px;
+  padding: 7px 8px 4px;
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--bg-panel);
+}
+
+.planner-quick-add .input {
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
 .kanban-col-body {
   padding: 8px;
   display: flex;
@@ -1470,54 +1530,143 @@ html[data-theme='daylight'] .chat-drop-overlay {
 }
 
 .kanban-empty {
-  padding: 14px 8px;
+  padding: 18px 8px;
   text-align: center;
   font-size: 11px;
   color: var(--text-muted);
 }
 
-.kanban-card {
+/* Planner-style Minimalist Card Tiles */
+.planner-card {
   border: 1px solid var(--border-strong);
   background: var(--bg-elevated);
-  padding: 9px 10px;
+  padding: 10px 11px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
 }
 
-.kanban-card.aging {
+.planner-card:hover,
+.planner-card:focus-visible {
+  border-color: var(--accent-primary);
+  outline: none;
+}
+
+.planner-card.aging {
   border-left: 2px solid var(--status-warn);
 }
 
-.kanban-card-top {
+.planner-card.is-done {
+  opacity: 0.72;
+}
+
+.planner-card.is-done .planner-card-title {
+  text-decoration: line-through;
+  color: var(--text-secondary);
+}
+
+.planner-card-top {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 6px;
 }
 
-.kanban-card-title {
-  font-size: 12.5px;
-  font-weight: 600;
-  line-height: 1.38;
-  color: var(--text-primary);
+.planner-card-tags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  align-items: center;
+  min-height: 16px;
 }
 
-.kanban-card-desc {
-  font-size: 11.5px;
+.epic-tag-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  border: 1px solid var(--accent-secondary);
+  color: var(--accent-secondary);
+  background: rgba(103, 183, 164, 0.1);
+  max-width: 185px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.planner-card-edit-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px;
+  display: inline-flex;
+  opacity: 0.7;
+}
+
+.planner-card-edit-btn:hover {
+  color: var(--accent-primary);
+  opacity: 1;
+}
+
+.planner-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.planner-card-checklist-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
   color: var(--text-secondary);
 }
 
-.kanban-card-dates {
+.mini-progress-track {
+  flex: 1;
+  height: 5px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-hairline);
+  overflow: hidden;
+}
+
+.mini-progress-fill {
+  height: 100%;
+  background: var(--status-ok);
+  transition: width 0.16s ease;
+}
+
+.planner-card-footer {
   display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.planner-card-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   font-size: 10.5px;
   color: var(--text-muted);
 }
 
-.kanban-card-dates .warn-text {
+.planner-card-meta .warn-text {
   color: var(--status-warn);
+}
+
+.planner-status-select {
+  padding: 2px 6px !important;
+  font-size: 11px !important;
 }
 
 .kanban-card-alert {
@@ -1528,16 +1677,354 @@ html[data-theme='daylight'] .chat-drop-overlay {
   background: rgba(224, 159, 62, 0.08);
 }
 
-.kanban-card-actions {
+/* Scannable Backlog Triage List */
+.backlog-toolbar {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.backlog-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-canvas);
+}
+
+.backlog-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--bg-elevated);
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+
+.backlog-row:last-child {
+  border-bottom: none;
+}
+
+.backlog-row:hover {
+  background: var(--bg-hover);
+}
+
+.backlog-row.aging {
+  border-left: 2px solid var(--status-warn);
+}
+
+.backlog-row-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.backlog-row-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.backlog-row-actions {
+  display: inline-flex;
+  align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+/* Jira-style Spanning Epics & Nested Child Tasks */
+.epic-horizon-scale {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.epic-horizon-scale-col {
+  padding: 4px 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hairline);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.epic-horizon-scale-col strong {
+  color: var(--text-primary);
+}
+
+.epic-roadmap-card {
+  border: 1px solid var(--border-strong);
+  background: var(--bg-panel);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.epic-roadmap-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.epic-roadmap-summary {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding-left: 24px;
+}
+
+.epic-span-track {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-hairline);
+}
+
+.epic-span-bar {
+  position: relative;
+  height: 24px;
+  border: 1px solid var(--accent-primary);
+  background: var(--accent-soft);
+  display: flex;
+  align-items: center;
+  padding: 0 9px;
+  overflow: hidden;
+}
+
+.epic-span-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(69, 178, 124, 0.28);
+  pointer-events: none;
+}
+
+.epic-span-label {
+  position: relative;
+  z-index: 1;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.epic-children-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-left: 16px;
+  border-left: 2px solid var(--border-strong);
+  margin-left: 6px;
+}
+
+.epic-child-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-elevated);
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+
+.epic-child-row:hover {
+  border-color: var(--accent-primary);
+}
+
+.epic-child-row.is-done {
+  opacity: 0.68;
+}
+
+.epic-child-row.is-done .epic-child-title {
+  text-decoration: line-through;
+}
+
+.epic-child-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.epic-step-num {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  font-size: 10.5px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-panel);
+  color: var(--text-muted);
+}
+
+.epic-child-title {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.epic-inline-add {
+  display: flex;
+  gap: 6px;
+  margin-top: 3px;
+  flex-wrap: wrap;
+}
+
+.epic-inline-add .input {
+  flex: 1 1 240px;
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+/* Centered Microsoft Planner / Trello Card & Create Modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 75;
+  background: rgba(5, 7, 11, 0.72);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.planner-modal {
+  width: min(680px, 100%);
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-panel);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.planner-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.planner-modal-title-input {
+  font-size: 15px !important;
+  font-weight: 700 !important;
+  flex: 1;
+}
+
+.planner-modal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 12px;
+}
+
+.planner-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.planner-field > span {
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.planner-checklist-box {
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-elevated);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.planner-checklist-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.checklist-items {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   margin-top: 2px;
 }
 
-/* Unified Multi-Source Calendar */
+.checklist-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  background: var(--bg-panel);
+  font-size: 12.5px;
+}
+
+.checklist-row.done span {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+
+.planner-unblocker-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px dashed var(--border-strong);
+  background: var(--bg-elevated);
+}
+
+.planner-modal-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-hairline);
+  flex-wrap: wrap;
+}
+
+/* Unified Multi-Source Calendar & Spanning Roadmap */
+.badge.epic {
+  border-color: var(--accent-secondary);
+  color: var(--accent-secondary);
+}
+
 .cal-header-row {
   display: grid;
   grid-template-columns: repeat(7, minmax(120px, 1fr));
@@ -1633,6 +2120,11 @@ html[data-theme='daylight'] .chat-drop-overlay {
   border-left: 2px solid var(--accent-secondary);
 }
 
+.cal-pill.epic {
+  border-left: 2px solid var(--accent-secondary);
+  background: rgba(103, 183, 164, 0.1);
+}
+
 .cal-pill-btn {
   border: none;
   background: transparent;
@@ -1663,6 +2155,102 @@ html[data-theme='daylight'] .chat-drop-overlay {
 
 .cal-pill-del:hover {
   color: var(--status-danger);
+}
+
+.cal-roadmap-scale {
+  display: grid;
+  grid-template-columns: 240px minmax(360px, 1fr);
+  gap: 10px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--bg-elevated);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.cal-roadmap-ticks {
+  display: flex;
+  justify-content: space-between;
+}
+
+.cal-roadmap-row {
+  display: grid;
+  grid-template-columns: 240px minmax(360px, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 9px 8px;
+  border-bottom: 1px solid var(--border-hairline);
+  overflow-x: auto;
+}
+
+.cal-roadmap-meta {
+  min-width: 0;
+}
+
+.cal-roadmap-epic-link {
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  text-align: left;
+}
+
+.cal-roadmap-epic-link:hover {
+  color: var(--accent-primary);
+}
+
+.cal-roadmap-lane {
+  position: relative;
+  height: 28px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-hairline);
+  overflow: hidden;
+}
+
+.cal-roadmap-bar {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid var(--accent-primary);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.cal-roadmap-bar.sprint {
+  border-color: var(--status-ok);
+  background: rgba(69, 178, 124, 0.14);
+  font-size: 10.5px;
+}
+
+.cal-roadmap-bar.epic {
+  border-color: var(--accent-secondary);
+  background: rgba(103, 183, 164, 0.14);
+}
+
+.cal-roadmap-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(69, 178, 124, 0.32);
+  pointer-events: none;
+}
+
+.cal-roadmap-bar-text {
+  position: relative;
+  z-index: 1;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Inline Interactive Flashcard Flip Widget in Chat */
@@ -2075,6 +2663,20 @@ html[data-theme='daylight'] .chat-drop-overlay {
     flex-wrap: nowrap;
     overflow-x: auto;
     scrollbar-width: none;
+  }
+
+  .planner-modal {
+    padding: 13px 14px;
+  }
+
+  .planner-modal-grid,
+  .studio-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cal-roadmap-scale,
+  .cal-roadmap-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .toast-banner {

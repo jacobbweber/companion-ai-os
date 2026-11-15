@@ -33,7 +33,8 @@ copy_clean_app() {
   cp -r "${REPO_ROOT}/harness.py" "${REPO_ROOT}/.env.example" "${REPO_ROOT}/companion" \
         "${REPO_ROOT}/configs" "${REPO_ROOT}/memory" "${REPO_ROOT}/skills" \
         "${REPO_ROOT}/specs" "${REPO_ROOT}/surfaces" "${dest}/"
-  rm -rf "${dest}/memory/"*.db* "${dest}/companion/__pycache__" "${dest}/surfaces/__pycache__"
+  rm -rf "${dest}/memory/"*.db* "${dest}/companion/__pycache__" "${dest}/surfaces/__pycache__" \
+         "${dest}/configs/__pycache__" "${dest}/memory/__pycache__"
   [[ -f "${REPO_ROOT}/LICENSE" ]] && cp "${REPO_ROOT}/LICENSE" "${dest}/"
   [[ -f "${REPO_ROOT}/README.md" ]] && cp "${REPO_ROOT}/README.md" "${dest}/"
 }
@@ -60,9 +61,9 @@ EnvironmentFile=-${DATA_DIR}/.env
 Environment="PYTHONUNBUFFERED=1"
 Environment="COMPANION_DATA_DIR=${DATA_DIR}"
 Environment="COMPANION_SELF_DEV_LOCKED=1"
-ExecStart=${PY_BIN} ${APP_DIR}/harness.py --data-dir "${DATA_DIR}" --locked --web --host 0.0.0.0 --port ${PORT}
-Restart=on-failure
-RestartSec=5
+ExecStart=${PY_BIN} ${APP_DIR}/harness.py --data-dir "${DATA_DIR}" --locked --web --host 127.0.0.1 --port ${PORT}
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=default.target

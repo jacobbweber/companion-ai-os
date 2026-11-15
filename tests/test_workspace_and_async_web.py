@@ -23,16 +23,19 @@ def _web_call(srv, path: str, method: str = "GET", payload: Dict[str, Any] | Non
     port = int(srv.server_address[1])
     url = f"http://127.0.0.1:{port}{path}"
     raw_body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    headers = {"Content-Type": "application/json"} if payload is not None else {}
+    headers: Dict[str, str] = {"Content-Type": "application/json"} if payload is not None else {}
+    if method.upper() == "POST" and hasattr(srv, "session"):
+        headers["X-Companion-CSRF"] = srv.session.csrf_token
     req = urllib.request.Request(url, data=raw_body, headers=headers, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
+        with opener.open(req, timeout=5.0) as resp:
             code, text = int(resp.status), resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         code, text = int(exc.code), exc.read().decode("utf-8", errors="replace")
     except Exception as exc:
         if "10013" in str(exc) or "PermissionError" in str(exc) or "Errno 13" in str(exc):
-            code, text = dispatch_raw_http(srv, method=method, path=path, body=raw_body)
+            code, text = dispatch_raw_http(srv, method=method, path=path, body=raw_body, headers=headers)
         else:
             raise
     return code, json.loads(text)
@@ -127,34 +130,35 @@ class TestWorkspaceAndAsyncWeb(unittest.TestCase):
             ext_dir = Path(tmp) / "external-demo-app"
             store = MemoryStore(db_path=Path(tmp) / "proj.db")
             try:
-                init_out = handle_slash_command(f"/project init {ext_dir}", [], store=store)
-                self.assertIn("Initialized & activated project", str(init_out))
-                self.assertFalse(settings.get_workspace().is_self_project)
-                self.assertEqual(resolve("app.py", for_write=True), ext_dir.resolve() / "app.py")
+                with memory_store_context(store):
+                    init_out = handle_slash_command(f"/project init {ext_dir}", [], store=store)
+                    self.assertIn("Initialized & activated project", str(init_out))
+                    self.assertFalse(settings.get_workspace().is_self_project)
+                    self.assertEqual(resolve("app.py", for_write=True), ext_dir.resolve() / "app.py")
 
-                # Writing inside external project succeeds cleanly
-                w_ok = tool_write_file({"path": "app.py", "content": '"""External app."""\nVALUE = 7\n'})
-                self.assertIn("wrote", w_ok)
-                self.assertTrue((ext_dir / "app.py").is_file())
+                    # Writing inside external project succeeds cleanly
+                    w_ok = tool_write_file({"path": "app.py", "content": '"""External app."""\nVALUE = 7\n'})
+                    self.assertIn("wrote", w_ok)
+                    self.assertTrue((ext_dir / "app.py").is_file())
 
-                # Attempting to overwrite Companion's own harness.py while external project is active MUST be mechanically blocked!
-                core_target = settings.root / "harness.py"
-                w_blocked = tool_write_file({"path": str(core_target), "content": "# blocked"})
-                self.assertIn("SAFETY GUARD REJECTED path", w_blocked)
-                self.assertIn("READ-ONLY", w_blocked)
+                    # Attempting to overwrite Companion's own harness.py while external project is active MUST be mechanically blocked!
+                    core_target = settings.root / "harness.py"
+                    w_blocked = tool_write_file({"path": str(core_target), "content": "# blocked"})
+                    self.assertIn("SAFETY GUARD REJECTED path", w_blocked)
+                    self.assertIn("READ-ONLY", w_blocked)
 
-                # Companion can still read its own skills/ runbooks for guidance while in external mode
-                skill_read = tool_read_file({"path": "skills/proactive-checkin/SKILL.md", "end_line": 5})
-                self.assertIn("proactive-checkin", skill_read)
+                    # Companion can still read its own skills/ runbooks for guidance while in external mode
+                    skill_read = tool_read_file({"path": "skills/proactive-checkin/SKILL.md", "end_line": 5})
+                    self.assertIn("proactive-checkin", skill_read)
 
-                # Context manager & /project self restore companion-self cleanly
-                back_out = dispatch("project_manage", {"action": "self"})
-                self.assertIn(SELF_PROJECT_ID, back_out)
-                self.assertTrue(settings.get_workspace().is_self_project)
+                    # Context manager & /project self restore companion-self cleanly
+                    back_out = dispatch("project_manage", {"action": "self"})
+                    self.assertIn(SELF_PROJECT_ID, back_out)
+                    self.assertTrue(settings.get_workspace().is_self_project)
 
-                with workspace_context(ext_dir):
-                    self.assertEqual(settings.active_project_root, ext_dir.resolve())
-                self.assertTrue(settings.get_workspace().is_self_project)
+                    with workspace_context(ext_dir):
+                        self.assertEqual(settings.active_project_root, ext_dir.resolve())
+                    self.assertTrue(settings.get_workspace().is_self_project)
             finally:
                 settings.reset_workspace()
                 store.close()

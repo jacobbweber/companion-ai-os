@@ -17,7 +17,7 @@ from companion.agile_boards import get_agile_manager
 from companion.archive_and_approvals import consume_session_nudges, session_id_context
 from companion.autonomy import run_autonomous_goal
 from companion.blueprint import (approve_blueprint_and_build, classify_blueprint_reply, create_or_revise_blueprint, handle_blueprint_conversation_turn, is_awaiting_blueprint_approval)
-from companion.config import settings
+from companion.config import agent_tool_turn_context, settings
 from companion.context import (build_system_prompt, compact_messages_if_needed, estimate_messages_chars, estimate_messages_tokens, format_context_budget_status, format_identity_summary, format_skills_catalog, manage_active_project, manage_companion_tone, manage_model_tier, run_first_boot_onboarding)
 from companion.core_actions import HARVEST_SLASH_VERBS, handle_harvest_slash
 from companion.education_engine import get_education_engine
@@ -65,7 +65,8 @@ def _execute_tool_calls(
                 telemetry.log("WARN", "safety", f"LoopGuard blocked repeated tool call `{name}`")
             result = intervention
         else:
-            result = dispatch(name, args)
+            with agent_tool_turn_context():
+                result = dispatch(name, args)
             if name == "system_doctor":
                 doctor_ok = "HEALTHY (PASS)" in result
             recovery_hint = loop_guard.record_result(name, result)
@@ -339,9 +340,9 @@ workflow_engine.bind_executors(tool_fn=dispatch, subagent_fn=lambda g, s=None, m
 hobby_engine.bind_runner(lambda m, lim, st, tag: run_agent_turn(m, max_iters=lim, store=st, session_tag=tag))
 
 
-def check_in() -> str:
+def check_in(store: Optional[MemoryStore] = None) -> str:
     """Provide a friendly proactive check-in summary of Companion's current state."""
-    mem, ws = get_memory_store(), settings.get_workspace()
+    mem, ws = store or get_memory_store(), settings.get_workspace()
     wf, spr, edu = mem.get_active_workflow(), get_agile_manager(store=mem).get_active_sprint(), get_education_engine(store=mem).get_progress_summary()
     ac = edu.get("active_course")
     return (
@@ -521,7 +522,7 @@ def handle_slash_command(cmd_str: str, messages: List[Dict[str, Any]], store: Op
     if verb in ("morning", "journal"):
         return hobby_engine.get_morning_briefing(mark_seen=True)
     if verb in ("checkin", "check-in"):
-        return check_in()
+        return check_in(store=mem)
     if verb in ("telemetry", "kpis", "metrics"):
         return telemetry.format_kpi_dashboard()
     if verb in ("traces", "waterfall", "trace"):

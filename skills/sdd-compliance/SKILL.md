@@ -14,10 +14,10 @@ Use this runbook before completing any code or architectural change, when diagno
    - `specs/` may ONLY contain `PRODUCT.md`, `ARCHITECTURE.md`, `CONTRACTS.md`, and `DECISIONS.md`.
    - Never create extra markdown files inside `specs/`. Operational runbooks belong in `skills/<skill-name>/SKILL.md`.
 2. **1-to-1 Module Registration**:
-   - Every `.py` module in `companion/` and `surfaces/` must be documented in both `specs/ARCHITECTURE.md` and `specs/CONTRACTS.md`, and mapped in `MODULE_LAYER_MAP` (`companion/disciplines.py`) and `CORE_COMPONENTS` (`configs/architecture.py`).
+   - Every `.py` module in `companion/`, `surfaces/`, `configs/`, and `memory/` must be documented in both `specs/ARCHITECTURE.md` and `specs/CONTRACTS.md`, and mapped in `MODULE_LAYER_MAP` (`companion/disciplines.py`) and `CORE_COMPONENTS` (`configs/architecture.py`).
 3. **AST Hygiene & Simplicity Budgets (`ADR-006`)**:
    - Zero unused imports across the repository and zero unreferenced top-level functions/classes in `companion/`.
-   - Every module must stay `<= 550` lines (`COMPANION_MAX_MODULE_LINES`) and every function `<= 100` lines (`COMPANION_MAX_FUNCTION_LINES`).
+   - Every module must stay `<= 700` lines (`COMPANION_MAX_MODULE_LINES`) and every function `<= 100` lines (`COMPANION_MAX_FUNCTION_LINES`), with zero semicolon-chained statements (`stmt1; stmt2`).
 4. **Downward-Only A-Frame Layer Flow**:
    - `Presentation (harness.py, surfaces/)` -> `Application (agent, autonomy, blueprint, intake, skill_forge, eval_harness, context, compaction, background_jobs, endpoints, mcp_hub, routines, calendar_engine, core_actions, harvest_tools, tools, os_tools, tool_schemas, hobbies)` -> `Workflow (workflow_graph, workflow_dag)` -> `Domain (checkpoints, safety, sdd, hygiene, disciplines, grounding, archive_and_approvals, vault, model_registry, wiki_templates, wiki_engine, wiki_curation, wiki_maintenance, attachments, agile_boards, education_engine, semantic_memory, memory_store, configs/architecture, memory/chat_memory)` -> `Infrastructure (config, telemetry, streaming, llm_wire, llm)`.
 

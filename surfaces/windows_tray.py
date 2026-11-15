@@ -23,7 +23,13 @@ from pathlib import Path
 from typing import Optional
 
 from companion.config import settings
+from companion.llm_wire import urlopen_safe
 from companion.telemetry import telemetry
+from surfaces.api_extensions import (
+    register_service_reload_handler,
+    spawn_companion_reload,
+    wait_for_port_release,
+)
 from surfaces.web_server import create_web_server
 
 
@@ -47,7 +53,7 @@ def is_companion_running_on_port(port: int, timeout: float = 0.6) -> bool:
     url = f"http://127.0.0.1:{int(port)}/api/health"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen_safe(req, timeout=timeout, allow_private_lan=True, allow_redirects=False) as resp:
             if resp.status != 200:
                 return False
             data = json.loads(resp.read(4096).decode("utf-8", errors="replace"))
@@ -60,9 +66,10 @@ def is_companion_running_on_port(port: int, timeout: float = 0.6) -> bool:
         return False
 
 
-def select_available_port(host: str = "0.0.0.0", preferred_port: int = 8000, max_tries: int = 10) -> int:
+def select_available_port(host: Optional[str] = None, preferred_port: int = 8000, max_tries: int = 10) -> int:
     """Return `preferred_port` if bindable, otherwise probe consecutive ports up to `max_tries`."""
-    probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    eff_host = (host or settings.web_host).strip() or "127.0.0.1"
+    probe_host = "127.0.0.1" if eff_host in ("0.0.0.0", "") else eff_host
     for offset in range(max(1, int(max_tries))):
         candidate = int(preferred_port) + offset
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -215,8 +222,29 @@ def _bind_win32_apis(user32, shell32, kernel32) -> None:
     shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 
 
-def _run_win32_tray_loop(local_url: str, on_quit) -> None:
-    """Run a pure-stdlib 64-bit Win32 `Shell_NotifyIconW` message loop on Windows."""
+def _pop_tray_menu(user32, hwnd: int, local_url: str) -> int:
+    """Display the Win32 right-click tray popup menu and handle immediate browser/folder actions."""
+    menu = user32.CreatePopupMenu()
+    user32.AppendMenuW(menu, 0x0000, 1001, "Open Companion Studio")
+    user32.AppendMenuW(menu, 0x0000, 1002, "Reload Companion (Apply Updates)")
+    user32.AppendMenuW(menu, 0x0000, 1003, "Open User Data Folder")
+    user32.AppendMenuW(menu, 0x0800, 0, None)
+    user32.AppendMenuW(menu, 0x0000, 1004, "Quit Companion")
+    pt = wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    user32.SetForegroundWindow(hwnd)
+    cmd = int(user32.TrackPopupMenu(menu, 0x0102, pt.x, pt.y, 0, hwnd, None))
+    user32.PostMessageW(hwnd, 0, 0, 0)
+    user32.DestroyMenu(menu)
+    if cmd == 1001:
+        webbrowser.open(local_url)
+    elif cmd == 1003:
+        open_user_data_folder()
+    return cmd
+
+
+def _run_win32_tray_loop(local_url: str, on_quit) -> bool:
+    """Run a pure-stdlib 64-bit Win32 `Shell_NotifyIconW` message loop on Windows (returns `True` on reload)."""
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -237,27 +265,10 @@ def _run_win32_tray_loop(local_url: str, on_quit) -> None:
         ]
 
     nid = _NotifyIconDataW()
-
-    def _show_menu(hwnd: int) -> None:
-        menu = user32.CreatePopupMenu()
-        user32.AppendMenuW(menu, 0x0000, 1001, "Open Companion Studio")
-        user32.AppendMenuW(menu, 0x0000, 1002, "Open User Data Folder")
-        user32.AppendMenuW(menu, 0x0800, 0, None)
-        user32.AppendMenuW(menu, 0x0000, 1003, "Quit Companion")
-        pt = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(pt))
-        user32.SetForegroundWindow(hwnd)
-        cmd = int(user32.TrackPopupMenu(menu, 0x0102, pt.x, pt.y, 0, hwnd, None))
-        user32.PostMessageW(hwnd, 0, 0, 0)
-        user32.DestroyMenu(menu)
-        if cmd == 1001:
-            webbrowser.open(local_url)
-        elif cmd == 1002:
-            open_user_data_folder()
-        elif cmd == 1003:
-            user32.DestroyWindow(hwnd)
+    reload_requested = False
 
     def _wnd_proc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+        nonlocal reload_requested
         if wm_taskbar_created and msg == wm_taskbar_created:
             shell32.Shell_NotifyIconW(0, ctypes.byref(nid))
             return 0
@@ -266,9 +277,13 @@ def _run_win32_tray_loop(local_url: str, on_quit) -> None:
             if ev == wm_lbuttondblclk:
                 webbrowser.open(local_url)
             elif ev in (wm_rbuttonup, wm_contextmenu, wm_lbuttonup):
-                _show_menu(hwnd)
+                cmd = _pop_tray_menu(user32, hwnd, local_url)
+                if cmd in (1002, 1004):
+                    reload_requested = reload_requested or (cmd == 1002)
+                    user32.DestroyWindow(hwnd)
             return 0
-        if msg == wm_command and (wparam & 0xFFFF) == 1003:
+        if msg == wm_command and (wparam & 0xFFFF) in (1002, 1004):
+            reload_requested = reload_requested or ((wparam & 0xFFFF) == 1002)
             user32.DestroyWindow(hwnd)
             return 0
         if msg == wm_destroy:
@@ -284,6 +299,7 @@ def _run_win32_tray_loop(local_url: str, on_quit) -> None:
     user32.RegisterClassW.argtypes = [ctypes.POINTER(WndClassW)]
     user32.RegisterClassW(ctypes.byref(wc))
     hwnd = int(user32.CreateWindowExW(0, cls_name, "Companion AI OS", 0, 0, 0, 0, 0, None, None, hinst, None))
+    register_service_reload_handler(lambda: bool(user32.PostMessageW(hwnd, wm_command, 1002, 0)))
 
     nid.cbSize = ctypes.sizeof(_NotifyIconDataW)
     nid.hWnd = hwnd
@@ -306,23 +322,29 @@ def _run_win32_tray_loop(local_url: str, on_quit) -> None:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
     finally:
+        register_service_reload_handler(None)
         shell32.Shell_NotifyIconW(2, ctypes.byref(nid))
         on_quit()
+    return reload_requested
 
 
-def start_tray_app(host: str = "0.0.0.0", port: Optional[int] = None, auto_open_browser: bool = True) -> None:
-    """Start Companion's Web Studio in the background and attach a desktop System Tray controller."""
+def start_tray_app(host: Optional[str] = None, port: Optional[int] = None, auto_open_browser: bool = True) -> None:
+    """Start Companion's Web Studio in the background (`127.0.0.1` default) and attach a desktop System Tray controller."""
     enable_windowless_subprocesses()
+    eff_host = (host or settings.web_host).strip() or "127.0.0.1"
     pref_port = int(port if port is not None else int(os.environ.get("COMPANION_WEB_PORT", "8000")))
-    if is_companion_running_on_port(pref_port):
+    is_reloading = os.environ.pop("COMPANION_RELOADING", "") == "1"
+    if is_reloading:
+        wait_for_port_release(eff_host, pref_port, timeout=6.0)
+    elif is_companion_running_on_port(pref_port):
         existing_url = f"http://127.0.0.1:{pref_port}"
         if auto_open_browser:
             webbrowser.open(existing_url)
         print(f"Companion is already running at {existing_url} — opened browser tab.")
         return
 
-    chosen_port = select_available_port(host=host, preferred_port=pref_port)
-    srv, sess = create_web_server(host=host, port=chosen_port)
+    chosen_port = pref_port if is_reloading else select_available_port(host=eff_host, preferred_port=pref_port)
+    srv, sess = create_web_server(host=eff_host, port=chosen_port)
     bound_port = int(srv.server_address[1])
     local_url = f"http://127.0.0.1:{bound_port}"
     telemetry.log("INFO", "tray", f"Started Companion Tray App on {local_url} ({sess.lan_url})")
@@ -330,10 +352,10 @@ def start_tray_app(host: str = "0.0.0.0", port: Optional[int] = None, auto_open_
     sess.idle_watcher.start()
     srv_thread = threading.Thread(target=srv.serve_forever, name="companion-tray-http", daemon=True)
     srv_thread.start()
-    if auto_open_browser:
+    if auto_open_browser and not is_reloading:
         webbrowser.open(local_url)
 
-    stopped = False
+    stopped, fallback_reload = False, False
 
     def _shutdown() -> None:
         nonlocal stopped
@@ -345,12 +367,23 @@ def start_tray_app(host: str = "0.0.0.0", port: Optional[int] = None, auto_open_
         srv.server_close()
 
     if sys.platform == "win32":
-        _run_win32_tray_loop(local_url, _shutdown)
+        should_reload = _run_win32_tray_loop(local_url, _shutdown)
     else:
+        def _fb_reload() -> None:
+            nonlocal fallback_reload
+            fallback_reload = True
+            threading.Thread(target=srv.shutdown, daemon=True).start()
+
+        register_service_reload_handler(_fb_reload)
         print(f"Companion running at {local_url} (Tray mode fallback on {sys.platform}; press Ctrl+C to stop).")
         try:
             srv_thread.join()
         except KeyboardInterrupt:
             pass
         finally:
+            register_service_reload_handler(None)
             _shutdown()
+        should_reload = fallback_reload
+
+    if should_reload:
+        spawn_companion_reload(port=bound_port)

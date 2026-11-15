@@ -9,7 +9,7 @@
 ### ADR-001: Zero-Dependency Python Stdlib Foundation
 - **Status**: `accepted`
 - **Context**: External dependencies in core agent loops cause environment fragility when self-evolving.
-- **Decision**: Keep Ring-0 core (`harness.py`, `companion/`, `surfaces/`, `configs/`) 100% Python 3.12 stdlib while allowing Ring-1 `skills/*/scripts/*.py` to declare isolated PEP 723 `uv run` dependencies.
+- **Decision**: Keep Ring-0 core (`harness.py`, `companion/`, `surfaces/`, `configs/`, `memory/`) 100% Python 3.12 stdlib while allowing Ring-1 `skills/*/scripts/*.py` to declare isolated PEP 723 `uv run` dependencies.
 - **Consequences**: Unbrickable zero-dependency core brain paired with an extensible, isolated skill toolbox.
 
 ### ADR-002: A-Frame Layered Modular Architecture
@@ -63,8 +63,8 @@
 ### ADR-010: Stdlib LAN Web Surface (surfaces/) & Multi-Phase Autonomous Goal Driver
 - **Status**: `accepted`
 - **Context**: Single-turn loops and external web frameworks caused unverified stub code during self-development.
-- **Decision**: Serve zero-dependency ThreadingHTTPServer LAN web interfaces in surfaces/ with disconnect-proof async job streaming, and drive multi-step builds via companion/autonomy.py with mechanical tier routing and System Doctor gates.
-- **Consequences**: Mobile/desktop LAN browser access with zero external dependencies and non-hallucinative feature delivery.
+- **Decision**: Serve zero-dependency ThreadingHTTPServer web interfaces in surfaces/ (defaulting to 127.0.0.1) with disconnect-proof async job streaming, and drive multi-step builds via companion/autonomy.py with mechanical tier routing and System Doctor gates.
+- **Consequences**: Mobile/desktop browser access with zero external dependencies and non-hallucinative feature delivery.
 
 ### ADR-011: Mechanical Cognitive Grounding, Phase Tool Gates & Inline Post-Edit Micro-Linting
 - **Status**: `accepted`
@@ -80,8 +80,8 @@
 
 ### ADR-013: Web UI Conversation Search & Git Save-Points Surface
 - **Status**: `accepted`
-- **Context**: Mobile and desktop LAN browser users need direct access to FTS5 conversation search and recent Git save-points without dropping to CLI commands.
-- **Decision**: Expose read-only `GET /api/search?q=<query>&limit=<n>` backed by `MemoryStore.search_conversations()` and include `recent_savepoints` in `GET /api/status` rendered in the Chat and Workflow & Doctor tabs (`surfaces/web_server.py`, `surfaces/web_assets.py`).
+- **Context**: Mobile and desktop browser users need direct access to FTS5 conversation search and recent Git save-points without dropping to CLI commands.
+- **Decision**: Expose read-only `GET /api/search?q=<query>&limit=<n>` backed by `MemoryStore.search_conversations()` and include mtime-cached `recent_savepoints` in `GET /api/status` (`surfaces/web_server.py`, `surfaces/web_assets.py`).
 - **Consequences**: Zero-dependency browser search and save-point visibility with non-blocking WAL reads.
 
 ### ADR-014: Domain-Neutral Cognitive Architecture, KnowledgePort, Dynamic GoalPlan DAGs & Skill Forge
@@ -90,11 +90,11 @@
 - **Decision**: Introduce `KnowledgePort` & `ExecutionTarget` (`companion/grounding.py`), readiness-aware uncompromised reasoning routing (`companion/intake.py`), dynamic `GoalPlan` DAGs (`companion/workflow_dag.py`), and staged capability promotion + `REFLECT` distillation (`companion/skill_forge.py`).
 - **Consequences**: General-purpose reliability across any domain, clean external Wiki/Sandbox ports, and compounding verified capabilities.
 
-### ADR-015: Live SSE Token Streaming, Hybrid Semantic RRF Memory & Zero-Login Home LAN Security
+### ADR-015: Live SSE Token Streaming, Hybrid Semantic RRF Memory & Loopback/Token-Gated LAN Security
 - **Status**: `accepted`
-- **Context**: Home LAN desktop/mobile users expect real-time token/phase streaming, conceptual memory recall without GPU swaps, and invisible browser protection without login screens.
-- **Decision**: Add ContextVar SSE streaming (`companion/streaming.py`, `GET /api/jobs/<id>/stream`), zero-swap hybrid BM25 + semantic RRF retrieval (`companion/semantic_memory.py`), static Web UI assets (`surfaces/static/`), and Host/Origin/Sec-Fetch-Site/CSRF LAN guards (`surfaces/web_server.py`).
-- **Consequences**: Responsive Antigravity/Claude-grade live UX, meaning-based memory recall in <5ms, and zero-login LAN safety.
+- **Context**: Desktop/mobile users expect real-time token/phase streaming, conceptual memory recall without GPU swaps, zero-login convenience on localhost, and strict authentication when exposed on LAN/Tailscale.
+- **Decision**: Add ContextVar SSE streaming (`companion/streaming.py`, `GET /api/jobs/<id>/stream`), zero-swap hybrid BM25 + semantic RRF retrieval (`companion/semantic_memory.py`), static Web UI assets (`surfaces/static/`), and loopback-default binding (`127.0.0.1`) with `COMPANION_WEB_TOKEN` non-loopback auth plus unconditional `Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF` guards (`surfaces/web_server.py`).
+- **Consequences**: Responsive live UX, meaning-based memory recall in <5ms, zero-login localhost ergonomics, and authenticated LAN/Tailscale safety.
 
 ### ADR-016: Companion 3.0 Harvest Backend — Shared CoreActions, Forever-Chat Jobs, Co-Owned Wiki 2.0, Blind Vault, Universal Endpoints, Partner-Aware Federated MCP & Respectful Routines
 - **Status**: `accepted`
@@ -111,7 +111,7 @@
 ### ADR-018: Multi-Provider LLM Registry, Pure-Stdlib Wire Dialects, Blind Vault Key Binding & Mechanical LAN Privacy Lock
 - **Status**: `accepted`
 - **Context**: Supporting both local LAN servers (Ollama, vLLM, LM Studio, llama.cpp) and frontier cloud APIs (Gemini, Anthropic Claude, OpenAI, xAI Grok, OpenRouter, DeepSeek, Groq) via static `.env` edits forced restarts, risked API key leakage, and lost provider-native reasoning/multimodal capabilities (`thoughtSignature`, Extended Thinking signatures, native audio/video).
-- **Decision**: Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`/`hybrid`/`cloud_allowed` outbound privacy lock).
+- **Decision**: Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`-by-default/`hybrid`/`cloud_allowed` outbound privacy lock).
 - **Consequences**: Instant hot-reload routing across local LAN and frontier models from Web UI (`System -> Models, Tiers & Context`) and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy.
 
 ### ADR-019: Independent Two-Lever Operating Architecture (`Hobby Mode` x `Self-Dev Mode`), Mechanical Read-Only Core Lock & 2-Track Hobby Split

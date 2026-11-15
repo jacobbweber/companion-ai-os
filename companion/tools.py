@@ -1,10 +1,8 @@
 """Comprehensive, Self-Guarded Tool Registry (A-Frame Application Layer, 26 tools)."""
 
-import ipaddress
 import json
 import os
 import re
-import socket
 import time
 import urllib.parse
 import urllib.request
@@ -12,7 +10,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from companion.config import SKIP_DIRS, agent_tool_turn_context, settings
+from companion.archive_and_approvals import get_approval_queue
+from companion.config import SKIP_DIRS, agent_tool_turn_context, is_in_agent_tool_turn, settings
 from companion.disciplines import ActionRiskTier, classify_action_risk
 from companion.grounding import get_execution_target
 from companion.harvest_tools import (
@@ -20,6 +19,7 @@ from companion.harvest_tools import (
     tool_job_manage, tool_mcp_manage, tool_routine_manage, tool_vault_manage, tool_wiki_manage,
 )
 from companion.hygiene import extract_python_symbol
+from companion.llm_wire import check_url_ssrf, urlopen_safe
 from companion.memory_store import get_memory_store
 from companion.os_tools import (
     tool_checkpoint_manage, tool_hobby_manage, tool_memory_manage, tool_project_manage,
@@ -338,31 +338,14 @@ class _HtmlToMarkdownParser(HTMLParser):
 
 
 def _validate_web_fetch_url(url: str) -> Optional[str]:
-    """Block SSRF against cloud metadata/link-local addresses and non-HTTP service ports."""
+    """Block SSRF against cloud metadata, loopback/private LAN addresses, and non-HTTP service ports."""
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return "error: valid http:// or https:// url is required"
     host = parsed.hostname.strip().lower()
     if host in _BLOCKED_METADATA_HOSTS:
         return f"SAFETY GUARD REJECTED: cloud metadata host blocked (`{host}`)"
-    try:
-        port = parsed.port
-    except ValueError:
-        return "error: invalid port in url"
-    if port in _BLOCKED_FETCH_PORTS:
-        return f"SAFETY GUARD REJECTED: non-HTTP service port `{port}` is blocked in web_fetch"
-    try:
-        ips = [ipaddress.ip_address(host)]
-    except ValueError:
-        try:
-            infos = socket.getaddrinfo(host, port or (443 if parsed.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
-            ips = [ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos]
-        except OSError:
-            ips = []
-    for ip_obj in ips:
-        if ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast:
-            return f"SAFETY GUARD REJECTED: link-local/metadata IP `{ip_obj}` is blocked in web_fetch"
-    return None
+    return check_url_ssrf(url, allow_private_lan=False, blocked_ports=tuple(_BLOCKED_FETCH_PORTS))
 
 
 def tool_web_fetch(args: Dict[str, Any]) -> str:
@@ -371,9 +354,12 @@ def tool_web_fetch(args: Dict[str, Any]) -> str:
     if url_err:
         return url_err
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "companion-os/2.4"}), timeout=30) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": "companion-os/3.4"})
+        with urlopen_safe(req, timeout=30, allow_private_lan=False, allow_redirects=True, blocked_ports=tuple(_BLOCKED_FETCH_PORTS)) as resp:
             ctype, raw = (resp.headers.get("Content-Type") or "").lower(), resp.read(_MAX_WEB_FETCH_BYTES + 1)
     except Exception as e:
+        if "SAFETY GUARD REJECTED" in str(e):
+            return str(e)
         return f"error: {type(e).__name__}: {e}"
     byte_capped, text = len(raw) > _MAX_WEB_FETCH_BYTES, raw[:_MAX_WEB_FETCH_BYTES].decode("utf-8", "replace")
     if "application/json" in ctype:
@@ -412,9 +398,15 @@ _GUARD_PREFIXES = (
 
 
 def _check_r3_risk_gate(name: str, args: Dict[str, Any]) -> Optional[str]:
-    if classify_action_risk(name, args) != ActionRiskTier.R3_HIGH_IMPACT_MUTATION or bool_arg(args, "confirmed", False) or is_r3_action_approved():
+    if classify_action_risk(name, args) != ActionRiskTier.R3_HIGH_IMPACT_MUTATION:
         return None
-    active = get_memory_store().get_active_workflow()
+    if name in ("endpoint_manage", "mcp_manage") and not current_workflow_phase():
+        return None
+    human_confirmed = bool_arg(args, "confirmed", False) and not is_in_agent_tool_turn()
+    if human_confirmed or is_r3_action_approved():
+        return None
+    store = get_memory_store()
+    active = store.get_active_workflow()
     if active:
         try:
             meta = json.loads(active.get("metadata_json") or "{}")
@@ -422,9 +414,18 @@ def _check_r3_risk_gate(name: str, args: Dict[str, Any]) -> Optional[str]:
             meta = {}
         if meta.get("r3_approved") and not meta.get("goal_dag"):
             return None
+    target_lbl = str(args.get("command") or args.get("code") or args.get("action") or name)[:120]
+    allowed, apr = get_approval_queue(store).check_or_enqueue(
+        category="r3_tool", action_name=name, target=target_lbl,
+        summary=f"Execute R3 `{name}`: {target_lbl}",
+        payload={"tool": name, **{k: v for k, v in args.items() if k != "confirmed"}},
+        requester="companion", confirmed=False, always_require_in_autonomous=True,
+    )
+    if allowed:
+        return None
     return (
-        f"RISK GATE REJECTED (R3) `{name}`: high-impact external or system command requires explicit user confirmation. "
-        "Align with the user first (or approve an R3 Blueprint / pass `confirmed=True` after user confirmation)."
+        f"RISK GATE REJECTED (R3) `{name}` (`{apr['approval_id']}`): high-impact external or system command requires explicit user confirmation. "
+        "Align with the user first (or approve the queued R3 request / Blueprint before retrying)."
     )
 
 

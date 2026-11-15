@@ -48,18 +48,20 @@ def _format_tool_result(res: Dict[str, Any]) -> str:
     return json.dumps(res, indent=2, default=str)
 
 
+def _clean_agent_params(args: Dict[str, Any], subaction: str) -> Dict[str, Any]:
+    params = {k: v for k, v in args.items() if k != "confirmed"}
+    params["subaction"] = subaction
+    return params
+
+
 def tool_job_manage(args: Dict[str, Any]) -> str:
     """Dispatch, inspect, cancel, or resume background jobs to keep the primary Forever Chat clean."""
-    params = dict(args)
-    params["subaction"] = str(args.get("action") or "list").strip().lower()
-    return _format_tool_result(execute_core_action("jobs", params, actor="companion"))
+    return _format_tool_result(execute_core_action("jobs", _clean_agent_params(args, str(args.get("action") or "list").strip().lower()), actor="companion"))
 
 
 def tool_wiki_manage(args: Dict[str, Any]) -> str:
     """Read, search, capture into `01_inbox/`, update, graduate, or export the 2D graph of the Knowledge Wiki."""
-    params = dict(args)
-    params["subaction"] = str(args.get("action") or "list").strip().lower()
-    return _format_tool_result(execute_core_action("wiki", params, actor="companion"))
+    return _format_tool_result(execute_core_action("wiki", _clean_agent_params(args, str(args.get("action") or "list").strip().lower()), actor="companion"))
 
 
 def tool_vault_manage(args: Dict[str, Any]) -> str:
@@ -70,57 +72,41 @@ def tool_vault_manage(args: Dict[str, Any]) -> str:
             f"error: VAULT ZERO-REVEAL POLICY: Companion tool `vault_manage` only supports symbolic metadata actions "
             f"{sorted(_BLIND_VAULT_ALLOWED_SUBACTIONS)} — raw secret values can never be read, set, or deleted by Companion."
         )
-    params = dict(args)
-    params["subaction"] = sub
-    return _format_tool_result(execute_core_action("vault", params, actor="companion"))
+    return _format_tool_result(execute_core_action("vault", _clean_agent_params(args, sub), actor="companion"))
 
 
 def tool_endpoint_manage(args: Dict[str, Any]) -> str:
     """Register, test, profile, and run bounded commands/requests across `ssh`, `winrm`, and `http_api` endpoints."""
-    params = dict(args)
-    params["subaction"] = str(args.get("action") or "list").strip().lower()
-    return _format_tool_result(execute_core_action("endpoints", params, actor="companion"))
+    return _format_tool_result(execute_core_action("endpoints", _clean_agent_params(args, str(args.get("action") or "list").strip().lower()), actor="companion"))
 
 
 def tool_mcp_manage(args: Dict[str, Any]) -> str:
     """Discover/call outbound MCP servers and handshake/delegate tasks to paired Federated Companion Partners."""
-    params = dict(args)
-    params["subaction"] = str(args.get("action") or "list").strip().lower()
-    return _format_tool_result(execute_core_action("mcp", params, actor="companion"))
+    return _format_tool_result(execute_core_action("mcp", _clean_agent_params(args, str(args.get("action") or "list").strip().lower()), actor="companion"))
 
 
 def tool_routine_manage(args: Dict[str, Any]) -> str:
     """Manage Respectful Routines, isolated self-dev sandbox clones, saved prompt templates, and pending approvals."""
     sub = str(args.get("action") or "list").strip().lower()
-    params = dict(args)
     if sub.startswith("sandbox_"):
-        params["subaction"] = sub.removeprefix("sandbox_")
-        return _format_tool_result(execute_core_action("sandbox", params, actor="companion"))
+        return _format_tool_result(execute_core_action("sandbox", _clean_agent_params(args, sub.removeprefix("sandbox_")), actor="companion"))
     if sub.startswith("prompt_"):
-        params["subaction"] = sub.removeprefix("prompt_")
-        return _format_tool_result(execute_core_action("prompts", params, actor="companion"))
+        return _format_tool_result(execute_core_action("prompts", _clean_agent_params(args, sub.removeprefix("prompt_")), actor="companion"))
     if sub == "list_approvals":
         return _format_tool_result(execute_core_action("approvals", {"subaction": "list", "status": "waiting"}, actor="companion"))
-    params["subaction"] = sub
-    return _format_tool_result(execute_core_action("routines", params, actor="companion"))
+    return _format_tool_result(execute_core_action("routines", _clean_agent_params(args, sub), actor="companion"))
 
 
 def tool_agile_manage(args: Dict[str, Any]) -> str:
     """Operate Multi-Board Kanban, Master Active Sprint, Capacity Slots, Epics, and 15m Unblocker Slicing."""
-    params = dict(args)
-    params["subaction"] = str(args.get("action") or "board_view").strip().lower()
-    return _format_tool_result(execute_core_action("agile", params, actor="companion"))
+    return _format_tool_result(execute_core_action("agile", _clean_agent_params(args, str(args.get("action") or "board_view").strip().lower()), actor="companion"))
 
 
 def tool_calendar_manage(args: Dict[str, Any]) -> str:
     """Operate Unified Calendar timeline across appointments, active sprints, task dates, routines, and SRS study reviews."""
-    params = dict(args)
-    params["subaction"] = str(args.get("action") or "window").strip().lower()
-    return _format_tool_result(execute_core_action("calendar", params, actor="companion"))
+    return _format_tool_result(execute_core_action("calendar", _clean_agent_params(args, str(args.get("action") or "window").strip().lower()), actor="companion"))
 
 
 def tool_education_manage(args: Dict[str, Any]) -> str:
     """Operate Headless Education courses, pedagogical stages, spaced repetition grading, and inline Chat flashcard decks."""
-    params = dict(args)
-    params["subaction"] = str(args.get("action") or "progress").strip().lower()
-    return _format_tool_result(execute_core_action("education", params, actor="companion"))
+    return _format_tool_result(execute_core_action("education", _clean_agent_params(args, str(args.get("action") or "progress").strip().lower()), actor="companion"))

@@ -52,19 +52,21 @@ class TestSDDHygieneAndHobbies(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = MemoryStore(db_path=root / "memory" / "test.db")
-            for i in range(20):
-                store.add_adr(
-                    title=f"ADR-1{i:02d}: Decision {i}",
-                    context="Ctx",
-                    decision="Dec",
-                    consequences="Cons",
-                    status="accepted",
-                )
-            dec_path = sync_decisions_md(store=store, root=root)
-            text = dec_path.read_text(encoding="utf-8")
-            self.assertIn("Historical / Superseded Decisions (Compacted)", text)
-            self.assertEqual(text.count("### ADR-"), MAX_ACTIVE_ADRS)
-            store.close()
+            try:
+                for i in range(20):
+                    store.add_adr(
+                        title=f"ADR-1{i:02d}: Decision {i}",
+                        context="Ctx",
+                        decision="Dec",
+                        consequences="Cons",
+                        status="accepted",
+                    )
+                dec_path = sync_decisions_md(store=store, root=root)
+                text = dec_path.read_text(encoding="utf-8")
+                self.assertIn("Historical / Superseded Decisions (Compacted)", text)
+                self.assertEqual(text.count("### ADR-"), MAX_ACTIVE_ADRS)
+            finally:
+                store.close()
 
     def test_live_workspace_passes_ast_hygiene_and_dead_code_check(self) -> None:
         rep = analyze_workspace_hygiene()

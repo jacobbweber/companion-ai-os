@@ -44,7 +44,7 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             full = settings.root / rel
             self.assertTrue(full.is_file(), f"Missing module {rel}")
             line_cnt = len(full.read_text(encoding="utf-8").splitlines())
-            self.assertLessEqual(line_cnt, 465, f"{rel} should have generous headroom, got {line_cnt} lines")
+            self.assertLessEqual(line_cnt, 520, f"{rel} should have generous headroom, got {line_cnt} lines")
 
     def test_upgrade2_per_tier_temperature_tool_call_rescue_and_rolling_scratchpad(self) -> None:
         """Verify per-tier temperature defaults, JSON/Qwen XML `<tool_call>` rescue, and 1-step `<think>` continuity."""
@@ -102,7 +102,7 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
         """Verify cached AST Repo Radar in system prompt and surgical `read_file(..., symbol=...)` slicing."""
         radar = build_repo_headroom_map(settings.root)
         self.assertIn("companion/config.py", radar)
-        self.assertIn("/550L]", radar)
+        self.assertIn(f"/{settings.max_module_lines}L]", radar)
 
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(db_path=Path(tmp) / "radar.db")

@@ -11,7 +11,10 @@ privacy classification, and live model discovery across three wire dialects:
 import ipaddress
 import json
 import re
+import socket
+import urllib.error
 import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.streaming import (
@@ -28,25 +31,108 @@ VALID_PRIVACY_MODES = ("hybrid", "local_only", "cloud_allowed")
 VALID_REASONING_EFFORTS = ("", "low", "medium", "high")
 _EFFORT_BUDGETS = {"low": 1024, "medium": 4096, "high": 8192}
 _LAN_HOST_SUFFIXES = (".local", ".lan", ".home", ".internal", ".home.arpa", ".localdomain", ".ts.net")
+_BLOCKED_METADATA_HOSTS = {"metadata.google.internal", "metadata", "instance-data", "169.254.169.254"}
 _CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 _OPENAI_REASONING_RE = re.compile(r"^(?:o1|o3|o4|gpt-5)(?:$|[-_])", re.I)
+_LOCAL_HOSTNAME = socket.gethostname().strip().lower()
+_ORIG_URLOPEN = urllib.request.urlopen
 
 
 def is_local_or_lan_endpoint(url: str) -> bool:
-    """Return `True` strictly when `url` resolves to loopback, private LAN (RFC1918), Tailscale CGNAT, or `.local`/`.lan`."""
+    """Return `True` strictly when `url` targets loopback, RFC1918 LAN, Tailscale CGNAT, or `.local`/`.lan` (never link-local metadata)."""
     raw = (url or "").strip()
     if not raw:
         return False
     host = (urllib.parse.urlsplit(raw if "://" in raw else f"http://{raw}").hostname or "").strip().lower()
-    if not host:
+    if not host or host in _BLOCKED_METADATA_HOSTS:
         return False
-    if host in ("localhost", "0.0.0.0") or "." not in host or host.endswith(_LAN_HOST_SUFFIXES):
+    if host in ("localhost", "0.0.0.0", "::1") or (bool(_LOCAL_HOSTNAME) and host == _LOCAL_HOSTNAME) or host.endswith(_LAN_HOST_SUFFIXES):
         return True
     try:
-        ip_obj = ipaddress.ip_address(host)
+        raw_ip = ipaddress.ip_address(host.strip("[]"))
+        ip_obj = getattr(raw_ip, "ipv4_mapped", None) or raw_ip
+        if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
+            return False
         return bool(ip_obj.is_loopback or ip_obj.is_private or (ip_obj.version == 4 and ip_obj in _CGNAT_NET))
     except ValueError:
         return False
+
+
+def check_url_ssrf(
+    url_or_host: str,
+    allow_private_lan: bool = False,
+    blocked_ports: Tuple[int, ...] = (),
+) -> Optional[str]:
+    """Validate `url_or_host` against metadata/link-local/private SSRF ranges and blocked non-HTTP ports."""
+    raw = (url_or_host or "").strip()
+    if not raw:
+        return "error: valid http:// or https:// url is required"
+    parsed = urllib.parse.urlsplit(raw if "://" in raw else f"http://{raw}")
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return "error: valid http:// or https:// url is required"
+    host = parsed.hostname.strip().lower()
+    if host in _BLOCKED_METADATA_HOSTS:
+        return f"SAFETY GUARD REJECTED: cloud metadata endpoint `{host}` is blocked"
+    try:
+        port = parsed.port
+    except ValueError:
+        return "error: invalid port in url"
+    if port is not None and port in blocked_ports:
+        return f"SAFETY GUARD REJECTED: non-HTTP service port `{port}` is blocked"
+    try:
+        ips = [ipaddress.ip_address(host.strip("[]"))]
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, port or (443 if parsed.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+            ips = [ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos]
+        except OSError:
+            ips = []
+    for raw_ip in ips:
+        ip_obj = getattr(raw_ip, "ipv4_mapped", None) or raw_ip
+        if ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast:
+            return f"SAFETY GUARD REJECTED: link-local/metadata IP `{ip_obj}` is blocked"
+        if not allow_private_lan and (
+            ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_reserved or (ip_obj.version == 4 and ip_obj in _CGNAT_NET)
+        ):
+            return f"SAFETY GUARD REJECTED: private/loopback IP `{ip_obj}` is blocked"
+    return None
+
+
+def urlopen_safe(
+    req_or_url: Any,
+    timeout: float = 20.0,
+    context: Any = None,
+    allow_private_lan: bool = True,
+    allow_redirects: bool = False,
+    blocked_ports: Tuple[int, ...] = (),
+) -> Any:
+    """Open `req_or_url` bypassing system HTTP proxies for local/LAN hosts and enforcing redirect SSRF checks."""
+    if urllib.request.urlopen is not _ORIG_URLOPEN:
+        kw = {"context": context} if context is not None else {}
+        return urllib.request.urlopen(req_or_url, timeout=timeout, **kw)
+    url = req_or_url.full_url if isinstance(req_or_url, urllib.request.Request) else str(req_or_url)
+
+    class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+            if not allow_redirects:
+                raise urllib.error.HTTPError(req.full_url, code, f"Redirects disabled ({msg})", headers, fp)
+            abs_url = urllib.parse.urljoin(req.full_url, newurl)
+            ssrf_err = check_url_ssrf(abs_url, allow_private_lan=allow_private_lan, blocked_ports=blocked_ports)
+            if ssrf_err:
+                raise PermissionError(ssrf_err)
+            new_req = super().redirect_request(req, fp, code, msg, headers, abs_url)
+            if new_req is not None and urllib.parse.urlsplit(req.full_url).netloc.lower() != urllib.parse.urlsplit(abs_url).netloc.lower():
+                for sensitive in ("Authorization", "authorization", "Cookie", "cookie", "X-Api-Key", "x-api-key"):
+                    new_req.headers.pop(sensitive, None)
+                    new_req.unredirected_hdrs.pop(sensitive, None)
+            return new_req
+
+    handlers: List[Any] = [_SafeRedirectHandler()]
+    if is_local_or_lan_endpoint(url):
+        handlers.append(urllib.request.ProxyHandler({}))
+    if context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(*handlers).open(req_or_url, timeout=timeout)
 
 
 def build_openai_resource_url(base_url: str, resource: str) -> str:
@@ -193,7 +279,8 @@ def _build_anthropic_request(
                     if (mime.startswith("image/") or mime == "application/pdf") and b64:
                         btype = "image" if mime.startswith("image/") else "document"
                         u_blocks.append({"type": btype, "source": {"type": "base64", "media_type": mime, "data": b64}})
-            u_blocks.append({"type": "text", "text": eff_txt or "Inspect the attached content."})
+            fallback_u = "Inspect the attached content." if (idx == last_u and media_uris) else (eff_txt or ".")
+            u_blocks.append({"type": "text", "text": eff_txt or fallback_u})
             _append_merged_turn(turns, "user", u_blocks, "content")
     if not turns or turns[0]["role"] != "user":
         turns.insert(0, {"role": "user", "content": [{"type": "text", "text": "Continue."}]})
@@ -222,7 +309,15 @@ def _sanitize_gemini_schema(node: Any) -> Any:
         return [_sanitize_gemini_schema(x) for x in node]
     if not isinstance(node, dict):
         return node
-    return {k: _sanitize_gemini_schema(v) for k, v in node.items() if k not in ("additionalProperties", "$schema", "title") and v is not None}
+    out: Dict[str, Any] = {}
+    for k, v in node.items():
+        if v is None or k in ("additionalProperties", "$schema", "title", "default", "examples"):
+            continue
+        if k == "properties" and isinstance(v, dict):
+            out[k] = {pk: _sanitize_gemini_schema(pv) for pk, pv in v.items() if pv is not None}
+        else:
+            out[k] = _sanitize_gemini_schema(v)
+    return out
 
 
 def _build_gemini_request(
@@ -270,7 +365,8 @@ def _build_gemini_request(
                     mime, b64 = _split_data_uri(uri)
                     if b64:
                         u_parts.append({"inlineData": {"mimeType": mime, "data": b64}})
-            u_parts.append({"text": eff_txt or "Inspect the attached media."})
+            fallback_g = "Inspect the attached media." if (idx == last_u and media_uris) else (eff_txt or ".")
+            u_parts.append({"text": eff_txt or fallback_g})
             _append_merged_turn(contents, "user", u_parts, "parts")
     if not contents or contents[0]["role"] != "user":
         contents.insert(0, {"role": "user", "parts": [{"text": "Continue."}]})
@@ -288,10 +384,12 @@ def _build_gemini_request(
             {"name": t["function"]["name"], "description": t["function"].get("description", ""), "parameters": _sanitize_gemini_schema(t["function"].get("parameters") or {"type": "object", "properties": {}})}
             for t in tools if isinstance(t, dict) and isinstance(t.get("function"), dict)
         ]
-        if decls and tool_choice != "none":
+        if decls:
             body["tools"] = [{"functionDeclarations": decls}]
-        elif tool_choice == "none":
-            body["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+            if tool_choice == "none":
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+            elif tool_choice == "required":
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
     headers = {"Content-Type": "application/json", "User-Agent": "companion-os/3.3", **({"x-goog-api-key": api_key} if api_key else {})}
     return url, headers, body
 

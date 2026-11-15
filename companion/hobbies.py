@@ -124,7 +124,7 @@ HOBBY_ROTATION: List[HobbySpec] = [
             "Execute your 'Spec-Driven Backlog Craftsman' self-dev hobby (follow `skills/engineering-workflow/SKILL.md`):\n"
             "1. Call `task_manage(action='list_all')` to inspect pending tasks and backlog items.\n"
             "2. Pick one pending item. If its capability is already implemented in `companion/`, verify its test coverage in a small test file.\n"
-            "3. Prefer extending smaller files well under the 550-line limit or authoring a 3-Tier `skills/<name>/` runbook. Include needed imports and usage in a single edit.\n"
+            "3. Prefer extending smaller files well under the 700-line limit or authoring a 3-Tier `skills/<name>/` runbook. Include needed imports and usage in a single edit.\n"
             "4. Run `system_doctor(run_tests=True)` to verify all 7 gates pass, and mark the backlog/task item `completed` via `task_manage`."
         ),
         preferred_tier="fast",

@@ -20,11 +20,13 @@ from companion.hobbies import (
     WebIdleHobbyWatcher,
     describe_operating_quadrant,
 )
+from companion.intake import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.safety import CheckpointManager, check_path_safety
 from companion.skill_forge import stage_and_promote_skill
 from companion.tool_schemas import phase_tool_context
 from companion.tools import dispatch
+from surfaces.api_extensions import register_service_reload_handler
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 
@@ -194,11 +196,11 @@ class TestTwoLeverSelfDevAndHobbies(unittest.TestCase):
                         self.assertIn("wrote", w_ext.lower())
 
                     # Human CLI `/selfdev on` unlocks core; `/selfdev off` re-locks it
-                    cli_on = handle_slash_command("/selfdev on", [])
+                    cli_on = handle_slash_command("/selfdev on", [], store=store)
                     self.assertIn("ON", str(cli_on))
                     self.assertTrue(settings.is_self_dev_enabled())
                     self.assertIsNone(check_path_safety(readme, write=True))
-                    cli_off = handle_slash_command("/selfdev off", [])
+                    cli_off = handle_slash_command("/selfdev off", [], store=store)
                     self.assertIn("OFF", str(cli_off))
                     self.assertFalse(settings.is_self_dev_enabled())
             finally:
@@ -371,6 +373,82 @@ class TestTwoLeverSelfDevAndHobbies(unittest.TestCase):
                 self.assertIn("Second job finished.", consumed)
                 self.assertEqual(peek_session_nudges(store=store), [])
             finally:
+                store.close()
+
+    def test_workflow_start_blocks_personal_goals_in_daily_driver_and_web_reload_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = MemoryStore(db_path=root / "reload_guard.db")
+            srv = None
+            try:
+                # 1. Step-0 intent router keeps personal goals & "our boards" in conversational coaching mode
+                dec = classify_turn_intent(
+                    "Lets utilize our boards, clean the barn is a long running goal across winter",
+                    store=store,
+                    root=root,
+                )
+                self.assertEqual(dec.mode, "GUIDED_CHANGE")
+
+                # 2. workflow_manage(action='start') is mechanically blocked when Self-Dev Mode is OFF on companion-self
+                #    and explicitly redirects personal/life goals to agile_manage(action='save_epic').
+                with workspace_context(settings.root, "companion-self"), memory_store_context(store):
+                    self.assertFalse(settings.is_self_dev_enabled())
+                    wf_out = dispatch(
+                        "workflow_manage",
+                        {
+                            "action": "start",
+                            "workflow_type": "self_evolution",
+                            "goal": "Clean the barn winter project",
+                        },
+                    )
+                    self.assertIn("SAFETY GUARD REJECTED", wf_out)
+                    self.assertIn("save_epic", wf_out)
+                    self.assertIsNone(store.get_active_workflow())
+
+                # 3. POST /api/reload enforces CSRF and dispatches registered reload callback
+                srv, sess = create_web_server(host="127.0.0.1", port=0, store=store)
+                code_no_csrf, _ = dispatch_raw_http(
+                    srv,
+                    "POST",
+                    "/api/reload",
+                    body=b'{"dry_run":true}',
+                    headers={"Origin": "http://127.0.0.1"},
+                )
+                self.assertEqual(code_no_csrf, 403)
+
+                code_dry, raw_dry = dispatch_raw_http(
+                    srv,
+                    "POST",
+                    "/api/reload",
+                    body=b'{"dry_run":true}',
+                    headers={"Origin": "http://127.0.0.1", "X-Companion-CSRF": sess.csrf_token},
+                )
+                self.assertEqual(code_dry, 200)
+                parsed_dry = json.loads(raw_dry)
+                self.assertTrue(parsed_dry["ok"])
+                self.assertTrue(parsed_dry["dry_run"])
+                self.assertTrue(isinstance(parsed_dry["command"], list) and len(parsed_dry["command"]) >= 2)
+
+                triggered = []
+                register_service_reload_handler(lambda: triggered.append(True))
+                try:
+                    with patch("surfaces.api_extensions.threading.Timer") as mock_timer:
+                        code_live, raw_live = dispatch_raw_http(
+                            srv,
+                            "POST",
+                            "/api/reload",
+                            body=b"{}",
+                            headers={"Origin": "http://127.0.0.1", "X-Companion-CSRF": sess.csrf_token},
+                        )
+                        self.assertEqual(code_live, 200)
+                        self.assertTrue(json.loads(raw_live)["reloading"])
+                        mock_timer.assert_called_once()
+                finally:
+                    register_service_reload_handler(None)
+            finally:
+                if srv is not None:
+                    srv.session.idle_watcher.stop()
+                    srv.server_close()
                 store.close()
 
 

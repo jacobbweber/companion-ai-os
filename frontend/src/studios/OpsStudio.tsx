@@ -6,10 +6,11 @@ import {
   FlaskConical,
   Play,
   RefreshCw,
+  RotateCw,
   ShieldCheck,
   Trash2,
 } from 'lucide-react';
-import { apiPost, callAction, fetchTelemetry } from '../api';
+import { apiPost, callAction, fetchTelemetry, reloadCompanionService } from '../api';
 import type {
   RoutineItem,
   SandboxClone,
@@ -32,6 +33,7 @@ export const OpsStudio: React.FC<OpsStudioProps> = ({ status, onOpenAutonomy, on
   const [doctorReport, setDoctorReport] = useState<string>('');
   const [sandboxOutput, setSandboxOutput] = useState<string>('');
   const [runningDoctor, setRunningDoctor] = useState(false);
+  const [reloading, setReloading] = useState(false);
 
   // Routine form
   const [rtId, setRtId] = useState('');
@@ -98,6 +100,25 @@ export const OpsStudio: React.FC<OpsStudioProps> = ({ status, onOpenAutonomy, on
           </p>
         </div>
         <div className="studio-actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={reloading}
+            title="Restart Companion Python service & reload UI with latest code"
+            onClick={async () => {
+              setReloading(true);
+              onToast('Reloading Companion backend & refreshing Studio...');
+              const r = await reloadCompanionService();
+              if (!r.ok) {
+                setReloading(false);
+                onToast(r.error || 'Could not reload service.');
+                return;
+              }
+              window.setTimeout(() => window.location.reload(), 250);
+            }}
+          >
+            <RotateCw size={13} /> {reloading ? 'Reloading...' : 'Reload Service'}
+          </button>
           <button
             type="button"
             className="btn"

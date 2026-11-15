@@ -31,8 +31,7 @@ class CheckpointManager:
         self._store = store
         self.file_backups_dir = self.backup_dir / "files"
         self.checkpoints_dir = self.backup_dir / "checkpoints"
-        self.file_backups_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        self._savepoints_cache: Optional[Tuple[Tuple[float, float, int], List[Dict[str, str]]]] = None
 
     def _get_store(self) -> Optional[Any]:
         if self._store is False:
@@ -94,12 +93,24 @@ class CheckpointManager:
         if not self.root.is_dir():
             return out
         for cur_r, dirs, fnames in os.walk(self.root):
-            dirs[:] = sorted(d for d in dirs if d not in self.SKIP_DIRS)
-            out.extend(Path(cur_r) / fn for fn in sorted(fnames))
+            cur_p = Path(cur_r)
+            dirs[:] = sorted(
+                d for d in dirs
+                if d not in self.SKIP_DIRS and not (cur_p / d).is_symlink()
+            )
+            for fn in sorted(fnames):
+                cand = cur_p / fn
+                if cand.is_symlink():
+                    try:
+                        if not cand.resolve().is_relative_to(self.root):
+                            continue
+                    except OSError:
+                        continue
+                out.append(cand)
         return out
 
     def create_checkpoint(self, label: str = "auto") -> Dict[str, Any]:
-        """Snapshot all tracked code, spec, and documentation files in the workspace."""
+        """Snapshot all tracked code, spec, and documentation files in the workspace (never `.env` or `secrets.env`)."""
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe_label = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in label)[:40]
         cp_id = f"cp_{stamp}_{safe_label}"
@@ -109,7 +120,9 @@ class CheckpointManager:
 
         manifest_files: List[Dict[str, str]] = []
         for item in self._iter_workspace_files():
-            if item.suffix.lower() not in self.TRACKED_EXTENSIONS and item.name not in (".env", ".gitignore", ".env.example"):
+            if item.name.lower() in (".env", "secrets.env") or (item.name.lower().startswith(".env.") and item.name.lower() != ".env.example"):
+                continue
+            if item.suffix.lower() not in self.TRACKED_EXTENSIONS and item.name not in (".gitignore", ".env.example"):
                 continue
             rel_path = item.relative_to(self.root)
             dest = files_dir / rel_path
@@ -178,8 +191,10 @@ class CheckpointManager:
         manifest_paths = {entry["path"] for entry in manifest.get("files", [])}
         for entry in manifest.get("files", []):
             rel = Path(entry["path"])
-            src = files_dir / rel
-            dst = self.root / rel
+            src = (files_dir / rel).resolve()
+            dst = (self.root / rel).resolve()
+            if not src.is_relative_to(files_dir.resolve()) or not dst.is_relative_to(self.root):
+                continue
             if src.is_file():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
@@ -244,10 +259,26 @@ class CheckpointManager:
     _RO_SKIP_SUFFIXES = {".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3"}
     _RO_SKIP_RELS = {"MEMORY.md", "IDENTITY.md", "secrets.env"}
 
+    def _iter_git_guard_files(self) -> List[Path]:
+        """Include `.git/config` and `.git/hooks/*` in read-only tree guards to block hook-persistence escapes."""
+        git_dir = self.root / ".git"
+        if not git_dir.is_dir():
+            return []
+        guarded: List[Path] = []
+        cfg = git_dir / "config"
+        if cfg.is_file() and not cfg.is_symlink():
+            guarded.append(cfg)
+        hooks_dir = git_dir / "hooks"
+        if hooks_dir.is_dir() and not hooks_dir.is_symlink():
+            for hp in sorted(hooks_dir.iterdir()):
+                if hp.is_file() and not hp.is_symlink():
+                    guarded.append(hp)
+        return guarded
+
     def snapshot_readonly_tree(self) -> Dict[str, bytes]:
         """Snapshot raw bytes of tracked files under `self.root` before read-only-locked subprocess execution (`ADR-007`/`ADR-019`)."""
         snap: Dict[str, bytes] = {}
-        for item in self._iter_workspace_files():
+        for item in [*self._iter_workspace_files(), *self._iter_git_guard_files()]:
             rel = str(item.relative_to(self.root)).replace("\\", "/")
             if rel in self._RO_SKIP_RELS or rel.startswith("data/") or item.suffix.lower() in self._RO_SKIP_SUFFIXES:
                 continue
@@ -261,7 +292,7 @@ class CheckpointManager:
         """Detect and immediately revert any subprocess modification, creation, or deletion inside `self.root` (`ADR-007`/`ADR-019`)."""
         reverted: List[str] = []
         current_rels: set[str] = set()
-        for item in self._iter_workspace_files():
+        for item in [*self._iter_workspace_files(), *self._iter_git_guard_files()]:
             rel = str(item.relative_to(self.root)).replace("\\", "/")
             if rel in self._RO_SKIP_RELS or rel.startswith("data/") or item.suffix.lower() in self._RO_SKIP_SUFFIXES:
                 continue
@@ -339,6 +370,7 @@ class CheckpointManager:
         blocked = [
             p for p in staged
             if Path(p).name.lower() in (".env", "secrets.env")
+            or (Path(p).name.lower().startswith(".env.") and Path(p).name.lower() != ".env.example")
             or Path(p).name.lower().endswith((".db", ".db-wal", ".db-shm", ".sqlite"))
             or ".companion_backups" in Path(p).parts
         ]
@@ -371,10 +403,17 @@ class CheckpointManager:
         }
 
     def list_git_savepoints(self, limit: int = 10) -> List[Dict[str, str]]:
-        """Return recent local Git commits in `self.root`, newest first."""
-        if not (self.root / ".git").exists():
+        """Return recent local Git commits in `self.root`, newest first (cached by `.git/HEAD` mtimes)."""
+        git_dir = self.root / ".git"
+        if not git_dir.exists():
             return []
-        rc, out = self._run_git(["log", f"-n{max(1, min(int(limit), 50))}", "--pretty=format:%h|%cs|%s"])
+        eff_lim = max(1, min(int(limit), 50))
+        head_mt = (git_dir / "HEAD").stat().st_mtime if (git_dir / "HEAD").is_file() else 0.0
+        logs_mt = (git_dir / "logs" / "HEAD").stat().st_mtime if (git_dir / "logs" / "HEAD").is_file() else 0.0
+        cache_key = (head_mt, logs_mt, eff_lim)
+        if self._savepoints_cache is not None and self._savepoints_cache[0] == cache_key:
+            return list(self._savepoints_cache[1])
+        rc, out = self._run_git(["log", f"-n{eff_lim}", "--pretty=format:%h|%cs|%s"])
         if rc != 0 or not out:
             return []
         entries: List[Dict[str, str]] = []
@@ -382,7 +421,8 @@ class CheckpointManager:
             parts = ln.split("|", 2)
             if len(parts) == 3:
                 entries.append({"commit": parts[0].strip(), "date": parts[1].strip(), "subject": parts[2].strip()})
-        return entries
+        self._savepoints_cache = (cache_key, entries)
+        return list(entries)
 
 
 checkpoint_manager = CheckpointManager()

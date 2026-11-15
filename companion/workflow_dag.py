@@ -377,7 +377,9 @@ def _evaluate_edge_condition(condition: str, node_passed: bool, output_text: str
 def is_node_output_passed(output: str) -> bool:
     """Determine whether a workflow node or step output represents a clean pass."""
     text = (output or "").strip()
-    if text.startswith(("error:", "exit=1", "SYNTAX GUARD REJECTED", "SKILL LINTER REJECTED", "WORKFLOW RECIPE LINTER REJECTED", "RISK GATE REJECTED", "PHASE TOOL GATE REJECTED")):
+    if re.match(r"^exit=(?!0\b)-?\d+\b", text):
+        return False
+    if text.startswith(("error:", "SYNTAX GUARD REJECTED", "SKILL LINTER REJECTED", "WORKFLOW RECIPE LINTER REJECTED", "RISK GATE REJECTED", "PHASE TOOL GATE REJECTED")):
         return False
     return not any(m in text for m in ("ISSUES DETECTED (FAIL)", "SPEC DRIFT / SPRAWL DETECTED (FAIL)", "HYGIENE ISSUES DETECTED"))
 

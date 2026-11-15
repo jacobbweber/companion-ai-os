@@ -71,28 +71,31 @@ def _emergency_boot_rollback(root_dir: Path, err: Exception) -> bool:
     latest = cps[0]
     try:
         manifest = json.loads((latest / "manifest.json").read_text(encoding="utf-8"))
-        ws_dir = latest / "workspace"
+        ws_dir = (latest / "workspace").resolve()
+        root_res = root_dir.resolve()
         manifest_paths = {entry["path"] for entry in manifest.get("files", [])}
         for entry in manifest.get("files", []):
             rel = Path(entry["path"])
-            src = ws_dir / rel
-            dst = root_dir / rel
-            if src.is_file():
+            if rel.is_absolute() or ".." in rel.parts:
+                continue
+            src = (ws_dir / rel).resolve()
+            dst = (root_res / rel).resolve()
+            if src.is_relative_to(ws_dir) and dst.is_relative_to(root_res) and src.is_file() and not src.is_symlink():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
         skip_dirs = {
-            ".git", "__pycache__", ".companion_backups", "data", "venv", ".venv", "node_modules",
+            ".git", "__pycache__", ".companion_backups", "data", "frontend", "venv", ".venv", "node_modules",
             ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "dist", "build", "coverage",
         }
         tracked_exts = {".py", ".md", ".json", ".toml", ".yaml", ".yml", ".ini", ".html", ".css", ".js"}
-        for cur_dir, dirs, files in os.walk(root_dir):
+        for cur_dir, dirs, files in os.walk(root_res):
             dirs[:] = [d for d in sorted(dirs) if d not in skip_dirs]
             cur_path = Path(cur_dir)
             for fname in sorted(files):
                 item = cur_path / fname
                 if item.suffix.lower() in tracked_exts:
-                    rel_str = str(item.relative_to(root_dir)).replace("\\", "/")
-                    if rel_str not in manifest_paths:
+                    rel_str = str(item.relative_to(root_res)).replace("\\", "/")
+                    if rel_str not in manifest_paths and not rel_str.startswith("surfaces/static/"):
                         try:
                             item.unlink()
                         except Exception:
@@ -136,6 +139,7 @@ _BOOT_ARGV = _extract_boot_env_flags(sys.argv[1:]) if __name__ == "__main__" els
 
 for _boot_attempt in range(2):
     try:
+        from companion import __version__
         from companion.agent import handle_slash_command, run_agent_turn
         from companion.config import settings
         from companion.context import build_system_prompt, is_identity_bootstrapped, run_first_boot_onboarding
@@ -176,7 +180,16 @@ HTTP_TIMEOUT = settings.http_timeout
 OUT_LIMIT = settings.out_limit
 SEARCH_LIMIT = settings.search_limit
 
-SYSTEM_PROMPT = build_system_prompt()
+_CACHED_SYSTEM_PROMPT: Optional[str] = None
+
+
+def __getattr__(name: str) -> str:
+    global _CACHED_SYSTEM_PROMPT
+    if name == "SYSTEM_PROMPT":
+        if _CACHED_SYSTEM_PROMPT is None:
+            _CACHED_SYSTEM_PROMPT = build_system_prompt()
+        return _CACHED_SYSTEM_PROMPT
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def run(messages):
@@ -249,7 +262,7 @@ def _read_interactive_input_with_idle_hobbies() -> Optional[str]:
 
 def _parse_host_port_args(rest: List[str]) -> tuple[str, Optional[int], bool]:
     """Parse optional `--host <h>`, `--port <p>`, `--no-browser`, or positional `[port]` flags."""
-    host = os.environ.get("COMPANION_WEB_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    host = settings.web_host
     port_arg: Optional[int] = None
     auto_open = True
     idx = 0
@@ -342,6 +355,12 @@ def _handle_cli_args(argv: List[str], store) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     argv = _extract_boot_env_flags(sys.argv[1:])
+    if argv and argv[0].strip() in ("--doctor", "-d", "/doctor"):
+        rep = run_system_doctor(run_tests=True)
+        print(rep["summary"])
+        if not rep["healthy"]:
+            sys.exit(1)
+        return
     store = get_memory_store()
     store.sync_memory_md()
     if settings.is_self_dev_enabled():
@@ -354,7 +373,7 @@ def main() -> None:
 
     hobby_badge = "ON" if store.is_hobby_mode_enabled() else "OFF"
     sd_badge = "ON" if store.is_self_dev_mode_enabled() else "OFF(RO)"
-    print(f"Companion AI OS v3.2  |  model={settings.model}  |  project={settings.get_workspace().project_id}  |  hobbies={hobby_badge}  |  self_dev={sd_badge}")
+    print(f"Companion AI OS v{__version__[:3]}  |  model={settings.model}  |  project={settings.get_workspace().project_id}  |  hobbies={hobby_badge}  |  self_dev={sd_badge}")
     print("Commands: /status, /selfdev, /hobby, /jobs, /wiki, /vault, /endpoints, /mcp, /routines, /trust, /goal, /doctor, /help, exit")
     if not is_identity_bootstrapped(store=store) and sys.stdin.isatty():
         run_first_boot_onboarding(store=store)

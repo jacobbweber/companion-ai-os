@@ -71,10 +71,7 @@ class CalendarManager:
     @property
     def store(self) -> MemoryStore:
         mem = self._store or get_memory_store()
-        with mem._lock:
-            for ddl in CALENDAR_DDL:
-                mem.conn.execute(ddl)
-            mem.conn.commit()
+        mem.ensure_schema("calendar", lambda m: [m.conn.execute(ddl) for ddl in CALENDAR_DDL] and None)
         return mem
 
     def upsert_event(
@@ -156,7 +153,7 @@ class CalendarManager:
                     seen_days[d_key] = (t_str, 1)
                 else:
                     seen_days[d_key] = (seen_days[d_key][0], seen_days[d_key][1] + 1)
-                cursor = nxt if (nxt - cursor) >= timedelta(hours=1) else (nxt + timedelta(hours=2))
+                cursor = nxt if nxt > cursor else (cursor + timedelta(minutes=1))
             for d_key, (first_hhmm, cnt) in seen_days.items():
                 freq_note = f" ({expr})" if cnt > 1 else f" @ {first_hhmm} UTC"
                 projected.append({
@@ -180,7 +177,7 @@ class CalendarManager:
         s_dt = _parse_ymd(start_date) if start_date else (now_dt.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_dt.weekday()))
         if s_dt is None:
             return {"ok": False, "error": f"Invalid `start_date` '{start_date}'; expected YYYY-MM-DD."}
-        span = max(1, min(120, int(days or 35)))
+        span = max(1, min(180, int(days or 35)))
         e_dt = (_parse_ymd(end_date) if end_date else None) or (s_dt + timedelta(days=span - 1))
         s_ymd, e_ymd = s_dt.strftime("%Y-%m-%d"), e_dt.strftime("%Y-%m-%d")
 
@@ -199,18 +196,32 @@ class CalendarManager:
         agile = get_agile_manager(store=self.store)
         sprints = [sp for sp in agile.list_sprints(24) if sp["start_date"] <= e_ymd and sp["end_date"] >= s_ymd]
         board_view = agile.get_board_view(board_id or "all-active-sprint")
+        hz_days = {"now": 30, "next": 90, "later": 180, "someday": 365}
+        epics: List[Dict[str, Any]] = []
+        for ep in agile.list_epics(board_id=board_id):
+            eff_s = _norm_date_prefix(ep.get("start_date") or "") or _norm_date_prefix(ep.get("created_at") or "") or today_s
+            t_ymd = _norm_date_prefix(ep.get("target_date") or "")
+            s_obj = _parse_ymd(eff_s) or now_dt
+            proj_end = t_ymd or (s_obj + timedelta(days=hz_days.get(ep.get("horizon") or "later", 90))).strftime("%Y-%m-%d")
+            epics.append({**ep, "effective_start_date": eff_s, "roadmap_end_date": max(eff_s, proj_end)})
+            if t_ymd and s_ymd <= t_ymd <= e_ymd:
+                items.append({
+                    "id": f"epic_{ep['epic_id']}", "date": t_ymd, "time": "", "source_type": "epic_milestone",
+                    "kind": ep["horizon"], "title": f"Epic Target: {ep['title']}", "all_day": True,
+                    "board_id": ep["board_id"], "epic_id": ep["epic_id"],
+                })
         for c in agile.list_dated_cards(board_id=board_id):
             if c["planned_date"] and s_ymd <= c["planned_date"] <= e_ymd:
                 items.append({
                     "id": f"plan_{c['card_id']}", "date": c["planned_date"], "time": "", "source_type": "sprint_task",
                     "kind": c["day_slot"], "title": c["title"], "all_day": True, "board_id": c["board_id"],
-                    "card_id": c["card_id"], "status": c["status"], "effort_size": c["effort_size"],
+                    "card_id": c["card_id"], "epic_id": c.get("epic_id", ""), "status": c["status"], "effort_size": c["effort_size"],
                 })
             if c["due_date"] and s_ymd <= c["due_date"] <= e_ymd:
                 items.append({
                     "id": f"due_{c['card_id']}", "date": c["due_date"], "time": "", "source_type": "deadline",
                     "kind": "due_date", "title": f"Due: {c['title']}", "all_day": True, "board_id": c["board_id"],
-                    "card_id": c["card_id"], "status": c["status"], "effort_size": c["effort_size"],
+                    "card_id": c["card_id"], "epic_id": c.get("epic_id", ""), "status": c["status"], "effort_size": c["effort_size"],
                 })
 
         if not board_id:
@@ -239,9 +250,9 @@ class CalendarManager:
 
         return {
             "ok": True, "today": today_s, "start_date": s_ymd, "end_date": e_ymd,
-            "sprints": sprints, "active_sprint": board_view.get("active_sprint"),
+            "sprints": sprints, "epics": epics, "active_sprint": board_view.get("active_sprint"),
             "items": items, "by_date": by_date,
-            "summary": f"Calendar `{s_ymd}` .. `{e_ymd}`: {len(items)} item(s), {len(sprints)} sprint window(s).",
+            "summary": f"Calendar `{s_ymd}` .. `{e_ymd}`: {len(items)} item(s), {len(sprints)} sprint window(s), {len(epics)} epic(s).",
         }
 
 

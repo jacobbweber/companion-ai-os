@@ -243,8 +243,10 @@ def extract_wikilinks(text: str) -> List[str]:
 
 def _parse_scalar(val: str) -> Any:
     clean = val.strip()
-    if (clean.startswith('"') and clean.endswith('"')) or (clean.startswith("'") and clean.endswith("'")):
-        return clean[1:-1]
+    if clean.startswith('"') and clean.endswith('"') and len(clean) >= 2:
+        return re.sub(r'\\(["\\])', r"\1", clean[1:-1])
+    if clean.startswith("'") and clean.endswith("'") and len(clean) >= 2:
+        return clean[1:-1].replace("''", "'").replace(r"\'", "'")
     if clean.lower() in ("true", "false"):
         return clean.lower() == "true"
     if re.fullmatch(r"-?\d+", clean):
@@ -324,8 +326,8 @@ def _format_yaml_value(v: Any) -> str:
     s = str(v).replace("\n", " ").strip()
     if not s:
         return '""'
-    needs_q = any(ch in s for ch in (":", "#", "[", "]", "{", "}", ",")) or s.lower() in ("true", "false", "null")
-    return '"' + s.replace('"', '\\"') + '"' if needs_q else s
+    needs_q = any(ch in s for ch in (":", "#", "[", "]", "{", "}", ",", '"', "'")) or s.lower() in ("true", "false", "null")
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"' if needs_q else s
 
 
 def render_frontmatter(meta: Dict[str, Any], body: str) -> str:
@@ -522,7 +524,8 @@ def validate_curated_note(
         headings_norm = [re.sub(r"[^a-z0-9]+", " ", h.lower()).strip() for h in _HEADING_RE.findall(clean_body)]
         for req_sec in tpl_info["required_sections"]:
             target_norm = re.sub(r"[^a-z0-9]+", " ", str(req_sec).lower()).strip()
-            if not any(target_norm in h or h in target_norm for h in headings_norm if h):
+            min_prefix = target_norm.split(" ")[0] if target_norm else ""
+            if not any(target_norm in h or (len(h) >= max(4, len(min_prefix)) and target_norm.startswith(h)) for h in headings_norm if h):
                 errors.append(f"Missing required section `## {req_sec}` mandated by template `{tpl_slug}`.")
 
     rel_meta = meta.get("related") if isinstance(meta.get("related"), list) else []

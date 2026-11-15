@@ -478,6 +478,21 @@ def revert_curation(engine: WikiEngine, tx_id_or_path: str, actor: str = "user",
             dst.write_text(render_frontmatter(meta, body), encoding="utf-8", newline="\n")
             restored_inbox.append(orig_in)
 
+    repointed_set = {str(p) for p in (target.get("repointed_links") or []) if p}
+    if repointed_set:
+        rev_dir = engine.root / "04_archive" / "revisions"
+        if rev_dir.is_dir():
+            for rev_file in sorted(rev_dir.glob("*_link_repoint_*.md")):
+                r_meta, r_body = parse_frontmatter(rev_file.read_text(encoding="utf-8", errors="replace"))
+                orig_p = str(r_meta.get("original_path") or "")
+                if r_meta.get("curation_tx_id") == tx_id and orig_p in repointed_set and orig_p not in prior_kb_map:
+                    for k_drop in ("archive_reason", "superseded_by", "original_path", "curation_tx_id"):
+                        r_meta.pop(k_drop, None)
+                    r_meta["status"] = "active"
+                    dst_r = engine.root / orig_p
+                    dst_r.parent.mkdir(parents=True, exist_ok=True)
+                    dst_r.write_text(render_frontmatter(r_meta, r_body), encoding="utf-8", newline="\n")
+
     with engine.store._lock:
         engine.store.conn.execute("UPDATE wiki_curation_history SET reverted = 1 WHERE tx_id = ?", (tx_id,))
         engine.store.conn.commit()

@@ -94,15 +94,21 @@ def compute_next_run_utc(schedule_expr: str, after_dt: Optional[datetime] = None
 
     fields = expr.split(" ")
     if len(fields) == 5:
+        dow_expr = re.sub(r"(?<!\d)7(?!\d)", "0", fields[4])
+        both_dom_dow = fields[2].strip() != "*" and dow_expr.strip() != "*"
         probe = base + timedelta(minutes=1)
         for _ in range(525_600):
             cron_dow = (probe.weekday() + 1) % 7
+            dom_ok = _match_cron_field(fields[2], probe.day, 1, 31)
+            dow_ok = _match_cron_field(dow_expr, cron_dow, 0, 6) or (
+                "-" in fields[4] and _match_cron_field(fields[4], 7 if cron_dow == 0 else cron_dow, 0, 7)
+            )
+            day_ok = (dom_ok or dow_ok) if both_dom_dow else (dom_ok and dow_ok)
             if (
                 _match_cron_field(fields[0], probe.minute, 0, 59)
                 and _match_cron_field(fields[1], probe.hour, 0, 23)
-                and _match_cron_field(fields[2], probe.day, 1, 31)
                 and _match_cron_field(fields[3], probe.month, 1, 12)
-                and (_match_cron_field(fields[4], cron_dow, 0, 6) or (fields[4] == "7" and cron_dow == 0))
+                and day_ok
             ):
                 return probe
             probe += timedelta(minutes=1)
@@ -127,10 +133,7 @@ class RoutineManager:
     @property
     def store(self) -> MemoryStore:
         mem = self._store or get_memory_store()
-        with mem._lock:
-            for ddl in ROUTINES_DDL:
-                mem.conn.execute(ddl)
-            mem.conn.commit()
+        mem.ensure_schema("routines", lambda m: [m.conn.execute(ddl) for ddl in ROUTINES_DDL] and None)
         return mem
 
     def create_or_update_routine(

@@ -25,6 +25,7 @@ from companion.llm_wire import (
     is_local_or_lan_endpoint,
     prepare_wire_request,
     read_wire_response,
+    urlopen_safe,
 )
 from companion.streaming import emit_stream_event, has_stream_sink, rescue_text_tool_calls, strip_thinking_tags
 from companion.telemetry import telemetry
@@ -33,6 +34,9 @@ from companion.telemetry import telemetry
 _CALL_PRIORITY: contextvars.ContextVar[str] = contextvars.ContextVar("companion_llm_priority", default="foreground")
 _ABORT_CHECK: contextvars.ContextVar[Optional[Callable[[], bool]]] = contextvars.ContextVar("companion_llm_abort_check", default=None)
 _ACTIVE_TIER: contextvars.ContextVar[str] = contextvars.ContextVar("companion_llm_tier", default="")
+_GLOBAL_FG_LOCK = threading.Lock()
+_GLOBAL_FG_COUNT = 0
+_GLOBAL_FG_THREADS: Dict[int, int] = {}
 
 
 class ModelGate:
@@ -51,16 +55,33 @@ class ModelGate:
     @contextlib.contextmanager
     def foreground_turn(self) -> Iterator[None]:
         """Mark an interactive user turn as active; background LLM calls wait until it finishes."""
+        global _GLOBAL_FG_COUNT
+        tid = threading.get_ident()
         tok = _CALL_PRIORITY.set("foreground")
+        with _GLOBAL_FG_LOCK:
+            _GLOBAL_FG_COUNT += 1
+            _GLOBAL_FG_THREADS[tid] = _GLOBAL_FG_THREADS.get(tid, 0) + 1
         with self._cond:
             self._fg_active += 1
             self._cond.notify_all()
         try:
             yield
         finally:
+            with _GLOBAL_FG_LOCK:
+                _GLOBAL_FG_COUNT = max(0, _GLOBAL_FG_COUNT - 1)
+                rem = _GLOBAL_FG_THREADS.get(tid, 1) - 1
+                if rem <= 0:
+                    _GLOBAL_FG_THREADS.pop(tid, None)
+                else:
+                    _GLOBAL_FG_THREADS[tid] = rem
             with self._cond:
                 self._fg_active = max(0, self._fg_active - 1)
                 self._cond.notify_all()
+            with _GATES_LOCK:
+                extra_gates = list(_ENDPOINT_GATES.values())
+            for g in extra_gates:
+                with g._cond:
+                    g._cond.notify_all()
             _CALL_PRIORITY.reset(tok)
 
     @contextlib.contextmanager
@@ -75,12 +96,18 @@ class ModelGate:
             _CALL_PRIORITY.reset(p_tok)
 
     @contextlib.contextmanager
-    def acquire_call(self, priority: Optional[str] = None) -> Iterator[None]:
-        """Serialize same-endpoint LLM calls (`_exec_lock`) so concurrent requests never thrash model swaps."""
+    def acquire_call(self, priority: Optional[str] = None, serialize: bool = True) -> Iterator[None]:
+        """Serialize same-endpoint local LLM calls (`_exec_lock`) while yielding background calls to foreground turns."""
         eff_prio = (priority or _CALL_PRIORITY.get() or "foreground").lower()
         abort_fn = _ABORT_CHECK.get()
-        if eff_prio != "background":
-            with self._exec_lock:
+        tid = threading.get_ident()
+        with _GLOBAL_FG_LOCK:
+            on_fg_thread = tid in _GLOBAL_FG_THREADS
+        if eff_prio != "background" or on_fg_thread:
+            if serialize:
+                with self._exec_lock:
+                    yield
+            else:
                 yield
             return
 
@@ -90,14 +117,19 @@ class ModelGate:
                 while True:
                     if abort_fn is not None and abort_fn():
                         raise InterruptedError("Background LLM call preempted by foreground user activity.")
-                    if self._fg_active == 0:
+                    with _GLOBAL_FG_LOCK:
+                        any_fg = _GLOBAL_FG_COUNT > 0
+                    if self._fg_active == 0 and not any_fg:
                         break
                     self._cond.wait(timeout=0.05)
                 self._bg_in_flight += 1
             finally:
                 self._bg_waiting = max(0, self._bg_waiting - 1)
         try:
-            with self._exec_lock:
+            if serialize:
+                with self._exec_lock:
+                    yield
+            else:
                 yield
         finally:
             with self._cond:
@@ -179,7 +211,7 @@ def probe_gateway_loaded_model(base_url: str, api_key: str = "", timeout: float 
     """Query swap-gateway `/health` (e.g. vLLM swap gateway) for `(loaded_model, upstream_healthy)`."""
     headers = {"User-Agent": "companion-os/2.3", **({"Authorization": f"Bearer {api_key}"} if api_key else {})}
     try:
-        with urllib.request.urlopen(urllib.request.Request(f"{base_url.rstrip('/')}/health", method="GET", headers=headers), timeout=timeout) as r:
+        with urlopen_safe(urllib.request.Request(f"{base_url.rstrip('/')}/health", method="GET", headers=headers), timeout=timeout, allow_private_lan=True, allow_redirects=False) as r:
             data = json.loads(r.read().decode("utf-8", errors="replace"))
         if isinstance(data, dict) and ("loaded_model" in data or "upstream_healthy" in data):
             loaded = str(data["loaded_model"]) if data.get("loaded_model") else None
@@ -219,14 +251,14 @@ def discover_provider_models(base_url: str, api_key: str = "", dialect: str = "o
         if d == "anthropic_messages":
             m_url = f"{base}/models" if base.lower().endswith("/v1") else f"{base}/v1/models"
             hdrs = {"User-Agent": "companion-os/3.3", "anthropic-version": "2023-06-01", **({"x-api-key": api_key} if api_key else {})}
-            with urllib.request.urlopen(urllib.request.Request(m_url, method="GET", headers=hdrs), timeout=timeout) as r:
+            with urlopen_safe(urllib.request.Request(m_url, method="GET", headers=hdrs), timeout=timeout, allow_private_lan=True, allow_redirects=False) as r:
                 data = json.loads(r.read().decode("utf-8", errors="replace"))
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
             items = [{"id": str(m["id"]), "label": str(m.get("display_name") or m["id"]), "loaded": False, "context_window": 200000} for m in (data.get("data") or []) if isinstance(m, dict) and m.get("id")]
         elif d == "gemini_native":
             g_base = base if base.lower().endswith(("/v1beta", "/v1alpha", "/v1")) else f"{base}/v1beta"
             hdrs = {"User-Agent": "companion-os/3.3", **({"x-goog-api-key": api_key} if api_key else {})}
-            with urllib.request.urlopen(urllib.request.Request(f"{g_base}/models", method="GET", headers=hdrs), timeout=timeout) as r:
+            with urlopen_safe(urllib.request.Request(f"{g_base}/models", method="GET", headers=hdrs), timeout=timeout, allow_private_lan=True, allow_redirects=False) as r:
                 data = json.loads(r.read().decode("utf-8", errors="replace"))
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
             items = [
@@ -239,7 +271,7 @@ def discover_provider_models(base_url: str, api_key: str = "", dialect: str = "o
             hdrs = {"User-Agent": "companion-os/3.3", **({"Authorization": f"Bearer {api_key}"} if api_key else {})}
             if "openrouter.ai" in base.lower():
                 hdrs["HTTP-Referer"], hdrs["X-Title"] = "https://companion.local", "Companion AI OS"
-            with urllib.request.urlopen(urllib.request.Request(m_url, method="GET", headers=hdrs), timeout=timeout) as r:
+            with urlopen_safe(urllib.request.Request(m_url, method="GET", headers=hdrs), timeout=timeout, allow_private_lan=True, allow_redirects=False) as r:
                 raw = r.read().decode("utf-8", errors="replace")
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
             data = json.loads(raw) if raw.strip().startswith(("{", "[")) else {}
@@ -248,7 +280,7 @@ def discover_provider_models(base_url: str, api_key: str = "", dialect: str = "o
             if raw_models and not loaded_ids and is_local_or_lan_endpoint(base):
                 ps_root = re.sub(r"/(?:v1|api/v1)$", "", base, flags=re.I)
                 try:
-                    with urllib.request.urlopen(urllib.request.Request(f"{ps_root}/api/ps", method="GET", headers=hdrs), timeout=0.8) as ps_r:
+                    with urlopen_safe(urllib.request.Request(f"{ps_root}/api/ps", method="GET", headers=hdrs), timeout=0.8, allow_private_lan=True, allow_redirects=False) as ps_r:
                         ps_data = json.loads(ps_r.read().decode("utf-8", errors="replace"))
                     loaded_ids = {str(x.get("name") or x.get("model")) for x in (ps_data.get("models") or []) if isinstance(x, dict)}
                 except Exception:
@@ -349,8 +381,13 @@ def recover_empty_synthesis(
             {"role": "assistant", "content": "I have reviewed the tool outputs."},
             {"role": "user", "content": prompt_text},
         ]
+    elif messages and messages[-1].get("role") == "user":
+        retry_msgs = messages + [
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": prompt_text},
+        ]
     else:
-        retry_msgs = messages + [{"role": "system", "content": prompt_text}]
+        retry_msgs = messages + [{"role": "user", "content": prompt_text}]
     try:
         retry_data = chat_fn(retry_msgs, None, "none")
         retry_msg = (retry_data.get("choices") or [{}])[0].get("message") or {}
@@ -427,10 +464,11 @@ def _post_completion(
     )
     payload = json.dumps(body).encode("utf-8")
     gate = get_endpoint_gate(target_base_url)
-    is_local_oai = eff_dialect == "openai_compat" and is_local_or_lan_endpoint(target_base_url)
+    is_local = is_local_or_lan_endpoint(target_base_url)
+    is_local_oai = eff_dialect == "openai_compat" and is_local
     healed_400, tried_ollama_fb = False, False
 
-    with gate.acquire_call(priority=priority):
+    with gate.acquire_call(priority=priority, serialize=is_local):
         eff_timeout, is_swap = _resolve_swap_window(gate, target_base_url, target_model, target_key, target_timeout) if is_local_oai else (target_timeout, False)
         max_attempts = max(max_retries + 1, 8) if is_swap else (max_retries + 1)
         try:
@@ -438,7 +476,7 @@ def _post_completion(
             while attempt < max_attempts:
                 req = urllib.request.Request(target_url, data=payload, method="POST", headers=headers)
                 try:
-                    with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
+                    with urlopen_safe(req, timeout=eff_timeout, allow_private_lan=True, allow_redirects=False) as resp:
                         data = read_wire_response(eff_dialect, resp)
                     if not isinstance(data, dict) or not data.get("choices"):
                         raise RuntimeError(f"Malformed LLM response (missing choices): {str(data)[:300]}")

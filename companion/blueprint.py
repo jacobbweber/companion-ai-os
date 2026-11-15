@@ -162,7 +162,7 @@ def _revise_existing_blueprint(
     contract = resolve_workspace_contract(target_root, is_self_project=settings.get_workspace().is_self_project and target_root == settings.root.resolve())
 
     for t in mem.get_all_tasks(status_filter="pending"):
-        if t.get("workflow_id") in (wf_id, None):
+        if t.get("workflow_id") == wf_id:
             mem.update_task(int(t["id"]), status="cancelled", verification_result="Superseded by Blueprint revision")
 
     half = max(4, max_phase_iters // 2)

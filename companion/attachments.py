@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -35,6 +36,7 @@ from companion.vault import get_vault_manager
 from companion.wiki_engine import get_wiki_engine
 
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB per file
+MAX_UNCOMPRESSED_STREAM_BYTES = 32 * 1024 * 1024  # 32 MB zip/zlib bomb cap
 INLINE_DOC_CHAR_LIMIT = 12_000
 MAX_EXTRACTED_CHARS = 250_000
 
@@ -100,8 +102,9 @@ def _attachments_base_dir(store: MemoryStore) -> Path:
 
 
 def _ensure_attachments_schema(store: MemoryStore) -> None:
-    with store._lock:
-        store.conn.execute(
+    store.ensure_schema(
+        "attachments",
+        lambda m: m.conn.execute(
             """CREATE TABLE IF NOT EXISTS chat_attachments (
                 attachment_id TEXT PRIMARY KEY, filename TEXT NOT NULL, mime_type TEXT NOT NULL,
                 kind TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
@@ -111,7 +114,19 @@ def _ensure_attachments_schema(store: MemoryStore) -> None:
                 width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
             )"""
         )
-        store.conn.commit()
+        and None,
+    )
+
+
+def _read_zip_member_safe(zf: zipfile.ZipFile, name: str, max_bytes: int = MAX_UNCOMPRESSED_STREAM_BYTES) -> bytes:
+    info = zf.getinfo(name)
+    if info.file_size > max_bytes:
+        raise ValueError(f"Archive entry `{name}` exceeds {max_bytes // (1024 * 1024)} MB uncompressed limit.")
+    with zf.open(info) as fh:
+        data = fh.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"Archive entry `{name}` exceeds {max_bytes // (1024 * 1024)} MB uncompressed limit.")
+    return data
 
 
 def _format_size(num_bytes: int) -> str:
@@ -130,7 +145,7 @@ def inspect_image_bytes(raw: bytes) -> Optional[Tuple[str, int, int]]:
         return "image/gif", int(w), int(h)
     if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP" and len(raw) >= 30:
         chunk = raw[12:16]
-        if chunk == b"VP8X" and len(raw) >= 30:
+        if chunk == "VP8X" or chunk == b"VP8X":
             w = 1 + int.from_bytes(raw[24:27], "little")
             h = 1 + int.from_bytes(raw[27:30], "little")
             return "image/webp", w, h
@@ -162,9 +177,10 @@ def _extract_pdf_stdlib_fallback(raw: bytes) -> str:
         chunk = m.group(1)
         for candidate in (chunk,):
             try:
-                dec = zlib.decompress(candidate)
+                decomp = zlib.decompressobj()
+                dec = decomp.decompress(candidate, 4 * 1024 * 1024)
             except Exception:
-                dec = chunk
+                dec = chunk[: 4 * 1024 * 1024]
             txt = dec.decode("latin-1", errors="ignore")
             for lit in re.findall(r"\(([^()\\]*(?:\\.[^()\\]*)*)\)\s*Tj", txt):
                 cleaned = lit.replace(r"\(", "(").replace(r"\)", ")").replace(r"\n", "\n").strip()
@@ -178,25 +194,29 @@ def _extract_pdf_stdlib_fallback(raw: bytes) -> str:
 
 
 def _extract_pdf(pdf_path: Path, raw: bytes) -> Tuple[str, str]:
-    """Extract PDF text via Ring-1 `scripts/extract_pdf.py` (`pypdf`), falling back to stdlib stream scan."""
+    """Extract PDF text via Ring-1 `scripts/extract_pdf.py` (`uv run --script` / `pypdf`), falling back to stdlib stream scan."""
     script = (settings.root / "skills" / "web-surface-dev" / "scripts" / "extract_pdf.py").resolve()
     if script.is_file():
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-B", str(script), str(pdf_path)],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                data = json.loads(proc.stdout.strip().splitlines()[-1])
-                if data.get("ok"):
-                    pages = int(data.get("pages") or 0)
-                    txt = str(data.get("text") or "").strip()
-                    label = f"{pages} page{'s' if pages != 1 else ''}"
-                    if not txt:
-                        txt = "[Scanned or image-only PDF: no selectable text layer found. Attach page screenshots for vision OCR.]"
-                    return txt, label
-        except Exception:
-            pass
+        uv_bin = shutil.which("uv")
+        cmds = (
+            ([uv_bin, "run", "--script", str(script), str(pdf_path)], [sys.executable, "-B", str(script), str(pdf_path)])
+            if uv_bin
+            else ([sys.executable, "-B", str(script), str(pdf_path)],)
+        )
+        for cmd in cmds:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    data = json.loads(proc.stdout.strip().splitlines()[-1])
+                    if data.get("ok"):
+                        pages = int(data.get("pages") or 0)
+                        txt = str(data.get("text") or "").strip()
+                        label = f"{pages} page{'s' if pages != 1 else ''}"
+                        if not txt:
+                            txt = "[Scanned or image-only PDF: no selectable text layer found. Attach page screenshots for vision OCR.]"
+                        return txt, label
+            except Exception:
+                continue
     fb = _extract_pdf_stdlib_fallback(raw)
     return (fb or "[PDF attached — no selectable text stream extracted.]"), "PDF"
 
@@ -205,7 +225,7 @@ def _extract_docx(raw: bytes) -> Tuple[str, str]:
     """Extract paragraphs and Markdown tables from `.docx` in 100% Python stdlib."""
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        xml_bytes = zf.read("word/document.xml")
+        xml_bytes = _read_zip_member_safe(zf, "word/document.xml")
     root = ET.fromstring(xml_bytes)
     body = root.find("w:body", ns)
     if body is None:
@@ -245,14 +265,14 @@ def _extract_xlsx(raw: bytes) -> Tuple[str, str]:
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
         shared: List[str] = []
         if "xl/sharedStrings.xml" in zf.namelist():
-            s_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            s_root = ET.fromstring(_read_zip_member_safe(zf, "xl/sharedStrings.xml"))
             for si in s_root.iter():
                 if si.tag.rsplit("}", 1)[-1] == "si":
-                    shared.append("".join(( node.text or "") for node in si.iter() if node.tag.rsplit("}", 1)[-1] == "t"))
+                    shared.append("".join((node.text or "") for node in si.iter() if node.tag.rsplit("}", 1)[-1] == "t"))
         sheet_names = sorted(n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
         sections: List[str] = []
         for s_idx, s_name in enumerate(sheet_names, 1):
-            s_root = ET.fromstring(zf.read(s_name))
+            s_root = ET.fromstring(_read_zip_member_safe(zf, s_name))
             rows_out: List[List[str]] = []
             for row_el in s_root.iter():
                 if row_el.tag.rsplit("}", 1)[-1] != "row":
@@ -289,7 +309,7 @@ def _extract_pptx(raw: bytes) -> Tuple[str, str]:
         slides = sorted(n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml"))
         out: List[str] = []
         for idx, s_name in enumerate(slides, 1):
-            root = ET.fromstring(zf.read(s_name))
+            root = ET.fromstring(_read_zip_member_safe(zf, s_name))
             runs = [el.text.strip() for el in root.iter() if el.tag.rsplit("}", 1)[-1] == "t" and el.text and el.text.strip()]
             if runs:
                 out.append(f"### Slide {idx}\n" + "\n".join(runs))
@@ -342,35 +362,37 @@ def _serialize_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
     }
 
 
-def ingest_attachment(
-    filename: str, data_base64: str, mime_type: str = "", store: Optional[MemoryStore] = None,
-) -> Dict[str, Any]:
+_OFFICE_EXTRACTORS = {
+    ".docx": (_extract_docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ".xlsx": (_extract_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ".pptx": (_extract_pptx, "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+}
+
+
+def ingest_attachment(filename: str, data_base64: str, mime_type: str = "", store: Optional[MemoryStore] = None) -> Dict[str, Any]:
     """Validate, persist, extract, scrub, and index an uploaded Forever Chat attachment."""
     mem = store or get_memory_store()
     _ensure_attachments_schema(mem)
-    clean_orig = Path((filename or "attachment").strip()).name
-    safe_name = _SAFE_NAME_RE.sub("_", clean_orig).strip("._") or "attachment.txt"
+    safe_name = _SAFE_NAME_RE.sub("_", Path((filename or "attachment").strip()).name).strip("._") or "attachment.txt"
     ext = Path(safe_name).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         return {"ok": False, "error": f"Unsupported file extension `{ext or '(none)'}`. Allowed: images (.png/.jpg/.webp/.gif), .pdf, .docx, .xlsx, .pptx, .md, .txt, .csv, .json, .yaml, and source code."}
     b64_clean = (data_base64 or "").strip()
     if "," in b64_clean[:256] and b64_clean.lower().startswith("data:"):
         b64_clean = b64_clean.split(",", 1)[1]
+    if len(b64_clean) > ((MAX_ATTACHMENT_BYTES * 4) // 3) + 256:
+        return {"ok": False, "error": "Attachment exceeds 20 MB limit."}
     try:
         raw = base64.b64decode(b64_clean, validate=False)
     except Exception as exc:
         return {"ok": False, "error": f"Invalid base64 attachment payload: {exc}"}
-    if not raw:
-        return {"ok": False, "error": "Attachment file is empty (0 bytes)."}
-    if len(raw) > MAX_ATTACHMENT_BYTES:
-        return {"ok": False, "error": f"Attachment exceeds 20 MB limit ({_format_size(len(raw))})."}
+    if not raw or len(raw) > MAX_ATTACHMENT_BYTES:
+        return {"ok": False, "error": "Attachment file is empty (0 bytes)." if not raw else f"Attachment exceeds 20 MB limit ({_format_size(len(raw))})."}
 
-    now_dt = datetime.now(timezone.utc)
-    aid = f"att_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+    now_dt, aid = datetime.now(timezone.utc), f"att_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
     month_dir = _attachments_base_dir(mem) / now_dt.strftime("%Y-%m")
     month_dir.mkdir(parents=True, exist_ok=True)
     raw_path = month_dir / f"{aid}_{safe_name}"
-
     width = height = 0
     extracted_text = extracted_path_str = wiki_path = ""
     if ext in IMAGE_EXTENSIONS:
@@ -378,8 +400,7 @@ def ingest_attachment(
         if img_info is None:
             return {"ok": False, "error": f"File `{safe_name}` does not contain valid PNG/JPEG/WEBP/GIF image bytes."}
         eff_mime, width, height = img_info
-        kind = "image"
-        meta_label = f"{width}×{height} • {_format_size(len(raw))}" if width and height else _format_size(len(raw))
+        kind, meta_label = "image", (f"{width}×{height} • {_format_size(len(raw))}" if width and height else _format_size(len(raw)))
         raw_path.write_bytes(raw)
     elif ext in AUDIO_MIMES or ext in VIDEO_MIMES:
         kind = "audio" if ext in AUDIO_MIMES else "video"
@@ -394,15 +415,10 @@ def ingest_attachment(
                     return {"ok": False, "error": f"File `{safe_name}` is not a valid PDF document."}
                 extracted_text, sub_lbl = _extract_pdf(raw_path, raw)
                 kind, eff_mime = "pdf", "application/pdf"
-            elif ext == ".docx":
-                extracted_text, sub_lbl = _extract_docx(raw)
-                kind, eff_mime = "office", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            elif ext == ".xlsx":
-                extracted_text, sub_lbl = _extract_xlsx(raw)
-                kind, eff_mime = "office", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            elif ext == ".pptx":
-                extracted_text, sub_lbl = _extract_pptx(raw)
-                kind, eff_mime = "office", "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            elif ext in _OFFICE_EXTRACTORS:
+                fn_ext, eff_mime = _OFFICE_EXTRACTORS[ext]
+                extracted_text, sub_lbl = fn_ext(raw)
+                kind = "office"
             else:
                 extracted_text, kind, sub_lbl = _extract_csv_or_text(ext, raw)
                 eff_mime = (mime_type or "text/plain; charset=utf-8").strip()
@@ -415,32 +431,22 @@ def ingest_attachment(
         ext_file = month_dir / f"{aid}.extracted.md"
         ext_file.write_text(f"# Extracted Attachment: {safe_name}\n\n{extracted_text}\n", encoding="utf-8")
         extracted_path_str = str(ext_file)
-
         if len(extracted_text) > INLINE_DOC_CHAR_LIMIT:
             slug = _SLUG_RE.sub("-", Path(safe_name).stem.lower()).strip("-")[:48] or "document"
             rel_wiki = f"03_resources/{now_dt.strftime('%Y-%m-%d')}-{slug}-{aid[-6:]}.md"
             proxy_body = f"# {safe_name}\n\n## Asset Metadata & Location\n- **Source**: `{safe_name}` (`{meta_label}`, id=`{aid}`)\n\n## Executive Summary & Key Facts\nAuto-filed Forever Chat `{kind}` attachment.\n\n## Extracted Highlights\n{extracted_text}"
-            w_res = get_wiki_engine(store=mem).save_or_update_note(
-                rel_wiki, content=proxy_body, title=f"Attachment: {safe_name}",
-                tags=["attachment", "resource", kind], actor="web", template="proxy-asset-note", ontology=["asset-provenance", "reference-knowledge"],
-            )
+            w_res = get_wiki_engine(store=mem).save_or_update_note(rel_wiki, content=proxy_body, title=f"Attachment: {safe_name}", tags=["attachment", "resource", kind], actor="companion", template="proxy-asset-note", ontology=["asset-provenance", "reference-knowledge"])
             if w_res.get("ok"):
                 wiki_path = str(w_res.get("path") or rel_wiki)
 
-    sha = hashlib.sha256(raw).hexdigest()[:24]
-    created_at = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    sha, created_at = hashlib.sha256(raw).hexdigest()[:24], now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     with mem._lock:
         mem.conn.execute(
-            """INSERT INTO chat_attachments
-               (attachment_id, filename, mime_type, kind, size_bytes, sha256, storage_path,
-                extracted_path, extracted_text, extracted_chars, meta_label, wiki_resource_path, width, height, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (aid, safe_name, eff_mime, kind, len(raw), sha, str(raw_path), extracted_path_str,
-             extracted_text, len(extracted_text), meta_label, wiki_path, width, height, created_at),
+            "INSERT INTO chat_attachments (attachment_id, filename, mime_type, kind, size_bytes, sha256, storage_path, extracted_path, extracted_text, extracted_chars, meta_label, wiki_resource_path, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (aid, safe_name, eff_mime, kind, len(raw), sha, str(raw_path), extracted_path_str, extracted_text, len(extracted_text), meta_label, wiki_path, width, height, created_at),
         )
         mem.conn.commit()
-    rec = get_attachment_record(aid, store=mem)
-    return {"ok": True, "attachment": rec}
+    return {"ok": True, "attachment": get_attachment_record(aid, store=mem)}
 
 
 def get_attachment_record(attachment_id: str, store: Optional[MemoryStore] = None) -> Optional[Dict[str, Any]]:

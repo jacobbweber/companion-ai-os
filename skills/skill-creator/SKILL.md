@@ -29,7 +29,7 @@ Before creating a brand-new `skills/<skill-name>/` directory, always run this qu
 1. **Check Existing Skills & Wiki**: Inspect `/skills` and `skills/knowledge-wiki/references/INDEX.md`. If a closely related skill already exists, prefer adding a new `references/*.md` guide or `workflows/*.json` recipe inside that existing skill rather than proliferating folders.
 2. **Check Installed Host CLIs**: Use `run_python` (`import shutil; print(shutil.which("..."))`) to check whether a standard CLI tool (`git`, `gh`, `rg`, `python`, `ssh`, `curl`) already solves the problem and only needs a lightweight `SKILL.md` wrapper.
 3. **Dry-Run Any Helper Script ("Pure Brain, Open Toolbox" — `ADR-001`)**:
-   - **Pure Stdlib Scripts (Default)**: Keep `skills/<skill-name>/scripts/<helper>.py` 100% Python stdlib (`<= 550` lines, `<= 100` lines/function, zero unused imports, with `--self-test` CLI flag) so it runs instantly anywhere via `sys.executable`.
+   - **Pure Stdlib Scripts (Default)**: Keep `skills/<skill-name>/scripts/<helper>.py` 100% Python stdlib (`<= 700` lines, `<= 100` lines/function, zero unused imports, with `--self-test` CLI flag) so it runs instantly anywhere via `sys.executable`.
    - **Isolated Power-Tool Scripts (PEP 723 + `uv`)**: When a skill genuinely needs specialized libraries (such as PDF/Office parsing, Playwright browser automation, or image/data tools), declare them in a PEP 723 inline header at the top of `scripts/<helper>.py`:
      ```python
      # /// script
@@ -50,7 +50,7 @@ Before creating a brand-new `skills/<skill-name>/` directory, always run this qu
    - **Deterministic Linter Rules (`SKILL LINTER`)**:
      - `name` must be kebab-case (`[a-z0-9-]+`) and match the parent folder `skills/<skill-name>/`.
      - `description` must be at least 10 characters.
-     - `required_tools` must list the primitive tools used by the skill.
+     - `required_tools` must list the primitive tools used by the skill (only `name`, `description`, and `required_tools` keys are valid in `SKILL.md` YAML frontmatter — never use `allowed-tools`).
      - Body must contain `## When to Use This Skill` and `## Step-by-Step Procedure` (or `## How to ...`).
 2. **Add Optional Tier-3 `references/` or `workflows/`**:
    - Put deep domain facts or cheat sheets in `skills/<skill-name>/references/<topic>.md` and link them in `SKILL.md`.

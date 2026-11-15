@@ -83,7 +83,7 @@ TOOLS: List[Dict[str, Any]] = [
         "time_window": _p("string", "Optional SQLite relative window such as `-7 days` or `-24 hours`."),
         "limit": _p("integer", "Maximum number of rows to return (default 15-20)."),
     }, ["action"]),
-    _tool("task_manage", "Create, update, and query immediate tasks and prioritized engineering backlog items in SQLite.", {
+    _tool("task_manage", "Create, update, and query internal software-workflow tasks and Companion's own engineering backlog (`MEMORY.md`). For the user's personal, home, or work tasks/goals, use `agile_manage` instead.", {
         "action": _p("string", "Task or backlog operation to execute.", enum=["add_task", "update_task", "list_tasks", "add_backlog", "update_backlog", "list_backlog", "list_all"]),
         "description": _p("string", "Clear, atomic task or backlog item description."),
         "task_id": _p("integer", "Numeric ID of an existing task (for `update_task`)."),
@@ -95,9 +95,9 @@ TOOLS: List[Dict[str, Any]] = [
         "verification_result": _p("string", "Evidence or test output proving task completion."),
         "estimated_effort": _p("string", "T-shirt or time estimate (`S`, `M`, `L`, `30m`)."),
     }, ["action"]),
-    _tool("workflow_manage", "Drive the State-Machine Workflow, draft/approve Blueprints, run `/goal` builds, forge/check/run 3-Tier skills (`check_skill`, `bootstrap_skill`, `run_script`), spawn subagents, or run JSON recipes.", {
-        "action": _p("string", "Workflow engine or Skill Forge action to execute.", enum=["start", "status", "transition", "recover", "blueprint", "approve", "autonomy", "http_smoke", "subagent", "list_recipes", "run_recipe", "check_skill", "bootstrap_skill", "run_script", "abort", "complete"]),
-        "workflow_type": _p("string", "Workflow classification when starting or running autonomy.", enum=["self_evolution", "engineering_feature", "bug_fix", "architecture_refactor"]),
+    _tool("workflow_manage", "Drive the Software Engineering State-Machine Workflow (`INTAKE..COMPLETE` with code snapshots & unit-test gates), draft/approve code Blueprints, run `/goal` software builds, forge/run 3-Tier skills, spawn subagents, or run JSON recipes. NEVER use `start`/`autonomy`/`blueprint` for personal, home, or work goals — use `agile_manage(action='save_epic')` instead.", {
+        "action": _p("string", "Software workflow engine or Skill Forge action (`start` is strictly for codebase builds, never personal/life goals).", enum=["start", "status", "transition", "recover", "blueprint", "approve", "autonomy", "http_smoke", "subagent", "list_recipes", "run_recipe", "check_skill", "bootstrap_skill", "run_script", "abort", "complete"]),
+        "workflow_type": _p("string", "Software workflow classification (`self_evolution` requires `Self-Dev Mode = ON`; never use for personal goals).", enum=["self_evolution", "engineering_feature", "bug_fix", "architecture_refactor"]),
         "goal": _p("string", "Objective text (pass `'resume'` with `action='autonomy'` to resume an interrupted goal)."),
         "module": _p("string", "Target Python web server module for `http_smoke` (default `surfaces.web_server`)."),
         "endpoints": _p("array", "URL paths to probe during `http_smoke` (e.g. `['/','/api/status']`).", items_type="string"),
@@ -240,17 +240,21 @@ TOOLS: List[Dict[str, Any]] = [
         "name": _p("string", "Template slug for `prompt_save` or `prompt_render`."),
         "template": _p("string", "Reusable prompt text (with optional `{{var}}` placeholders) for `prompt_save`."),
     }, ["action"]),
-    _tool("agile_manage", "Operate Multi-Board Kanban, Master Active Sprint (`all-active-sprint`), Weekday/Weekend Capacity Slots, Horizon Epics, and 15m Anti-Procrastination Unblockers.", {
-        "action": _p("string", "Agile/Kanban sub-action.", enum=["board_view", "list_boards", "save_board", "list_epics", "save_epic", "list_sprints", "start_sprint", "rollover_sprint", "capacity", "save_card", "move_card", "delete_card", "slice_unblocker"]),
+    _tool("agile_manage", "Operate Multi-Board Kanban, Personal Goals / Horizon Epics (`save_epic`), Master Active Sprint (`all-active-sprint`), Weekday/Weekend Capacity Slots, Card Checklists, and 15m Anti-Procrastination Unblockers.", {
+        "action": _p("string", "Agile/Kanban sub-action (`save_epic` for personal/long-running goals; `save_card` with `epic_id` for child tasks).", enum=["board_view", "list_boards", "save_board", "list_epics", "save_epic", "delete_epic", "list_sprints", "start_sprint", "rollover_sprint", "capacity", "save_card", "move_card", "delete_card", "slice_unblocker"]),
         "board_id": _p("string", "Board slug (`all-active-sprint`, `life-home`, `work-career`, `software-companion`, or custom board ID)."),
+        "epic_id": _p("string", "Epic ID (`ep_...`) when updating/deleting an epic or linking a child card (`save_card`) under a personal goal / Epic."),
         "card_id": _p("string", "Card ID (`crd_...`) for `save_card`, `move_card`, `delete_card`, or `slice_unblocker`."),
-        "title": _p("string", "Title for board, epic, sprint, card, or `slice_unblocker` first step."),
-        "description": _p("string", "Detailed card notes, acceptance criteria, or context."),
+        "title": _p("string", "Title for board, epic/personal goal, sprint, card, or `slice_unblocker` first step."),
+        "description": _p("string", "Detailed card notes, epic summary, acceptance criteria, or context."),
+        "checklist": _p("array", "Optional checklist subtask strings inside a card (e.g. `['Clean stalls', 'Swap carburetor']`).", items_type="string"),
         "status": _p("string", "Kanban column status.", enum=["backlog", "sprint_todo", "in_progress", "blocked", "verify", "done"]),
         "horizon": _p("string", "Planning horizon (`now`, `next`, `later`, `someday`).", enum=["now", "next", "later", "someday"]),
         "effort_size": _p("string", "Effort slot size (`quick` <30m=1, `half_day`=2, `full_day`=4, `multi_day`=8).", enum=["quick", "half_day", "full_day", "multi_day"]),
         "day_slot": _p("string", "Day-of-week execution slot (`weekday`, `weekend`, `any`).", enum=["weekday", "weekend", "any"]),
         "priority": _p("integer", "Card priority from 1 (highest) to 5 (lowest)."),
+        "start_date": _p("string", "Optional start date (`YYYY-MM-DD`) for an epic or sprint."),
+        "target_date": _p("string", "Optional target completion date (`YYYY-MM-DD`) for an epic (`save_epic`)."),
         "planned_date": _p("string", "Planned execution date (`YYYY-MM-DD`) surfaced on the Unified Calendar."),
         "due_date": _p("string", "Hard due date (`YYYY-MM-DD`) surfaced on the Unified Calendar."),
         "blocked_reason": _p("string", "Reason or external dependency blocking a `blocked` card."),
@@ -367,7 +371,7 @@ _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "endpoint_manage": frozenset({"register", "remove", "ssh_exec", "winrm_exec", "api_request"}),
     "mcp_manage": frozenset({"register_server", "call_tool", "register_partner", "delegate_partner"}),
     "routine_manage": frozenset({"create", "delete", "tick", "sandbox_create", "sandbox_cleanup", "prompt_save"}),
-    "agile_manage": frozenset({"save_board", "save_epic", "start_sprint", "rollover_sprint", "save_card", "move_card", "delete_card", "slice_unblocker"}),
+    "agile_manage": frozenset({"save_board", "save_epic", "delete_epic", "start_sprint", "rollover_sprint", "save_card", "move_card", "delete_card", "slice_unblocker"}),
     "calendar_manage": frozenset({"add_event", "delete_event"}),
     "education_manage": frozenset({"save_course", "set_active", "advance_stage", "upsert_items", "grade_item", "curate_note"}),
 }

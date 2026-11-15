@@ -16,7 +16,7 @@ Use this runbook during `IMPLEMENT` and `VERIFY` phases before claiming any feat
 ## Step-by-Step Procedure
 1. **Write Real Behavioral Unit Tests (`tests/test_*.py`)**:
    - Exercise real functions, SQLite persistence (`tempfile.TemporaryDirectory`), and ephemeral HTTP servers (`port=0`) with deterministic assertions.
-   - Keep every test module `<= 550` lines and every test method `<= 100` lines.
+   - Keep every test module `<= 700` lines and every test method `<= 100` lines.
 2. **Run Targeted Verification & Smoke Probes**:
    - For web changes, execute `workflow_manage(action="http_smoke", module="surfaces.web_server")`.
    - Run `sdd_manage(action="verify")` to catch unused imports, dead definitions, or undocumented modules immediately.

@@ -179,17 +179,18 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
             ws_root.mkdir()
             store = MemoryStore(db_path=Path(tmp) / "web_bp.db")
             fake_web_chat = _make_fake_bp_chat([])
-            srv, _ = create_web_server(host="127.0.0.1", port=0, store=store, chat_fn=fake_web_chat)
+            srv, sess = create_web_server(host="127.0.0.1", port=0, store=store, chat_fn=fake_web_chat)
             try:
+                csrf_hdrs = {"Origin": "http://127.0.0.1", "X-Companion-CSRF": sess.csrf_token}
                 with workspace_context(ws_root, "web-bp"):
-                    code, raw = dispatch_raw_http(srv, method="POST", path="/api/chat", body=json.dumps({"message": "Build widget module", "mode": "plan", "async": False}).encode("utf-8"))
+                    code, raw = dispatch_raw_http(srv, method="POST", path="/api/chat", body=json.dumps({"message": "Build widget module", "mode": "plan", "async": False}).encode("utf-8"), headers=csrf_hdrs)
                     self.assertEqual(code, 200)
                     self.assertTrue(json.loads(raw)["awaiting_approval"])
                     _, st_raw = dispatch_raw_http(srv, method="GET", path="/api/status")
                     self.assertTrue(json.loads(st_raw)["awaiting_approval"])
 
                     with patch("companion.autonomy.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
-                        code2, raw2 = dispatch_raw_http(srv, method="POST", path="/api/chat", body=json.dumps({"message": "/approve", "async": False}).encode("utf-8"))
+                        code2, raw2 = dispatch_raw_http(srv, method="POST", path="/api/chat", body=json.dumps({"message": "/approve", "async": False}).encode("utf-8"), headers=csrf_hdrs)
                     self.assertEqual(code2, 200)
                     self.assertIn("COMPLETE", json.loads(raw2)["response"])
                     _, st_raw2 = dispatch_raw_http(srv, method="GET", path="/api/status")
@@ -236,9 +237,13 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
                 self.assertIn("[Companion] Initial verified build", logs[0]["subject"])
                 _, tracked = cp_mgr._run_git(["ls-files"])
                 self.assertNotIn(".env", tracked.splitlines())
-                with workspace_context(ws_root, "git-cf-ws"):
-                    slash_log = handle_slash_command("/checkpoint log", [{"role": "system", "content": "sys"}])
-                    self.assertIn("Initial verified build", str(slash_log))
+                slash_store = MemoryStore(db_path=Path(tmp) / "git_slash.db")
+                try:
+                    with workspace_context(ws_root, "git-cf-ws"):
+                        slash_log = handle_slash_command("/checkpoint log", [{"role": "system", "content": "sys"}], store=slash_store)
+                        self.assertIn("Initial verified build", str(slash_log))
+                finally:
+                    slash_store.close()
 
         cmp_res = run_live_flight_eval(suite="compare", chat_fn=_scripted_flight_model, check_endpoints=False, verbose=False)
         self.assertTrue(cmp_res["passed"], cmp_res["summary"])

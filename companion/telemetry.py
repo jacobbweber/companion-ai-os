@@ -35,13 +35,23 @@ class SecretRedactor:
     """Scrubs API keys, Bearer tokens, and known environment secrets before SQLite telemetry persistence."""
 
     def __init__(self, extra_secrets: Optional[List[str]] = None):
+        self._lock = threading.RLock()
         self._extra = [s for s in (extra_secrets or []) if isinstance(s, str) and len(s.strip()) >= 8]
+
+    def register_secret(self, secret: str) -> None:
+        clean = (secret or "").strip()
+        if len(clean) < 8:
+            return
+        with self._lock:
+            if clean not in self._extra:
+                self._extra.append(clean)
 
     def redact(self, text: str) -> str:
         if not text:
             return ""
         scrubbed = str(text)
-        known: List[str] = list(self._extra)
+        with self._lock:
+            known: List[str] = list(self._extra)
         if settings.api_key and len(settings.api_key) >= 8:
             known.append(settings.api_key)
         for env_k, env_v in os.environ.items():
@@ -136,7 +146,7 @@ def telemetry_db_context(db_path: Optional[Path]) -> Iterator[None]:
     finally:
         _CONTEXTUAL_TELEMETRY_DB.reset(tok)
         if is_custom:
-            with _CTX_DB_LOCK:
+            with telemetry._lock, _CTX_DB_LOCK:
                 rem = _CTX_REFCOUNTS.get(key, 1) - 1
                 if rem <= 0:
                     _CTX_REFCOUNTS.pop(key, None)
@@ -157,16 +167,31 @@ class TelemetryEngine:
         self._lock = threading.RLock()
         self._explicit_db = db_path is not None
         self.db_path = Path(db_path or settings.db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
+        self.conn: Optional[sqlite3.Connection] = None
+        self._conn_path: Optional[Path] = None
         self._test_mem_conn: Optional[sqlite3.Connection] = None
-        with self._lock:
-            _init_telemetry_conn(self.conn, wal=True)
+        if self._explicit_db:
+            self._ensure_disk_conn(self.db_path)
         self._active_trace_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
             f"companion_trace_{id(self)}", default=None
         )
         self._trace_starts: Dict[str, float] = {}
         self._ended_counter = 0
+
+    def _ensure_disk_conn(self, target_path: Path) -> sqlite3.Connection:
+        resolved = Path(target_path).resolve()
+        if self.conn is not None and self._conn_path == resolved:
+            return self.conn
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = _init_telemetry_conn(sqlite3.connect(str(resolved), timeout=30.0, check_same_thread=False), wal=True)
+        self._conn_path = resolved
+        self.db_path = resolved
+        return self.conn
 
     @property
     def active_trace_id(self) -> Optional[str]:
@@ -178,8 +203,8 @@ class TelemetryEngine:
 
     def _active_conn(self) -> sqlite3.Connection:
         """Resolve the active SQLite connection (honoring explicit DBs, `telemetry_db_context`, and test isolation)."""
-        if self._explicit_db or self.db_path.resolve() != settings.db_path.resolve():
-            return self.conn
+        if self._explicit_db:
+            return self._ensure_disk_conn(self.db_path)
         ctx_db = _CONTEXTUAL_TELEMETRY_DB.get()
         if ctx_db is not None:
             key = str(ctx_db.resolve())
@@ -196,7 +221,7 @@ class TelemetryEngine:
                     sqlite3.connect(":memory:", check_same_thread=False), wal=False
                 )
             return self._test_mem_conn
-        return self.conn
+        return self._ensure_disk_conn(settings.db_path)
 
     def start_trace(self, trace_type: str = "user_turn", name: str = "turn") -> str:
         """Start a new waterfall trace and set it as the active trace in the current `ContextVar`."""
@@ -306,7 +331,7 @@ class TelemetryEngine:
             cur = conn.cursor()
             cur.execute(
                 "INSERT INTO telemetry_logs (level, component, trace_id, message) VALUES (?, ?, ?, ?)",
-                (lvl, (component or "core").strip()[:40], tid, safe_msg),
+                (lvl, (component or "core").strip().lower()[:40], tid, safe_msg),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -315,7 +340,7 @@ class TelemetryEngine:
         """Compute live system KPIs across traces, LLM calls, tools, safety guards, and logs."""
         with self._lock:
             cur = self._active_conn().cursor()
-            cur.execute("SELECT COUNT(*), COALESCE(AVG(duration_ms), 0.0), COALESCE(MAX(duration_ms), 0.0) FROM telemetry_traces")
+            cur.execute("SELECT COUNT(*), COALESCE(AVG(duration_ms), 0.0), COALESCE(MAX(duration_ms), 0.0) FROM telemetry_traces WHERE status != 'active'")
             tr_count, tr_avg, tr_max = cur.fetchone() or (0, 0.0, 0.0)
             cur.execute("SELECT COUNT(*), COALESCE(AVG(duration_ms), 0.0), COALESCE(MAX(duration_ms), 0.0), SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) FROM telemetry_spans WHERE span_type = 'llm_call'")
             llm_cnt, llm_avg, llm_max, llm_err = cur.fetchone() or (0, 0.0, 0.0, 0)
@@ -431,17 +456,23 @@ class TelemetryEngine:
 
     def handle_tool(self, args: Dict[str, Any]) -> str:
         """Dispatch `telemetry_manage` tool actions for the agent or UI bridge."""
+        def _as_int(val: Any, default: int) -> int:
+            try:
+                return int(val) if val is not None and str(val).strip() else default
+            except (TypeError, ValueError):
+                return default
+
         action = str(args.get("action") or "kpis").strip().lower()
         if action in ("kpis", "metrics", "status", "scorecard"):
             return self.format_kpi_dashboard()
         if action in ("waterfall", "trace"):
             return self.format_waterfall(trace_id=str(args.get("trace_id") or ""))
         if action in ("recent_traces", "traces"):
-            return self.format_recent_traces(limit=int(args.get("limit") or 10))
+            return self.format_recent_traces(limit=_as_int(args.get("limit"), 10))
         if action in ("logs", "app_logs"):
-            return self.format_recent_logs(level=str(args.get("level") or ""), component=str(args.get("component") or ""), limit=int(args.get("limit") or 25))
+            return self.format_recent_logs(level=str(args.get("level") or ""), component=str(args.get("component") or ""), limit=_as_int(args.get("limit"), 25))
         if action == "prune":
-            res = self.prune_old_telemetry(max_traces=int(args.get("max_traces") or 500), max_logs=int(args.get("max_logs") or 2000))
+            res = self.prune_old_telemetry(max_traces=_as_int(args.get("max_traces"), 500), max_logs=_as_int(args.get("max_logs"), 2000))
             return f"Pruned telemetry retention: {res}"
         if action == "log_event":
             msg = str(args.get("message") or "").strip()
@@ -459,6 +490,8 @@ class TelemetryEngine:
                         c.close()
                     except Exception:
                         pass
+            self.conn = None
+            self._conn_path = None
             self._test_mem_conn = None
 
 

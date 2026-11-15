@@ -30,7 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from companion import __version__
 from companion.archive_and_approvals import get_approval_queue, get_trust_mode
 from companion.background_jobs import get_job_manager
-from companion.config import settings
+from companion.config import is_in_agent_tool_turn, settings
+from companion.llm_wire import check_url_ssrf, urlopen_safe
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.vault import get_vault_manager, normalize_secret_name
 from companion.wiki_engine import get_wiki_engine
@@ -68,7 +69,13 @@ def _slug(raw: str) -> str:
 
 
 def _compute_tools_fingerprint(tools: List[Dict[str, Any]]) -> str:
-    canonical = json.dumps([(str(t.get("name") or ""), str(t.get("description") or "")) for t in sorted(tools, key=lambda x: str(x.get("name") or ""))], sort_keys=True)
+    canonical = json.dumps(
+        [
+            (str(t.get("name") or ""), str(t.get("description") or ""), t.get("inputSchema") or {})
+            for t in sorted(tools, key=lambda x: str(x.get("name") or ""))
+        ],
+        sort_keys=True,
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
 
 
@@ -127,14 +134,17 @@ def build_local_peer_identity(store: Optional[MemoryStore] = None) -> Dict[str, 
     }
 
 
-def _parse_http_mcp_body(raw_text: str) -> Dict[str, Any]:
+def _parse_http_mcp_body(raw_text: str, expected_id: Any = None) -> Dict[str, Any]:
     txt = (raw_text or "").strip()
     if not txt or txt.startswith("{"):
         return json.loads(txt) if txt else {}
     last_json: Dict[str, Any] = {}
     for ln in txt.splitlines():
         if ln.startswith("data:") and ln[5:].strip().startswith("{"):
-            last_json = json.loads(ln[5:].strip())
+            obj = json.loads(ln[5:].strip())
+            last_json = obj
+            if expected_id is not None and obj.get("id") == expected_id:
+                return obj
     return last_json
 
 
@@ -147,24 +157,33 @@ class MCPHub:
     @property
     def store(self) -> MemoryStore:
         mem = self._store or get_memory_store()
-        with mem._lock:
-            for ddl in MCP_DDL:
-                mem.conn.execute(ddl)
-            mem.conn.commit()
+        mem.ensure_schema("mcp_hub", lambda m: [m.conn.execute(ddl) for ddl in MCP_DDL] and None)
         return mem
 
-    def register_server(self, server_id: str, transport: str, label: str = "", command: str = "", args: Optional[List[str]] = None, url: str = "", credential_ref: str = "", allowed_tools: Optional[List[str]] = None, enabled: bool = True) -> Dict[str, Any]:
+    def register_server(
+        self, server_id: str, transport: str, label: str = "", command: str = "",
+        args: Optional[List[str]] = None, url: str = "", credential_ref: str = "",
+        allowed_tools: Optional[List[str]] = None, enabled: bool = True, actor: str = "user",
+    ) -> Dict[str, Any]:
         """Register a `stdio` or `http` outbound MCP server using a symbolic Vault `credential_ref`."""
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
+            return {"ok": False, "error": "MCP GUARD REJECTED: Only the user can register or modify outbound MCP servers."}
         sid, tr = _slug(server_id or label), (transport or "").strip().lower()
         if not sid or tr not in ("stdio", "http"):
             return {"ok": False, "error": "`server_id` and `transport` (`stdio` or `http`) are required."}
         if tr == "stdio" and not (command or "").strip():
             return {"ok": False, "error": "`command` is required for `stdio` MCP servers."}
-        if tr == "http" and not (url or "").strip().startswith(("http://", "https://")):
-            return {"ok": False, "error": "Valid `http://` or `https://` `url` is required for `http` MCP servers."}
+        if tr == "http":
+            if not (url or "").strip().startswith(("http://", "https://")):
+                return {"ok": False, "error": "Valid `http://` or `https://` `url` is required for `http` MCP servers."}
+            ssrf_err = check_url_ssrf(url, allow_private_lan=True)
+            if ssrf_err:
+                return {"ok": False, "error": ssrf_err}
         cred_slug = normalize_secret_name(credential_ref) if credential_ref else ""
         if cred_slug:
-            get_vault_manager(store=self.store).declare_placeholder(cred_slug, cred_type="bearer_token", description=f"Credential for MCP server `{sid}`", allow_list=[f"mcp:{sid}"])
+            get_vault_manager(store=self.store).declare_placeholder(
+                cred_slug, cred_type="bearer_token", description=f"Credential for MCP server `{sid}`", allow_list=[f"mcp:{sid}"], actor=actor,
+            )
         with self.store._lock:
             self.store.conn.execute(
                 "INSERT INTO mcp_servers (server_id, label, transport, command, args_json, url, credential_ref, allowed_tools_json, enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(server_id) DO UPDATE SET label=excluded.label, transport=excluded.transport, command=excluded.command, args_json=excluded.args_json, url=excluded.url, credential_ref=excluded.credential_ref, allowed_tools_json=excluded.allowed_tools_json, enabled=excluded.enabled, updated_at=CURRENT_TIMESTAMP",
@@ -190,7 +209,9 @@ class MCPHub:
         ids = [str(r[0]) for r in self.store._fetch_rows("SELECT server_id FROM mcp_servers ORDER BY server_id ASC")]
         return [s for sid in ids if (s := self.get_server(sid)) is not None]
 
-    def remove_server(self, server_id: str) -> Dict[str, Any]:
+    def remove_server(self, server_id: str, actor: str = "user") -> Dict[str, Any]:
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
+            return {"ok": False, "error": "MCP GUARD REJECTED: Only the user can remove outbound MCP servers."}
         sid = _slug(server_id)
         with self.store._lock:
             cur = self.store.conn.execute("DELETE FROM mcp_servers WHERE server_id = ?", (sid,))
@@ -209,6 +230,9 @@ class MCPHub:
             secret_val = val_or_err
 
         if srv["transport"] == "http":
+            ssrf_err = check_url_ssrf(srv["url"], allow_private_lan=True)
+            if ssrf_err:
+                return False, {}, ssrf_err
             headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
             if secret_val:
                 headers["Authorization"] = f"Bearer {secret_val}"
@@ -216,18 +240,21 @@ class MCPHub:
                 headers["Mcp-Session-Id"] = str(srv["session_id"])
             try:
                 req = urllib.request.Request(srv["url"], data=json.dumps(rpc_req).encode("utf-8"), method="POST", headers=headers)
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with urlopen_safe(req, timeout=timeout, allow_private_lan=True, allow_redirects=False) as resp:
                     new_sid = resp.headers.get("Mcp-Session-Id") or ""
                     if new_sid and new_sid != srv.get("session_id"):
                         with self.store._lock:
                             self.store.conn.execute("UPDATE mcp_servers SET session_id = ? WHERE server_id = ?", (new_sid[:120], srv["server_id"]))
                             self.store.conn.commit()
                     raw = resp.read(524_288).decode("utf-8", errors="replace")
-                return True, _parse_http_mcp_body(raw), ""
+                return True, _parse_http_mcp_body(raw, expected_id=rpc_req.get("id")), ""
             except Exception as exc:
                 return False, {}, vault.scrub_output(f"MCP HTTP error: {type(exc).__name__}: {exc}", extra_secrets=[secret_val] if secret_val else None)
 
         env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "HOME": os.environ.get("HOME", os.environ.get("USERPROFILE", ""))}
+        for win_k in ("PATHEXT", "COMSPEC", "SYSTEMDRIVE", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"):
+            if os.environ.get(win_k):
+                env[win_k] = os.environ[win_k]
         if secret_val:
             env["MCP_AUTH_TOKEN"] = secret_val
         init_line = json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "companion", "version": __version__}}})
@@ -244,9 +271,9 @@ class MCPHub:
                     parsed_last = obj
                     if target_id is not None and obj.get("id") == target_id:
                         return True, obj, ""
-            if parsed_last:
+            if target_id is None and parsed_last:
                 return True, parsed_last, ""
-            return False, {}, vault.scrub_output((proc.stderr or "Empty stdio MCP output")[:300], extra_secrets=[secret_val] if secret_val else None)
+            return False, {}, vault.scrub_output((proc.stderr or "Missing matching JSON-RPC response ID in stdio MCP output")[:300], extra_secrets=[secret_val] if secret_val else None)
         except Exception as exc:
             return False, {}, vault.scrub_output(f"MCP stdio error: {type(exc).__name__}: {exc}", extra_secrets=[secret_val] if secret_val else None)
 
@@ -257,6 +284,7 @@ class MCPHub:
             return {"ok": False, "error": f"MCP server `{server_id}` not found."}
         if srv["transport"] == "http":
             self._send_rpc(srv, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "companion", "version": __version__}}})
+            srv = self.get_server(server_id) or srv
         ok, resp, err = self._send_rpc(srv, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         if not ok:
             return {"ok": False, "error": err}
@@ -264,7 +292,8 @@ class MCPHub:
         allow_set = {str(x) for x in srv.get("allowed_tools", []) if str(x)}
         filtered = [t for t in raw_tools if not allow_set or str(t.get("name")) in allow_set]
         fp = _compute_tools_fingerprint(filtered)
-        approved_fp = fp if actor.strip().lower() in ("user", "cli", "web") else srv.get("approved_fingerprint", "")
+        is_human = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
+        approved_fp = fp if is_human else srv.get("approved_fingerprint", "")
         with self.store._lock:
             self.store.conn.execute(
                 "UPDATE mcp_servers SET discovered_tools_json = ?, tools_fingerprint = ?, approved_fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE server_id = ?",
@@ -274,7 +303,7 @@ class MCPHub:
         return {"ok": True, "server_id": srv["server_id"], "tools": filtered, "tools_fingerprint": fp, "is_approved": fp == approved_fp, "summary": f"Discovered {len(filtered)} tool(s) on `{srv['server_id']}` (fingerprint=`{fp}`, approved={fp == approved_fp})."}
 
     def approve_server(self, server_id: str, actor: str = "user") -> Dict[str, Any]:
-        if actor.strip().lower() not in ("user", "cli", "web"):
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
             return {"ok": False, "error": "MCP GUARD REJECTED: Only the user can approve an MCP server's tool fingerprint."}
         srv = self.get_server(server_id)
         if not srv or not srv["tools_fingerprint"]:
@@ -302,12 +331,13 @@ class MCPHub:
         if tool_name not in known_names:
             return {"ok": False, "error": f"Tool `{tool_name}` is not in the discovered/allowed tool list for `{srv['server_id']}` ({sorted(known_names)})."}
 
-        if actor.strip().lower() not in ("user", "cli", "web") and srv["approved_fingerprint"] != srv["tools_fingerprint"]:
+        is_human = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
+        if not is_human and srv["approved_fingerprint"] != srv["tools_fingerprint"]:
             allowed, apr = get_approval_queue(self.store).check_or_enqueue(
                 category="mcp_server", action_name="approve_mcp_tools", target=srv["server_id"],
                 summary=f"Approve MCP server `{srv['label']}` (`{srv['server_id']}`) tool list fingerprint `{srv['tools_fingerprint']}` ({sorted(known_names)}).",
                 payload={"server_id": srv["server_id"], "fingerprint": srv["tools_fingerprint"]},
-                requester=actor, confirmed=confirmed, always_require_in_autonomous=True,
+                requester=actor, confirmed=confirmed and is_human, always_require_in_autonomous=True,
             )
             if not allowed:
                 return {"ok": False, "awaiting_approval": True, "approval_id": apr["approval_id"], "error": f"MCP SERVER APPROVAL REQUIRED (`{apr['approval_id']}`): Server `{srv['server_id']}` tool fingerprint `{srv['tools_fingerprint']}` awaits approval."}
@@ -334,16 +364,17 @@ class MCPHub:
     ) -> Dict[str, Any]:
         """Enable or disable Inbound Hosted MCP ('The Order Counter' — off by default, protected by Vault token)."""
         tok_slug = normalize_secret_name(token_ref or "hosted-mcp-token") or "hosted-mcp-token"
-        if enabled and actor.strip().lower() not in ("user", "cli", "web"):
+        is_human = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
+        if enabled and not is_human:
             allowed, apr = get_approval_queue(self.store).check_or_enqueue(
                 category="mcp_server", action_name="enable_hosted_mcp", target="hosted_mcp",
                 summary=f"Enable inbound Hosted MCP 'Order Counter' protected by Vault token `{tok_slug}`.",
                 payload={"token_ref": tok_slug, "allow_wiki_read": allow_wiki_read},
-                requester=actor, confirmed=confirmed, always_require_in_autonomous=True,
+                requester=actor, confirmed=confirmed and is_human, always_require_in_autonomous=True,
             )
             if not allowed:
                 return {"ok": False, "awaiting_approval": True, "approval_id": apr["approval_id"], "error": f"Approval `{apr['approval_id']}` required to enable inbound Hosted MCP."}
-        get_vault_manager(store=self.store).declare_placeholder(tok_slug, cred_type="bearer_token", description="Inbound Hosted MCP Order Counter token", allow_list=["hosted_mcp"])
+        get_vault_manager(store=self.store).declare_placeholder(tok_slug, cred_type="bearer_token", description="Inbound Hosted MCP Order Counter token", allow_list=["hosted_mcp"], actor=actor)
         self.store.set_user_profile("hosted_mcp_enabled", "on" if enabled else "off")
         self.store.set_user_profile("hosted_mcp_token_ref", tok_slug)
         self.store.set_user_profile("hosted_mcp_allow_wiki_read", "on" if allow_wiki_read else "off")
@@ -374,6 +405,9 @@ class MCPHub:
             return (403 if "disabled" in auth_err else 401), {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32001, "message": auth_err}}
 
         method = str(payload.get("method") or "")
+        if "id" not in payload or req_id is None:
+            if method.startswith("notifications/"):
+                return 202, {}
         prof = self.store.get_user_profile()
         wiki_ok = prof.get("hosted_mcp_allow_wiki_read", "off") == "on"
         exposed = list(HOSTED_MCP_SAFE_TOOLS) + (list(_WIKI_READ_MCP_TOOLS) if wiki_ok else [])
@@ -414,15 +448,22 @@ class MCPHub:
 
     # --- Partner-Aware Federation (Paired Companion Instances, e.g., Workstation <-> Lab GPU Node) ---
 
-    def register_partner(self, partner_id: str, url: str, label: str = "", credential_ref: str = "", enabled: bool = True) -> Dict[str, Any]:
+    def register_partner(self, partner_id: str, url: str, label: str = "", credential_ref: str = "", enabled: bool = True, actor: str = "user") -> Dict[str, Any]:
         """Pair with a remote Federated Companion instance URL (`http://<host>:<port>/api/mcp`) + Vault token."""
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
+            return {"ok": False, "error": "MCP GUARD REJECTED: Only the user can register or modify federated partners."}
         pid = _slug(partner_id or label)
         clean_url = (url or "").strip()
         if not pid or not clean_url.startswith(("http://", "https://")):
             return {"ok": False, "error": "`partner_id` and `http(s)://.../api/mcp` `url` are required."}
+        ssrf_err = check_url_ssrf(clean_url, allow_private_lan=True)
+        if ssrf_err:
+            return {"ok": False, "error": ssrf_err}
         cred_slug = normalize_secret_name(credential_ref) if credential_ref else ""
         if cred_slug:
-            get_vault_manager(store=self.store).declare_placeholder(cred_slug, cred_type="bearer_token", description=f"Federated partner token for `{pid}`", allow_list=[f"partner:{pid}"])
+            get_vault_manager(store=self.store).declare_placeholder(
+                cred_slug, cred_type="bearer_token", description=f"Federated partner token for `{pid}`", allow_list=[f"partner:{pid}"], actor=actor,
+            )
         with self.store._lock:
             self.store.conn.execute(
                 """INSERT INTO federated_partners (partner_id, label, url, credential_ref, enabled, updated_at)
@@ -448,7 +489,9 @@ class MCPHub:
         ids = [str(r[0]) for r in self.store._fetch_rows("SELECT partner_id FROM federated_partners ORDER BY partner_id ASC")]
         return [p for pid in ids if (p := self.get_partner(pid)) is not None]
 
-    def remove_partner(self, partner_id: str) -> Dict[str, Any]:
+    def remove_partner(self, partner_id: str, actor: str = "user") -> Dict[str, Any]:
+        if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
+            return {"ok": False, "error": "MCP GUARD REJECTED: Only the user can remove federated partners."}
         pid = _slug(partner_id)
         with self.store._lock:
             cur = self.store.conn.execute("DELETE FROM federated_partners WHERE partner_id = ?", (pid,))
@@ -467,13 +510,16 @@ class MCPHub:
         if self._partner_rpc_fn is not None:
             resp = self._partner_rpc_fn(partner, rpc_payload, tok)
         else:
+            ssrf_err = check_url_ssrf(partner["url"], allow_private_lan=True)
+            if ssrf_err:
+                return False, {}, ssrf_err
             headers = {"Content-Type": "application/json", "Accept": "application/json"}
             if tok:
                 headers["Authorization"] = f"Bearer {tok}"
             try:
                 req = urllib.request.Request(partner["url"], data=json.dumps(rpc_payload).encode("utf-8"), method="POST", headers=headers)
-                with urllib.request.urlopen(req, timeout=12.0) as http_resp:
-                    resp = _parse_http_mcp_body(http_resp.read(262_144).decode("utf-8", errors="replace"))
+                with urlopen_safe(req, timeout=12.0, allow_private_lan=True, allow_redirects=False) as http_resp:
+                    resp = _parse_http_mcp_body(http_resp.read(262_144).decode("utf-8", errors="replace"), expected_id=1)
             except urllib.error.HTTPError as exc:
                 return False, {}, f"Partner HTTP {exc.code}"
             except Exception as exc:
