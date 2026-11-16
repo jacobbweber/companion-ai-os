@@ -183,7 +183,6 @@ def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
         "self_dev_lock_reason": settings.self_dev_lock_reason(),
         "operating_quadrant": describe_operating_quadrant(bg_on, self_dev_on),
         "unseen_autonomy_count": len(unseen_journal),
-        "unseen_hobbies_count": len(unseen_journal),
         "provider_count": len(m_snap["providers"]),
         "pending_approvals_count": len(waiting_approvals),
         "pending_approvals": waiting_approvals[:5],

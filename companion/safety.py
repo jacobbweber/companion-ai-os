@@ -175,7 +175,7 @@ def check_path_safety(path: Path, write: bool = False, allowed_roots: Optional[L
                 return (
                     f"SAFETY GUARD REJECTED path: Companion core (`{ws_chk.self_root}`) is mechanically locked READ-ONLY "
                     "because `Self-Dev Mode` is OFF (`ADR-019`). Enable `/selfdev on` (or toggle `Self-Dev Mode` in "
-                    "Web UI `System -> Autonomy & Hobbies`), or write inside `data/` or an external `/project` workspace."
+                    "Web UI `Settings -> General & Autonomy`), or write inside `data/` or an external `/project` workspace."
                 )
     return None
 

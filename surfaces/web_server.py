@@ -223,7 +223,7 @@ class CompanionWebSession:
             "companion_name": prof.get("companion_name") or settings.companion_name or "Companion",
             "user_name": prof.get("user_name") or settings.user_name or "Partner",
             "tone": prof.get("companion_tone", "balanced"), "active_model_tier": prof.get("active_model_tier", "auto"),
-            "fast_model": f_cfg.model, "reasoning_model": r_cfg.model, "hobby_mode": prof.get("background_autonomy", prof.get("hobby_mode", "off")),
+            "fast_model": f_cfg.model, "reasoning_model": r_cfg.model,
             "workspace": {"project_id": ws.project_id, "project_root": str(ws.project_root), "is_self_project": ws.is_self_project},
             "busy": self.busy, "active_action": self.active_action, "busy_seconds": busy_sec,
             "model_swap": active_swap_status(), "active_job": active_job, "lan_url": self.lan_url, "workflow": active_wf,
@@ -603,7 +603,7 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             sess.idle_watcher.record_human_activity()
         ext_act = handle_extended_post(route, body, self.headers, sess.store)
         if ext_act is not None:
-            if route in ("/api/actions/autonomy", "/api/actions/hobbies"):
+            if route == "/api/actions/autonomy":
                 fresh_sys = build_system_prompt(store=sess.store)
                 with sess._turn_lock:
                     if sess.messages and sess.messages[0].get("role") == "system":

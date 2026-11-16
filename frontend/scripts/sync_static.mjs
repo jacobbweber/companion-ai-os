@@ -24,12 +24,12 @@ rawJs = rawJs.replace(/cdn\./gi, 'local-doc.');
 const rawCss = cssFiles.map((f) => fs.readFileSync(path.join(distDir, f), 'utf-8')).join('\n');
 
 const indexHtml = `<!DOCTYPE html>
-<html lang="en" data-theme="storm">
+<html lang="en" data-theme="obsidian">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <!-- COMPANION_CSRF_META -->
-  <title>Companion AI OS — Studio Command</title>
+  <title>Companion AI OS v3.5</title>
   <!-- COMPANION_INLINE_CSS -->
 </head>
 <body>

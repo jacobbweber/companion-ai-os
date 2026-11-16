@@ -538,12 +538,12 @@ def parse_selfdev_slash(parts: List[str]) -> Dict[str, Any]:
 
 
 def execute_autonomy_mode_action(p: Dict[str, Any], actor: str = "user", store: Optional[MemoryStore] = None) -> Dict[str, Any]:
-    """CoreAction handler for Two-Lever Operating Architecture (`autonomy` / `hobbies` compatibility alias)."""
+    """CoreAction handler for Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`)."""
     mem = store or get_memory_store()
     rm = get_routine_manager(store=mem)
     sub = str(p.get("subaction") or p.get("action") or "status").strip().lower()
 
-    if sub in ("set_autonomy", "set_hobby_mode", "set_hobby", "on", "off", "toggle"):
+    if sub in ("set_autonomy", "on", "off", "toggle"):
         val = True if sub == "on" else (False if sub == "off" else (not mem.is_background_autonomy_enabled() if sub == "toggle" else bool(p.get("enabled", True))))
         mem.set_background_autonomy(val)
     elif sub == "set_self_dev":
@@ -553,7 +553,7 @@ def execute_autonomy_mode_action(p: Dict[str, Any], actor: str = "user", store: 
             return {"ok": False, "error": f"PRIVILEGE GUARD REJECTED: Self-Dev Mode is locked by environment: {settings.self_dev_lock_reason()}"}
         mem.set_self_dev_mode(bool(p.get("enabled")), actor=actor)
     elif sub in ("run", "run_now"):
-        rid = str(p.get("routine_id") or p.get("hobby") or "wiki_gardener")
+        rid = str(p.get("routine_id") or "wiki_gardener")
         return rm.run_routine_now(rid, run_in_background=bool(p.get("run_in_background", False)))
     elif sub in ("morning", "journal"):
         entries = mem.get_autonomy_journal(limit=int(p.get("limit") or 15), mark_seen=bool(p.get("mark_seen", True)))
@@ -564,7 +564,7 @@ def execute_autonomy_mode_action(p: Dict[str, Any], actor: str = "user", store: 
     routines = rm.list_routines()
     journal = mem.get_autonomy_journal(limit=10, mark_seen=False)
     return {
-        "ok": True, "background_autonomy": bg_on, "hobby_mode": "on" if bg_on else "off",
+        "ok": True, "background_autonomy": bg_on,
         "self_dev_mode": "on" if sd_on else "off", "self_dev_locked": settings.is_self_dev_locked_by_env(),
         "operating_quadrant": quad, "quadrant": quad, "routines": routines, "journal": journal, "summary": quad["summary"],
     }

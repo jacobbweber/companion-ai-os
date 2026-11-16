@@ -664,3 +664,15 @@ def get_dag_run(run_id: str, store: Optional[MemoryStore] = None) -> Optional[Di
         (run_id.strip(),),
     )
     return out
+
+
+def list_dag_runs(store: Optional[MemoryStore] = None, limit: int = 25) -> List[Dict[str, Any]]:
+    """Return recent persisted `dag_runs` records ordered newest-first."""
+    mem = store or get_memory_store()
+    mem.ensure_schema("dag_runtime", _init_dag_tables)
+    cap = max(1, min(int(limit or 25), 100))
+    return mem._fetch_dicts(
+        ["run_id", "dag_name", "status", "paused_node_id", "approval_id", "error", "created_at", "updated_at"],
+        "SELECT run_id, dag_name, status, paused_node_id, approval_id, error, created_at, updated_at FROM dag_runs ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+        (cap,),
+    )

@@ -2,7 +2,7 @@
 """
 Companion AI OS — Self-Evolving, Spec-Driven, State-Machine Local AI Companion & Engineering Agent.
 
-Entry Point, CLI/REPL & Non-Blocking Idle Hobby Watcher (A-Frame Presentation Apex).
+Entry Point, CLI/REPL & Non-Blocking Idle Autonomy Watcher (A-Frame Presentation Apex).
 Delegates to the modular `companion/` A-Frame package while preserving full
 backward-compatible module exports and boot-time self-recovery.
 
@@ -14,7 +14,7 @@ Usage:
   One-shot prompt  : python harness.py "your prompt"
   Health Doctor    : python harness.py --doctor
   Live Status HUD  : python harness.py --status
-  Hobby Controls   : python harness.py "/hobby on" | "/hobby status" | "/morning"
+  Autonomy Controls: python harness.py "/autonomy on" | "/autonomy status" | "/morning"
 """
 
 import json
@@ -310,7 +310,7 @@ def _handle_cli_args(argv: List[str], store) -> None:
         "--goal": "/goal", "-g": "/goal",
         "--backlog": "/backlog", "-b": "/backlog",
         "--specs": "/specs", "--skills": "/skills", "--subagent": "/subagent", "--hygiene": "/hygiene",
-        "--autonomy": "/autonomy", "--hobby": "/hobby", "--selfdev": "/selfdev", "--self-dev": "/selfdev", "--morning": "/morning",
+        "--autonomy": "/autonomy", "--selfdev": "/selfdev", "--self-dev": "/selfdev", "--morning": "/morning",
         "--memory": "/memory", "--checkpoint": "/checkpoint",
         "--rollback": "/rollback", "--reset": "/reset",
         "--identity": "/identity", "--tone": "/tone", "--model": "/model", "--models": "/model", "--providers": "/providers", "--onboard": "/onboard",

@@ -28,6 +28,7 @@ from companion.routines import (
     cleanup_sandbox_clone, create_sandbox_clone, diff_sandbox_clone, execute_autonomy_mode_action,
     get_routine_manager, list_sandbox_clones, parse_selfdev_slash, verify_sandbox_clone,
 )
+from companion.skill_forge import execute_customizations_action
 from companion.vault import create_snapshot_backup, get_vault_manager, list_snapshot_backups, restore_snapshot_backup
 from companion.wiki_curation import commit_curation_plan, inspect_graduation, list_curation_history, revert_curation, validate_curation_plan
 from companion.wiki_engine import get_wiki_engine
@@ -568,7 +569,7 @@ def _parse_agile_slash(verb: str, parts: List[str]) -> Dict[str, Any]:
 CORE_ACTIONS: Dict[str, ActionSpec] = {
     "trust": ActionSpec("trust", "governance", "Inspect or set the 3-tier global Trust Mode (`strict`, `balanced`, `autonomous`).", False, _act_trust),
     "autonomy": ActionSpec("autonomy", "governance", "Manage Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`), Idle Routines, and Morning Journal.", False, lambda p, a, m: execute_autonomy_mode_action(p, actor=a, store=m)),
-    "hobbies": ActionSpec("hobbies", "governance", "Compatibility alias for `autonomy` (`Background Autonomy` x `Self-Dev Mode` & Morning Journal).", False, lambda p, a, m: execute_autonomy_mode_action(p, actor=a, store=m)),
+    "customizations": ActionSpec("customizations", "skills", "Inspect Capability Packs (`skills/` & `data/skills/`), Verified Python DAGs, and `dag_runs`, or run/resume DAGs.", False, execute_customizations_action),
     "approvals": ActionSpec("approvals", "governance", "Inspect or resolve pending human-in-the-loop approval requests.", False, _act_approvals),
     "archive": ActionSpec("archive", "memory", "Search Forever Chat (Hot + Cold Archive) or archive conversations >90d.", False, _act_archive),
     "prompts": ActionSpec("prompts", "memory", "Manage and render reusable templates in the Saved Prompts Library.", False, _act_prompts),

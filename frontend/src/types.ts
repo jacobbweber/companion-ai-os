@@ -1,17 +1,44 @@
-export type ThemeId = 'storm' | 'loftra' | 'obsidian' | 'orbital' | 'graphite' | 'daylight';
+export type ThemeId = 'obsidian' | 'daylight' | 'graphite' | 'storm' | 'loftra' | 'orbital';
 
-export type StudioId =
+export type SurfaceId =
   | 'chat'
   | 'boards'
   | 'calendar'
-  | 'wiki'
-  | 'jobs'
-  | 'system';
+  | 'knowledge'
+  | 'automations'
+  | 'customizations';
+
+export type SettingsSectionId =
+  | 'general'
+  | 'appearance'
+  | 'identity'
+  | 'models'
+  | 'vault'
+  | 'federation'
+  | 'ops';
 
 export interface WorkspaceInfo {
   project_id: string;
   project_root: string;
   is_self_project: boolean;
+}
+
+export interface TriggerPolicySpec {
+  mode: 'manual' | 'scheduled' | 'on_idle' | string;
+  schedule_expr?: string;
+  idle_min_seconds?: number;
+  allowed_window?: string;
+  cooldown_seconds?: number;
+  precheck_name?: string;
+  requires_self_dev?: boolean;
+}
+
+export interface OperatingQuadrant {
+  quadrant: 'interactive_standard' | 'interactive_self_dev' | 'autonomous_partner' | 'self_evolving_os' | string;
+  label: string;
+  background_autonomy: boolean;
+  self_dev_mode: boolean;
+  summary: string;
 }
 
 export interface ConnectedPartnerSummary {
@@ -76,13 +103,13 @@ export interface WebStatus {
   active_model_tier: string;
   fast_model: string;
   reasoning_model: string;
-  hobby_mode: string;
-  self_dev_mode?: string;
+  background_autonomy?: 'on' | 'off' | string;
+  self_dev_mode?: 'on' | 'off' | string;
   self_dev_enabled?: boolean;
   self_dev_locked?: boolean;
   self_dev_lock_reason?: string;
   operating_quadrant?: OperatingQuadrant;
-  unseen_hobbies_count?: number;
+  unseen_autonomy_count?: number;
   workspace: WorkspaceInfo;
   busy: boolean;
   active_action: string;
@@ -107,6 +134,7 @@ export interface WebStatus {
   agile_summary?: {
     active_sprint_title: string;
     open_cards: number;
+    blocked_count?: number;
     aging_count: number;
   };
   education_summary?: {
@@ -241,7 +269,7 @@ export interface WikiDiffFile {
 
 export interface WikiDiffPayload {
   ok: boolean;
-  mode?: 'lineage_diff' | 'approval_preview' | 'draft_preview' | string;
+  mode?: string;
   path?: string;
   compare_to?: string;
   approval_id?: string;
@@ -475,7 +503,7 @@ export interface OutboundMcpServer {
   url: string;
   credential_ref: string;
   allowed_tools: string[];
-  discovered_tools: Array<{ name: string; description?: string }>;
+  discovered_tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>;
   tools_fingerprint: string;
   approved_fingerprint: string;
   is_approved: boolean;
@@ -486,14 +514,43 @@ export interface RoutineItem {
   routine_id: string;
   title: string;
   schedule_expr: string;
+  trigger_policy: TriggerPolicySpec;
   target_kind: string;
   target_name: string;
+  inputs?: Record<string, unknown>;
   enabled: boolean;
   catch_up: boolean;
   next_run_at: string;
   last_run_at: string;
+  last_job_id?: string;
   last_status: string;
   missed_count: number;
+  updated_at?: string;
+}
+
+export interface AutonomyJournalEntry {
+  id: number;
+  entry_kind: 'routine' | 'goal_slice' | string;
+  entry_name?: string;
+  target_id?: string;
+  status: string;
+  summary: string;
+  checkpoint_id?: string;
+  doctor_passed?: boolean;
+  seen_by_user?: boolean;
+  created_at: string;
+}
+
+export interface AutonomySnapshot {
+  ok: boolean;
+  background_autonomy: boolean;
+  self_dev_mode: 'on' | 'off' | string;
+  self_dev_locked: boolean;
+  operating_quadrant: OperatingQuadrant;
+  routines: RoutineItem[];
+  journal: AutonomyJournalEntry[];
+  summary?: string;
+  error?: string;
 }
 
 export interface SnapshotBackup {
@@ -553,114 +610,120 @@ export interface TelemetryPayload {
   }>;
 }
 
-export interface AgileBoard {
-  board_id: string;
-  title: string;
-  kind: 'life' | 'work' | 'project' | 'software' | string;
+export interface ProjectGraphEntry {
   project_id: string;
-  description: string;
-  archived: boolean;
-  open_cards: number;
-}
-
-export interface AgileChecklistItem {
-  id: string;
-  text: string;
-  done: boolean;
-}
-
-export interface AgileEpic {
-  epic_id: string;
-  board_id: string;
-  board_title?: string;
+  slug: string;
   title: string;
-  horizon: 'now' | 'next' | 'later' | 'someday' | string;
+  goal_summary: string;
+  kind: 'goal' | 'project' | 'life' | 'work' | 'software' | string;
   status: string;
-  start_date: string;
-  target_date: string;
-  wiki_path: string;
-  summary: string;
-  card_count?: number;
-  done_card_count?: number;
-  progress_pct?: number;
-  effective_start_date?: string;
-  roadmap_end_date?: string;
+  trigger_policy: TriggerPolicySpec;
+  wiki_hub_path?: string;
+  metadata?: Record<string, unknown>;
   created_at?: string;
   updated_at?: string;
 }
 
-export interface AgileSprint {
+export interface WorkItemVerificationSpec {
+  kind?: 'assertion' | 'evidence_file' | 'check_command' | 'script_validator' | 'domain_validator' | 'human_gate' | string;
+  target?: string;
+  contains?: string;
+  description?: string;
+  params?: Record<string, unknown>;
+}
+
+export interface WorkItemChecklistEntry {
+  id?: string;
+  text: string;
+  done?: boolean;
+}
+
+export interface WorkItem {
+  id: number;
+  item_id: string;
+  card_id: string;
+  project_id: string;
+  milestone_id: string;
+  epic_id: string;
+  timebox_id: string;
   sprint_id: string;
+  workflow_id?: number | null;
+  item_kind: string;
   title: string;
-  goal_summary: string;
+  description: string;
+  category?: string;
+  status: 'backlog' | 'ready' | 'in_progress' | 'blocked' | 'verify' | 'done' | string;
+  column_key: 'backlog' | 'ready' | 'in_progress' | 'blocked' | 'verify' | 'done' | string;
+  owner: 'companion' | 'human' | 'collaborative' | string;
+  stage_kind: 'OBSERVE_DATA' | 'CURATE_DIKW' | 'FORGE_CAPABILITY' | 'DELIVER_AND_VERIFY' | string;
+  priority: number;
+  depends_on: string[];
+  verification: WorkItemVerificationSpec;
+  dag_name: string;
+  checkpoint_id: string;
+  acceptance_criteria: string;
+  verification_result: string;
+  estimate_minutes: number;
+  planned_date: string;
+  due_date: string;
+  checklist: Array<string | WorkItemChecklistEntry>;
+  tags: string[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface MilestoneEntry {
+  milestone_id: string;
+  project_id: string;
+  title: string;
+  description: string;
+  stage_kind: string;
+  status: string;
+  target_date: string;
+  sort_order?: number;
+  item_count?: number;
+  done_count?: number;
+  progress_pct?: number;
+  items?: WorkItem[];
+}
+
+export interface TimeboxEntry {
+  timebox_id: string;
+  sprint_id: string;
+  project_id: string;
+  title: string;
+  goal: string;
   start_date: string;
   end_date: string;
   status: string;
-  weekday_capacity_slots: number;
-  weekend_capacity_slots: number;
   retro_notes: string;
 }
 
-export interface AgileCard {
-  card_id: string;
-  board_id: string;
-  board_title: string;
-  epic_id: string;
-  epic_title: string;
-  sprint_id: string;
+export interface BoardColumnProjection {
+  col_key: string;
   title: string;
-  description: string;
-  status: 'backlog' | 'sprint_todo' | 'in_progress' | 'blocked' | 'verify' | 'done' | string;
-  horizon: 'now' | 'next' | 'later' | 'someday' | string;
-  priority: number;
-  effort_size: 'quick' | 'half_day' | 'full_day' | 'multi_day' | string;
-  day_slot: 'weekday' | 'weekend' | 'any' | string;
-  slot_points: number;
-  planned_date: string;
-  due_date: string;
-  blocked_reason: string;
-  depends_on: string[];
-  unresolved_deps: Array<{ card_id: string; title: string }>;
-  tags: string[];
-  checklist: AgileChecklistItem[];
-  checklist_done: number;
-  checklist_total: number;
-  rollover_count: number;
-  age_days: number;
-  untouched_days: number;
-  is_aging: boolean;
-  workflow_id?: number | null;
+  cards: WorkItem[];
 }
 
-export interface AgileCapacity {
-  has_active_sprint: boolean;
-  sprint?: AgileSprint;
-  weekday_used: number;
-  weekday_capacity: number;
-  weekend_used: number;
-  weekend_capacity: number;
-  any_used: number;
-  total_used?: number;
-  total_capacity?: number;
-  done_count: number;
-  total_count: number;
-  over_capacity: boolean;
-  warnings: string[];
-}
-
-export interface AgileBoardView {
+export interface ProjectBoardProjection {
   ok: boolean;
-  board_id: string;
-  boards: AgileBoard[];
-  epics: AgileEpic[];
-  active_sprint: AgileSprint | null;
-  capacity: AgileCapacity;
-  cards: AgileCard[];
-  all_cards: AgileCard[];
-  backlog_cards: AgileCard[];
-  columns: Record<string, AgileCard[]>;
-  horizons: Record<string, AgileCard[]>;
-  aging_cards: AgileCard[];
+  project: ProjectGraphEntry;
+  board: ProjectGraphEntry;
+  boards: ProjectGraphEntry[];
+  columns: BoardColumnProjection[];
+  cards: WorkItem[];
+  items?: WorkItem[];
+  milestones: MilestoneEntry[];
+  epics: MilestoneEntry[];
+  active_sprint: TimeboxEntry | null;
+  sprints: TimeboxEntry[];
+  counts: {
+    total: number;
+    companion_ready: number;
+    human_pending: number;
+    blocked: number;
+    done: number;
+  };
   summary?: string;
 }
 
@@ -688,9 +751,11 @@ export interface CalendarWindow {
   today: string;
   start_date: string;
   end_date: string;
-  sprints: AgileSprint[];
-  active_sprint: AgileSprint | null;
-  epics?: AgileEpic[];
+  sprints?: TimeboxEntry[];
+  timeboxes?: TimeboxEntry[];
+  active_sprint: TimeboxEntry | null;
+  epics?: MilestoneEntry[];
+  milestones?: MilestoneEntry[];
   items: CalendarItem[];
   by_date: Record<string, CalendarItem[]>;
 }
@@ -803,87 +868,52 @@ export interface ModelMatrixSnapshot {
   error?: string;
 }
 
-export interface OperatingQuadrant {
-  id: 'quiet_daily_driver' | 'personal_daily_driver' | 'deliberate_self_dev' | 'autonomous_lab' | string;
-  code: 'Q1' | 'Q2' | 'Q3' | 'Q4' | string;
-  title: string;
-  summary: string;
-  hobby_enabled: boolean;
-  self_dev_enabled: boolean;
-  core_read_only: boolean;
-  eligible_tracks: string[];
-}
-
-export interface HobbyCatalogItem {
+export interface SkillPackSummary {
   name: string;
-  title: string;
-  track: 'personal' | 'self_dev' | string;
-  discipline: string;
   description: string;
-  preferred_tier: string;
-  eligible: boolean;
-  locked_reason: string;
-  is_next: boolean;
+  required_tools: string;
+  path: string;
+  scope: 'core' | 'user' | string;
+  references: string;
+  dags: string;
+  scripts: string;
 }
 
-export interface HobbyJournalEntry {
-  id: number;
-  hobby_name: string;
-  status: string;
-  summary: string;
-  checkpoint_id: string;
-  doctor_passed: boolean;
-  seen_by_user?: boolean;
+export interface VerifiedDagSummary {
+  name: string;
+  skill: string;
+  description: string;
+  path: string;
+  nodes: string[];
+  input_schema: Record<string, string>;
+}
+
+export interface DagRunSummary {
+  run_id: string;
+  dag_name: string;
+  status: 'completed' | 'waiting_approval' | 'failed' | 'running' | string;
+  paused_node_id: string;
+  approval_id: string;
+  error: string;
   created_at: string;
+  updated_at: string;
 }
 
-export interface OperatingModesSnapshot {
+export interface CustomizationsSnapshot {
   ok: boolean;
-  hobby_enabled: boolean;
-  hobby_mode: 'on' | 'off' | string;
-  self_dev_enabled: boolean;
-  self_dev_mode: 'on' | 'off' | string;
-  self_dev_locked: boolean;
-  self_dev_lock_reason: string;
-  immutable_core: boolean;
-  quadrant: OperatingQuadrant;
-  idle_minutes: number;
-  cooldown_minutes: number;
-  max_iters: number;
-  next_hobby: string;
-  catalog: HobbyCatalogItem[];
-  journal: HobbyJournalEntry[];
-  unseen_count: number;
-  morning_briefing: string;
+  skills: SkillPackSummary[];
+  dags: VerifiedDagSummary[];
+  dag_runs: DagRunSummary[];
   summary?: string;
-  error?: string;
 }
 
-export interface IdentitySnapshot {
-  ok: boolean;
-  onboarded: boolean;
-  companion_name: string;
-  companion_soul: string;
-  companion_tone: string;
-  valid_tones: Record<string, string>;
-  user_name: string;
-  user_profile: string;
-  role: string;
-  communication_style: string;
-  workspace: {
-    project_id: string;
-    project_root: string;
-    is_self_project: boolean;
-    self_root: string;
-    known_projects: Record<string, string>;
-  };
-  paths: {
-    data_dir: string;
-    db_path: string;
-    identity_md_path: string;
-    memory_md_path: string;
-    user_skills_dir: string;
-  };
-  summary?: string;
-  error?: string;
-}
+export type AuxInspectorTarget =
+  | { kind: 'work_item'; itemId: string; projectId?: string }
+  | { kind: 'project'; projectId: string }
+  | { kind: 'routine'; routineId?: string; createNew?: boolean }
+  | { kind: 'skill'; skillName: string; asset?: string }
+  | { kind: 'dag'; dagName: string }
+  | { kind: 'wiki_note'; notePath: string }
+  | { kind: 'job'; jobId: string }
+  | { kind: 'approvals' }
+  | null;

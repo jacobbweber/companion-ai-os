@@ -1,62 +1,67 @@
 import React, { useEffect, useRef, useState } from 'react';
-import {
-  Bell,
-  BookOpen,
-  Calendar,
-  Check,
-  FolderKanban,
-  MessageSquare,
-  Moon,
-  Palette,
-  Rocket,
-  Settings2,
-  ShieldAlert,
-  Sparkles,
-  Sun,
-  X,
-} from 'lucide-react';
+import { Inbox, PanelLeftOpen, PanelRight } from 'lucide-react';
 import { callAction, fetchStatus } from './api';
-import { BoardsStudio } from './studios/BoardsStudio';
-import { CalendarStudio } from './studios/CalendarStudio';
-import { ChatStudio } from './studios/ChatStudio';
-import { JobsApprovalsStudio } from './studios/JobsApprovalsStudio';
-import { SystemStudio, type SystemSubTab } from './studios/SystemStudio';
-import { WikiStudio } from './studios/WikiStudio';
-import type { StudioId, ThemeId, WebStatus } from './types';
+import { SettingsModal } from './settings/SettingsModal';
+import { ActivityPopover } from './shell/ActivityPopover';
+import { AuxSplitPane } from './shell/AuxSplitPane';
+import { CommandPaletteModal } from './shell/CommandPaletteModal';
+import { LeftSidebar } from './shell/LeftSidebar';
+import { AutomationsSurface } from './surfaces/AutomationsSurface';
+import { BoardGoalsSurface } from './surfaces/BoardGoalsSurface';
+import { CalendarSurface } from './surfaces/CalendarSurface';
+import { ChatSurface } from './surfaces/ChatSurface';
+import { CustomizationsSurface } from './surfaces/CustomizationsSurface';
+import { KnowledgeSurface } from './surfaces/KnowledgeSurface';
+import type {
+  AuxInspectorTarget,
+  ProjectGraphEntry,
+  SettingsSectionId,
+  SurfaceId,
+  ThemeId,
+  WebStatus,
+} from './types';
 
-const THEMES: Array<{ id: ThemeId; label: string }> = [
-  { id: 'storm', label: 'Storm & Safety Orange' },
-  { id: 'loftra', label: 'Loftra Industrial' },
-  { id: 'obsidian', label: 'Obsidian Matte' },
-  { id: 'orbital', label: 'Orbital Brutalist' },
-  { id: 'graphite', label: 'Graphite Minimal' },
-  { id: 'daylight', label: 'Daylight Paper' },
-];
+const SURFACE_LABELS: Record<SurfaceId, string> = {
+  chat: 'Conversation',
+  boards: 'Board & Goals',
+  calendar: 'Calendar',
+  knowledge: 'Knowledge',
+  automations: 'Automations',
+  customizations: 'Customizations',
+};
 
 export const App: React.FC = () => {
-  const [studio, setStudio] = useState<StudioId>('chat');
+  const [surface, setSurface] = useState<SurfaceId>('chat');
+  const [railCollapsed, setRailCollapsed] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth <= 768 : false
+  );
   const [theme, setTheme] = useState<ThemeId>(() => {
     const saved = window.localStorage.getItem('companion_theme') as ThemeId | null;
-    return saved && THEMES.some((t) => t.id === saved) ? saved : 'storm';
+    return saved || 'obsidian';
   });
-  const [lastDarkTheme, setLastDarkTheme] = useState<ThemeId>('storm');
   const [status, setStatus] = useState<WebStatus | null>(null);
-  const [wikiTargetNote, setWikiTargetNote] = useState<string>('');
-  const [systemTab, setSystemTab] = useState<SystemSubTab>('models');
-  const [systemTabNonce, setSystemTabNonce] = useState<number>(0);
-  const [toast, setToast] = useState<string>('');
-  const [showNotifs, setShowNotifs] = useState<boolean>(false);
-  const notifAnchorRef = useRef<HTMLDivElement | null>(null);
+  const [projects, setProjects] = useState<ProjectGraphEntry[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>('');
+  const [auxTarget, setAuxTarget] = useState<AuxInspectorTarget>(null);
+  const [showActivity, setShowActivity] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId>('general');
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [wikiInitialPath, setWikiInitialPath] = useState('');
+  const [conversationNonce, setConversationNonce] = useState(0);
+  const [dataRefreshNonce, setDataRefreshNonce] = useState(0);
+  const [toast, setToast] = useState('');
+  const activityAnchorRef = useRef<HTMLDivElement | null>(null);
 
-  const openSystemTab = (tab: SystemSubTab) => {
-    setSystemTab(tab);
-    setSystemTabNonce((n) => n + 1);
-    setStudio('system');
+  const showToast = (msg: string) => {
+    setToast(msg);
+    window.setTimeout(() => {
+      setToast((cur) => (cur === msg ? '' : cur));
+    }, 4000);
   };
 
   const applyTheme = (next: ThemeId) => {
     setTheme(next);
-    if (next !== 'daylight') setLastDarkTheme(next);
     document.documentElement.setAttribute('data-theme', next);
     window.localStorage.setItem('companion_theme', next);
   };
@@ -65,541 +70,313 @@ export const App: React.FC = () => {
     document.documentElement.setAttribute('data-theme', theme);
   }, []);
 
-  const refreshStatus = async () => {
+  const refreshStatusAndProjects = async () => {
     try {
-      const s = await fetchStatus();
-      if (s.ok) setStatus(s);
+      const [st, bRes] = await Promise.all([
+        fetchStatus(),
+        callAction<{ boards?: ProjectGraphEntry[] }>('agile', { subaction: 'list_boards' }),
+      ]);
+      if (st.ok) {
+        setStatus(st);
+        if (!selectedProjectId && st.workspace?.project_id) {
+          setSelectedProjectId(st.workspace.project_id);
+        }
+      }
+      if (bRes.boards) {
+        setProjects(bRes.boards);
+        if (!selectedProjectId && bRes.boards.length > 0) {
+          setSelectedProjectId(bRes.boards[0].project_id);
+        }
+      }
     } catch {
       // ignore transient poll error
     }
   };
 
   useEffect(() => {
-    void refreshStatus();
+    void refreshStatusAndProjects();
     const timer = window.setInterval(() => {
-      if (document.visibilityState !== 'hidden') void refreshStatus();
-    }, 4000);
-    const onVis = () => {
-      if (document.visibilityState === 'visible') void refreshStatus();
-    };
-    document.addEventListener('visibilitychange', onVis);
-    return () => {
-      window.clearInterval(timer);
-      document.removeEventListener('visibilitychange', onVis);
-    };
+      if (document.visibilityState !== 'hidden') {
+        void fetchStatus().then((s) => {
+          if (s.ok) setStatus(s);
+        }).catch(() => {});
+      }
+    }, 5000);
+    return () => window.clearInterval(timer);
   }, []);
 
-  const showToast = (msg: string) => {
-    setToast(msg);
-    window.setTimeout(() => {
-      setToast((cur) => (cur === msg ? '' : cur));
-    }, 4200);
-  };
-
-  const openWikiNote = (notePath: string) => {
-    setWikiTargetNote(notePath);
-    setStudio('wiki');
-  };
-
-  const toggleLightDark = () => {
-    applyTheme(theme === 'daylight' ? lastDarkTheme : 'daylight');
-  };
-
-  const onlinePartners = (status?.connected_partners || []).filter((p) => p.online);
-  const dueStudyCount = status?.education_summary?.due_total || 0;
-  const openBoardCards = status?.agile_summary?.open_cards || 0;
-  const agingBoardCards = status?.agile_summary?.aging_count || 0;
-  const pendingApprovals = status?.pending_approvals || [];
-  const passiveNudges = (status?.session_nudges || []).filter((n) => n.category !== 'approval');
-  const unseenHobbies = status?.unseen_hobbies_count || 0;
-  const bellCount = pendingApprovals.length + passiveNudges.length + unseenHobbies;
-
   useEffect(() => {
-    if (!showNotifs) return;
-    const onPointerDown = (ev: MouseEvent) => {
-      if (notifAnchorRef.current && !notifAnchorRef.current.contains(ev.target as Node)) {
-        setShowNotifs(false);
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'k') {
+        ev.preventDefault();
+        setSearchOpen((v) => !v);
+      } else if (ev.key === 'Escape') {
+        setShowActivity(false);
+        setSearchOpen(false);
       }
     };
-    const onKeyDown = (ev: KeyboardEvent) => {
-      if (ev.key === 'Escape') setShowNotifs(false);
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    if (!showActivity) return;
+    const onPointerDown = (ev: MouseEvent) => {
+      if (activityAnchorRef.current && !activityAnchorRef.current.contains(ev.target as Node)) {
+        setShowActivity(false);
+      }
     };
     document.addEventListener('mousedown', onPointerDown);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('mousedown', onPointerDown);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, [showNotifs]);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [showActivity]);
 
-  const dismissOneNudge = async (nudgeId?: number) => {
-    if (!nudgeId) return;
-    await callAction('approvals', { subaction: 'dismiss_nudges', nudge_id: nudgeId });
-    await refreshStatus();
-  };
-
-  const clearAllNotifications = async () => {
-    const tasks: Array<Promise<unknown>> = [
-      callAction('approvals', { subaction: 'dismiss_nudges' }),
-    ];
-    if (unseenHobbies > 0) {
-      tasks.push(callAction('hobbies', { subaction: 'morning', mark_seen: true }));
+  const handleSelectSurface = (next: SurfaceId) => {
+    setShowActivity(false);
+    setSurface(next);
+    if (typeof window !== 'undefined' && window.innerWidth <= 768) {
+      setRailCollapsed(true);
     }
-    await Promise.all(tasks);
-    await refreshStatus();
-    showToast('Cleared unread notifications.');
   };
 
-  const resolveBellApproval = async (approvalId: string, decision: 'approve' | 'deny') => {
-    const res = await callAction('approvals', {
-      subaction: decision,
-      approval_id: approvalId,
-    });
-    await refreshStatus();
-    showToast(res.summary || res.error || `Marked ${approvalId} as ${decision}.`);
+  const handleSelectProject = (projectId: string, openBoard = false) => {
+    setShowActivity(false);
+    setSelectedProjectId(projectId);
+    if (openBoard) {
+      handleSelectSurface('boards');
+    } else if (typeof window !== 'undefined' && window.innerWidth <= 768) {
+      setRailCollapsed(true);
+    }
   };
+
+  const handleCreateProject = async (title: string) => {
+    const res = await callAction<{ project?: ProjectGraphEntry }>('agile', {
+      subaction: 'create_project',
+      title,
+      kind: 'project',
+    });
+    if (res.ok && res.project) {
+      await refreshStatusAndProjects();
+      setSelectedProjectId(res.project.project_id);
+      handleSelectSurface('boards');
+      showToast(`Created project "${res.project.title}".`);
+    } else {
+      showToast(res.error || 'Could not create project.');
+    }
+  };
+
+  const activeProjTitle =
+    projects.find((p) => p.project_id === selectedProjectId || p.slug === selectedProjectId)?.title ||
+    status?.workspace?.project_id ||
+    'Companion';
+
+  const pendingApprovalsCount = status?.pending_approvals?.length || 0;
+  const passiveNudgeCount = (status?.session_nudges || []).filter((n) => n.category !== 'approval').length;
+  const unseenAutonomy = status?.unseen_autonomy_count || 0;
+  const activityBadgeCount = pendingApprovalsCount + passiveNudgeCount + unseenAutonomy;
 
   return (
-    <div className="app-shell">
-      {/* Top Tactical Telemetry Header */}
-      <header className="top-bar">
-        <div
-          className="brand-cluster"
-          role="button"
-          tabIndex={0}
-          style={{ cursor: 'pointer' }}
-          title="Click to customize Companion Name, User Profile & Workspace"
-          onClick={() => openSystemTab('identity')}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') openSystemTab('identity');
-          }}
-        >
-          <div className="brand-mark mono">C3</div>
-          <div>
-            <div className="brand-title">
-              {status?.companion_name || 'Companion AI OS'}{' '}
-              <span className="mono" style={{ color: 'var(--accent-primary)', fontSize: 11 }}>
-                v3.4
-              </span>
+    <div className="agy-shell">
+      <LeftSidebar
+        collapsed={railCollapsed}
+        activeSurface={surface}
+        status={status}
+        projects={projects}
+        selectedProjectId={selectedProjectId}
+        onToggleCollapse={() => setRailCollapsed((c) => !c)}
+        onNewConversation={() => {
+          setConversationNonce((n) => n + 1);
+          handleSelectSurface('chat');
+        }}
+        onSelectSurface={handleSelectSurface}
+        onSelectProject={handleSelectProject}
+        onCreateProject={handleCreateProject}
+        onOpenSearch={() => setSearchOpen(true)}
+        onOpenSettings={() => {
+          setShowActivity(false);
+          setSettingsSection('general');
+          setSettingsOpen(true);
+        }}
+        onRefresh={() => void refreshStatusAndProjects()}
+      />
+
+      <div className="agy-workspace-frame">
+        <main className="agy-center-col">
+          {/* Calm Minimal Breadcrumb Top Bar */}
+          <header className="canvas-topbar">
+            <div className="breadcrumb-row">
+              {railCollapsed && (
+                <button
+                  type="button"
+                  className="icon-btn"
+                  data-testid="expand-sidebar-btn"
+                  onClick={() => setRailCollapsed(false)}
+                  title="Open navigation"
+                  aria-label="Open navigation"
+                >
+                  <PanelLeftOpen size={15} />
+                </button>
+              )}
+              <span className="breadcrumb-project">{activeProjTitle}</span>
+              <span style={{ color: 'var(--text-muted)' }}>/</span>
+              <span className="breadcrumb-title">{SURFACE_LABELS[surface]}</span>
             </div>
-            <div className="brand-sub mono desktop-only">
-              PROJECT: {status?.workspace?.project_id || 'companion-self'}
+
+            <div className="topbar-right" ref={activityAnchorRef}>
+              {status?.busy && (
+                <span className="status-pill-quiet">
+                  <span className="status-dot busy" />
+                  <span>{status.active_action || 'Working...'}</span>
+                </span>
+              )}
+
+              <button
+                type="button"
+                className={`icon-btn ${showActivity ? 'active' : ''}`}
+                data-testid="top-activity-btn"
+                onClick={() => setShowActivity((v) => !v)}
+                title="Approvals, Background Tasks & Activity"
+                aria-label="Workspace Activity"
+              >
+                <Inbox size={15} />
+                {activityBadgeCount > 0 && (
+                  <span className={`icon-badge-dot ${pendingApprovalsCount > 0 ? 'urgent' : ''}`}>
+                    {activityBadgeCount}
+                  </span>
+                )}
+              </button>
+
+              {showActivity && (
+                <ActivityPopover
+                  status={status}
+                  onClose={() => setShowActivity(false)}
+                  onRefreshStatus={refreshStatusAndProjects}
+                  onToast={showToast}
+                  onSelectSurface={handleSelectSurface}
+                  onInspect={(t) => setAuxTarget(t)}
+                />
+              )}
+
+              <button
+                type="button"
+                className={`icon-btn ${auxTarget ? 'active' : ''}`}
+                data-testid="toggle-aux-pane-btn"
+                onClick={() =>
+                  setAuxTarget((cur) => (cur ? null : { kind: 'approvals' }))
+                }
+                title="Toggle Auxiliary Inspector Pane"
+                aria-label="Toggle Auxiliary Pane"
+              >
+                <PanelRight size={15} />
+              </button>
             </div>
-          </div>
-        </div>
+          </header>
 
-        <div className="hud-strip">
-          <span className="hud-chip">
-            <span className={`status-dot ${status?.busy ? 'busy' : ''}`} />
-            <span className="mono">
-              {status?.busy
-                ? `ACTIVE: ${status.active_action || 'WORKING'} (${status.busy_seconds}s)`
-                : 'READY'}
-            </span>
-          </span>
-
-          <button
-            type="button"
-            data-testid="hud-chip-selfdev"
-            className={`hud-chip mono desktop-only ${status?.self_dev_enabled ? 'warn' : 'ok'}`}
-            style={{ cursor: 'pointer' }}
-            onClick={() => openSystemTab('autonomy')}
-            title="Open Autonomy, Self-Dev Lock & Two-Track Hobbies"
-          >
-            {status?.self_dev_enabled ? 'SELF-DEV: ON' : 'SELF-DEV: OFF (RO)'}
-          </button>
-
-          <button
-            type="button"
-            data-testid="hud-chip-hobbies"
-            className={`hud-chip mono desktop-only ${status?.hobby_mode === 'on' ? 'accent' : ''}`}
-            style={{ cursor: 'pointer' }}
-            onClick={() => openSystemTab('autonomy')}
-            title="Open Autonomy, Self-Dev Lock & Two-Track Hobbies"
-          >
-            HOBBIES: {(status?.hobby_mode || 'off').toUpperCase()}
-            {(status?.unseen_hobbies_count || 0) > 0
-              ? ` • ${status?.unseen_hobbies_count} NEW`
-              : ''}
-          </button>
-
-          <span className="hud-chip accent mono desktop-only">
-            TRUST: {(status?.trust_mode || 'balanced').toUpperCase()}
-          </span>
-
-          <button
-            type="button"
-            className={`hud-chip mono desktop-only ${status?.privacy_mode === 'local_only' ? 'ok' : 'accent'}`}
-            style={{ cursor: 'pointer' }}
-            onClick={() => openSystemTab('models')}
-            title="Open Models, Tiers & Outbound Privacy Lock"
-          >
-            PRIVACY: {(status?.privacy_mode || 'local_only').toUpperCase()}
-          </button>
-
-          {onlinePartners.length > 0 && (
-            <span className="hud-chip ok mono desktop-only">
-              PARTNERS: {onlinePartners.length} ONLINE
-            </span>
+          {/* Active Workspace Surface */}
+          {surface === 'chat' && (
+            <ChatSurface
+              status={status}
+              projects={projects}
+              selectedProjectId={selectedProjectId}
+              conversationNonce={conversationNonce}
+              onSelectProject={(pid) => setSelectedProjectId(pid)}
+              onInspect={(t) => setAuxTarget(t)}
+              onRefreshStatus={refreshStatusAndProjects}
+              onToast={showToast}
+            />
           )}
 
-          {/* Compact Top-Bar Notification Bell (Mobile + Desktop) */}
-          <div className="notif-anchor" ref={notifAnchorRef}>
-            <button
-              type="button"
-              data-testid="top-notification-bell"
-              aria-label="Notifications"
-              className={`btn notif-btn ${
-                pendingApprovals.length > 0
-                  ? 'has-urgent'
-                  : bellCount > 0
-                    ? 'has-unread'
-                    : ''
-              }`}
-              onClick={() => setShowNotifs((v) => !v)}
-              title="Notifications, Approvals & Background Updates"
-            >
-              <Bell size={13} />
-              {bellCount > 0 && <span className="notif-badge mono">{bellCount}</span>}
-            </button>
+          {surface === 'boards' && (
+            <BoardGoalsSurface
+              selectedProjectId={selectedProjectId}
+              refreshNonce={dataRefreshNonce}
+              selectedItemId={auxTarget?.kind === 'work_item' ? auxTarget.itemId : undefined}
+              onSelectProject={(pid) => setSelectedProjectId(pid)}
+              onInspect={(t) => setAuxTarget(t)}
+              onRefreshStatus={refreshStatusAndProjects}
+              onToast={showToast}
+            />
+          )}
 
-            {showNotifs && (
-              <div className="notif-popover" data-testid="notification-popover">
-                <div className="notif-head">
-                  <span>Notifications ({bellCount})</span>
-                  {(passiveNudges.length > 0 || unseenHobbies > 0) && (
-                    <button
-                      type="button"
-                      className="btn btn-ghost"
-                      style={{ padding: '2px 7px', fontSize: 11 }}
-                      onClick={() => void clearAllNotifications()}
-                    >
-                      Clear All
-                    </button>
-                  )}
-                </div>
+          {surface === 'calendar' && <CalendarSurface onToast={showToast} />}
 
-                {pendingApprovals.map((apr) => (
-                  <div key={apr.approval_id} className="notif-item urgent">
-                    <div className="notif-item-top">
-                      <div>
-                        <strong className="mono" style={{ color: 'var(--status-warn)' }}>
-                          <ShieldAlert size={11} style={{ marginRight: 4, verticalAlign: '-1px' }} />
-                          APPROVAL NEEDED
-                        </strong>
-                        <div style={{ marginTop: 2 }}>
-                          {apr.summary || `${apr.category}:${apr.action_name}`}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="notif-item-actions">
-                      <button
-                        type="button"
-                        className="btn btn-primary"
-                        style={{ padding: '3px 8px', fontSize: 11 }}
-                        onClick={() => void resolveBellApproval(apr.approval_id, 'approve')}
-                      >
-                        <Check size={11} /> Approve
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-danger"
-                        style={{ padding: '3px 8px', fontSize: 11 }}
-                        onClick={() => void resolveBellApproval(apr.approval_id, 'deny')}
-                      >
-                        <X size={11} /> Deny
-                      </button>
-                      <button
-                        type="button"
-                        className="btn"
-                        style={{ padding: '3px 8px', fontSize: 11 }}
-                        onClick={() => {
-                          setStudio('jobs');
-                          setShowNotifs(false);
-                        }}
-                      >
-                        Review
-                      </button>
-                    </div>
-                  </div>
-                ))}
+          {surface === 'knowledge' && (
+            <KnowledgeSurface
+              initialNotePath={wikiInitialPath}
+              onRefreshStatus={refreshStatusAndProjects}
+              onToast={showToast}
+            />
+          )}
 
-                {unseenHobbies > 0 && (
-                  <div className="notif-item">
-                    <div className="notif-item-top">
-                      <div>
-                        <strong className="mono" style={{ color: 'var(--accent-primary)' }}>
-                          <Sparkles size={11} style={{ marginRight: 4, verticalAlign: '-1px' }} />
-                          HOBBY JOURNAL
-                        </strong>
-                        <div style={{ marginTop: 2 }}>
-                          {unseenHobbies} unseen hobby session{unseenHobbies === 1 ? '' : 's'} ready
-                          in your `/morning` briefing.
-                        </div>
-                      </div>
-                    </div>
-                    <div className="notif-item-actions">
-                      <button
-                        type="button"
-                        className="btn"
-                        style={{ padding: '3px 8px', fontSize: 11 }}
-                        onClick={() => {
-                          openSystemTab('autonomy');
-                          setShowNotifs(false);
-                        }}
-                      >
-                        Open Briefing
-                      </button>
-                    </div>
-                  </div>
-                )}
+          {surface === 'automations' && (
+            <AutomationsSurface
+              status={status}
+              refreshNonce={dataRefreshNonce}
+              onInspect={(t) => setAuxTarget(t)}
+              onRefreshStatus={refreshStatusAndProjects}
+              onToast={showToast}
+            />
+          )}
 
-                {passiveNudges.map((n, idx) => {
-                  const rowId = n.id ?? n.nudge_id;
-                  return (
-                    <div key={rowId ?? idx} className="notif-item">
-                      <div className="notif-item-top">
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <span className="mono" style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>
-                            [{(n.category || 'update').toUpperCase()}]
-                          </span>{' '}
-                          {n.message}
-                        </div>
-                        {rowId && (
-                          <button
-                            type="button"
-                            aria-label="Dismiss notification"
-                            className="btn btn-ghost"
-                            style={{ padding: '2px 5px' }}
-                            onClick={() => void dismissOneNudge(rowId)}
-                          >
-                            <X size={11} />
-                          </button>
-                        )}
-                      </div>
-                      <div className="notif-item-actions">
-                        <button
-                          type="button"
-                          className="btn btn-ghost"
-                          style={{ padding: '2px 7px', fontSize: 11 }}
-                          onClick={() => {
-                            setStudio('jobs');
-                            setShowNotifs(false);
-                          }}
-                        >
-                          Departures
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
+          {surface === 'customizations' && (
+            <CustomizationsSurface
+              refreshNonce={dataRefreshNonce}
+              onInspect={(t) => setAuxTarget(t)}
+              onToast={showToast}
+            />
+          )}
+        </main>
 
-                {bellCount === 0 && (
-                  <div
-                    className="mono"
-                    style={{
-                      padding: '14px 6px',
-                      textAlign: 'center',
-                      fontSize: 11.5,
-                      color: 'var(--text-muted)',
-                    }}
-                  >
-                    All caught up — no unread updates.
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+        {/* Closed-by-default Right Split Auxiliary Inspector Pane (Mobile Bottom Sheet) */}
+        <AuxSplitPane
+          target={auxTarget}
+          onClose={() => setAuxTarget(null)}
+          onChanged={() => {
+            setDataRefreshNonce((n) => n + 1);
+            void refreshStatusAndProjects();
+          }}
+          onToast={showToast}
+          onJumpToWiki={(notePath) => {
+            setWikiInitialPath(notePath);
+            setAuxTarget(null);
+            handleSelectSurface('knowledge');
+          }}
+          onSelectSurface={handleSelectSurface}
+        />
+      </div>
 
-          {/* 1-Click Light / Dark Toggle */}
-          <button
-            type="button"
-            className="btn top-theme-toggle"
-            style={{ padding: '4px 9px' }}
-            onClick={toggleLightDark}
-            title="Toggle Light / Dark Mode"
-          >
-            {theme === 'daylight' ? <Moon size={13} /> : <Sun size={13} />}
-            <span className="desktop-only">{theme === 'daylight' ? 'Dark' : 'Light'}</span>
-          </button>
+      {/* Centered Two-Column Settings Modal */}
+      {settingsOpen && (
+        <SettingsModal
+          initialSection={settingsSection}
+          status={status}
+          theme={theme}
+          projects={projects}
+          onApplyTheme={applyTheme}
+          onClose={() => setSettingsOpen(false)}
+          onRefreshStatus={refreshStatusAndProjects}
+          onToast={showToast}
+        />
+      )}
 
-          {/* 4-Preset Theme Changer */}
-          <label className="hud-chip top-theme-select" style={{ padding: '2px 7px' }}>
-            <Palette size={12} />
-            <select
-              aria-label="Select Studio Theme"
-              className="select"
-              style={{ border: 'none', padding: '2px 4px', background: 'transparent' }}
-              value={theme}
-              onChange={(e) => applyTheme(e.target.value as ThemeId)}
-            >
-              {THEMES.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.label}
-                </option>
-              ))}
-            </select>
-          </label>
+      {/* Command Palette (`Ctrl+K`) */}
+      {searchOpen && (
+        <CommandPaletteModal
+          projects={projects}
+          onClose={() => setSearchOpen(false)}
+          onSelectSurface={handleSelectSurface}
+          onSelectProject={handleSelectProject}
+          onOpenSettings={(sec) => {
+            if (sec) setSettingsSection(sec);
+            setSettingsOpen(true);
+          }}
+        />
+      )}
+
+      {toast && (
+        <div className="toast-banner" role="status">
+          {toast}
         </div>
-      </header>
-
-      {/* Left Studio Command Rail (Vertical on Desktop, Single-Row Strip on Mobile) */}
-      <aside className="nav-rail" aria-label="Studio Navigation">
-        <div className="nav-group">
-          <div className="nav-section-label">Command Studios</div>
-          <div className="nav-items">
-            <button
-              type="button"
-              className={`nav-btn ${studio === 'chat' ? 'active' : ''}`}
-              onClick={() => setStudio('chat')}
-            >
-              <span className="nav-btn-left">
-                <MessageSquare size={15} />
-                <span>Forever Chat</span>
-              </span>
-              {dueStudyCount > 0 && <span className="nav-badge warn">{dueStudyCount}</span>}
-            </button>
-
-            <button
-              type="button"
-              className={`nav-btn ${studio === 'boards' ? 'active' : ''}`}
-              onClick={() => setStudio('boards')}
-            >
-              <span className="nav-btn-left">
-                <FolderKanban size={15} />
-                <span>Boards</span>
-              </span>
-              {(agingBoardCards > 0 || openBoardCards > 0) && (
-                <span className={`nav-badge ${agingBoardCards > 0 ? 'warn' : ''}`}>
-                  {openBoardCards}
-                </span>
-              )}
-            </button>
-
-            <button
-              type="button"
-              className={`nav-btn ${studio === 'calendar' ? 'active' : ''}`}
-              onClick={() => setStudio('calendar')}
-            >
-              <span className="nav-btn-left">
-                <Calendar size={15} />
-                <span>Calendar</span>
-              </span>
-            </button>
-
-            <button
-              type="button"
-              className={`nav-btn ${studio === 'wiki' ? 'active' : ''}`}
-              onClick={() => setStudio('wiki')}
-            >
-              <span className="nav-btn-left">
-                <BookOpen size={15} />
-                <span>Wiki &amp; Mind Map</span>
-              </span>
-            </button>
-
-            <button
-              type="button"
-              className={`nav-btn ${studio === 'jobs' ? 'active' : ''}`}
-              onClick={() => setStudio('jobs')}
-            >
-              <span className="nav-btn-left">
-                <Rocket size={15} />
-                <span>Jobs &amp; Routines</span>
-              </span>
-              {((status?.pending_approvals_count || 0) > 0 ||
-                (status?.background_jobs_active || 0) > 0) && (
-                <span
-                  className={`nav-badge ${(status?.pending_approvals_count || 0) > 0 ? 'warn' : ''}`}
-                >
-                  {(status?.pending_approvals_count || 0) + (status?.background_jobs_active || 0)}
-                </span>
-              )}
-            </button>
-
-            <button
-              type="button"
-              className={`nav-btn ${studio === 'system' ? 'active' : ''}`}
-              onClick={() => setStudio('system')}
-            >
-              <span className="nav-btn-left">
-                <Settings2 size={15} />
-                <span>System</span>
-              </span>
-              {(status?.connected_partners?.length || 0) > 0 && (
-                <span className="nav-badge">{status?.connected_partners?.length}</span>
-              )}
-            </button>
-          </div>
-        </div>
-
-        <div className="rail-footer">
-          <div className="rail-kv">
-            <span>FAST TIER</span>
-            <span title={status?.fast_model}>{status?.fast_model || 'qwen2.5:7b'}</span>
-          </div>
-          <div className="rail-kv">
-            <span>REASONING</span>
-            <span title={status?.reasoning_model}>{status?.reasoning_model || 'qwen2.5:7b'}</span>
-          </div>
-          <div className="rail-kv">
-            <span>ORDER COUNTER</span>
-            <span>{status?.hosted_mcp_enabled ? 'ON' : 'OFF'}</span>
-          </div>
-          <div className="rail-kv">
-            <span>LAN URL</span>
-            <span title={status?.lan_url}>{status?.lan_url?.replace('http://', '') || 'local'}</span>
-          </div>
-        </div>
-      </aside>
-
-      {/* Active Studio Viewport */}
-      <main className="studio-viewport">
-        {studio === 'chat' && (
-          <ChatStudio
-            status={status}
-            onRefreshStatus={() => void refreshStatus()}
-            onOpenWikiNote={openWikiNote}
-            onNavigateStudio={(target) => setStudio(target)}
-            onOpenSystemTab={openSystemTab}
-            onToast={showToast}
-          />
-        )}
-        {studio === 'boards' && (
-          <BoardsStudio
-            onOpenWikiNote={openWikiNote}
-            onRefreshStatus={() => void refreshStatus()}
-            onToast={showToast}
-          />
-        )}
-        {studio === 'calendar' && (
-          <CalendarStudio
-            onNavigateStudio={(target) => setStudio(target)}
-            onToast={showToast}
-          />
-        )}
-        {studio === 'wiki' && (
-          <WikiStudio initialNotePath={wikiTargetNote} onToast={showToast} />
-        )}
-        {studio === 'jobs' && (
-          <JobsApprovalsStudio
-            onOpenWikiNote={openWikiNote}
-            onRefreshStatus={() => void refreshStatus()}
-            onToast={showToast}
-          />
-        )}
-        {studio === 'system' && (
-          <SystemStudio
-            status={status}
-            initialTab={systemTab}
-            tabNonce={systemTabNonce}
-            onRefreshStatus={() => void refreshStatus()}
-            onToast={showToast}
-          />
-        )}
-      </main>
-
-      {toast && <div className="toast-banner mono">{toast}</div>}
+      )}
     </div>
   );
 };

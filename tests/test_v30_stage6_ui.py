@@ -46,6 +46,7 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
             self.assertIn(theme_id, js_text)
         css_compact = css_text.replace('"', "").replace("'", "").replace(" ", "")
         for token in (
+            "data-theme=obsidian",
             "data-theme=storm",
             "data-theme=loftra",
             "#ff5f00",
@@ -53,21 +54,24 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
             "data-theme=graphite",
             "data-theme=daylight",
             "100dvh",
+            ".agy-shell",
             ".nav-items",
-            "max-width:920px",
+            "max-width:768px",
             "max-width:640px",
             "safe-area-inset-bottom",
         ):
             self.assertIn(token, css_compact)
 
         for label in (
+            "Obsidian Matte",
+            "Daylight Paper",
+            "Graphite Minimal",
             "Storm & Safety Orange",
             "Loftra Industrial",
-            "Obsidian Matte",
             "Orbital Brutalist",
-            "Graphite Minimal",
-            "Daylight Paper",
-            "Forever Chat",
+            "Board & Goals",
+            "Automations",
+            "Customizations",
             "Departures Board",
             "Blind Credential Vault",
             "Partner Federation",

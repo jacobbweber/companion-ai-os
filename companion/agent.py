@@ -563,7 +563,7 @@ def handle_slash_command(cmd_str: str, messages: List[Dict[str, Any]], store: Op
         return format_skills_catalog(skill_name=arg or None)
     if verb in ("subagent", "worker"):
         return _dispatch_subagent_slash(arg)
-    if verb in ("autonomy", "hobby"):
+    if verb == "autonomy":
         sub, sub_arg = (arg.split()[0].lower() if arg else "status"), (arg.split(None, 1)[1].strip() if len(arg.split(None, 1)) > 1 else None)
         res_aut = execute_autonomy_mode_action({"subaction": sub, "routine_id": sub_arg}, actor="cli", store=mem)
         return str(res_aut.get("summary") or res_aut.get("error") or "")

@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from companion.checkpoints import CheckpointManager, checkpoint_manager
 from companion.config import SELF_PROJECT_ID, settings
-from companion.dag_runtime import self_test_dag
+from companion.dag_runtime import discover_dags, execute_dag_by_name, get_dag_run, list_dag_runs, resume_dag_run, self_test_dag
 from companion.disciplines import iter_ast_import_targets
 from companion.grounding import (
     discover_skills,
@@ -35,7 +35,7 @@ from companion.grounding import (
     rank_relevant_skills,
 )
 from companion.hygiene import find_unused_imports_in_source
-from companion.memory_store import MemoryStore, has_memory_store_override
+from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
 from companion.safety import validate_python_syntax
 from companion.sdd import (
     check_wiki_author_guard,
@@ -52,6 +52,7 @@ __all__ = [
     "build_skill_script_command",
     "check_make_vs_borrow",
     "distill_workflow_reflection",
+    "execute_customizations_action",
     "run_skill_script",
     "stage_and_promote_skill",
 ]
@@ -398,3 +399,40 @@ def distill_workflow_reflection(
     for a_key, a_val in artifact_facts:
         port.propose_update(key=a_key, value=a_val, project_id=pid, source="reflect", confidence=0.95)
     return {"fact_key": key, "artifacts_recorded": rels[:10], "artifact_facts": [k for k, _ in artifact_facts]}
+
+
+def execute_customizations_action(p: Dict[str, Any], _actor: str = "user", store: Optional[MemoryStore] = None) -> Dict[str, Any]:
+    """CoreAction handler for Customizations (`skills/`, `data/skills/`, verified Python `dags`, and `dag_runs`)."""
+    mem = store or get_memory_store()
+    sub = str(p.get("subaction") or p.get("action") or "list").strip().lower()
+    if sub in ("read_skill", "inspect_skill"):
+        s_clean = str(p.get("skill") or p.get("name") or "").strip().lower()
+        asset = str(p.get("asset") or "SKILL.md").strip().lstrip("/\\").replace("\\", "/")
+        roots = [settings.user_skills_dir.resolve(), (settings.root / "skills").resolve()]
+        sdir = next(((r / s_clean).resolve() for r in roots if s_clean and (r / s_clean / "SKILL.md").is_file() and (r / s_clean).resolve().is_relative_to(r)), None)
+        if sdir is None:
+            return {"ok": False, "error": f"Skill pack `{s_clean}` not found."}
+        target = (sdir / asset).resolve()
+        if not target.is_relative_to(sdir) or not target.is_file():
+            return {"ok": False, "error": f"Asset `{asset}` not found inside `{s_clean}`."}
+        files = ["SKILL.md", *[f"{sub_d}/{f.name}" for sub_d in ("references", "dags", "scripts") if (sdir / sub_d).is_dir() for f in sorted((sdir / sub_d).iterdir()) if f.is_file()]]
+        return {"ok": True, "skill": s_clean, "asset": asset, "files": files, "content": target.read_text(encoding="utf-8", errors="replace"), "summary": f"Loaded `{s_clean}/{asset}`."}
+    if sub == "get_dag_run":
+        rec = get_dag_run(str(p.get("run_id") or ""), store=mem)
+        return {"ok": rec is not None, "dag_run": rec, "error": "" if rec else "DAG run not found."}
+    if sub in ("run_dag", "resume_dag"):
+        from companion.agent import ensure_dag_runtime_bound
+
+        ensure_dag_runtime_bound()
+        if sub == "resume_dag":
+            return resume_dag_run(str(p.get("run_id") or ""), store=mem)
+        raw_params = p.get("params")
+        params = raw_params if isinstance(raw_params, dict) else (json.loads(raw_params) if isinstance(raw_params, str) and raw_params.strip().startswith("{") else {})
+        return execute_dag_by_name(str(p.get("dag") or p.get("dag_name") or ""), params=params, store=mem)
+    skills = discover_skills(settings.root)
+    dags = discover_dags(settings.root)
+    runs = list_dag_runs(store=mem, limit=int(p.get("limit") or 20))
+    return {
+        "ok": True, "skills": skills, "dags": dags, "dag_runs": runs,
+        "summary": f"Customizations: {len(skills)} Capability Pack(s), {len(dags)} Verified Python DAG(s), {len(runs)} recent DAG run(s).",
+    }
