@@ -110,6 +110,7 @@ export interface WebStatus {
   self_dev_lock_reason?: string;
   operating_quadrant?: OperatingQuadrant;
   unseen_autonomy_count?: number;
+  focus_project_id?: string;
   workspace: WorkspaceInfo;
   busy: boolean;
   active_action: string;
@@ -899,6 +900,15 @@ export interface DagRunSummary {
   updated_at: string;
 }
 
+export interface DagNodeRunEntry {
+  node_id: string;
+  status: string;
+  attempt?: number;
+  duration_ms?: number;
+  output?: unknown;
+  error?: string;
+}
+
 export interface CustomizationsSnapshot {
   ok: boolean;
   skills: SkillPackSummary[];
@@ -913,6 +923,7 @@ export type AuxInspectorTarget =
   | { kind: 'routine'; routineId?: string; createNew?: boolean }
   | { kind: 'skill'; skillName: string; asset?: string }
   | { kind: 'dag'; dagName: string }
+  | { kind: 'dag_run'; runId: string }
   | { kind: 'wiki_note'; notePath: string }
   | { kind: 'job'; jobId: string }
   | { kind: 'approvals' }

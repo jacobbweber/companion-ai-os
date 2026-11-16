@@ -94,7 +94,7 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
                 <span>{apr.category}</span>
               </div>
               <div style={{ fontSize: 12.5, margin: '4px 0 8px', color: 'var(--text-primary)' }}>
-                {apr.summary || `${apr.action_name} (${apr.target})`}
+                {(apr.summary || `${apr.action_name} (${apr.target})`).replace(/`/g, '')}
               </div>
               <div style={{ display: 'flex', gap: 6 }}>
                 <button

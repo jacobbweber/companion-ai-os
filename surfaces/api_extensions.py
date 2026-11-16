@@ -160,7 +160,10 @@ def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
     active_bg = [j for j in jobs if j["status"] in ("queued", "running", "waiting_approval")]
     partners = get_mcp_hub(store=store).list_partners()
     nudges = peek_session_nudges(session_id="web_ui", store=store) + peek_session_nudges(session_id="main", store=store)
-    agile_view = get_project_graph(store=store).get_board_projection()
+    pg = get_project_graph(store=store)
+    agile_view = pg.get_board_projection()
+    all_open_items = [c for c in pg.list_items() if c["column_key"] != "done"]
+    all_blocked_items = [c for c in all_open_items if c["column_key"] == "blocked"]
     edu_prog = get_education_engine(store=store).get_progress_summary()
     ac = edu_prog.get("active_course")
     sp = agile_view.get("active_sprint")
@@ -189,11 +192,12 @@ def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
         "background_jobs_active": len(active_bg),
         "hosted_mcp_enabled": prof.get("hosted_mcp_enabled", "off") == "on",
         "session_nudges": nudges[:8],
+        "focus_project_id": agile_view["project"]["project_id"],
         "agile_summary": {
             "active_sprint_title": sp["title"] if sp else "",
-            "open_cards": sum(1 for c in agile_view["cards"] if c["column_key"] != "done"),
-            "blocked_count": agile_view["counts"]["blocked"],
-            "aging_count": agile_view["counts"]["blocked"],
+            "open_cards": len(all_open_items),
+            "blocked_count": len(all_blocked_items),
+            "aging_count": len(all_blocked_items),
         },
         "education_summary": {
             "active_course_id": ac["course_id"] if ac else "",
@@ -295,6 +299,9 @@ def dispatch_chat_or_job_with_attachments(
     """Prepare optional file/image attachments and invoke `submit_async_chat` or `execute_chat`."""
     msg = str(body.get("message") or "")
     mode = str(body.get("mode") or "chat")
+    focus_pid = str(body.get("project_id") or "").strip()
+    if focus_pid:
+        get_project_graph(store=sess.store).set_focus_project(focus_pid)
     raw_ids = body.get("attachment_ids")
     att_ids = [str(x) for x in raw_ids] if isinstance(raw_ids, list) else None
     prep = prepare_turn_attachments(msg, att_ids, store=sess.store)

@@ -36,7 +36,12 @@ def _format_tool_result(res: Dict[str, Any]) -> str:
     if not res.get("ok", False):
         return f"error: {res.get('error') or res.get('summary') or 'Operation failed.'}"
     if res.get("markdown_block"):
-        return f"{res.get('summary', '')}\n\nInclude this fenced block verbatim in your reply to render the interactive deck:\n{res['markdown_block']}".strip()
+        return (
+            f"{res.get('summary', '')}\n\n"
+            "[INTERNAL NOTE FOR ASSISTANT — DO NOT ASK THE USER TO COPY ANYTHING: "
+            "Companion's Chat UI automatically renders the fenced block below as a live interactive widget in your reply.]\n"
+            f"{res['markdown_block']}"
+        ).strip()
     if "output" in res and res.get("summary"):
         return f"{res['summary']}\n{res['output']}"
     if "output" in res:

@@ -424,7 +424,7 @@ Tools (`companion/tools.py`) are L1 atomic execution primitives; Skills (`skills
 
 [EXECUTION REMINDERS]
 - Partnership Rule: Never ask the User to run internal tools or write code — execute tools autonomously and communicate in warm, plain executive English.
-- Surgical Reads & Inline Guard: Use `read_file(path="...", symbol="ClassName.method")` to inspect exact AST definitions without wasting context. `write_file`/`edit_file` run an instant micro-linter (blocking `>550L` modules, `>100L` functions, upward A-Frame imports, and external packages).
+- Surgical Reads & Inline Guard: Use `read_file(path="...", symbol="ClassName.method")` to inspect exact AST definitions without wasting context. `write_file`/`edit_file` run an instant micro-linter (blocking `>700L` modules, `>100L` functions, upward A-Frame imports, and external packages).
 - Practice SDD: keep `specs/PRODUCT.md`, `specs/ARCHITECTURE.md`, `specs/CONTRACTS.md`, and `specs/DECISIONS.md` aligned with Companion core changes (`sdd_manage` / `system_doctor`).
 - Switch or initialize isolated external projects via `project_manage(action="init"|"switch"|"self"|"list")` or `/project`.
 - Wiki Warehouse notes (`01_inbox/`, `02_knowledge/`, `03_resources/`, `04_archive/`) live in the Wiki Warehouse, not the repo root — always use `wiki_manage` directly (never `list_dir`/`read_file` on `01_inbox` or `02_knowledge`). Stage rough captures into `01_inbox/` first; when curating/graduating to `02_knowledge/`, prioritize deliberate multi-turn quality (`inspect_graduation` -> `read` every `must_read` overlap -> pick one of the 11 governed templates & absorb into sections -> `validate_curation` -> `commit_curation`).

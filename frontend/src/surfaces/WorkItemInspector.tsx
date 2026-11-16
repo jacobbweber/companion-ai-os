@@ -34,6 +34,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
   const [owner, setOwner] = useState('companion');
   const [status, setStatus] = useState('ready');
   const [stageKind, setStageKind] = useState('DELIVER_AND_VERIFY');
+  const [milestoneId, setMilestoneId] = useState('');
   const [priority, setPriority] = useState(3);
   const [dependsOn, setDependsOn] = useState<string[]>([]);
   const [dagName, setDagName] = useState('');
@@ -80,6 +81,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
             setOwner(found.owner || 'companion');
             setStatus(found.status || 'ready');
             setStageKind(found.stage_kind || 'DELIVER_AND_VERIFY');
+            setMilestoneId(found.milestone_id || '');
             setPriority(found.priority ?? 3);
             setDependsOn(found.depends_on || []);
             setDagName(found.dag_name || '');
@@ -183,6 +185,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
       owner,
       status,
       stage_kind: stageKind,
+      milestone_id: milestoneId,
       priority,
       depends_on: dependsOn,
       dag_name: dagName,
@@ -236,7 +239,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
         <input className="input" value={title} onChange={(e) => setTitle(e.target.value)} />
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+      <div className="form-grid-2">
         <div>
           <label className="field-label">Owner</label>
           <select className="select" value={owner} onChange={(e) => setOwner(e.target.value)}>
@@ -257,6 +260,20 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
           </select>
         </div>
       </div>
+
+      {(board?.milestones || []).length > 0 && (
+        <div>
+          <label className="field-label">Milestone</label>
+          <select className="select" value={milestoneId} onChange={(e) => setMilestoneId(e.target.value)}>
+            <option value="">Unassigned</option>
+            {(board?.milestones || []).map((ms) => (
+              <option key={ms.milestone_id} value={ms.milestone_id}>
+                {ms.title}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 90px', gap: 10 }}>
         <div>

@@ -123,9 +123,21 @@ class ProjectGraphManager:
     def resolve_project_id(self, project_id: Optional[str] = None) -> str:
         raw = (project_id or "").strip()
         if not raw:
+            focused = self.store.get_user_profile().get("active_goal_project_id", "").strip()
+            if focused:
+                f_row = self.store._fetch_rows("SELECT project_id FROM projects WHERE project_id = ? OR slug = ? LIMIT 1", (focused, focused))
+                if f_row:
+                    return str(f_row[0][0])
             return settings.get_workspace().project_id or SELF_PROJECT_ID
         row = self.store._fetch_rows("SELECT project_id FROM projects WHERE project_id = ? OR slug = ? LIMIT 1", (raw, raw))
         return str(row[0][0]) if row else raw
+
+    def set_focus_project(self, project_id: str) -> Dict[str, Any]:
+        """Set the user's active Goal/Project focus across UI and Chat tool turns."""
+        pid = self.resolve_project_id(project_id)
+        proj = self.get_project(pid)
+        self.store.set_user_profile("active_goal_project_id", proj["project_id"])
+        return proj
 
     def create_project(
         self,
@@ -559,9 +571,16 @@ def format_project_graph_hud(store: Optional[MemoryStore] = None) -> str:
     tb_txt = f"`{tb['title']}` ({tb['start_date']}..{tb['end_date']})" if tb else "(none)"
     tp = proj["trigger_policy"]
     win = f" [{tp['allowed_window']}]" if tp.get("allowed_window") else ""
+    open_rows = [
+        f"    - `{it['item_id']}` [{it['owner']} | {it['column_key']}]: {it['title']}"
+        for it in view.get("cards", [])
+        if it.get("column_key") != "done"
+    ][:5]
+    goal_line = f"\n  Goal : {proj['goal_summary']}" if proj.get("goal_summary") else ""
+    items_block = ("\n" + "\n".join(open_rows)) if open_rows else ""
     return (
-        f"[PROJECT & GOAL GRAPH (`{proj['slug']}` | trigger=`{tp['mode']}{win}` | timebox={tb_txt})]\n"
-        f"  Items: total={cnt['total']} | companion_ready={cnt['companion_ready']} | human_pending={cnt['human_pending']} | blocked={cnt['blocked']} | done={cnt['done']}"
+        f"[PROJECT & GOAL GRAPH (`{proj['title']}` | project_id=`{proj['project_id']}` | slug=`{proj['slug']}` | trigger=`{tp['mode']}{win}` | timebox={tb_txt})]{goal_line}\n"
+        f"  Items: total={cnt['total']} | companion_ready={cnt['companion_ready']} | human_pending={cnt['human_pending']} | blocked={cnt['blocked']} | done={cnt['done']}{items_block}"
     )
 
 

@@ -138,7 +138,7 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
 
       {showAddProvider && (
         <div className="card-group" style={{ padding: 14 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          <div className="form-grid-2">
             <div>
               <label className="field-label">Provider ID</label>
               <input className="input" placeholder="e.g. ollama-lan or gemini" value={provId} onChange={(e) => setProvId(e.target.value)} />
@@ -182,7 +182,7 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
       <div className="card-group">
         {providers.length === 0 ? (
           <div className="card-row">
-            <span style={{ color: 'var(--text-muted)' }}>Using default `.env` inference endpoints.</span>
+            <span style={{ color: 'var(--text-muted)' }}>Using default .env inference endpoints.</span>
           </div>
         ) : (
           providers.map((p) => (
@@ -236,7 +236,7 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
               </div>
 
               {isOpen && (
-                <div style={{ padding: '0 16px 14px', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+                <div className="form-grid-3" style={{ padding: '0 16px 14px' }}>
                   <div>
                     <label className="field-label">Model Name</label>
                     <input
@@ -292,7 +292,7 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
 
       {showCompactionAdv && (
         <div className="card-group" style={{ marginTop: 8, padding: 14 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+          <div className="form-grid-3">
             <div>
               <label className="field-label">Trigger %</label>
               <input type="number" className="input" value={trigPct} onChange={(e) => setTrigPct(Number(e.target.value))} />

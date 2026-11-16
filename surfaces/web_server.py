@@ -16,6 +16,7 @@ from companion.config import settings
 from companion.context import build_system_prompt, manage_active_project, manage_companion_tone, manage_model_tier
 from companion.llm import active_swap_status, chat, model_gate
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
+from companion.project_graph import get_project_graph
 from companion.safety import run_system_doctor
 from companion.streaming import stream_event_context
 from companion.telemetry import TelemetryEngine, telemetry
@@ -389,6 +390,9 @@ class CompanionWebSession:
             notes.append(manage_companion_tone(str(payload["tone"]), store=self.store))
         if payload.get("project"):
             notes.append(manage_active_project(str(payload["project"]), store=self.store))
+        if payload.get("focus_project_id"):
+            fp = get_project_graph(store=self.store).set_focus_project(str(payload["focus_project_id"]))
+            notes.append(f"Focused Goal/Project set to `{fp['title']}` (`{fp['project_id']}`).")
         if notes:
             fresh_sys = build_system_prompt(store=self.store)
             with self._turn_lock:

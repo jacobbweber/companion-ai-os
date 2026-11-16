@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Check, ExternalLink, Play, X } from 'lucide-react';
+import { Check, ExternalLink, Play, RotateCcw, X } from 'lucide-react';
 import { callAction } from '../api';
 import { MarkdownView } from '../components/MarkdownView';
 import { WorkItemInspector } from '../surfaces/WorkItemInspector';
@@ -7,6 +7,8 @@ import type {
   ApprovalRequest,
   AuxInspectorTarget,
   BackgroundJob,
+  DagNodeRunEntry,
+  DagRunSummary,
   RoutineItem,
   SurfaceId,
   VerifiedDagSummary,
@@ -49,8 +51,10 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
   const [dagMeta, setDagMeta] = useState<VerifiedDagSummary | null>(null);
   const [dagParamsText, setDagParamsText] = useState('{}');
   const [dagOutput, setDagOutput] = useState('');
+  const [dagRunDetail, setDagRunDetail] = useState<(DagRunSummary & { node_runs?: DagNodeRunEntry[] }) | null>(null);
   const [wikiDetail, setWikiDetail] = useState<WikiNoteDetail | null>(null);
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
+  const [selectedJob, setSelectedJob] = useState<BackgroundJob | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
 
   useEffect(() => {
@@ -104,17 +108,31 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
           setDagMeta(found);
         }
       );
+    } else if (target.kind === 'dag_run') {
+      void callAction<{ run?: DagRunSummary; node_runs?: DagNodeRunEntry[] }>('customizations', {
+        subaction: 'get_dag_run',
+        run_id: target.runId,
+      }).then((res) => {
+        if (res.run) {
+          setDagRunDetail({ ...res.run, node_runs: res.node_runs || [] });
+        }
+      });
     } else if (target.kind === 'wiki_note') {
       void callAction<WikiNoteDetail>('wiki', { subaction: 'read', path: target.notePath }).then((res) => {
         if (res.ok) setWikiDetail(res as unknown as WikiNoteDetail);
       });
     } else if (target.kind === 'job' || target.kind === 'approvals') {
+      setSelectedJob(null);
       void Promise.all([
         callAction<{ jobs?: BackgroundJob[] }>('jobs', { subaction: 'list' }),
         callAction<{ approvals?: ApprovalRequest[] }>('approvals', { subaction: 'list', status: 'waiting' }),
-      ]).then(([jRes, aRes]) => {
+        target.kind === 'job'
+          ? callAction<{ job?: BackgroundJob }>('jobs', { subaction: 'get', job_id: target.jobId })
+          : Promise.resolve({ job: undefined }),
+      ]).then(([jRes, aRes, oneJob]) => {
         if (jRes.jobs) setJobs(jRes.jobs);
         if (aRes.approvals) setApprovals(aRes.approvals);
+        if (oneJob.job) setSelectedJob(oneJob.job);
       });
     }
   }, [target]);
@@ -134,9 +152,11 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
             ? `Pack: ${target.skillName}`
             : target.kind === 'dag'
               ? `DAG: ${target.dagName}`
-              : target.kind === 'wiki_note'
-                ? wikiDetail?.title || target.notePath
-                : 'Tasks & Approvals';
+              : target.kind === 'dag_run'
+                ? `DAG Run: ${dagRunDetail?.dag_name || target.runId}`
+                : target.kind === 'wiki_note'
+                  ? wikiDetail?.title || target.notePath
+                  : 'Tasks & Approvals';
 
   const saveRoutine = async () => {
     const slug = (rtId || rtTitle).trim();
@@ -220,16 +240,16 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                   <label className="field-label">Allowed Time Window (e.g. 22:00-06:00 or blank for anytime)</label>
                   <input className="input mono" placeholder="22:00-06:00" value={rtWin} onChange={(e) => setRtWin(e.target.value)} />
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                  <div>
-                    <label className="field-label">Min Idle (sec)</label>
-                    <input type="number" className="input" value={rtIdleSec} onChange={(e) => setRtIdleSec(Number(e.target.value))} />
-                  </div>
-                  <div>
-                    <label className="field-label">Cooldown (sec)</label>
-                    <input type="number" className="input" value={rtCoolSec} onChange={(e) => setRtCoolSec(Number(e.target.value))} />
-                  </div>
+              <div className="form-grid-2">
+                <div>
+                  <label className="field-label">Min Idle (sec)</label>
+                  <input type="number" className="input" value={rtIdleSec} onChange={(e) => setRtIdleSec(Number(e.target.value))} />
                 </div>
+                <div>
+                  <label className="field-label">Cooldown (sec)</label>
+                  <input type="number" className="input" value={rtCoolSec} onChange={(e) => setRtCoolSec(Number(e.target.value))} />
+                </div>
+              </div>
                 <div>
                   <label className="field-label">Eligibility Precheck (Optional)</label>
                   <select className="select" value={rtPrecheck} onChange={(e) => setRtPrecheck(e.target.value)}>
@@ -284,11 +304,7 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                   className={`btn btn-sm ${activeAsset === f ? 'btn-primary' : ''}`}
                   onClick={async () => {
                     setActiveAsset(f);
-                    const res = await callAction<{ content?: string }>('customizations', {
-                      subaction: 'read_skill',
-                      skill: target.skillName,
-                      asset: f,
-                    });
+                    const res = await callAction<{ content?: string }>('customizations', { subaction: 'read_skill', skill: target.skillName, asset: f });
                     setSkillContent(res.content || '');
                   }}
                 >
@@ -297,21 +313,9 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
               ))}
             </div>
             {activeAsset.endsWith('.md') ? (
-              <div className="md-body">
-                <MarkdownView content={skillContent} />
-              </div>
+              <div className="md-body"><MarkdownView content={skillContent} /></div>
             ) : (
-              <pre
-                className="mono"
-                style={{
-                  padding: 12,
-                  borderRadius: 'var(--radius-sm)',
-                  background: 'var(--code-bg)',
-                  border: '1px solid var(--border-hairline)',
-                  fontSize: 11.5,
-                  overflowX: 'auto',
-                }}
-              >
+              <pre className="mono" style={{ padding: 12, borderRadius: 'var(--radius-sm)', background: 'var(--code-bg)', border: '1px solid var(--border-hairline)', fontSize: 11.5, overflowX: 'auto' }}>
                 {skillContent}
               </pre>
             )}
@@ -320,29 +324,16 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
 
         {target.kind === 'dag' && (
           <div style={{ display: 'grid', gap: 12 }}>
-            <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
-              {dagMeta?.description}
-            </div>
+            <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>{dagMeta?.description}</div>
             <div>
-              <label className="field-label">
-                JSON Input Params (`{JSON.stringify(dagMeta?.input_schema || {})}`)
-              </label>
-              <textarea
-                className="textarea mono"
-                rows={4}
-                value={dagParamsText}
-                onChange={(e) => setDagParamsText(e.target.value)}
-              />
+              <label className="field-label">JSON Input Params ({JSON.stringify(dagMeta?.input_schema || {})})</label>
+              <textarea className="textarea mono" rows={4} value={dagParamsText} onChange={(e) => setDagParamsText(e.target.value)} />
             </div>
             <button
               type="button"
               className="btn btn-primary"
               onClick={async () => {
-                const res = await callAction('customizations', {
-                  subaction: 'run_dag',
-                  dag: target.dagName,
-                  params: dagParamsText,
-                });
+                const res = await callAction('customizations', { subaction: 'run_dag', dag: target.dagName, params: dagParamsText });
                 setDagOutput(res.summary || res.error || JSON.stringify(res, null, 2));
                 onChanged();
               }}
@@ -350,20 +341,50 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
               <Play size={13} /> Execute DAG
             </button>
             {dagOutput && (
-              <pre
-                className="mono"
-                style={{
-                  padding: 12,
-                  borderRadius: 'var(--radius-sm)',
-                  background: 'var(--code-bg)',
-                  border: '1px solid var(--border-hairline)',
-                  fontSize: 11.5,
-                  whiteSpace: 'pre-wrap',
-                }}
-              >
+              <pre className="mono" style={{ padding: 12, borderRadius: 'var(--radius-sm)', background: 'var(--code-bg)', border: '1px solid var(--border-hairline)', fontSize: 11.5, whiteSpace: 'pre-wrap' }}>
                 {dagOutput}
               </pre>
             )}
+          </div>
+        )}
+
+        {target.kind === 'dag_run' && dagRunDetail && (
+          <div style={{ display: 'grid', gap: 12 }} data-testid="dag-run-inspector">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span className="mono" style={{ fontSize: 12 }}>{dagRunDetail.run_id}</span>
+              <span className={`badge ${dagRunDetail.status === 'completed' ? 'ok' : dagRunDetail.status === 'waiting_approval' ? 'warn' : ''}`}>
+                {dagRunDetail.status}
+              </span>
+            </div>
+            {dagRunDetail.status !== 'completed' && (
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={async () => {
+                  const r = await callAction('customizations', { subaction: 'resume_dag', run_id: dagRunDetail.run_id });
+                  onToast(r.summary || r.error || 'Resumed DAG run.');
+                  onChanged();
+                }}
+              >
+                <RotateCcw size={12} /> Approve &amp; Resume DAG
+              </button>
+            )}
+            <div className="field-label">Step Checkpoints</div>
+            <div className="card-group">
+              {(dagRunDetail.node_runs || []).map((nr) => (
+                <div key={nr.node_id} className="card-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <strong className="mono" style={{ fontSize: 12 }}>{nr.node_id}</strong>
+                    <span className={`badge ${nr.status === 'completed' ? 'ok' : ''}`}>{nr.status}</span>
+                  </div>
+                  {(nr.output !== undefined || nr.error) && (
+                    <pre className="mono" style={{ margin: 0, fontSize: 11, whiteSpace: 'pre-wrap', color: 'var(--text-secondary)' }}>
+                      {nr.error || (typeof nr.output === 'string' ? nr.output : JSON.stringify(nr.output, null, 2))}
+                    </pre>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
@@ -403,7 +424,7 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                     <div key={apr.approval_id} className="card-row">
                       <div className="card-row-info">
                         <div className="card-row-title">{apr.category}</div>
-                        <div className="card-row-desc">{apr.summary}</div>
+                        <div className="card-row-desc">{(apr.summary || '').replace(/`/g, '')}</div>
                       </div>
                       <div style={{ display: 'inline-flex', gap: 6 }}>
                         <button
@@ -435,6 +456,50 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
               </div>
             </div>
 
+            {selectedJob && (
+              <div className="card-group" style={{ padding: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <strong>{selectedJob.title || selectedJob.goal}</strong>
+                  <div style={{ display: 'inline-flex', gap: 6 }}>
+                    {selectedJob.status === 'running' && (
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        onClick={async () => {
+                          await callAction('jobs', { subaction: 'cancel', job_id: selectedJob.job_id });
+                          onChanged();
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    )}
+                    {selectedJob.status === 'waiting_approval' && (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        onClick={async () => {
+                          await callAction('jobs', { subaction: 'resume', job_id: selectedJob.job_id });
+                          onChanged();
+                        }}
+                      >
+                        Resume
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="md-body" style={{ fontSize: 12.5 }}>
+                  <MarkdownView
+                    content={
+                      selectedJob.envelope_summary ||
+                      selectedJob.partial_output ||
+                      selectedJob.error ||
+                      `Status: ${selectedJob.status}`
+                    }
+                  />
+                </div>
+              </div>
+            )}
+
             <div>
               <div className="field-label">Departures Board ({jobs.length})</div>
               <div className="card-group">
@@ -442,7 +507,15 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                   <div className="card-row"><span style={{ color: 'var(--text-muted)' }}>No background jobs yet.</span></div>
                 ) : (
                   jobs.map((j) => (
-                    <div key={j.job_id} className="card-row">
+                    <div
+                      key={j.job_id}
+                      className="card-row"
+                      style={{ cursor: 'pointer' }}
+                      onClick={async () => {
+                        const r = await callAction<{ job?: BackgroundJob }>('jobs', { subaction: 'get', job_id: j.job_id });
+                        setSelectedJob(r.job || j);
+                      }}
+                    >
                       <div className="card-row-info">
                         <div className="card-row-title">{j.title || j.goal}</div>
                         <div className="card-row-desc">{j.envelope_summary || j.status}</div>

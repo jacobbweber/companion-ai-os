@@ -155,6 +155,22 @@ def _synthesize_turn_budget_exit(
     return fallback
 
 
+def _extract_turn_widget_fence(messages: List[Dict[str, Any]], start_idx: int) -> str:
+    """Return the latest fenced `companion-flashcards` widget emitted by tools in this turn, if any."""
+    latest = ""
+    for msg in messages[max(0, start_idx):]:
+        if msg.get("role") != "tool":
+            continue
+        raw = str(msg.get("content") or "")
+        marker = "```companion-flashcards"
+        if marker in raw:
+            sub = raw[raw.rfind(marker):]
+            end = sub.find("```", len(marker))
+            if end != -1:
+                latest = sub[: end + 3].strip()
+    return latest
+
+
 def _run_step_loop(
     messages: List[Dict[str, Any]], iter_limit: int, user_text: str, intent_mode: str, top_tier: Optional[str],
     chat_fn: Callable[..., Dict[str, Any]], mem: MemoryStore, session_tag: Optional[str], tid: Optional[str], verbose: bool,
@@ -162,7 +178,7 @@ def _run_step_loop(
 ) -> str:
     """Execute the step-by-step tool loop with rolling `<think>` scratchpad and phase-scoped tool gates."""
     loop_guard, last_doctor_pass, rolling_scratchpad, prior_step_tier = LoopGuard(), None, "", None
-    turn_iso, cur_nudges = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), 0
+    turn_iso, cur_nudges, turn_start_idx = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), 0, len(messages)
     for step in range(iter_limit):
         sys_prompt = build_system_prompt(store=mem, user_query=user_text) + (f"\n\n{nudge_banner}\n" if nudge_banner else "")
         if step >= 1 and rolling_scratchpad:
@@ -207,6 +223,9 @@ def _run_step_loop(
                 continue
             with tier_context(step_tier):
                 final_text = clean_text if clean_text.strip() else recover_empty_synthesis(messages, chat_fn, prior_thinking=thinking_text)
+            widget_fence = _extract_turn_widget_fence(messages, turn_start_idx)
+            if widget_fence and "```companion-flashcards" not in final_text:
+                final_text = f"{final_text.rstrip()}\n\n{widget_fence}".strip()
             messages.append({"role": "assistant", "content": final_text})
             mem.log_message("assistant", final_text, session_tag=session_tag)
             if tid:

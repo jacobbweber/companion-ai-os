@@ -223,7 +223,12 @@ export const CustomizationsSurface: React.FC<CustomizationsSurfaceProps> = ({
                 </div>
                 <div className="card-group">
                   {dagRuns.slice(0, 10).map((run) => (
-                    <div key={run.run_id} className="card-row">
+                    <div
+                      key={run.run_id}
+                      className="card-row"
+                      style={{ cursor: 'pointer' }}
+                      onClick={() => onInspect({ kind: 'dag_run', runId: run.run_id })}
+                    >
                       <div className="card-row-info">
                         <div className="card-row-title">
                           {run.dag_name}{' '}
@@ -248,7 +253,10 @@ export const CustomizationsSurface: React.FC<CustomizationsSurfaceProps> = ({
                         <button
                           type="button"
                           className="btn btn-sm"
-                          onClick={() => void resumeRun(run.run_id)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void resumeRun(run.run_id);
+                          }}
                         >
                           <RotateCcw size={12} /> Resume
                         </button>
@@ -276,7 +284,7 @@ export const CustomizationsSurface: React.FC<CustomizationsSurfaceProps> = ({
 
             {showAddMcp && (
               <div className="card-group" style={{ padding: 14 }}>
-                <div style={{ display: 'grid', gridTemplateColumns: '150px 120px 1fr', gap: 10 }}>
+                <div className="form-grid-mcp">
                   <input className="input mono" placeholder="server-id" value={mcpId} onChange={(e) => setMcpId(e.target.value)} />
                   <select className="select" value={mcpTransport} onChange={(e) => setMcpTransport(e.target.value as 'stdio' | 'http')}>
                     <option value="stdio">stdio</option>

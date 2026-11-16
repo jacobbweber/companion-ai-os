@@ -1,13 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import {
+  ArrowLeft,
   Edit3,
   Eye,
   FileDiff,
   GraduationCap,
   Network,
+  Play,
   Plus,
   Search,
   Sparkles,
+  Trash2,
 } from 'lucide-react';
 import { callAction } from '../api';
 import { DiffView } from '../components/DiffView';
@@ -25,16 +28,19 @@ import type {
 
 interface KnowledgeSurfaceProps {
   initialNotePath?: string;
+  initialMode?: 'notes' | 'mindmap' | 'study';
   onRefreshStatus: () => Promise<void>;
   onToast: (msg: string) => void;
 }
 
 export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
   initialNotePath = '',
+  initialMode = 'notes',
   onRefreshStatus,
   onToast,
 }) => {
-  const [mode, setMode] = useState<'notes' | 'mindmap' | 'study'>('notes');
+  const [mode, setMode] = useState<'notes' | 'mindmap' | 'study'>(initialMode);
+  const [mobilePane, setMobilePane] = useState<'list' | 'reading'>(initialNotePath ? 'reading' : 'list');
   const [folder, setFolder] = useState<string>('');
   const [query, setQuery] = useState('');
   const [notes, setNotes] = useState<WikiNoteSummary[]>([]);
@@ -52,28 +58,31 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
   // Education & Spaced Repetition
   const [courses, setCourses] = useState<EducationCourse[]>([]);
   const [studyDeck, setStudyDeck] = useState<FlashcardDeckPayload | null>(null);
+  const [newCourseTitle, setNewCourseTitle] = useState('');
 
-  const loadNotes = async () => {
-    const res = query.trim()
-      ? await callAction<{ results?: WikiNoteSummary[]; notes?: WikiNoteSummary[] }>('wiki', {
+  const loadNotes = async (overrideQuery?: string) => {
+    const q = (overrideQuery !== undefined ? overrideQuery : query).trim();
+    const res = q
+      ? await callAction<{ hits?: WikiNoteSummary[]; results?: WikiNoteSummary[]; notes?: WikiNoteSummary[] }>('wiki', {
           subaction: 'search',
-          query: query.trim(),
+          query: q,
         })
-      : await callAction<{ results?: WikiNoteSummary[]; notes?: WikiNoteSummary[] }>('wiki', {
+      : await callAction<{ hits?: WikiNoteSummary[]; results?: WikiNoteSummary[]; notes?: WikiNoteSummary[] }>('wiki', {
           subaction: 'list',
           folder,
         });
-    const list = res.notes || res.results || [];
+    const list = res.hits || res.notes || res.results || [];
     setNotes(list);
     if (!selectedNote && list.length > 0) {
-      void openNote(initialNotePath || list[0].rel_path);
+      void openNote(initialNotePath || list[0].rel_path, false);
     }
   };
 
-  const openNote = async (path: string) => {
+  const openNote = async (path: string, switchMobile = true) => {
     if (!path) return;
     setDiff(null);
     setEditing(false);
+    if (switchMobile) setMobilePane('reading');
     const res = await callAction<WikiNoteDetail>('wiki', { subaction: 'read', path });
     if (res.ok) {
       const detail = res as unknown as WikiNoteDetail;
@@ -82,6 +91,29 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
     }
   };
 
+  const loadStudyState = async (courseId = '') => {
+    const prog = await callAction<{ courses?: EducationCourse[]; active_course?: EducationCourse }>('education', {
+      subaction: 'progress',
+    });
+    const list = prog.courses || [];
+    setCourses(list);
+    const targetId = courseId || prog.active_course?.course_id || list[0]?.course_id || '';
+    if (targetId) {
+      const dRes = await callAction<{ ok?: boolean; deck?: FlashcardDeckPayload }>('education', {
+        subaction: 'flashcard_deck',
+        course_id: targetId,
+        limit: 8,
+      });
+      setStudyDeck(dRes.ok && dRes.deck ? dRes.deck : null);
+    } else {
+      setStudyDeck(null);
+    }
+  };
+
+  useEffect(() => {
+    setMode(initialMode);
+  }, [initialMode]);
+
   useEffect(() => {
     void loadNotes();
   }, [folder]);
@@ -89,7 +121,7 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
   useEffect(() => {
     if (initialNotePath) {
       setMode('notes');
-      void openNote(initialNotePath);
+      void openNote(initialNotePath, true);
     }
   }, [initialNotePath]);
 
@@ -99,13 +131,7 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
         if (res.ok) setGraph(res as unknown as MindMapGraph);
       });
     } else if (mode === 'study') {
-      void callAction<{ courses?: EducationCourse[]; due_deck?: FlashcardDeckPayload }>(
-        'education',
-        { subaction: 'progress' }
-      ).then((res) => {
-        if (res.courses) setCourses(res.courses);
-        if (res.due_deck) setStudyDeck(res.due_deck);
-      });
+      void loadStudyState();
     }
   }, [mode]);
 
@@ -117,13 +143,47 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
       title: selectedNote.title,
       content: editBody,
       expected_hash: selectedNote.content_hash,
+      confirmed: true,
     });
     if (res.ok) {
       setEditing(false);
-      await openNote(selectedNote.path);
+      await openNote(selectedNote.path, false);
       onToast(res.summary || 'Saved Wiki note.');
     } else {
       onToast(res.error || 'Could not save note.');
+    }
+  };
+
+  const trashSelectedNote = async () => {
+    if (!selectedNote) return;
+    const res = await callAction('wiki', {
+      subaction: 'trash',
+      path: selectedNote.path,
+      confirmed: true,
+    });
+    if (res.ok) {
+      setSelectedNote(null);
+      setMobilePane('list');
+      await loadNotes();
+      onToast(res.summary || 'Moved note to recoverable Trash.');
+    } else {
+      onToast(res.error || 'Could not trash note.');
+    }
+  };
+
+  const createQuickCourse = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newCourseTitle.trim()) return;
+    const res = await callAction('education', {
+      subaction: 'save_course',
+      title: newCourseTitle.trim(),
+      set_active: true,
+    });
+    if (res.ok) {
+      setNewCourseTitle('');
+      await loadStudyState();
+      await onRefreshStatus();
+      onToast(res.summary || 'Created study course.');
     }
   };
 
@@ -250,14 +310,32 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
       {mode === 'study' && (
         <div className="surface-scroll">
           <div className="surface-container" style={{ maxWidth: 780 }}>
+            <form onSubmit={(e) => void createQuickCourse(e)} style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+              <input
+                className="input"
+                placeholder="Start a new study course (e.g. Rust Ownership, ZFS Storage)..."
+                value={newCourseTitle}
+                onChange={(e) => setNewCourseTitle(e.target.value)}
+              />
+              <button type="submit" className="btn btn-primary btn-sm" style={{ flexShrink: 0 }}>
+                <Plus size={12} /> Add Course
+              </button>
+            </form>
+
             {studyDeck && studyDeck.cards.length > 0 && (
-              <FlashcardDeckWidget deck={studyDeck} onGraded={() => void onRefreshStatus()} />
+              <FlashcardDeckWidget
+                deck={studyDeck}
+                onGraded={() => {
+                  void loadStudyState(studyDeck.course_id);
+                  void onRefreshStatus();
+                }}
+              />
             )}
             <div className="card-group" style={{ marginTop: 14 }}>
               {courses.length === 0 ? (
                 <div className="card-row">
                   <span style={{ color: 'var(--text-muted)' }}>
-                    No active courses yet — ask Companion in Chat to design a course on any topic!
+                    No active courses yet — add a topic above or ask Companion in Chat to build a course with flashcards!
                   </span>
                 </div>
               ) : (
@@ -266,10 +344,21 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                     <div className="card-row-info">
                       <div className="card-row-title">{c.title}</div>
                       <div className="card-row-desc">
-                        {c.mastered_modules}/{c.total_modules} modules • {c.due_count} cards due
+                        {c.mastered_modules}/{c.total_modules} modules • {c.total_items} card(s) ({c.due_count} due)
                       </div>
                     </div>
-                    <span className="badge accent">{c.mastery_pct}% mastery</span>
+                    <div style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                      <span className="badge accent">{c.mastery_pct}% mastery</span>
+                      {c.total_items > 0 && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => void loadStudyState(c.course_id)}
+                        >
+                          <Play size={11} /> Deck
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))
               )}
@@ -279,29 +368,43 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
       )}
 
       {mode === 'notes' && (
-        <div className="wiki-shell">
+        <div className={`wiki-shell mobile-${mobilePane}`}>
           <div className="wiki-sidebar">
             <div className="wiki-note-list">
-              {notes.map((n) => (
-                <button
-                  key={n.rel_path}
-                  type="button"
-                  className={`wiki-note-item ${selectedNote?.path === n.rel_path ? 'active' : ''}`}
-                  onClick={() => void openNote(n.rel_path)}
-                >
-                  <div style={{ fontWeight: 500, fontSize: 13 }}>{n.title}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-                    {n.folder} • {n.author}
-                  </div>
-                </button>
-              ))}
+              {notes.length === 0 ? (
+                <div style={{ padding: 14, fontSize: 12.5, color: 'var(--text-muted)' }}>
+                  No matching notes found.
+                </div>
+              ) : (
+                notes.map((n) => (
+                  <button
+                    key={n.rel_path}
+                    type="button"
+                    className={`wiki-note-item ${selectedNote?.path === n.rel_path ? 'active' : ''}`}
+                    onClick={() => void openNote(n.rel_path, true)}
+                  >
+                    <div style={{ fontWeight: 500, fontSize: 13 }}>{n.title}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                      {n.folder} • {n.author}
+                    </div>
+                  </button>
+                ))
+              )}
             </div>
           </div>
 
           <div className="wiki-main">
             {selectedNote ? (
-              <div style={{ flex: 1, overflowY: 'auto', padding: '20px 28px' }}>
+              <div style={{ flex: 1, overflowY: 'auto', padding: '18px 22px' }}>
                 <div style={{ maxWidth: 760, margin: '0 auto' }}>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm mobile-only-btn"
+                    style={{ marginBottom: 10 }}
+                    onClick={() => setMobilePane('list')}
+                  >
+                    <ArrowLeft size={13} /> All Notes ({notes.length})
+                  </button>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
                     <div>
                       <h2 style={{ margin: 0, fontSize: 20 }}>{selectedNote.title}</h2>
@@ -309,7 +412,7 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                         <span className="mono">{selectedNote.path}</span> • Author: {selectedNote.author}
                       </div>
                     </div>
-                    <div style={{ display: 'inline-flex', gap: 6 }}>
+                    <div style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
                       {selectedNote.path.startsWith('01_inbox/') && (
                         <button
                           type="button"
@@ -319,6 +422,7 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                               subaction: 'graduate',
                               path: selectedNote.path,
                               domain: selectedNote.domain || 'general',
+                              confirmed: true,
                             });
                             await loadNotes();
                             onToast(r.summary || r.error || 'Graduated note.');
@@ -330,13 +434,17 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                       <button type="button" className="btn btn-sm" onClick={() => void inspectNoteDiff()}>
                         <FileDiff size={12} /> Diff
                       </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() => setEditing((v) => !v)}
-                      >
+                      <button type="button" className="btn btn-sm" onClick={() => setEditing((v) => !v)}>
                         {editing ? <Eye size={12} /> : <Edit3 size={12} />}
                         {editing ? 'Preview' : 'Edit'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        title="Move note to recoverable Trash"
+                        onClick={() => void trashSelectedNote()}
+                      >
+                        <Trash2 size={12} />
                       </button>
                     </div>
                   </div>
@@ -365,7 +473,12 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                     <div className="md-body">
                       <MarkdownView
                         content={selectedNote.body || selectedNote.raw}
-                        onOpenWikiNote={(target) => void openNote(target)}
+                        onOpenWikiNote={(target) => void openNote(target, true)}
+                        onFilterTag={(tag) => {
+                          setQuery(tag);
+                          setMobilePane('list');
+                          void loadNotes(tag);
+                        }}
                       />
                     </div>
                   )}

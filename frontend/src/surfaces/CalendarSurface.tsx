@@ -1,13 +1,19 @@
 import React, { useEffect, useState } from 'react';
 import { Calendar as CalIcon, Clock, Plus, Trash2 } from 'lucide-react';
 import { callAction } from '../api';
-import type { CalendarItem, CalendarWindow } from '../types';
+import type { AuxInspectorTarget, CalendarItem, CalendarWindow } from '../types';
 
 interface CalendarSurfaceProps {
+  onInspect: (target: AuxInspectorTarget) => void;
+  onOpenStudy: () => void;
   onToast: (msg: string) => void;
 }
 
-export const CalendarSurface: React.FC<CalendarSurfaceProps> = ({ onToast }) => {
+export const CalendarSurface: React.FC<CalendarSurfaceProps> = ({
+  onInspect,
+  onOpenStudy,
+  onToast,
+}) => {
   const [range, setRange] = useState<'today' | 'week' | 'month'>('week');
   const [win, setWin] = useState<CalendarWindow | null>(null);
   const [showAdd, setShowAdd] = useState(false);
@@ -100,14 +106,14 @@ export const CalendarSurface: React.FC<CalendarSurfaceProps> = ({ onToast }) => 
 
         {showAdd && (
           <form onSubmit={(e) => void addEvent(e)} className="card-group" style={{ padding: 14 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px 150px auto', gap: 10, alignItems: 'end' }}>
+            <div className="form-grid-event">
               <div>
                 <label className="field-label">Event Title</label>
                 <input className="input" placeholder="Dentist, Focus block, Milestone..." value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
               </div>
               <div>
-                <label className="field-label">Date / Time</label>
-                <input className="input mono" placeholder="YYYY-MM-DD" value={startAt} onChange={(e) => setStartAt(e.target.value)} />
+                <label className="field-label">Date</label>
+                <input type="date" className="input mono" value={startAt.slice(0, 10)} onChange={(e) => setStartAt(e.target.value)} />
               </div>
               <div>
                 <label className="field-label">Category</label>
@@ -143,32 +149,50 @@ export const CalendarSurface: React.FC<CalendarSurfaceProps> = ({ onToast }) => 
                   {dt} {dt === win?.today ? '• Today' : ''}
                 </div>
                 <div className="card-group" style={{ marginBottom: 0 }}>
-                  {items.map((it) => (
-                    <div key={it.id} className="card-row">
-                      <div className="card-row-info">
-                        <div className="card-row-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                          <CalIcon size={13} style={{ color: 'var(--accent-primary)' }} />
-                          <span>{it.title}</span>
-                          <span className="badge">{it.source_type.replace(/_/g, ' ')}</span>
-                        </div>
-                        {it.time && (
-                          <div className="card-row-desc">
-                            <Clock size={11} style={{ verticalAlign: '-1px', marginRight: 4 }} />
-                            {it.time}
+                  {items.map((it) => {
+                    const isWorkItem = Boolean(it.card_id);
+                    const isRoutine = Boolean(it.routine_id);
+                    const isStudy = it.source_type === 'study_review' || it.source_type.includes('study');
+                    const clickable = isWorkItem || isRoutine || isStudy;
+                    return (
+                      <div
+                        key={it.id}
+                        className="card-row"
+                        style={{ cursor: clickable ? 'pointer' : 'default' }}
+                        onClick={() => {
+                          if (it.card_id) onInspect({ kind: 'work_item', itemId: it.card_id, projectId: it.board_id });
+                          else if (it.routine_id) onInspect({ kind: 'routine', routineId: it.routine_id });
+                          else if (isStudy) onOpenStudy();
+                        }}
+                      >
+                        <div className="card-row-info">
+                          <div className="card-row-title" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            <CalIcon size={13} style={{ color: 'var(--accent-primary)' }} />
+                            <span>{it.title}</span>
+                            <span className="badge">{it.source_type.replace(/_/g, ' ')}</span>
                           </div>
+                          {it.time && (
+                            <div className="card-row-desc">
+                              <Clock size={11} style={{ verticalAlign: '-1px', marginRight: 4 }} />
+                              {it.time}
+                            </div>
+                          )}
+                        </div>
+                        {it.source_type === 'event' && (
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void deleteEvent(it.id);
+                            }}
+                          >
+                            <Trash2 size={13} />
+                          </button>
                         )}
                       </div>
-                      {it.source_type === 'event' && (
-                        <button
-                          type="button"
-                          className="btn btn-ghost btn-sm"
-                          onClick={() => void deleteEvent(it.id)}
-                        >
-                          <Trash2 size={13} />
-                        </button>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             );

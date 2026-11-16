@@ -13,13 +13,15 @@ import {
 import { apiPost, callAction, uploadAttachment } from '../api';
 import type { ChatAttachment, ProjectGraphEntry, PromptTemplate, WebStatus } from '../types';
 
+export type ComposerExecMode = 'chat' | 'plan' | 'goal' | 'job';
+
 interface ComposerBarProps {
   status: WebStatus | null;
   projects: ProjectGraphEntry[];
   selectedProjectId: string;
   busy: boolean;
   onSelectProject: (projectId: string) => void;
-  onSendMessage: (message: string, attachmentIds: string[], runAsBgJob: boolean) => Promise<void>;
+  onSendMessage: (message: string, attachmentIds: string[], execMode: ComposerExecMode) => Promise<void>;
   onRefreshStatus: () => Promise<void>;
   onToast: (msg: string) => void;
 }
@@ -49,8 +51,9 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
   const [uploading, setUploading] = useState(false);
   const [openMenu, setOpenMenu] = useState<'none' | 'context' | 'model' | 'posture' | 'project'>('none');
   const [prompts, setPrompts] = useState<PromptTemplate[]>([]);
-  const [runAsBgJob, setRunAsBgJob] = useState(false);
+  const [execMode, setExecMode] = useState<ComposerExecMode>('chat');
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const activeTier = status?.active_model_tier || 'auto';
   const trustMode = status?.trust_mode || 'balanced';
@@ -87,9 +90,12 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
   const openContextMenu = async () => {
     const next = openMenu === 'context' ? 'none' : 'context';
     setOpenMenu(next);
-    if (next === 'context' && prompts.length === 0) {
-      const res = await callAction<{ templates?: PromptTemplate[] }>('prompts', { subaction: 'list' });
-      if (res.templates) setPrompts(res.templates.slice(0, 6));
+    if (next === 'context') {
+      const res = await callAction<{ prompts?: PromptTemplate[]; templates?: PromptTemplate[] }>('prompts', {
+        subaction: 'list',
+      });
+      const items = res.prompts || res.templates || [];
+      setPrompts(items.slice(0, 6));
     }
   };
 
@@ -122,12 +128,12 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
     const text = draft.trim();
     if ((!text && attachments.length === 0) || busy || uploading) return;
     const ids = attachments.map((a) => a.id);
-    const asJob = runAsBgJob;
+    const chosenMode = execMode;
     setDraft('');
     setAttachments([]);
-    setRunAsBgJob(false);
+    setExecMode('chat');
     setOpenMenu('none');
-    await onSendMessage(text || 'Inspect attached file(s).', ids, asJob);
+    await onSendMessage(text || 'Inspect attached file(s).', ids, chosenMode);
   };
 
   return (
@@ -170,13 +176,19 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
           </div>
 
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-            {runAsBgJob && (
-              <span className="badge accent" title="Will run asynchronously in Forever-Chat Background Jobs">
-                <Rocket size={11} /> Background Job
+            {execMode !== 'chat' && (
+              <span className="badge accent">
+                <Rocket size={11} />{' '}
+                {execMode === 'plan'
+                  ? 'Plan First'
+                  : execMode === 'goal'
+                    ? 'Autonomous Goal'
+                    : 'Background Job'}
                 <button
                   type="button"
                   style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
-                  onClick={() => setRunAsBgJob(false)}
+                  onClick={() => setExecMode('chat')}
+                  aria-label="Reset execution mode"
                 >
                   <X size={11} />
                 </button>
@@ -206,7 +218,15 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
                 key={item.cmd}
                 type="button"
                 className="popover-row"
-                onClick={() => setDraft(item.cmd)}
+                onClick={() => {
+                  if (item.cmd.endsWith(' ')) {
+                    setDraft(item.cmd);
+                    textareaRef.current?.focus();
+                  } else {
+                    setDraft('');
+                    void onSendMessage(item.cmd, [], 'chat');
+                  }
+                }}
               >
                 <strong className="mono">{item.cmd.trim()}</strong>
                 <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>{item.desc}</span>
@@ -217,6 +237,7 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
 
         {/* Main Prompt Input */}
         <textarea
+          ref={textareaRef}
           className="composer-textarea"
           data-testid="chat-composer-input"
           rows={1}
@@ -253,7 +274,7 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
 
             {openMenu === 'context' && (
               <div className="composer-up-menu" data-testid="composer-context-sheet">
-                <div className="popover-group-label">Add Context</div>
+                <div className="popover-group-label">Add Context &amp; Mode</div>
                 <button
                   type="button"
                   className="popover-row"
@@ -261,16 +282,28 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
                 >
                   <span>Upload file or image...</span>
                 </button>
-                <button
-                  type="button"
-                  className="popover-row"
-                  onClick={() => {
-                    setRunAsBgJob((v) => !v);
-                    setOpenMenu('none');
-                  }}
-                >
-                  <span>{runAsBgJob ? 'Switch to Foreground Turn' : 'Dispatch as Background Job'}</span>
-                </button>
+                {(
+                  [
+                    ['plan', 'Plan First (Blueprint)', 'Align before editing'],
+                    ['goal', 'Autonomous Goal', 'Multi-step + Doctor gates'],
+                    ['job', 'Background Job', 'Run async in background'],
+                  ] as const
+                ).map(([mId, mLabel, mSub]) => (
+                  <button
+                    key={mId}
+                    type="button"
+                    className="popover-row"
+                    onClick={() => {
+                      setExecMode((cur) => (cur === mId ? 'chat' : mId));
+                      setOpenMenu('none');
+                    }}
+                  >
+                    <span>{mLabel}</span>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                      {execMode === mId ? 'Active ✓' : mSub}
+                    </span>
+                  </button>
+                ))}
                 <div className="popover-group-label">Focus &amp; Memory</div>
                 <button
                   type="button"
@@ -278,7 +311,7 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
                   data-testid="composer-compact-btn"
                   onClick={() => {
                     setOpenMenu('none');
-                    void onSendMessage('/compact', [], false);
+                    void onSendMessage('/compact', [], 'chat');
                   }}
                 >
                   <span>Compact Context</span>
@@ -290,7 +323,7 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
                   data-testid="composer-fresh-focus-btn"
                   onClick={() => {
                     setOpenMenu('none');
-                    void onSendMessage('/clear', [], false);
+                    void onSendMessage('/clear', [], 'chat');
                   }}
                 >
                   <span>Fresh Focus</span>

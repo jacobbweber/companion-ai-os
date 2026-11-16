@@ -262,15 +262,30 @@ export const AutomationsSurface: React.FC<AutomationsSurfaceProps> = ({
         </div>
 
         {/* Collapsible Morning Autonomy Briefing */}
-        <button
-          type="button"
-          className="btn btn-ghost btn-sm"
-          onClick={() => setShowBriefing((v) => !v)}
-          style={{ marginBottom: 8 }}
-        >
-          {showBriefing ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-          <Sparkles size={13} /> Morning Autonomy Briefing ({journal.length})
-        </button>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8 }}>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => setShowBriefing((v) => !v)}
+          >
+            {showBriefing ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            <Sparkles size={13} /> Morning Autonomy Briefing ({journal.length})
+          </button>
+          {(status?.unseen_autonomy_count || 0) > 0 && (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={async () => {
+                await callAction('autonomy', { subaction: 'morning', mark_seen: true });
+                await onRefreshStatus();
+                await loadAll();
+                onToast('Marked Morning Autonomy Briefing as read.');
+              }}
+            >
+              Mark Briefing Read ({status?.unseen_autonomy_count})
+            </button>
+          )}
+        </div>
 
         {showBriefing && (
           <div className="card-group">

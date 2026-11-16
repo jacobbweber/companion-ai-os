@@ -1,24 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import {
-  Activity,
-  ArchiveRestore,
-  ChevronDown,
-  ChevronRight,
-  Plus,
-  RefreshCw,
-  RotateCw,
-  ShieldCheck,
-  Trash2,
-} from 'lucide-react';
-import { apiPost, callAction, reloadCompanionService } from '../api';
-import type {
-  FederatedPartner,
-  RemoteEndpoint,
-  SandboxClone,
-  SnapshotBackup,
-  VaultAuditEntry,
-  VaultSecretMeta,
-} from '../types';
+import { Activity, ArchiveRestore, ChevronDown, ChevronRight, Plus, RefreshCw, RotateCw, ShieldCheck, Trash2 } from 'lucide-react';
+import { apiPost, callAction, fetchTelemetry, reloadCompanionService } from '../api';
+import type { FederatedPartner, RemoteEndpoint, SandboxClone, SnapshotBackup, TelemetryPayload, VaultAuditEntry, VaultSecretMeta } from '../types';
 
 interface SettingsInfraPanelProps {
   section: 'vault' | 'federation' | 'ops';
@@ -26,11 +9,7 @@ interface SettingsInfraPanelProps {
   onToast: (msg: string) => void;
 }
 
-export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
-  section,
-  onRefreshStatus,
-  onToast,
-}) => {
+export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section, onRefreshStatus, onToast }) => {
   // Vault & Endpoints
   const [secrets, setSecrets] = useState<VaultSecretMeta[]>([]);
   const [audit, setAudit] = useState<VaultAuditEntry[]>([]);
@@ -56,12 +35,14 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
   const [pUrl, setPUrl] = useState('');
   const [pCred, setPCred] = useState('');
 
-  // Backups, Sandboxes & System Doctor
+  // Backups, Sandboxes, Telemetry & System Doctor
   const [backups, setBackups] = useState<SnapshotBackup[]>([]);
   const [sandboxes, setSandboxes] = useState<SandboxClone[]>([]);
   const [doctorReport, setDoctorReport] = useState('');
   const [runningDoctor, setRunningDoctor] = useState(false);
   const [reloading, setReloading] = useState(false);
+  const [showTelemetry, setShowTelemetry] = useState(false);
+  const [telemetry, setTelemetry] = useState<TelemetryPayload | null>(null);
 
   const loadSection = async () => {
     if (section === 'vault') {
@@ -80,12 +61,14 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
       if (res.partners) setPartners(res.partners);
       if (typeof res.hosted_mcp_enabled === 'boolean') setHostedEnabled(res.hosted_mcp_enabled);
     } else {
-      const [bRes, sRes] = await Promise.all([
+      const [bRes, sRes, tRes] = await Promise.all([
         callAction<{ snapshots?: SnapshotBackup[] }>('backup', { subaction: 'list' }),
         callAction<{ sandboxes?: SandboxClone[] }>('sandbox', { subaction: 'list' }),
+        fetchTelemetry().catch(() => null),
       ]);
       if (bRes.snapshots) setBackups(bRes.snapshots);
       if (sRes.sandboxes) setSandboxes(sRes.sandboxes);
+      if (tRes && tRes.ok) setTelemetry(tRes);
     }
   };
 
@@ -123,6 +106,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
       protocol: epProto,
       host: epHost.trim(),
       credential_ref: epCred.trim(),
+      confirmed: true,
     });
     if (res.ok) {
       setEpId('');
@@ -148,7 +132,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
 
         {showAddSecret && (
           <div className="card-group" style={{ padding: 14 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div className="form-grid-2">
               <div>
                 <label className="field-label">Symbolic Name</label>
                 <input className="input mono" placeholder="e.g. home-assistant-token" value={secName} onChange={(e) => setSecName(e.target.value)} />
@@ -206,7 +190,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
 
         {showAddEndpoint && (
           <div className="card-group" style={{ padding: 14 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div className="form-grid-2">
               <div>
                 <label className="field-label">Endpoint ID</label>
                 <input className="input mono" placeholder="gpu-node" value={epId} onChange={(e) => setEpId(e.target.value)} />
@@ -308,6 +292,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
                   subaction: 'configure_hosted',
                   enabled: !hostedEnabled,
                   token_ref: hostedTokenRef,
+                  confirmed: true,
                 });
                 if (res.ok) {
                   setHostedEnabled(!hostedEnabled);
@@ -335,7 +320,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
 
         {showAddPartner && (
           <div className="card-group" style={{ padding: 14 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            <div className="form-grid-3">
               <input className="input mono" placeholder="partner-id" value={pId} onChange={(e) => setPId(e.target.value)} />
               <input className="input mono" placeholder="http://192.168.1.x:8000/api/mcp" value={pUrl} onChange={(e) => setPUrl(e.target.value)} />
               <input className="input mono" placeholder="Vault token ref" value={pCred} onChange={(e) => setPCred(e.target.value)} />
@@ -345,12 +330,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
                 type="button"
                 className="btn btn-primary btn-sm"
                 onClick={async () => {
-                  const r = await callAction('partners', {
-                    subaction: 'register',
-                    partner_id: pId.trim(),
-                    url: pUrl.trim(),
-                    credential_ref: pCred.trim(),
-                  });
+                  const r = await callAction('partners', { subaction: 'register', partner_id: pId.trim(), url: pUrl.trim(), credential_ref: pCred.trim() });
                   if (r.ok) {
                     setPId('');
                     setPUrl('');
@@ -406,7 +386,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
             <div className="card-row-title">7-Stage System Doctor</div>
             <div className="card-row-desc">Verify AST syntax, A-Frame layers, SDD sync, dead-code hygiene, SQLite &amp; unit tests.</div>
           </div>
-          <div style={{ display: 'inline-flex', gap: 6 }}>
+          <div style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
             <button
               type="button"
               className="btn btn-sm"
@@ -465,33 +445,18 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
       </div>
 
       {doctorReport && (
-        <pre
-          className="mono"
-          style={{
-            padding: 12,
-            borderRadius: 'var(--radius-sm)',
-            background: 'var(--code-bg)',
-            border: '1px solid var(--border-hairline)',
-            fontSize: 11.5,
-            overflowX: 'auto',
-            marginBottom: 14,
-          }}
-        >
+        <pre className="mono" style={{ padding: 12, borderRadius: 'var(--radius-sm)', background: 'var(--code-bg)', border: '1px solid var(--border-hairline)', fontSize: 11.5, overflowX: 'auto', marginBottom: 14 }}>
           {doctorReport}
         </pre>
       )}
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <span className="field-label" style={{ margin: 0 }}>Secret-Free Snapshot Backups</span>
-        <button
-          type="button"
-          className="btn btn-sm"
-          onClick={async () => {
-            const r = await callAction('backup', { subaction: 'create', label: 'manual' });
-            await loadSection();
-            onToast(r.summary || 'Created snapshot backup.');
-          }}
-        >
+        <button type="button" className="btn btn-sm" onClick={async () => {
+          const r = await callAction('backup', { subaction: 'create', label: 'manual' });
+          await loadSection();
+          onToast(r.summary || 'Created snapshot backup.');
+        }}>
           <Plus size={12} /> Create Snapshot
         </button>
       </div>
@@ -506,14 +471,10 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
                 <div className="card-row-title mono">{b.snapshot_id}</div>
                 <div className="card-row-desc">{b.wiki_files} Wiki files • {b.created_at}</div>
               </div>
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={async () => {
-                  const r = await callAction('backup', { subaction: 'restore', snapshot_id: b.snapshot_id });
-                  onToast(r.summary || r.error || 'Restored snapshot.');
-                }}
-              >
+              <button type="button" className="btn btn-sm" onClick={async () => {
+                const r = await callAction('backup', { subaction: 'restore', snapshot_id: b.snapshot_id });
+                onToast(r.summary || r.error || 'Restored snapshot.');
+              }}>
                 <ArchiveRestore size={12} /> Restore
               </button>
             </div>
@@ -523,15 +484,11 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <span className="field-label" style={{ margin: 0 }}>Isolated Self-Dev Sandbox Clones</span>
-        <button
-          type="button"
-          className="btn btn-sm"
-          onClick={async () => {
-            const r = await callAction('sandbox', { subaction: 'create', label: 'experiment' });
-            await loadSection();
-            onToast(r.summary || r.error || 'Created sandbox clone.');
-          }}
-        >
+        <button type="button" className="btn btn-sm" onClick={async () => {
+          const r = await callAction('sandbox', { subaction: 'create', label: 'experiment' });
+          await loadSection();
+          onToast(r.summary || r.error || 'Created sandbox clone.');
+        }}>
           <Plus size={12} /> New Sandbox Clone
         </button>
       </div>
@@ -546,20 +503,42 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({
                 <div className="card-row-title mono">{s.sandbox_id}</div>
                 <div className="card-row-desc">{s.copied_files} files</div>
               </div>
-              <button
-                type="button"
-                className="btn btn-danger btn-sm"
-                onClick={async () => {
+              <div style={{ display: 'inline-flex', gap: 6 }}>
+                <button type="button" className="btn btn-sm" onClick={async () => {
+                  const r = await callAction('sandbox', { subaction: 'verify', sandbox_id: s.sandbox_id });
+                  onToast(r.summary || r.error || 'Verified sandbox.');
+                }}>
+                  <ShieldCheck size={12} /> Verify
+                </button>
+                <button type="button" className="btn btn-danger btn-sm" onClick={async () => {
                   await callAction('sandbox', { subaction: 'cleanup', sandbox_id: s.sandbox_id });
                   await loadSection();
-                }}
-              >
-                <Trash2 size={12} /> Clean Up
-              </button>
+                }}>
+                  <Trash2 size={12} /> Clean Up
+                </button>
+              </div>
             </div>
           ))
         )}
       </div>
+
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowTelemetry((v) => !v)}>
+        {showTelemetry ? <ChevronDown size={13} /> : <ChevronRight size={13} />} Telemetry, Traces &amp; System Logs ({telemetry?.traces?.length || 0})
+      </button>
+
+      {showTelemetry && telemetry && (
+        <div className="card-group" style={{ marginTop: 8 }}>
+          {telemetry.traces.slice(0, 6).map((tr) => (
+            <div key={tr.trace_id} className="card-row" style={{ fontSize: 12 }}>
+              <div className="card-row-info">
+                <div className="card-row-title">{tr.name || tr.trace_type}</div>
+                <div className="card-row-desc mono">{tr.trace_id} • {Math.round(tr.duration_ms)}ms • {tr.span_count} spans</div>
+              </div>
+              <span className={`badge ${tr.status === 'ok' ? 'ok' : 'warn'}`}>{tr.status}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 };

@@ -88,6 +88,10 @@ _MUTATION_VERBS = frozenset({
 })
 _ADVANCE_VERBS = frozenset({"advance", "continue", "proceed", "resume", "tackle"})
 _GOAL_NOUNS = frozenset({"goal", "slice", "milestone", "project", "work"})
+_PERSONAL_ASSISTANT_NOUNS = frozenset({
+    "course", "courses", "flashcard", "flashcards", "study", "quiz", "calendar", "appointment",
+    "reminder", "task", "tasks", "card", "cards", "board", "milestone", "milestones", "note", "notes", "inbox",
+})
 
 
 def _tokenize_words(text: str) -> List[str]:
@@ -198,7 +202,7 @@ def assess_turn_readiness(
         reasons.append("explicit alignment or scoping request")
 
     unknowns = _filter_external_unknown_targets(clean, list(eff_grounding.unknown_terms)) if eff_grounding else ()
-    if len(unknowns) >= 2 and has_mutation:
+    if len(unknowns) >= 2 and has_mutation and not (words & _PERSONAL_ASSISTANT_NOUNS):
         reasons.append(f"multiple unverified external targets ({', '.join(unknowns[:3])})")
 
     return ReadinessAssessment(

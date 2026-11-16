@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Inbox, PanelLeftOpen, PanelRight } from 'lucide-react';
-import { callAction, fetchStatus } from './api';
+import { apiPost, callAction, fetchStatus } from './api';
 import { SettingsModal } from './settings/SettingsModal';
 import { ActivityPopover } from './shell/ActivityPopover';
 import { AuxSplitPane } from './shell/AuxSplitPane';
@@ -22,7 +22,7 @@ import type {
 } from './types';
 
 const SURFACE_LABELS: Record<SurfaceId, string> = {
-  chat: 'Conversation',
+  chat: 'Chat',
   boards: 'Board & Goals',
   calendar: 'Calendar',
   knowledge: 'Knowledge',
@@ -48,6 +48,7 @@ export const App: React.FC = () => {
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>('general');
   const [searchOpen, setSearchOpen] = useState(false);
   const [wikiInitialPath, setWikiInitialPath] = useState('');
+  const [knowledgeInitialMode, setKnowledgeInitialMode] = useState<'notes' | 'mindmap' | 'study'>('notes');
   const [dataRefreshNonce, setDataRefreshNonce] = useState(0);
   const [toast, setToast] = useState('');
   const activityAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -77,8 +78,9 @@ export const App: React.FC = () => {
       ]);
       if (st.ok) {
         setStatus(st);
-        if (!selectedProjectId && st.workspace?.project_id) {
-          setSelectedProjectId(st.workspace.project_id);
+        const initialFocus = st.focus_project_id || st.workspace?.project_id || '';
+        if (!selectedProjectId && initialFocus) {
+          setSelectedProjectId(initialFocus);
         }
       }
       if (bRes.boards) {
@@ -137,10 +139,15 @@ export const App: React.FC = () => {
     }
   };
 
+  const syncProjectFocus = (projectId: string) => {
+    setSelectedProjectId(projectId);
+    void apiPost('/api/settings', { focus_project_id: projectId }).catch(() => {});
+  };
+
   const handleSelectProject = (projectId: string, openBoard = false) => {
     setShowActivity(false);
-    setSelectedProjectId(projectId);
-    if (openBoard) {
+    syncProjectFocus(projectId);
+    if (openBoard || (surface !== 'chat' && surface !== 'boards')) {
       handleSelectSurface('boards');
     } else if (typeof window !== 'undefined' && window.innerWidth <= 768) {
       setRailCollapsed(true);
@@ -154,8 +161,8 @@ export const App: React.FC = () => {
       kind: 'project',
     });
     if (res.ok && res.project) {
+      syncProjectFocus(res.project.project_id);
       await refreshStatusAndProjects();
-      setSelectedProjectId(res.project.project_id);
       handleSelectSurface('boards');
       showToast(`Created project "${res.project.title}".`);
     } else {
@@ -211,7 +218,21 @@ export const App: React.FC = () => {
                   <PanelLeftOpen size={15} />
                 </button>
               )}
-              <span className="breadcrumb-project">{activeProjTitle}</span>
+              <button
+                type="button"
+                className="breadcrumb-project"
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  padding: '2px 5px',
+                  borderRadius: 'var(--radius-xs)',
+                  cursor: 'pointer',
+                }}
+                title={surface === 'boards' ? 'Jump to Chat for this project' : 'Open project Board & Goals'}
+                onClick={() => handleSelectSurface(surface === 'boards' ? 'chat' : 'boards')}
+              >
+                {activeProjTitle}
+              </button>
               <span style={{ color: 'var(--text-muted)' }}>/</span>
               <span className="breadcrumb-title">{SURFACE_LABELS[surface]}</span>
             </div>
@@ -256,7 +277,13 @@ export const App: React.FC = () => {
                 className={`icon-btn ${auxTarget ? 'active' : ''}`}
                 data-testid="toggle-aux-pane-btn"
                 onClick={() =>
-                  setAuxTarget((cur) => (cur ? null : { kind: 'approvals' }))
+                  setAuxTarget((cur) =>
+                    cur
+                      ? null
+                      : surface === 'boards' && selectedProjectId
+                        ? { kind: 'project', projectId: selectedProjectId }
+                        : { kind: 'approvals' }
+                  )
                 }
                 title="Toggle Auxiliary Inspector Pane"
                 aria-label="Toggle Auxiliary Pane"
@@ -272,7 +299,7 @@ export const App: React.FC = () => {
               status={status}
               projects={projects}
               selectedProjectId={selectedProjectId}
-              onSelectProject={(pid) => setSelectedProjectId(pid)}
+              onSelectProject={(pid) => syncProjectFocus(pid)}
               onInspect={(t) => setAuxTarget(t)}
               onRefreshStatus={refreshStatusAndProjects}
               onToast={showToast}
@@ -284,18 +311,28 @@ export const App: React.FC = () => {
               selectedProjectId={selectedProjectId}
               refreshNonce={dataRefreshNonce}
               selectedItemId={auxTarget?.kind === 'work_item' ? auxTarget.itemId : undefined}
-              onSelectProject={(pid) => setSelectedProjectId(pid)}
+              onSelectProject={(pid) => syncProjectFocus(pid)}
               onInspect={(t) => setAuxTarget(t)}
               onRefreshStatus={refreshStatusAndProjects}
               onToast={showToast}
             />
           )}
 
-          {surface === 'calendar' && <CalendarSurface onToast={showToast} />}
+          {surface === 'calendar' && (
+            <CalendarSurface
+              onInspect={(t) => setAuxTarget(t)}
+              onOpenStudy={() => {
+                setKnowledgeInitialMode('study');
+                handleSelectSurface('knowledge');
+              }}
+              onToast={showToast}
+            />
+          )}
 
           {surface === 'knowledge' && (
             <KnowledgeSurface
               initialNotePath={wikiInitialPath}
+              initialMode={knowledgeInitialMode}
               onRefreshStatus={refreshStatusAndProjects}
               onToast={showToast}
             />
@@ -346,6 +383,12 @@ export const App: React.FC = () => {
           theme={theme}
           projects={projects}
           onApplyTheme={applyTheme}
+          onSelectProject={(pid) => {
+            syncProjectFocus(pid);
+            setSettingsOpen(false);
+            handleSelectSurface('boards');
+            setAuxTarget({ kind: 'project', projectId: pid });
+          }}
           onClose={() => setSettingsOpen(false)}
           onRefreshStatus={refreshStatusAndProjects}
           onToast={showToast}

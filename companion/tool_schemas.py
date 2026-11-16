@@ -294,6 +294,7 @@ TOOLS: List[Dict[str, Any]] = [
         "modules": _p("array", "Ordered list of syllabus module titles for `save_course`.", items_type="string"),
         "module_slug": _p("string", "Target module slug for `advance_stage`, `upsert_items`, or `curate_note`."),
         "stage": _p("string", "Pedagogical stage for `advance_stage`.", enum=["priming", "dual_coding", "elaboration", "retrieval", "mastered"]),
+        "items": {"type": "array", "description": "Preferred batch array of `{prompt, answer, topic, explanation}` objects for `upsert_items` (saves all flashcards in 1 call).", "items": {"type": "object"}},
         "prompt": _p("string", "Flashcard front or quiz question prompt when adding a single item via `upsert_items`."),
         "answer": _p("string", "Flashcard back or canonical answer when adding a single item via `upsert_items`."),
         "topic": _p("string", "Concept/topic label for study items or `flashcard_deck` filter."),

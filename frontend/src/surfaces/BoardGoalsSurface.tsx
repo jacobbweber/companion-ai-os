@@ -427,7 +427,7 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
               {(board?.milestones || []).length === 0 ? (
                 <div className="card-row">
                   <span style={{ color: 'var(--text-muted)' }}>
-                    No milestones yet — add one or click &ldquo;Seed 4 DIKW Stages&rdquo; (`Observe -&gt; Curate -&gt; Forge -&gt; Deliver`).
+                    No milestones yet — add one or click &ldquo;Seed 4 DIKW Stages&rdquo; (Observe &rarr; Curate &rarr; Forge &rarr; Deliver).
                   </span>
                 </div>
               ) : (

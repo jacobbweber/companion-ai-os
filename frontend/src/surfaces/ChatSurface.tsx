@@ -17,7 +17,7 @@ import type {
   ProjectGraphEntry,
   WebStatus,
 } from '../types';
-import { ComposerBar } from './ComposerBar';
+import { ComposerBar, type ComposerExecMode } from './ComposerBar';
 
 interface ChatSurfaceProps {
   status: WebStatus | null;
@@ -106,8 +106,8 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     }
   }, [messages]);
 
-  const sendMessage = async (text: string, attachmentIds: string[], runAsBgJob: boolean) => {
-    if (runAsBgJob) {
+  const sendMessage = async (text: string, attachmentIds: string[], execMode: ComposerExecMode) => {
+    if (execMode === 'job') {
       const jRes = await callAction('jobs', {
         subaction: 'dispatch',
         title: text.slice(0, 72),
@@ -188,6 +188,8 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
         error?: string;
       }>('/api/chat', {
         message: text,
+        mode: execMode,
+        project_id: selectedProjectId,
         attachment_ids: attachmentIds,
         async: true,
       });
@@ -277,7 +279,17 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     }
   };
 
+  const resolvePendingApproval = async (approvalId: string, decision: 'approve' | 'deny') => {
+    const res = await callAction('approvals', {
+      subaction: decision,
+      approval_id: approvalId,
+    });
+    await onRefreshStatus();
+    onToast(res.summary || res.error || `Approval ${decision}d.`);
+  };
+
   const userName = status?.user_name || 'Partner';
+  const inlineApprovals = status?.pending_approvals || [];
 
   return (
     <div className="chat-canvas-wrap" data-testid="chat-surface">
@@ -306,16 +318,61 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
             <button
               type="button"
               className="btn btn-primary btn-sm"
-              onClick={() => void sendMessage('approve', [], false)}
+              onClick={() => void sendMessage('approve', [], 'chat')}
             >
               <Check size={12} /> Approve &amp; Build
             </button>
             <button
               type="button"
               className="btn btn-danger btn-sm"
-              onClick={() => void sendMessage('cancel blueprint', [], false)}
+              onClick={() => void sendMessage('cancel blueprint', [], 'chat')}
             >
               <X size={12} /> Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {inlineApprovals.length > 0 && (
+        <div
+          data-testid="chat-inline-approvals"
+          style={{
+            maxWidth: 760,
+            margin: '10px auto 0',
+            width: 'calc(100% - 32px)',
+            padding: '9px 14px',
+            borderRadius: 'var(--radius-md)',
+            background: 'var(--bg-elevated)',
+            border: '1px solid var(--status-warn)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 10,
+            flexWrap: 'wrap',
+          }}
+        >
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 12.5 }}>
+            <ShieldAlert size={14} style={{ color: 'var(--status-warn)', flexShrink: 0 }} />
+            <span>
+              <strong>{inlineApprovals[0].category}:</strong>{' '}
+              {(inlineApprovals[0].summary || `${inlineApprovals[0].action_name} (${inlineApprovals[0].target})`).replace(/`/g, '')}
+              {inlineApprovals.length > 1 ? ` (+${inlineApprovals.length - 1} more)` : ''}
+            </span>
+          </span>
+          <div style={{ display: 'inline-flex', gap: 6 }}>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              onClick={() => void resolvePendingApproval(inlineApprovals[0].approval_id, 'approve')}
+            >
+              <Check size={12} /> Approve
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger btn-sm"
+              onClick={() => void resolvePendingApproval(inlineApprovals[0].approval_id, 'deny')}
+            >
+              <X size={12} /> Deny
             </button>
           </div>
         </div>

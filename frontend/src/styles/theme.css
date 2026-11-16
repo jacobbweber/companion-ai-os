@@ -321,16 +321,17 @@ textarea {
 
 .icon-badge-dot {
   position: absolute;
-  top: 4px;
-  right: 4px;
-  min-width: 14px;
-  height: 14px;
-  padding: 0 3.5px;
+  top: -4px;
+  right: -5px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
   border-radius: 999px;
   background: var(--accent-primary);
   color: #fff;
   font-size: 9.5px;
   font-weight: 600;
+  box-shadow: 0 0 0 2px var(--bg-canvas);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1558,8 +1559,40 @@ textarea {
 }
 
 /* --- Mobile Responsive Bottom Sheets & Antigravity Home Parity (`<= 768px`) --- */
-.sheet-drag-handle {
+.sheet-drag-handle,
+.mobile-only-btn {
   display: none;
+}
+
+.form-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.form-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.form-grid-event {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 155px 145px auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.form-grid-mcp {
+  display: grid;
+  grid-template-columns: 150px 120px minmax(180px, 1fr);
+  gap: 10px;
+}
+
+.settings-nav-items {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 @media (max-width: 768px) {
@@ -1631,9 +1664,45 @@ textarea {
     flex-shrink: 0;
   }
 
+  .settings-nav-items {
+    flex-direction: row;
+    gap: 6px;
+    width: max-content;
+  }
+
+  .settings-nav-col .rail-nav-item {
+    width: auto;
+    flex-shrink: 0;
+    white-space: nowrap;
+    padding: 6px 11px;
+  }
+
+  .settings-desktop-only {
+    display: none !important;
+  }
+
+  .mobile-only-btn {
+    display: inline-flex;
+  }
+
   .posture-grid-2,
-  .wiki-shell {
+  .wiki-shell,
+  .form-grid-event,
+  .form-grid-mcp,
+  .form-grid-3 {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .wiki-shell.mobile-reading .wiki-sidebar {
+    display: none;
+  }
+
+  .wiki-shell.mobile-list .wiki-main {
+    display: none;
+  }
+
+  .wiki-sidebar {
+    border-right: none;
   }
 
   .surface-scroll {
@@ -1642,6 +1711,10 @@ textarea {
 }
 
 @media (max-width: 640px) {
+  .form-grid-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .composer-textarea,
   .input,
   .select,

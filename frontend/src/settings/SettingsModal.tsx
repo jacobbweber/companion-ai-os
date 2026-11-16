@@ -1,18 +1,21 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Cpu,
   Folder,
   Globe,
   KeyRound,
   Palette,
+  Plus,
   Settings2,
   Sliders,
+  Trash2,
   UserCheck,
   X,
 } from 'lucide-react';
 import { apiPost, callAction } from '../api';
 import type {
   ProjectGraphEntry,
+  PromptTemplate,
   SettingsSectionId,
   ThemeId,
   WebStatus,
@@ -26,6 +29,7 @@ interface SettingsModalProps {
   theme: ThemeId;
   projects: ProjectGraphEntry[];
   onApplyTheme: (t: ThemeId) => void;
+  onSelectProject?: (projectId: string) => void;
   onClose: () => void;
   onRefreshStatus: () => Promise<void>;
   onToast: (msg: string) => void;
@@ -56,6 +60,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   theme,
   projects,
   onApplyTheme,
+  onSelectProject,
   onClose,
   onRefreshStatus,
   onToast,
@@ -66,6 +71,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [compTone, setCompTone] = useState(status?.companion_tone || status?.tone || 'balanced');
   const [uName, setUName] = useState(status?.user_name || 'Partner');
   const [uProf, setUProf] = useState(status?.user_profile || '');
+
+  // Saved Prompts Library state
+  const [prompts, setPrompts] = useState<PromptTemplate[]>([]);
+  const [showAddPrompt, setShowAddPrompt] = useState(false);
+  const [ptName, setPtName] = useState('');
+  const [ptBody, setPtBody] = useState('');
+
+  const loadPrompts = async () => {
+    const res = await callAction<{ prompts?: PromptTemplate[] }>('prompts', { subaction: 'list' });
+    if (res.prompts) setPrompts(res.prompts);
+  };
+
+  useEffect(() => {
+    if (section === 'identity') void loadPrompts();
+  }, [section]);
+
+  const savePromptTpl = async () => {
+    if (!ptName.trim() || !ptBody.trim()) return;
+    const res = await callAction('prompts', {
+      subaction: 'save',
+      name: ptName.trim(),
+      template: ptBody.trim(),
+    });
+    if (res.ok) {
+      setPtName('');
+      setPtBody('');
+      setShowAddPrompt(false);
+      await loadPrompts();
+      onToast(res.summary || 'Saved prompt template.');
+    } else {
+      onToast(res.error || 'Could not save prompt template.');
+    }
+  };
 
   const bgAutonomy = status?.background_autonomy === 'on';
   const selfDev = Boolean(status?.self_dev_enabled);
@@ -132,51 +170,56 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   return (
     <div className="modal-backdrop" onClick={onClose} data-testid="settings-modal-backdrop">
       <div className="settings-modal" onClick={(e) => e.stopPropagation()} data-testid="settings-modal">
-        {/* Left Navigation Column */}
+        {/* Left Navigation Column (Compact Horizontal Pill Strip on Mobile) */}
         <div className="settings-nav-col">
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            <div className="rail-section-head" style={{ paddingTop: 0 }}>
+          <div>
+            <div className="rail-section-head settings-desktop-only" style={{ paddingTop: 0 }}>
               <span>Settings</span>
             </div>
-            {NAV_ITEMS.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                data-testid={`settings-tab-${item.id}`}
-                className={`rail-nav-item ${section === item.id ? 'active' : ''}`}
-                onClick={() => setSection(item.id)}
-              >
-                <span className="rail-nav-left">
-                  {item.icon}
-                  <span>{item.label}</span>
-                </span>
-              </button>
-            ))}
+            <div className="settings-nav-items">
+              {NAV_ITEMS.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  data-testid={`settings-tab-${item.id}`}
+                  className={`rail-nav-item ${section === item.id ? 'active' : ''}`}
+                  onClick={() => setSection(item.id)}
+                >
+                  <span className="rail-nav-left">
+                    {item.icon}
+                    <span>{item.label}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
 
             {projects.length > 0 && (
-              <>
+              <div className="settings-desktop-only">
                 <div className="rail-divider" />
                 <div className="rail-section-head">
                   <span>Projects</span>
                 </div>
                 {projects.slice(0, 5).map((p) => (
-                  <div
+                  <button
                     key={p.project_id}
+                    type="button"
                     className="rail-nav-item"
-                    style={{ fontSize: 12, cursor: 'default' }}
+                    style={{ fontSize: 12 }}
+                    onClick={() => onSelectProject?.(p.project_id)}
                   >
                     <span className="rail-nav-left">
                       <Folder size={13} />
                       <span>{p.title}</span>
                     </span>
                     <span className="badge">{p.trigger_policy?.mode || 'manual'}</span>
-                  </div>
+                  </button>
                 ))}
-              </>
+              </div>
             )}
           </div>
 
           <div
+            className="settings-desktop-only"
             style={{
               padding: '10px 8px 2px',
               borderTop: '1px solid var(--border-hairline)',
@@ -341,37 +384,87 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             )}
 
             {section === 'identity' && (
-              <div className="card-group" style={{ padding: 16 }}>
-                <div style={{ display: 'grid', gap: 12 }}>
-                  <div>
-                    <label className="field-label">Companion Name</label>
-                    <input className="input" value={compName} onChange={(e) => setCompName(e.target.value)} />
+              <div>
+                <div className="card-group" style={{ padding: 16 }}>
+                  <div style={{ display: 'grid', gap: 12 }}>
+                    <div className="form-grid-2">
+                      <div>
+                        <label className="field-label">Companion Name</label>
+                        <input className="input" value={compName} onChange={(e) => setCompName(e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="field-label">Communication Tone</label>
+                        <select className="select" value={compTone} onChange={(e) => setCompTone(e.target.value)}>
+                          <option value="concise">Concise</option>
+                          <option value="balanced">Balanced</option>
+                          <option value="elaborate">Elaborate</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="field-label">Companion Soul &amp; Ethos</label>
+                      <textarea className="textarea" rows={2} value={compSoul} onChange={(e) => setCompSoul(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="field-label">Your Name</label>
+                      <input className="input" value={uName} onChange={(e) => setUName(e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="field-label">Your Profile &amp; Working Style</label>
+                      <textarea className="textarea" rows={2} value={uProf} onChange={(e) => setUProf(e.target.value)} />
+                    </div>
+                    <div>
+                      <button type="button" className="btn btn-primary" onClick={() => void saveIdentity()}>
+                        Save Identity
+                      </button>
+                    </div>
                   </div>
-                  <div>
-                    <label className="field-label">Companion Soul &amp; Ethos</label>
-                    <textarea className="textarea" rows={2} value={compSoul} onChange={(e) => setCompSoul(e.target.value)} />
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <span className="field-label" style={{ margin: 0 }}>Saved Prompts Library (Composer + Menu)</span>
+                  <button type="button" className="btn btn-sm" onClick={() => setShowAddPrompt((v) => !v)}>
+                    <Plus size={12} /> New Prompt
+                  </button>
+                </div>
+
+                {showAddPrompt && (
+                  <div className="card-group" style={{ padding: 14, display: 'grid', gap: 8 }}>
+                    <input className="input mono" placeholder="Prompt slug (e.g. weekly-review)" value={ptName} onChange={(e) => setPtName(e.target.value)} />
+                    <textarea className="textarea" rows={3} placeholder="Reusable prompt text..." value={ptBody} onChange={(e) => setPtBody(e.target.value)} />
+                    <div>
+                      <button type="button" className="btn btn-primary btn-sm" onClick={() => void savePromptTpl()}>
+                        Save Prompt Template
+                      </button>
+                    </div>
                   </div>
-                  <div>
-                    <label className="field-label">Communication Tone</label>
-                    <select className="select" value={compTone} onChange={(e) => setCompTone(e.target.value)}>
-                      <option value="concise">Concise</option>
-                      <option value="balanced">Balanced</option>
-                      <option value="elaborate">Elaborate</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="field-label">Your Name</label>
-                    <input className="input" value={uName} onChange={(e) => setUName(e.target.value)} />
-                  </div>
-                  <div>
-                    <label className="field-label">Your Profile &amp; Working Style</label>
-                    <textarea className="textarea" rows={2} value={uProf} onChange={(e) => setUProf(e.target.value)} />
-                  </div>
-                  <div>
-                    <button type="button" className="btn btn-primary" onClick={() => void saveIdentity()}>
-                      Save Identity
-                    </button>
-                  </div>
+                )}
+
+                <div className="card-group">
+                  {prompts.length === 0 ? (
+                    <div className="card-row">
+                      <span style={{ color: 'var(--text-muted)' }}>No saved prompt templates yet.</span>
+                    </div>
+                  ) : (
+                    prompts.map((pt) => (
+                      <div key={pt.name} className="card-row">
+                        <div className="card-row-info">
+                          <div className="card-row-title mono">{pt.name}</div>
+                          <div className="card-row-desc">{pt.template.slice(0, 96)}</div>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          onClick={async () => {
+                            await callAction('prompts', { subaction: 'delete', name: pt.name });
+                            await loadPrompts();
+                          }}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))
+                  )}
                 </div>
               </div>
             )}

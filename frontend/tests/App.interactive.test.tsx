@@ -43,11 +43,14 @@ execute_core_action(
     store=store,
 )
 
-# Seed a project + human/companion items + a waiting endpoint approval
+# Seed a project + human/companion items + saved prompt + study deck + waiting endpoint approval
 pg = get_project_graph(store=store)
 proj = pg.create_project(title="Garage & Truck Reset", goal_summary="Fix truck and organize shelves", kind="project")
 h_item = pg.create_item(proj["project_id"], title="Measure garage wall", owner="human", status="ready")
 pg.create_item(proj["project_id"], title="Draft shelving cut-list", owner="companion", depends_on=[h_item["item_id"]])
+execute_core_action("prompts", {"subaction": "save", "name": "morning-scan", "template": "Summarize my open items."}, actor="user", store=store)
+execute_core_action("education", {"subaction": "save_course", "title": "ZFS Basics", "modules": ["Pools"]}, actor="user", store=store)
+execute_core_action("education", {"subaction": "upsert_items", "course_id": "zfs-basics", "items": [{"prompt": "What is a vdev?", "answer": "Virtual device"}]}, actor="user", store=store)
 get_endpoint_manager(store=store).propose_endpoint("test-metrics", "http_api", "http://127.0.0.1:9191", actor="companion")
 
 def fake_chat(*args, **kwargs):
@@ -280,13 +283,16 @@ describe('Companion v3.5 Progressive-Disclosure UI & Headless Core Parity', () =
     await flushUi(220);
     expect(container.textContent).toContain('Companion v3.5 UI is live and verified.');
 
-    // Verify no '+ New Conversation' wipe button exists, and Fresh Focus drops an inline divider without blanking Forever Chat
+    // Verify no '+ New Conversation' wipe button exists, inline approvals + saved prompts render, and Fresh Focus drops an inline divider without blanking Forever Chat
     expect(container.querySelector('[data-testid="new-conversation-btn"]')).toBeNull();
     expect(container.querySelector('[data-testid="nav-chat"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="chat-inline-approvals"]')).toBeTruthy();
     const ctxBtn = container.querySelector('[data-testid="composer-add-context-btn"]') as HTMLButtonElement;
     await act(async () => {
       ctxBtn.click();
     });
+    await flushUi(100);
+    expect(container.querySelector('[data-testid="composer-context-sheet"]')?.textContent).toContain('morning-scan');
     const freshFocusBtn = container.querySelector('[data-testid="composer-fresh-focus-btn"]') as HTMLButtonElement;
     expect(freshFocusBtn).toBeTruthy();
     await act(async () => {
@@ -374,6 +380,29 @@ describe('Companion v3.5 Progressive-Disclosure UI & Headless Core Parity', () =
     await flushUi(150);
     await flushUi(150);
     expect(container.querySelector('[data-testid="routine-row-nightly-snap"]')).toBeTruthy();
+
+    // Navigate to Knowledge -> verify Search (hits) & Study (interactive FlashcardDeckWidget)
+    const navKnow = container.querySelector('[data-testid="nav-knowledge"]') as HTMLButtonElement;
+    await act(async () => {
+      navKnow.click();
+    });
+    await flushUi(120);
+    const wikiSearch = container.querySelector('[data-testid="knowledge-surface"] input') as HTMLInputElement;
+    await act(async () => {
+      setInputValue(wikiSearch, 'homelab');
+      wikiSearch.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    await flushUi(120);
+    expect(container.querySelector('[data-testid="knowledge-surface"]')?.textContent).toContain('GPU Compute Node');
+
+    const studyPill = Array.from(container.querySelectorAll('.segmented-pill')).find((b) =>
+      b.textContent?.includes('Study')
+    ) as HTMLButtonElement;
+    await act(async () => {
+      studyPill.click();
+    });
+    await flushUi(140);
+    expect(container.querySelector('.flashcard-widget')?.textContent).toContain('What is a vdev?');
 
     // Navigate to Customizations and inspect Skills + Python DAGs
     const navCust = container.querySelector('[data-testid="nav-customizations"]') as HTMLButtonElement;

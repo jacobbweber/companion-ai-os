@@ -570,6 +570,45 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
             dec = execute_core_action("approvals", {"subaction": "decide", "approval_id": ep_prop["approval_id"], "decision": "approved"}, actor="web", store=store)
             self.assertTrue(dec["ok"])
 
+    def test_project_focus_bridge_personal_triage_and_flashcard_fence_guard(self) -> None:
+        from companion.agent import _extract_turn_widget_fence
+        from companion.intake import assess_turn_readiness, triage_turn
+        from companion.project_graph import format_project_graph_hud
+
+        with tempfile.TemporaryDirectory() as tmp, contextlib.closing(MemoryStore(db_path=Path(tmp) / "focus.db")) as store:
+            pg = get_project_graph(store=store)
+            proj = pg.create_project("Kitchen Remodel", goal_summary="New cabinets and lighting", kind="project")
+            pg.set_focus_project(proj["project_id"])
+            self.assertEqual(pg.resolve_project_id(), proj["project_id"])
+            item = pg.create_item(None, "Measure north wall", owner="human", status="ready")
+            self.assertEqual(item["project_id"], proj["project_id"])
+            hud = format_project_graph_hud(store=store)
+            self.assertIn("Kitchen Remodel", hud)
+            self.assertIn("Measure north wall", hud)
+
+            r_personal = assess_turn_readiness(
+                "Create a short study course on Proxmox ZFS Basics with 2 flashcards",
+                store=store,
+                root=settings.root,
+            )
+            self.assertEqual(r_personal.status, "READY")
+            t_personal = triage_turn(
+                "Create a short study course on Proxmox ZFS Basics with 2 flashcards",
+                store=store,
+                root=settings.root,
+            )
+            self.assertEqual(t_personal.suggested_tier, "fast")
+            self.assertFalse(t_personal.needs_blueprint)
+
+            fence = _extract_turn_widget_fence(
+                [
+                    {"role": "user", "content": "quiz me"},
+                    {"role": "tool", "content": "Built deck:\n```companion-flashcards\n{\"course_id\":\"zfs\",\"deck_title\":\"ZFS\",\"cards\":[]}\n```"},
+                ],
+                0,
+            )
+            self.assertTrue(fence.startswith("```companion-flashcards"))
+
 
 if __name__ == "__main__":
     unittest.main()
