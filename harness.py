@@ -84,7 +84,7 @@ def _emergency_boot_rollback(root_dir: Path, err: Exception) -> bool:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
         skip_dirs = {
-            ".git", "__pycache__", ".companion_backups", "data", "frontend", "venv", ".venv", "node_modules",
+            ".git", ".agents", "__pycache__", ".companion_backups", "data", "frontend", "venv", ".venv", "node_modules",
             ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "dist", "build", "coverage",
         }
         tracked_exts = {".py", ".md", ".json", ".toml", ".yaml", ".yml", ".ini", ".html", ".css", ".js"}
