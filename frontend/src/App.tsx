@@ -48,7 +48,6 @@ export const App: React.FC = () => {
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>('general');
   const [searchOpen, setSearchOpen] = useState(false);
   const [wikiInitialPath, setWikiInitialPath] = useState('');
-  const [conversationNonce, setConversationNonce] = useState(0);
   const [dataRefreshNonce, setDataRefreshNonce] = useState(0);
   const [toast, setToast] = useState('');
   const activityAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -183,10 +182,6 @@ export const App: React.FC = () => {
         projects={projects}
         selectedProjectId={selectedProjectId}
         onToggleCollapse={() => setRailCollapsed((c) => !c)}
-        onNewConversation={() => {
-          setConversationNonce((n) => n + 1);
-          handleSelectSurface('chat');
-        }}
         onSelectSurface={handleSelectSurface}
         onSelectProject={handleSelectProject}
         onCreateProject={handleCreateProject}
@@ -277,7 +272,6 @@ export const App: React.FC = () => {
               status={status}
               projects={projects}
               selectedProjectId={selectedProjectId}
-              conversationNonce={conversationNonce}
               onSelectProject={(pid) => setSelectedProjectId(pid)}
               onInspect={(t) => setAuxTarget(t)}
               onRefreshStatus={refreshStatusAndProjects}

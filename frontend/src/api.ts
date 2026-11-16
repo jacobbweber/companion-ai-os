@@ -116,8 +116,12 @@ export async function fetchStatus(): Promise<WebStatus> {
   return apiGet<WebStatus>('/api/status');
 }
 
-export async function fetchHistory(limit = 100): Promise<{ ok: boolean; messages: ChatMessage[] }> {
-  return apiGet<{ ok: boolean; messages: ChatMessage[] }>(`/api/history?limit=${limit}`);
+export async function fetchHistory(
+  limit = 80,
+  beforeId = 0
+): Promise<{ ok: boolean; has_more?: boolean; messages: ChatMessage[] }> {
+  const qs = beforeId > 0 ? `?limit=${limit}&before_id=${beforeId}` : `?limit=${limit}`;
+  return apiGet<{ ok: boolean; has_more?: boolean; messages: ChatMessage[] }>(`/api/history${qs}`);
 }
 
 export function fileToDataUrl(file: File): Promise<string> {

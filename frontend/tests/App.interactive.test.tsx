@@ -279,6 +279,22 @@ describe('Companion v3.5 Progressive-Disclosure UI & Headless Core Parity', () =
     });
     await flushUi(220);
     expect(container.textContent).toContain('Companion v3.5 UI is live and verified.');
+
+    // Verify no '+ New Conversation' wipe button exists, and Fresh Focus drops an inline divider without blanking Forever Chat
+    expect(container.querySelector('[data-testid="new-conversation-btn"]')).toBeNull();
+    expect(container.querySelector('[data-testid="nav-chat"]')).toBeTruthy();
+    const ctxBtn = container.querySelector('[data-testid="composer-add-context-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      ctxBtn.click();
+    });
+    const freshFocusBtn = container.querySelector('[data-testid="composer-fresh-focus-btn"]') as HTMLButtonElement;
+    expect(freshFocusBtn).toBeTruthy();
+    await act(async () => {
+      freshFocusBtn.click();
+    });
+    await flushUi(120);
+    expect(container.querySelector('[data-testid="chat-divider-focus_marker"]')).toBeTruthy();
+    expect(container.textContent).toContain('Companion v3.5 UI is live and verified.');
   });
 
   it('approves staged requests in 1 click from ActivityPopover and exercises Board & Goals + Right Split Inspector', async () => {

@@ -30,7 +30,8 @@ const SLASH_COMMANDS = [
   { cmd: '/morning', desc: 'Read overnight & idle Autonomy Briefing' },
   { cmd: '/checkin', desc: 'Executive check-in on goals, priorities & health' },
   { cmd: '/doctor', desc: 'Run 7-stage System Doctor diagnostics' },
-  { cmd: '/compact', desc: 'Compact active conversation context window' },
+  { cmd: '/compact', desc: 'Compact working window into long-term memory (keeps Forever Chat)' },
+  { cmd: '/clear', desc: 'Fresh Focus — shift topic cleanly (keeps Forever Chat history)' },
 ];
 
 export const ComposerBar: React.FC<ComposerBarProps> = ({
@@ -269,6 +270,31 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
                   }}
                 >
                   <span>{runAsBgJob ? 'Switch to Foreground Turn' : 'Dispatch as Background Job'}</span>
+                </button>
+                <div className="popover-group-label">Focus &amp; Memory</div>
+                <button
+                  type="button"
+                  className="popover-row"
+                  data-testid="composer-compact-btn"
+                  onClick={() => {
+                    setOpenMenu('none');
+                    void onSendMessage('/compact', [], false);
+                  }}
+                >
+                  <span>Compact Context</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Distill window</span>
+                </button>
+                <button
+                  type="button"
+                  className="popover-row"
+                  data-testid="composer-fresh-focus-btn"
+                  onClick={() => {
+                    setOpenMenu('none');
+                    void onSendMessage('/clear', [], false);
+                  }}
+                >
+                  <span>Fresh Focus</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Shift topic</span>
                 </button>
                 {prompts.length > 0 && (
                   <>

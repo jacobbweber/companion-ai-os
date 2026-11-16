@@ -6,7 +6,7 @@ import {
   Folder,
   FolderKanban,
   FolderPlus,
-  MessageSquarePlus,
+  MessageSquare,
   PanelLeftClose,
   RefreshCw,
   Search,
@@ -22,7 +22,6 @@ interface LeftSidebarProps {
   projects: ProjectGraphEntry[];
   selectedProjectId: string;
   onToggleCollapse: () => void;
-  onNewConversation: () => void;
   onSelectSurface: (surface: SurfaceId) => void;
   onSelectProject: (projectId: string, openBoard?: boolean) => void;
   onCreateProject: (title: string) => Promise<void>;
@@ -32,6 +31,7 @@ interface LeftSidebarProps {
 }
 
 const SURFACE_NAV: Array<{ id: SurfaceId; label: string; icon: React.ReactNode }> = [
+  { id: 'chat', label: 'Chat', icon: <MessageSquare size={15} /> },
   { id: 'boards', label: 'Board & Goals', icon: <FolderKanban size={15} /> },
   { id: 'calendar', label: 'Calendar', icon: <Calendar size={15} /> },
   { id: 'knowledge', label: 'Knowledge', icon: <BookOpen size={15} /> },
@@ -46,7 +46,6 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   projects,
   selectedProjectId,
   onToggleCollapse,
-  onNewConversation,
   onSelectSurface,
   onSelectProject,
   onCreateProject,
@@ -120,16 +119,6 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
           </button>
         </div>
       </div>
-
-      <button
-        type="button"
-        className="rail-new-chat-btn"
-        data-testid="new-conversation-btn"
-        onClick={onNewConversation}
-      >
-        <MessageSquarePlus size={15} />
-        <span>New Conversation</span>
-      </button>
 
       <nav className="nav-items" aria-label="Surfaces">
         {SURFACE_NAV.map((item) => {

@@ -2,19 +2,8 @@
 Exposes Companion AI OS over `ThreadingHTTPServer` (`127.0.0.1:<port>` default, token-gated on LAN) with CSRF, SSE streaming, and WAL status APIs.
 """
 
-import contextvars
+import contextvars, io, ipaddress, json, os, secrets, socket, sqlite3, sys, threading, time, urllib.parse
 from http.cookies import SimpleCookie
-import io
-import ipaddress
-import json
-import os
-import secrets
-import socket
-import sqlite3
-import sys
-import threading
-import time
-import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -180,7 +169,8 @@ class CompanionWebSession:
         self.active_job_id, self.busy, self.active_action, self._busy_started = "", False, "", 0.0
         self.idle_watcher = create_session_idle_watcher(self)
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": build_system_prompt(store=self.store)}]
-        rows = _read_rows(self.db_path, "SELECT role, content FROM (SELECT id, role, content FROM conversations WHERE role IN ('user', 'assistant') ORDER BY id DESC LIMIT 12) ORDER BY id ASC")
+        cut = _read_rows(self.db_path, "SELECT COALESCE(MAX(id), 0) FROM conversations WHERE session_tag = 'focus_marker'")
+        rows = _read_rows(self.db_path, "SELECT role, content FROM (SELECT id, role, content FROM conversations WHERE id > ? AND role IN ('user', 'assistant') AND COALESCE(session_tag, '') NOT IN ('focus_marker', 'compact_marker') ORDER BY id DESC LIMIT 12) ORDER BY id ASC", (int(cut[0][0]) if cut else 0,))
         self.messages.extend({"role": str(r), "content": str(c)} for r, c in rows)
 
     def _serialize_job(self, job: Dict[str, Any], include_live_spans: bool = False) -> Dict[str, Any]:
@@ -232,13 +222,13 @@ class CompanionWebSession:
             **enrich_web_status(self.store),
         }
 
-    def get_history_payload(self, limit: int = 60, include_tools: bool = False) -> Dict[str, Any]:
+    def get_history_payload(self, limit: int = 60, include_tools: bool = False, before_id: int = 0) -> Dict[str, Any]:
         cap = max(1, min(int(limit), 200))
-        role_clause = "" if include_tools else "WHERE role IN ('user', 'assistant') "
-        sql = f"SELECT id, role, content, timestamp, COALESCE(session_tag, '') FROM (SELECT id, role, content, timestamp, session_tag FROM conversations {role_clause}ORDER BY id DESC LIMIT ?) ORDER BY id ASC"
-        rows = _read_rows(self.db_path, sql, (cap,))
-        items = [{"id": int(cid), "role": str(role), "content": str(content), "timestamp": str(ts), "session_tag": str(tag)} for cid, role, content, ts, tag in rows]
-        return {"ok": True, "count": len(items), "messages": items}
+        clauses = ([] if include_tools else ["role IN ('user', 'assistant')"]) + (["id < ?"] if before_id > 0 else [])
+        where_sql = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        rows = _read_rows(self.db_path, f"SELECT id, role, content, timestamp, COALESCE(session_tag, '') FROM conversations {where_sql}ORDER BY id DESC LIMIT ?", (*((int(before_id),) if before_id > 0 else ()), cap + 1))
+        items = [{"id": int(cid), "role": str(role), "content": str(content), "timestamp": str(ts), "session_tag": str(tag)} for cid, role, content, ts, tag in reversed(rows[:cap])]
+        return {"ok": True, "count": len(items), "has_more": len(rows) > cap, "messages": items}
 
     def get_search_payload(self, query: str = "", limit: int = 20) -> Dict[str, Any]:
         rows = self.store.search_conversations(query=query, limit=min(max(1, limit), 100))
@@ -275,9 +265,14 @@ class CompanionWebSession:
                 try:
                     slash_out = handle_slash_command(clean_msg, self.messages, store=self.store, chat_fn=self.chat_fn, interactive=False)
                     if slash_out is not None:
-                        if clean_msg.lower() not in ("/reset", "/clear"):
-                            self.store.log_message("user", clean_msg, session_tag="web_slash")
-                            self.store.log_message("assistant", slash_out, session_tag="web_slash")
+                        low_cmd = clean_msg.lower()
+                        m_tag = "focus_marker" if low_cmd in ("/reset", "/clear") else ("compact_marker" if low_cmd.startswith("/compact") and "status" not in low_cmd else "")
+                        if m_tag:
+                            marker = "Fresh working focus — earlier messages remain saved & searchable." if m_tag == "focus_marker" else "Context compacted into long-term memory — earlier messages remain saved & searchable."
+                            self.store.log_message("assistant", marker, session_tag=m_tag)
+                            return 200, {"ok": True, "role": "assistant", "mode": "slash", "session_tag": m_tag, "response": marker}
+                        self.store.log_message("user", clean_msg, session_tag="web_slash")
+                        self.store.log_message("assistant", slash_out, session_tag="web_slash")
                         return 200, {"ok": True, "role": "assistant", "mode": "slash", "response": slash_out}
                     if mode in ("plan", "goal") and not is_awaiting_blueprint_approval(self.store):
                         tag, label = ("web_plan", "[Plan First]") if mode == "plan" else ("web_goal", "[Goal Mode]")
@@ -550,11 +545,11 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         elif route == "/api/jobs" or route.startswith("/api/jobs/"):
             self._send_json(*sess.get_job_payload(route.split("/api/jobs/", 1)[1] if route.startswith("/api/jobs/") else ""))
         elif route == "/api/history":
-            lim = _parse_int_qs(qs, "limit", 60)
-            if lim is None:
-                self._send_json(400, {"ok": False, "error": "Invalid integer `limit` parameter"})
+            lim, bef = _parse_int_qs(qs, "limit", 60), _parse_int_qs(qs, "before_id", 0)
+            if lim is None or bef is None:
+                self._send_json(400, {"ok": False, "error": "Invalid integer `limit` or `before_id` parameter"})
                 return
-            self._send_json(200, sess.get_history_payload(limit=lim, include_tools=(qs.get("include_tools") or ["0"])[0] in ("1", "true", "yes")))
+            self._send_json(200, sess.get_history_payload(limit=lim, include_tools=(qs.get("include_tools") or ["0"])[0] in ("1", "true", "yes"), before_id=max(0, bef)))
         elif route == "/api/telemetry":
             lim = _parse_int_qs(qs, "limit", 12)
             if lim is None:

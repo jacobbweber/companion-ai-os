@@ -23,7 +23,6 @@ interface ChatSurfaceProps {
   status: WebStatus | null;
   projects: ProjectGraphEntry[];
   selectedProjectId: string;
-  conversationNonce: number;
   onSelectProject: (projectId: string) => void;
   onInspect: (target: AuxInspectorTarget) => void;
   onRefreshStatus: () => Promise<void>;
@@ -34,23 +33,59 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
   status,
   projects,
   selectedProjectId,
-  conversationNonce,
   onSelectProject,
   onInspect,
   onRefreshStatus,
   onToast,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [hasOlder, setHasOlder] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [sending, setSending] = useState(false);
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [stagedIds, setStagedIds] = useState<Record<string, boolean>>({});
+  const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const lastTailIdRef = useRef<string>('');
   const unsubRef = useRef<(() => void) | null>(null);
 
   const loadHistory = async () => {
     const res = await fetchHistory(80);
     if (res.ok && Array.isArray(res.messages)) {
       setMessages(res.messages);
+      setHasOlder(Boolean(res.has_more));
+    }
+  };
+
+  const loadOlderMessages = async () => {
+    if (loadingOlder || !hasOlder) return;
+    const firstNumeric = messages.find((m) => typeof m.id === 'number' && m.id > 0);
+    if (!firstNumeric || typeof firstNumeric.id !== 'number') {
+      setHasOlder(false);
+      return;
+    }
+    const scrollEl = scrollAreaRef.current;
+    const prevHeight = scrollEl ? scrollEl.scrollHeight : 0;
+    setLoadingOlder(true);
+    try {
+      const res = await fetchHistory(60, firstNumeric.id);
+      if (res.ok && Array.isArray(res.messages)) {
+        setHasOlder(Boolean(res.has_more));
+        if (res.messages.length > 0) {
+          setMessages((prev) => {
+            const seen = new Set(prev.map((p) => String(p.id)));
+            const older = res.messages.filter((m) => !seen.has(String(m.id)));
+            return [...older, ...prev];
+          });
+          window.requestAnimationFrame(() => {
+            if (scrollEl) {
+              scrollEl.scrollTop += scrollEl.scrollHeight - prevHeight;
+            }
+          });
+        }
+      }
+    } finally {
+      setLoadingOlder(false);
     }
   };
 
@@ -62,16 +97,14 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
   }, []);
 
   useEffect(() => {
-    if (conversationNonce > 0) {
-      setMessages([]);
+    const tailId = messages.length > 0 ? String(messages[messages.length - 1].id) : '';
+    if (tailId && tailId !== lastTailIdRef.current) {
+      lastTailIdRef.current = tailId;
+      if (typeof endRef.current?.scrollIntoView === 'function') {
+        endRef.current.scrollIntoView({ behavior: 'smooth' });
+      }
     }
-  }, [conversationNonce]);
-
-  useEffect(() => {
-    if (typeof endRef.current?.scrollIntoView === 'function') {
-      endRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [messages.length]);
+  }, [messages]);
 
   const sendMessage = async (text: string, attachmentIds: string[], runAsBgJob: boolean) => {
     if (runAsBgJob) {
@@ -82,6 +115,48 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
       });
       await onRefreshStatus();
       onToast(jRes.summary || 'Dispatched to Background Jobs.');
+      return;
+    }
+
+    const lowCmd = text.trim().toLowerCase();
+    const isFocusMarkerCmd =
+      lowCmd === '/clear' ||
+      lowCmd === '/reset' ||
+      (lowCmd.startsWith('/compact') && !lowCmd.includes('status'));
+
+    if (isFocusMarkerCmd) {
+      setSending(true);
+      try {
+        const mRes = await apiPost<{
+          ok?: boolean;
+          response?: string;
+          session_tag?: string;
+          error?: string;
+        }>('/api/chat', {
+          message: text.trim(),
+          attachment_ids: [],
+          async: true,
+        });
+        if (mRes.ok) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `m_${Date.now()}`,
+              role: 'assistant',
+              content:
+                mRes.response ||
+                'Working focus refreshed — Forever Chat history remains saved & searchable.',
+              timestamp: new Date().toISOString(),
+              session_tag: mRes.session_tag || 'focus_marker',
+            },
+          ]);
+        } else if (mRes.error) {
+          onToast(mRes.error);
+        }
+      } finally {
+        setSending(false);
+        await onRefreshStatus();
+      }
       return;
     }
 
@@ -246,7 +321,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
         </div>
       )}
 
-      <div className="chat-scroll-area">
+      <div className="chat-scroll-area" ref={scrollAreaRef}>
         {messages.length === 0 ? (
           <div className="chat-empty-hero">
             <div className="chat-hero-glyph">
@@ -256,8 +331,35 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
           </div>
         ) : (
           <div className="chat-column">
+            {hasOlder && (
+              <div className="chat-load-older-wrap">
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  data-testid="load-older-messages-btn"
+                  disabled={loadingOlder}
+                  onClick={() => void loadOlderMessages()}
+                >
+                  {loadingOlder ? 'Loading earlier messages...' : 'Load earlier messages'}
+                </button>
+              </div>
+            )}
             {messages.map((msg) => {
               const mid = String(msg.id);
+              if (
+                msg.session_tag === 'focus_marker' ||
+                msg.session_tag === 'compact_marker'
+              ) {
+                return (
+                  <div
+                    key={mid}
+                    className="chat-focus-divider"
+                    data-testid={`chat-divider-${msg.session_tag}`}
+                  >
+                    <span>{msg.content}</span>
+                  </div>
+                );
+              }
               if (msg.role === 'user') {
                 return (
                   <div key={mid} className="msg-user-bubble">
