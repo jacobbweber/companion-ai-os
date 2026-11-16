@@ -192,8 +192,9 @@ class CalendarManager:
                 continue
             d_key = _norm_date_prefix(ev["start_at"])
             t_part = ev["start_at"][11:16] if len(ev["start_at"]) >= 16 and not ev["all_day"] else ""
+            e_part = ev["end_at"][11:16] if len(ev["end_at"]) >= 16 and not ev["all_day"] else ""
             items.append({
-                "id": ev["event_id"], "date": d_key, "time": t_part, "source_type": "event",
+                "id": ev["event_id"], "date": d_key, "time": t_part, "end_time": e_part, "source_type": "event",
                 "kind": ev["kind"], "title": ev["title"], "all_day": ev["all_day"],
                 "board_id": ev["board_id"], "card_id": ev["card_id"], "notes": ev["notes"], "end_at": ev["end_at"],
             })

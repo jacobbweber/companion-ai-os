@@ -732,6 +732,8 @@ export interface CalendarItem {
   id: string;
   date: string;
   time: string;
+  end_time?: string;
+  end_at?: string;
   source_type: 'event' | 'sprint_task' | 'deadline' | 'routine' | 'study_review' | 'epic_milestone' | string;
   kind: string;
   title: string;

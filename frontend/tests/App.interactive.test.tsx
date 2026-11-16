@@ -381,6 +381,36 @@ describe('Companion v3.5 Progressive-Disclosure UI & Headless Core Parity', () =
     await flushUi(150);
     expect(container.querySelector('[data-testid="routine-row-nightly-snap"]')).toBeTruthy();
 
+    // Navigate to Calendar -> verify Week 24h grid, < / > navigation arrows, Month 7-col grid, and Day view
+    const navCal = container.querySelector('[data-testid="nav-calendar"]') as HTMLButtonElement;
+    await act(async () => {
+      navCal.click();
+    });
+    await flushUi(120);
+    expect(container.querySelector('[data-testid="cal-week-grid"]')).toBeTruthy();
+    const initialTitle = container.querySelector('[data-testid="calendar-period-title"]')?.textContent || '';
+    const nextBtn = container.querySelector('[data-testid="calendar-next-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      nextBtn.click();
+    });
+    await flushUi(100);
+    expect(container.querySelector('[data-testid="calendar-period-title"]')?.textContent).not.toBe(initialTitle);
+
+    const monthBtn = container.querySelector('[data-testid="cal-range-month"]') as HTMLButtonElement;
+    await act(async () => {
+      monthBtn.click();
+    });
+    await flushUi(100);
+    expect(container.querySelector('[data-testid="cal-month-grid"]')).toBeTruthy();
+    expect(container.querySelectorAll('.cal-month-cell').length).toBeGreaterThanOrEqual(28);
+
+    const dayBtn = container.querySelector('[data-testid="cal-range-day"]') as HTMLButtonElement;
+    await act(async () => {
+      dayBtn.click();
+    });
+    await flushUi(100);
+    expect(container.querySelector('[data-testid="cal-day-grid"]')).toBeTruthy();
+
     // Navigate to Knowledge -> verify Search (hits) & Study (interactive FlashcardDeckWidget)
     const navKnow = container.querySelector('[data-testid="nav-knowledge"]') as HTMLButtonElement;
     await act(async () => {
