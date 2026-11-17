@@ -411,18 +411,45 @@ describe('Companion v3.5 Progressive-Disclosure UI & Headless Core Parity', () =
     await flushUi(100);
     expect(container.querySelector('[data-testid="cal-day-grid"]')).toBeTruthy();
 
-    // Navigate to Knowledge -> verify Search (hits) & Study (interactive FlashcardDeckWidget)
+    // Navigate to Knowledge -> verify Directory Tree, Open/Collapse Explorer, YAML Frontmatter Search & Study
     const navKnow = container.querySelector('[data-testid="nav-knowledge"]') as HTMLButtonElement;
     await act(async () => {
       navKnow.click();
     });
-    await flushUi(120);
-    const wikiSearch = container.querySelector('[data-testid="knowledge-surface"] input') as HTMLInputElement;
+    await flushUi(140);
+    const treeEl = container.querySelector('[data-testid="wiki-directory-tree"]');
+    expect(treeEl).toBeTruthy();
+    expect(treeEl?.textContent).toContain('01_inbox');
+    expect(treeEl?.textContent).toContain('02_knowledge');
+    expect(treeEl?.textContent).toContain('homelab');
+    expect(treeEl?.textContent).toContain('03_resources');
+    expect(treeEl?.textContent).toContain('04_archive');
+
+    const toggleExplorerBtn = container.querySelector('[data-testid="wiki-toggle-explorer-btn"]') as HTMLButtonElement;
     await act(async () => {
-      setInputValue(wikiSearch, 'homelab');
+      toggleExplorerBtn.click();
+    });
+    await flushUi(60);
+    expect(container.querySelector('.wiki-shell')?.className).toContain('sidebar-collapsed');
+    await act(async () => {
+      toggleExplorerBtn.click();
+    });
+    await flushUi(60);
+    expect(container.querySelector('.wiki-shell')?.className).not.toContain('sidebar-collapsed');
+
+    const fmFiltersBtn = container.querySelector('[data-testid="wiki-frontmatter-filters-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      fmFiltersBtn.click();
+    });
+    await flushUi(60);
+    expect(container.querySelector('[data-testid="wiki-frontmatter-drawer"]')?.textContent).toContain('YAML keys:');
+
+    const wikiSearch = container.querySelector('[data-testid="wiki-frontmatter-search-input"]') as HTMLInputElement;
+    await act(async () => {
+      setInputValue(wikiSearch, 'domain:homelab tag:homelab');
       wikiSearch.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     });
-    await flushUi(120);
+    await flushUi(180);
     expect(container.querySelector('[data-testid="knowledge-surface"]')?.textContent).toContain('GPU Compute Node');
 
     const studyPill = Array.from(container.querySelectorAll('.segmented-pill')).find((b) =>

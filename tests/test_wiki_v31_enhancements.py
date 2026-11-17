@@ -215,6 +215,75 @@ class TestWikiV31Enhancements(unittest.TestCase):
             self.assertIn("Origin Prompt", rd["body"])
             self.assertIn("preventive-maintenance", rd["ontology"])
 
+    def test_yaml_frontmatter_search_and_directory_tree(self) -> None:
+        with memory_store_context(self.store):
+            n1 = self.wk.save_or_update_note(
+                "02_knowledge/homelab/proxmox-nvme.md",
+                (
+                    "---\n"
+                    "title: Proxmox NVMe Node\n"
+                    "summary: ZFS NVMe mirror configuration for cluster node pve-01.\n"
+                    "template: homelab-host-spec\n"
+                    "tags: [proxmox, nvme, zfs]\n"
+                    "ontology: [datacenter-compute, virtualization-fabric]\n"
+                    "rack_unit: u14\n"
+                    "---\n\n"
+                    "# Proxmox NVMe Node\n\n"
+                    "## Hardware & Compute Profile\nDual NVMe ZFS pool.\n\n"
+                    "## Network & Management\n10GbE trunk.\n\n"
+                    "## Services & Workloads\nKVM guests.\n\n"
+                    "## Operations & Notes\nLinked to [[vlan-matrix]].\n"
+                ),
+                actor="user",
+                confirmed=True,
+            )
+            self.assertTrue(n1["ok"], n1)
+
+            n2 = self.wk.save_or_update_note(
+                "02_knowledge/software-dev/dag-patterns.md",
+                (
+                    "---\n"
+                    "title: Deterministic DAG Patterns\n"
+                    "summary: Code-controlled workflow graphs.\n"
+                    "template: zettelkasten-atomic\n"
+                    "tags: [dags, python]\n"
+                    "ontology: [configuration-automation]\n"
+                    "---\n\n"
+                    "# Deterministic DAG Patterns\n\n"
+                    "## Core Idea\nAcyclic execution.\n\n"
+                    "## Mechanism & Context\nTopological sort.\n\n"
+                    "## Connections\nLinked to [[proxmox-nvme]].\n"
+                ),
+                actor="user",
+                confirmed=True,
+            )
+            self.assertTrue(n2["ok"], n2)
+
+            # Directory tree returns all 4 canonical warehouse roots + nested folders + frontmatter facets
+            tree_res = execute_core_action("wiki", {"subaction": "tree"}, actor="web", store=self.store)
+            self.assertTrue(tree_res["ok"], tree_res)
+            root_names = [r["rel_path"] for r in tree_res["tree"]]
+            self.assertEqual(root_names, ["01_inbox", "02_knowledge", "03_resources", "04_archive"])
+            know_node = next(r for r in tree_res["tree"] if r["rel_path"] == "02_knowledge")
+            self.assertEqual(know_node["file_count"], 2)
+            sub_domains = [c["name"] for c in know_node["children"] if c["kind"] == "folder"]
+            self.assertEqual(sub_domains, ["homelab", "software-dev"])
+            self.assertIn("rack_unit", tree_res["facets"]["keys"])
+
+            # Structured YAML frontmatter queries (standard + custom YAML keys + #tag shorthand)
+            h_tpl = execute_core_action("wiki", {"subaction": "search", "query": "template:homelab-host-spec"}, actor="web", store=self.store)
+            self.assertEqual([h["rel_path"] for h in h_tpl["hits"]], ["02_knowledge/homelab/proxmox-nvme.md"])
+
+            h_custom = execute_core_action("wiki", {"subaction": "search", "query": "rack_unit:u14 #zfs"}, actor="web", store=self.store)
+            self.assertEqual([h["rel_path"] for h in h_custom["hits"]], ["02_knowledge/homelab/proxmox-nvme.md"])
+            self.assertEqual(h_custom["hits"][0]["match_kind"], "frontmatter")
+
+            h_has = execute_core_action("wiki", {"subaction": "search", "query": "has:rack_unit"}, actor="web", store=self.store)
+            self.assertEqual([h["rel_path"] for h in h_has["hits"]], ["02_knowledge/homelab/proxmox-nvme.md"])
+
+            h_combo = execute_core_action("wiki", {"subaction": "search", "query": "domain:software-dev Topological"}, actor="web", store=self.store)
+            self.assertEqual([h["rel_path"] for h in h_combo["hits"]], ["02_knowledge/software-dev/dag-patterns.md"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -207,6 +207,7 @@ export interface WikiNoteSummary {
   author: 'user' | 'companion' | string;
   tags: string[];
   ontology?: string[];
+  frontmatter?: Record<string, unknown>;
   content_hash: string;
   updated_at: string;
   last_verified_at?: string;
@@ -215,9 +216,48 @@ export interface WikiNoteSummary {
   overdue_days?: number;
   stale?: boolean;
   excerpt: string;
-  match_kind?: 'direct' | 'ontology_bridge' | string;
+  match_kind?: 'direct' | 'frontmatter' | 'ontology_bridge' | string;
+  matched_fields?: string[];
   shared_ontology?: string[];
   via_note?: string;
+}
+
+export interface WikiTreeNode {
+  kind: 'folder' | 'file';
+  name: string;
+  rel_path: string;
+  folder: string;
+  file_count?: number;
+  children?: WikiTreeNode[];
+  title?: string;
+  domain?: string;
+  topic?: string;
+  author?: string;
+  template?: string;
+  document_type?: string;
+  status?: string;
+  tags?: string[];
+  ontology?: string[];
+  stale?: boolean;
+  system_file?: boolean;
+  is_asset?: boolean;
+  asset_url?: string;
+}
+
+export interface WikiFacetItem {
+  value: string;
+  count: number;
+}
+
+export interface WikiFrontmatterFacets {
+  domains: WikiFacetItem[];
+  tags: WikiFacetItem[];
+  ontology: WikiFacetItem[];
+  templates: WikiFacetItem[];
+  document_types: WikiFacetItem[];
+  authors: WikiFacetItem[];
+  statuses: WikiFacetItem[];
+  keys: string[];
 }
 
 export interface WikiNoteDetail {

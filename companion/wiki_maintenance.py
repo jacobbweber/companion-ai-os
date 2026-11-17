@@ -24,7 +24,7 @@ from companion.archive_and_approvals import get_approval_queue
 from companion.attachments import MAX_ATTACHMENT_BYTES, inspect_image_bytes
 from companion.disciplines import walk_pruned_files
 from companion.telemetry import redact_secrets
-from companion.wiki_engine import WikiEngine, compute_note_staleness
+from companion.wiki_engine import WIKI_FOLDERS, WikiEngine, compute_note_staleness
 from companion.wiki_templates import (
     BUILTIN_TEMPLATE_MAP, as_slug_list, canonicalize_ontology, default_review_days,
     hydrate_note_meta, load_tag_authority, parse_frontmatter, recommend_templates,
@@ -32,7 +32,7 @@ from companion.wiki_templates import (
 )
 
 __all__ = [
-    "compute_wiki_diff", "consolidate_ontology", "execute_wiki_maintenance_subaction",
+    "build_wiki_directory_tree", "compute_wiki_diff", "consolidate_ontology", "execute_wiki_maintenance_subaction",
     "ingest_wiki_asset", "list_stale_notes", "read_wiki_asset_raw",
     "stage_chat_turn_to_inbox", "verify_note_freshness",
 ]
@@ -406,8 +406,125 @@ def stage_chat_turn_to_inbox(
     return engine.capture_inbox(title=eff_title, content=staged_body, tags=["chat-turn", chosen_tpl], source="chat-turn", actor=actor, template=chosen_tpl, ontology=ont)
 
 
+def _collect_frontmatter_facets(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    buckets: Dict[str, Dict[str, int]] = {
+        "domains": {}, "tags": {}, "ontology": {}, "templates": {},
+        "document_types": {}, "authors": {}, "statuses": {},
+    }
+    key_set: set[str] = set()
+    scalar_map = (
+        ("domains", "domain"), ("templates", "template"),
+        ("document_types", "document_type"), ("authors", "author"), ("statuses", "status"),
+    )
+    for r in active_rows:
+        for b_name, field in scalar_map:
+            if val := str(r.get(field) or "").strip():
+                buckets[b_name][val] = buckets[b_name].get(val, 0) + 1
+        for tg in r.get("tags") or []:
+            if s := str(tg).strip():
+                buckets["tags"][s] = buckets["tags"].get(s, 0) + 1
+        for ont in r.get("ontology") or []:
+            if s := str(ont).strip():
+                buckets["ontology"][s] = buckets["ontology"].get(s, 0) + 1
+        fm = r.get("frontmatter") if isinstance(r.get("frontmatter"), dict) else {}
+        for k, v in fm.items():
+            if v not in (None, "", []):
+                key_set.add(str(k).strip().lower())
+    return {
+        **{
+            k: [{"value": val, "count": cnt} for val, cnt in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:30]]
+            for k, d in buckets.items()
+        },
+        "keys": sorted(key_set),
+    }
+
+
+def _walk_wiki_dir_node(base: Path, cur_dir: Path, by_rel: Dict[str, Dict[str, Any]], include_system: bool) -> Dict[str, Any]:
+    rel_dir = str(cur_dir.relative_to(base)).replace("\\", "/")
+    root_folder = rel_dir.split("/", 1)[0]
+    children: List[Dict[str, Any]] = []
+    total_files = 0
+    entries = sorted(cur_dir.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())) if cur_dir.is_dir() else []
+    for entry in entries:
+        if entry.name.startswith(".") or entry.is_symlink():
+            continue
+        rel_entry = str(entry.relative_to(base)).replace("\\", "/")
+        if entry.is_dir():
+            if not include_system and rel_entry in ("03_resources/templates", "03_resources/assets"):
+                continue
+            sub_node = _walk_wiki_dir_node(base, entry, by_rel, include_system)
+            total_files += int(sub_node["file_count"])
+            children.append(sub_node)
+            continue
+        is_sys = rel_entry.startswith(("03_resources/templates/", "03_resources/assets/")) or rel_entry == "03_resources/tag-authority.md"
+        if not include_system and is_sys:
+            continue
+        suffix = entry.suffix.lower()
+        if suffix == ".md":
+            idx = by_rel.get(rel_entry)
+            if idx:
+                node: Dict[str, Any] = {
+                    "kind": "file", "name": entry.name, "rel_path": rel_entry, "folder": root_folder,
+                    "title": idx["title"], "domain": idx["domain"], "topic": idx.get("topic") or "",
+                    "author": idx["author"], "template": idx.get("template") or "",
+                    "document_type": idx.get("document_type") or "", "status": idx.get("status") or "",
+                    "tags": idx["tags"], "ontology": idx["ontology"], "stale": bool(idx.get("stale")),
+                    "system_file": False,
+                }
+            else:
+                meta, body = parse_frontmatter(entry.read_text(encoding="utf-8", errors="replace"))
+                title = str(meta.get("title") or next((ln.lstrip("# ").strip() for ln in body.splitlines() if ln.strip()), entry.stem))[:120]
+                node = {
+                    "kind": "file", "name": entry.name, "rel_path": rel_entry, "folder": root_folder,
+                    "title": title, "domain": str(meta.get("domain") or root_folder), "topic": "",
+                    "author": str(meta.get("author") or "system"), "template": str(meta.get("template") or ""),
+                    "document_type": str(meta.get("document_type") or ("template" if "/templates/" in rel_entry else "authority")),
+                    "status": "system", "tags": as_slug_list(meta.get("tags")), "ontology": as_slug_list(meta.get("ontology")),
+                    "stale": False, "system_file": True,
+                }
+            children.append(node)
+            total_files += 1
+        elif suffix in _MIME_EXT_MAP and rel_entry.startswith("03_resources/assets/"):
+            children.append({
+                "kind": "file", "name": entry.name, "rel_path": rel_entry, "folder": root_folder,
+                "title": entry.name, "domain": "assets", "topic": "", "author": "user",
+                "template": "", "document_type": "asset", "status": "asset",
+                "tags": [], "ontology": [], "stale": False, "system_file": True,
+                "is_asset": True, "asset_url": f"/api/wiki/assets/{entry.name}",
+            })
+            total_files += 1
+    return {
+        "kind": "folder", "name": cur_dir.name, "rel_path": rel_dir,
+        "folder": root_folder, "file_count": total_files, "children": children,
+    }
+
+
+def build_wiki_directory_tree(engine: WikiEngine, include_archive: bool = True, include_system: bool = True) -> Dict[str, Any]:
+    """Return the full 4-folder Wiki directory tree (`01_inbox`..`04_archive`) and live YAML frontmatter facets."""
+    base = engine.ensure_warehouse()
+    active_notes = engine.list_notes(limit=500)
+    arch_notes = engine.list_notes(folder="04_archive", limit=500) if include_archive else []
+    by_rel = {str(r["rel_path"]): r for r in [*active_notes, *arch_notes]}
+    roots = [f for f in WIKI_FOLDERS if include_archive or f != "04_archive"]
+    tree = [_walk_wiki_dir_node(base, base / f, by_rel, include_system=include_system) for f in roots if (base / f).is_dir()]
+    facets = _collect_frontmatter_facets(active_notes)
+    total_files = sum(int(n["file_count"]) for n in tree)
+    lines = [f"=== Knowledge Wiki Directory Tree ({total_files} file(s)) ==="] + [
+        f"  * `{n['rel_path']}/` ({n['file_count']} file(s))" for n in tree
+    ]
+    return {
+        "ok": True, "tree": tree, "facets": facets,
+        "total_files": total_files, "active_note_count": len(active_notes),
+        "summary": "\n".join(lines),
+    }
+
+
 def execute_wiki_maintenance_subaction(wk: WikiEngine, sub: str, p: Dict[str, Any], actor: str) -> Optional[Dict[str, Any]]:
-    """Dispatch Wiki 3.1 maintenance subactions (`diff`, `consolidate_ontology`, `verify_note`, `list_stale`, `upload_asset`, `stage_turn`)."""
+    """Dispatch Wiki 3.1 maintenance subactions (`tree`, `diff`, `consolidate_ontology`, `verify_note`, `list_stale`, `upload_asset`, `stage_turn`)."""
+    if sub in ("tree", "directory_tree", "facets"):
+        inc_arch = str(p.get("include_archive", "true")).strip().lower() not in ("false", "0", "no")
+        inc_sys = str(p.get("include_system", "true")).strip().lower() not in ("false", "0", "no")
+        return build_wiki_directory_tree(wk, include_archive=inc_arch, include_system=inc_sys)
     if sub in ("diff", "diff_note"):
         return compute_wiki_diff(wk, path=str(p.get("path") or ""), compare_to=str(p.get("compare_to") or ""), approval_id=str(p.get("approval_id") or ""), proposed_content=str(p.get("proposed_content") or ""))
     if sub == "consolidate_ontology":

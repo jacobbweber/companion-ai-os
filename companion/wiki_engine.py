@@ -36,7 +36,7 @@ WIKI_FOLDERS = ("01_inbox", "02_knowledge", "03_resources", "04_archive")
 _INLINE_TAG_RE = re.compile(r"(?:^|\s)#([a-zA-Z][a-zA-Z0-9_-]{1,39})\b")
 
 WIKI_DDL: Tuple[str, ...] = (
-    "CREATE TABLE IF NOT EXISTS wiki_notes_index (rel_path TEXT PRIMARY KEY, stem TEXT NOT NULL, folder TEXT NOT NULL, domain TEXT DEFAULT '', topic TEXT DEFAULT '', title TEXT NOT NULL, summary TEXT DEFAULT '', author TEXT NOT NULL DEFAULT 'companion', status TEXT DEFAULT 'active', template TEXT DEFAULT '', document_type TEXT DEFAULT '', tags_json TEXT DEFAULT '[]', ontology_json TEXT DEFAULT '[]', supersedes_json TEXT DEFAULT '[]', superseded_by TEXT DEFAULT '', uid TEXT DEFAULT '', word_count INTEGER DEFAULT 0, context_tokens INTEGER DEFAULT 0, content_hash TEXT NOT NULL, updated_at TEXT DEFAULT '', last_verified_at TEXT DEFAULT '', review_after_days INTEGER DEFAULT 365, excerpt TEXT DEFAULT '', body_text TEXT DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS wiki_notes_index (rel_path TEXT PRIMARY KEY, stem TEXT NOT NULL, folder TEXT NOT NULL, domain TEXT DEFAULT '', topic TEXT DEFAULT '', title TEXT NOT NULL, summary TEXT DEFAULT '', author TEXT NOT NULL DEFAULT 'companion', status TEXT DEFAULT 'active', template TEXT DEFAULT '', document_type TEXT DEFAULT '', tags_json TEXT DEFAULT '[]', ontology_json TEXT DEFAULT '[]', frontmatter_json TEXT DEFAULT '{}', supersedes_json TEXT DEFAULT '[]', superseded_by TEXT DEFAULT '', uid TEXT DEFAULT '', word_count INTEGER DEFAULT 0, context_tokens INTEGER DEFAULT 0, content_hash TEXT NOT NULL, updated_at TEXT DEFAULT '', last_verified_at TEXT DEFAULT '', review_after_days INTEGER DEFAULT 365, excerpt TEXT DEFAULT '', body_text TEXT DEFAULT '')",
     "CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(rel_path UNINDEXED, title, tags, body_text)",
     "CREATE TABLE IF NOT EXISTS wiki_links_index (source_path TEXT NOT NULL, target_ref TEXT NOT NULL, resolved_path TEXT DEFAULT '', PRIMARY KEY (source_path, target_ref))",
     "CREATE INDEX IF NOT EXISTS idx_wiki_links_resolved ON wiki_links_index(resolved_path)",
@@ -48,11 +48,84 @@ WIKI_DDL: Tuple[str, ...] = (
 _EXTRA_INDEX_COLS: Tuple[Tuple[str, str], ...] = (
     ("topic", "TEXT DEFAULT ''"), ("summary", "TEXT DEFAULT ''"), ("status", "TEXT DEFAULT 'active'"),
     ("template", "TEXT DEFAULT ''"), ("document_type", "TEXT DEFAULT ''"), ("ontology_json", "TEXT DEFAULT '[]'"),
+    ("frontmatter_json", "TEXT DEFAULT '{}'"),
     ("supersedes_json", "TEXT DEFAULT '[]'"), ("superseded_by", "TEXT DEFAULT ''"), ("uid", "TEXT DEFAULT ''"),
     ("word_count", "INTEGER DEFAULT 0"), ("context_tokens", "INTEGER DEFAULT 0"),
     ("last_verified_at", "TEXT DEFAULT ''"), ("review_after_days", "INTEGER DEFAULT 365"),
 )
-_SUMMARY_COLS = ["rel_path", "stem", "folder", "domain", "topic", "title", "summary", "author", "status", "template", "document_type", "tags_json", "ontology_json", "superseded_by", "content_hash", "updated_at", "last_verified_at", "review_after_days", "excerpt"]
+_SUMMARY_COLS = ["rel_path", "stem", "folder", "domain", "topic", "title", "summary", "author", "status", "template", "document_type", "tags_json", "ontology_json", "frontmatter_json", "superseded_by", "content_hash", "updated_at", "last_verified_at", "review_after_days", "excerpt"]
+_FM_KEY_ALIASES: Dict[str, str] = {
+    "tag": "tags", "ont": "ontology", "dom": "domain", "tpl": "template",
+    "type": "document_type", "doc": "document_type", "dir": "folder", "path": "folder",
+}
+_FM_TOKEN_RE = re.compile(r'(?:^|\s)(?:#([a-zA-Z0-9_-]+)|([a-zA-Z_][a-zA-Z0-9_-]*):(?:"([^"]+)"|\'([^\']+)\'|([^\s]+)))')
+
+
+def _flatten_frontmatter_fts(meta: Dict[str, Any], tags: List[str], ont: List[str], summary: str) -> str:
+    parts: List[str] = [*tags, *ont, summary]
+    for k, v in meta.items():
+        ks = str(k).strip().lower()
+        if not ks or v in (None, "", []):
+            continue
+        vals = [str(x).strip() for x in v if str(x).strip()] if isinstance(v, (list, tuple)) else [str(v).strip()]
+        for sv in vals:
+            parts.extend([ks, sv, f"{ks}:{sv}"])
+    return " ".join(parts)
+
+
+def _parse_frontmatter_query(query: str) -> Tuple[List[Tuple[str, str]], str]:
+    filters: List[Tuple[str, str]] = []
+    spans: List[Tuple[int, int]] = []
+    for m in _FM_TOKEN_RE.finditer(query or ""):
+        if m.group(1):
+            filters.append(("tags", m.group(1).lower()))
+            spans.append(m.span())
+            continue
+        raw_k = (m.group(2) or "").lower()
+        raw_v = (m.group(3) or m.group(4) or m.group(5) or "").strip()
+        if raw_k in ("http", "https") or raw_v.startswith("//") or not raw_v:
+            continue
+        filters.append((_FM_KEY_ALIASES.get(raw_k, raw_k), raw_v))
+        spans.append(m.span())
+    if not spans:
+        return [], (query or "").strip()
+    rem: List[str] = []
+    last = 0
+    for s, e in spans:
+        rem.append(query[last:s])
+        last = e
+    rem.append(query[last:])
+    return filters, re.sub(r"\s+", " ", "".join(rem)).strip()
+
+
+def _match_frontmatter_row(row: Dict[str, Any], filters: List[Tuple[str, str]]) -> Tuple[bool, List[str]]:
+    meta = row.get("frontmatter") if isinstance(row.get("frontmatter"), dict) else {}
+    matched_labels: List[str] = []
+    for key, raw_val in filters:
+        choices = [c.strip().lower() for c in raw_val.split(",") if c.strip()]
+        if not choices:
+            continue
+        if key == "has":
+            ok = any((c in meta and meta[c] not in (None, "", [])) or bool(row.get(c)) for c in choices)
+        elif key == "stale":
+            want = choices[0] in ("true", "1", "yes")
+            ok = bool(row.get("stale")) is want
+        elif key == "folder":
+            rp = str(row.get("rel_path") or "").lower()
+            fl = str(row.get("folder") or "").lower()
+            ok = any(fl == c or rp.startswith(c.rstrip("/") + "/") or c in rp for c in choices)
+        else:
+            cand_vals: List[str] = []
+            for src in (row.get(key), meta.get(key)):
+                if isinstance(src, (list, tuple)):
+                    cand_vals.extend(str(x).lower() for x in src if str(x).strip())
+                elif src not in (None, ""):
+                    cand_vals.append(str(src).lower())
+            ok = any(any(c == cv or c in cv for cv in cand_vals) for c in choices)
+        if not ok:
+            return False, []
+        matched_labels.append(f"{key}:{raw_val}")
+    return True, matched_labels
 
 
 def _is_system_wiki_file(rel: str) -> bool:
@@ -185,10 +258,10 @@ class WikiEngine:
             cur = self.store.conn.cursor()
             cur.execute("DELETE FROM wiki_fts WHERE rel_path = ?", (rel,))
             cur.execute(
-                "INSERT OR REPLACE INTO wiki_notes_index (rel_path, stem, folder, domain, topic, title, summary, author, status, template, document_type, tags_json, ontology_json, supersedes_json, superseded_by, uid, word_count, context_tokens, content_hash, updated_at, last_verified_at, review_after_days, excerpt, body_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (rel, full_path.stem.lower(), folder, domain, topic, title, summary, author, str(meta.get("status") or ("inbox" if folder == "01_inbox" else "active")), str(meta.get("template") or ""), str(meta.get("document_type") or ""), json.dumps(all_tags), json.dumps(all_ont), json.dumps(sup_list), sup_by_str, str(meta.get("uid") or ""), int(meta.get("word_count") or metrics["word_count"]), int(meta.get("context_tokens") or metrics["context_tokens"]), sha16_bytes(raw_bytes), upd, ver_at, rev_days, excerpt, body),
+                "INSERT OR REPLACE INTO wiki_notes_index (rel_path, stem, folder, domain, topic, title, summary, author, status, template, document_type, tags_json, ontology_json, frontmatter_json, supersedes_json, superseded_by, uid, word_count, context_tokens, content_hash, updated_at, last_verified_at, review_after_days, excerpt, body_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rel, full_path.stem.lower(), folder, domain, topic, title, summary, author, str(meta.get("status") or ("inbox" if folder == "01_inbox" else "active")), str(meta.get("template") or ""), str(meta.get("document_type") or ""), json.dumps(all_tags), json.dumps(all_ont), json.dumps(meta, ensure_ascii=False), json.dumps(sup_list), sup_by_str, str(meta.get("uid") or ""), int(meta.get("word_count") or metrics["word_count"]), int(meta.get("context_tokens") or metrics["context_tokens"]), sha16_bytes(raw_bytes), upd, ver_at, rev_days, excerpt, body),
             )
-            cur.execute("INSERT INTO wiki_fts (rel_path, title, tags, body_text) VALUES (?, ?, ?, ?)", (rel, title, f"{' '.join(all_tags)} {' '.join(all_ont)} {summary}", body))
+            cur.execute("INSERT INTO wiki_fts (rel_path, title, tags, body_text) VALUES (?, ?, ?, ?)", (rel, title, _flatten_frontmatter_fts(meta, all_tags, all_ont, summary), body))
             cur.execute("DELETE FROM wiki_links_index WHERE source_path = ?", (rel,))
             for ref in rel_links:
                 cur.execute("INSERT OR REPLACE INTO wiki_links_index (source_path, target_ref, resolved_path) VALUES (?, ?, ?)", (rel, ref, self._resolve_wikilink_target(cur, ref)))
@@ -227,7 +300,10 @@ class WikiEngine:
         mem = self.store
         key = (id(mem), str(base))
         with _WIKI_FS_LOCK:
-            if key not in _INDEXED_WIKI_ROOTS and not mem._fetch_rows("SELECT 1 FROM wiki_notes_index LIMIT 1"):
+            if key not in _INDEXED_WIKI_ROOTS and (
+                not mem._fetch_rows("SELECT 1 FROM wiki_notes_index LIMIT 1")
+                or mem._fetch_rows("SELECT 1 FROM wiki_notes_index WHERE frontmatter_json = '{}' LIMIT 1")
+            ):
                 self.rebuild_index()
             else:
                 _INDEXED_WIKI_ROOTS.add(key)
@@ -342,7 +418,9 @@ class WikiEngine:
         eff_topic = parts[2] if parts[0] == "02_knowledge" and len(parts) == 4 else str(in_meta.get("topic") or old_meta.get("topic") or "")
         eff_tpl = slugify_wiki(template or str(in_meta.get("template") or old_meta.get("template") or ("standard-note" if parts[0] == "02_knowledge" else "inbox-raw")), "standard-note")
         eff_status = status.strip() or str(in_meta.get("status") or old_meta.get("status") or ("inbox" if parts[0] == "01_inbox" else "active"))
-        merged_meta = hydrate_note_meta({**old_meta, **in_meta}, eff_title, in_body, eff_author, eff_status, eff_tpl, eff_domain, eff_topic, as_slug_list(tags if tags is not None else (in_meta.get("tags") or old_meta.get("tags") or [])), canonicalize_ontology(self.root, ontology if ontology is not None else (in_meta.get("ontology") or old_meta.get("ontology") or [])), now_iso, summary=summary)
+        raw_tags = tags if tags is not None else (in_meta["tags"] if "tags" in in_meta else old_meta.get("tags") or [])
+        raw_ont = ontology if ontology is not None else (in_meta["ontology"] if "ontology" in in_meta else old_meta.get("ontology") or [])
+        merged_meta = hydrate_note_meta({**old_meta, **in_meta}, eff_title, in_body, eff_author, eff_status, eff_tpl, eff_domain, eff_topic, as_slug_list(raw_tags), canonicalize_ontology(self.root, raw_ont), now_iso, summary=summary or str(in_meta.get("summary") or ""))
         prior_governed = existed and not is_user and not validate_curated_note(self.root, old_meta, old_body, existing_domain_notes=0)
         if parts[0] == "02_knowledge" and (prior_governed or bool(template.strip()) or bool(in_meta.get("template"))):
             errs = validate_curated_note(self.root, merged_meta, in_body, existing_domain_notes=self._count_other_domain_notes(eff_domain, rel))
@@ -445,6 +523,7 @@ class WikiEngine:
         for r in rows:
             r["tags"] = json.loads(r.pop("tags_json") or "[]")
             r["ontology"] = json.loads(r.pop("ontology_json") or "[]")
+            r["frontmatter"] = json.loads(r.pop("frontmatter_json", "") or "{}")
             age_d, rev_d, is_stale = compute_note_staleness(str(r.get("folder") or ""), str(r.get("template") or ""), str(r.get("last_verified_at") or ""), str(r.get("updated_at") or ""), r.get("review_after_days"))
             r["review_after_days"], r["days_since_verified"], r["stale"] = rev_d, age_d, is_stale
         return rows
@@ -461,7 +540,7 @@ class WikiEngine:
                 continue
             r_ont = canonicalize_ontology(self.root, json.loads(r.pop("ontology_json") or "[]"))
             if shared := sorted(ont_set.intersection(r_ont)):
-                r.update({"tags": json.loads(r.pop("tags_json") or "[]"), "ontology": r_ont, "match_kind": "ontology_bridge", "shared_ontology": shared, "bridge_via": via_label})
+                r.update({"tags": json.loads(r.pop("tags_json") or "[]"), "ontology": r_ont, "frontmatter": json.loads(r.pop("frontmatter_json", "") or "{}"), "match_kind": "ontology_bridge", "shared_ontology": shared, "bridge_via": via_label})
                 scored.append((len(shared), r))
         scored.sort(key=lambda item: item[0], reverse=True)
         return [item[1] for item in scored[:limit]]
@@ -471,38 +550,59 @@ class WikiEngine:
         clean_q = (query or "").strip()
         if not clean_q:
             return self.list_notes(limit=limit)
-        cols, arch_sql = [*_SUMMARY_COLS, "body_text"], ("" if include_archive else "WHERE folder != '04_archive' ")
-        by_path = {str(r["rel_path"]): r for r in self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM wiki_notes_index {arch_sql}ORDER BY updated_at DESC LIMIT 250")}
-        tokens = [t for t in re.findall(r"[a-zA-Z0-9_-]+", clean_q) if t.lower() not in ("and", "or")]
-        lex_paths: List[str] = []
-        if tokens:
-            hit_paths: List[str] = []
-            with self.store._lock:
-                for joiner in (" AND ", " OR "):
-                    hits = self.store.conn.execute("SELECT rel_path FROM wiki_fts WHERE wiki_fts MATCH ? ORDER BY rank LIMIT ?", (joiner.join(f'"{t}"*' for t in tokens), max(limit * 2, 20))).fetchall()
-                    if hits:
-                        hit_paths = [str(h[0]) for h in hits]
-                        break
-            missing = [p for p in hit_paths if p not in by_path]
-            if missing:
-                ph = ", ".join("?" for _ in missing)
-                arch_cond = "" if include_archive else " AND folder != '04_archive'"
-                for r in self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM wiki_notes_index WHERE rel_path IN ({ph}){arch_cond}", tuple(missing)):
-                    by_path[str(r["rel_path"])] = r
-            lex_paths = [p for p in hit_paths if p in by_path]
-        ranked = hybrid_rrf_rank(clean_q, [(p, f"{r['title']} {r['summary']} {r['tags_json']} {r['ontology_json']} {r['body_text'][:1200]}") for p, r in by_path.items()], lexical_ids=lex_paths, limit=limit)
+        fm_filters, free_q = _parse_frontmatter_query(clean_q)
+        eff_arch = include_archive or any(
+            (k == "folder" and "04_archive" in v.lower()) or (k == "status" and "archive" in v.lower())
+            for k, v in fm_filters
+        )
+        cols, arch_sql = [*_SUMMARY_COLS, "body_text"], ("" if eff_arch else "WHERE folder != '04_archive' ")
+        raw_rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM wiki_notes_index {arch_sql}ORDER BY updated_at DESC, rel_path ASC LIMIT 400")
+        by_path: Dict[str, Dict[str, Any]] = {}
+        matched_map: Dict[str, List[str]] = {}
+        for r in raw_rows:
+            r["tags"] = json.loads(r.get("tags_json") or "[]")
+            r["ontology"] = json.loads(r.get("ontology_json") or "[]")
+            r["frontmatter"] = json.loads(r.get("frontmatter_json") or "{}")
+            age_d, rev_d, is_stale = compute_note_staleness(str(r.get("folder") or ""), str(r.get("template") or ""), str(r.get("last_verified_at") or ""), str(r.get("updated_at") or ""), r.get("review_after_days"))
+            r["review_after_days"], r["days_since_verified"], r["stale"] = rev_d, age_d, is_stale
+            if fm_filters:
+                ok_fm, labels = _match_frontmatter_row(r, fm_filters)
+                if not ok_fm:
+                    continue
+                matched_map[str(r["rel_path"])] = labels
+            by_path[str(r["rel_path"])] = r
+        if not by_path:
+            return []
+        if not free_q:
+            ranked_paths = list(by_path.keys())[: max(1, int(limit))]
+        else:
+            tokens = [t for t in re.findall(r"[a-zA-Z0-9_-]+", free_q) if t.lower() not in ("and", "or")]
+            lex_paths: List[str] = []
+            if tokens:
+                with self.store._lock:
+                    for joiner in (" AND ", " OR "):
+                        hits = self.store.conn.execute("SELECT rel_path FROM wiki_fts WHERE wiki_fts MATCH ? ORDER BY rank LIMIT ?", (joiner.join(f'"{t}"*' for t in tokens), max(limit * 2, 30))).fetchall()
+                        if hits:
+                            lex_paths = [str(h[0]) for h in hits if str(h[0]) in by_path]
+                            if lex_paths:
+                                break
+            ranked_paths = hybrid_rrf_rank(
+                free_q,
+                [(p, f"{r['title']} {r['summary']} {r['domain']} {r['topic']} {r['template']} {r['document_type']} {r['author']} {r['status']} {r['tags_json']} {r['ontology_json']} {r['frontmatter_json']} {r['body_text'][:1200]}") for p, r in by_path.items()],
+                lexical_ids=lex_paths,
+                limit=limit,
+            )
         out: List[Dict[str, Any]] = []
         seed_ont: List[str] = []
-        for p in ranked:
+        for p in ranked_paths:
             if p in by_path:
                 raw_r = by_path[p]
-                ont = json.loads(raw_r.get("ontology_json") or "[]")
-                seed_ont.extend(ont)
-                item = {**raw_r, "tags": json.loads(raw_r.get("tags_json") or "[]"), "ontology": ont, "match_kind": "direct"}
-                for k_drop in ("tags_json", "ontology_json", "body_text"):
+                seed_ont.extend(raw_r.get("ontology") or [])
+                item = {**raw_r, "match_kind": "frontmatter" if (fm_filters and not free_q) else "direct", "matched_fields": matched_map.get(p, [])}
+                for k_drop in ("tags_json", "ontology_json", "frontmatter_json", "body_text"):
                     item.pop(k_drop, None)
                 out.append(item)
-        if include_ontology_bridges and seed_ont and len(out) < limit:
+        if include_ontology_bridges and not fm_filters and seed_ont and len(out) < limit:
             out.extend(self.find_ontology_bridges([x["rel_path"] for x in out[:3]], seed_ont, [x["rel_path"] for x in out], limit=limit - len(out)))
         return out
 

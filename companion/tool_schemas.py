@@ -158,8 +158,8 @@ TOOLS: List[Dict[str, Any]] = [
         "allowed_tools": _p("string", "Optional comma-separated tool names to grant the worker."),
     }, ["action"]),
     _tool("wiki_manage", "Operate the Co-Owned 4-Folder Knowledge Wiki Warehouse (`01_inbox`..`04_archive`), 11 governed templates, Multi-Turn Deliberate Curation (`inspect_graduation` -> `read` -> `validate_curation` -> `commit_curation`), `ontology` cross-domain bridges, Never-Delete lineage (`curation_history`/`revert_curation`), and 2D Mind Map.", {
-        "action": _p("string", "Wiki Warehouse, Template, Maintenance, or Deliberate Curation operation (`capture_inbox` stages in `01_inbox/`; `inspect_graduation` -> `validate_curation` -> `commit_curation` graduates into `02_knowledge/`; `diff`, `list_stale`, `verify_note`, and `consolidate_ontology` maintain quality).", enum=[
-            "list", "read", "search", "capture_inbox", "save", "graduate",
+        "action": _p("string", "Wiki Warehouse, Template, Maintenance, or Deliberate Curation operation (`capture_inbox` stages in `01_inbox/`; `inspect_graduation` -> `validate_curation` -> `commit_curation` graduates into `02_knowledge/`; `tree`, `diff`, `list_stale`, `verify_note`, and `consolidate_ontology` maintain quality).", enum=[
+            "list", "tree", "read", "search", "capture_inbox", "save", "graduate",
             "inspect_graduation", "validate_curation", "commit_curation", "curation_history", "revert_curation",
             "list_templates", "read_template", "save_template", "tag_authority", "create_proxy_note", "deep_curate_job",
             "diff", "consolidate_ontology", "verify_note", "list_stale", "stage_turn",
@@ -170,7 +170,7 @@ TOOLS: List[Dict[str, Any]] = [
         "summary": _p("string", "1-2 sentence executive summary required in `02_knowledge/` frontmatter (or asset summary for `create_proxy_note`)."),
         "template": _p("string", "Governed template slug (`zettelkasten-atomic`, `adr-decision`, `sop-runbook`, `concept-map-system-hub`, `concept-comparison`, `dikw-pyramid-of-insight`, `weekly-worklog`, `standard-note`, `homelab-host-spec`, `homelab-network-matrix`, `proxy-asset-note`)."),
         "content": _p("string", "Markdown note body matching the selected template's `required_sections` (supports `[[wikilinks]]`, zero unfilled placeholders)."),
-        "query": _p("string", "Search query string when `action='search'` (returns direct hits + 2-hop `ontology` bridges)."),
+        "query": _p("string", "Search query string when `action='search'` — supports YAML frontmatter `key:value` filters (`tag:...`, `domain:...`, `template:...`, `ontology:...`, `author:...`, `type:...`, `has:...`, or any custom YAML key) combined with free-text and 2-hop `ontology` bridges."),
         "domain": _p("string", "Top-level domain folder under `02_knowledge/` (e.g. `homelab`, `equipment-ops`, `software-engineering`, `health-fitness`)."),
         "topic": _p("string", "Optional second-level topic folder under `02_knowledge/<domain>/`."),
         "tags": _p("string", "Comma-separated kebab-case tags for note frontmatter."),
