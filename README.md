@@ -3,13 +3,13 @@
 A local-first, privacy-locked, self-hosted **AI Companion & Autonomous Engineering OS** built on a **100% Python 3.12 standard library core** (`zero pip install` required to run!).
 
 Companion combines a warm, long-memory everyday assistant with deterministic engineering guardrails:
-- **6 Built-In Web Studios** (pre-compiled offline bundle — no Node.js required at runtime):
-  1. **Forever Chat** (streaming thoughts/tokens, multimodal vision & document attachments, Socratic Study Drawer & inline 3D-flip flashcards)
-  2. **Agile & Kanban Boards** (Life/Home, Work/Career, Software & Custom boards, Weekday/Weekend slot math, Aging Radar & 15-minute Procrastination Unblocker)
-  3. **Unified Calendar** (merges appointments, active sprints, planned tasks, recurring routines & spaced-repetition reviews)
-  4. **Co-Owned Knowledge Wiki & 2D Mind Map** (plain Markdown 4-folder warehouse, 11 governed templates, visual diffs, Inbox staging & dual-author safety)
-  5. **Background Jobs & Respectful Routines** (Departures Board, fingerprint-verified Human Approvals Queue & crash-safe workers)
-  6. **System Studio** (`Identity & Profile`, Multi-Provider LLM Router, Zero-Reveal Blind Credential Vault, SSH/WinRM/HTTP Endpoints, Federated MCP, Autonomy & Hobbies, Snapshots & 7-Stage System Doctor)
+- **Progressive-Disclosure Web UI** (pre-compiled offline bundle — no Node.js required at runtime):
+  1. **Forever Chat** (continuous timeline with cursor history, non-destructive focus/compaction dividers, multimodal attachments & inline 3D-flip flashcards)
+  2. **Board & Goals (`ProjectGraph`)** (unified Life, Work & Software projects, milestones, `human`/`companion`/`collaborative` items & Right Split Inspector)
+  3. **Unified Calendar** (Google/Outlook-style `Day`, `Week`, and `Month` grids merging appointments, planned items, recurring routines & spaced-repetition reviews)
+  4. **Co-Owned Knowledge Wiki & 2D Mind Map** (4-folder Markdown warehouse, collapsible Directory Tree Explorer, YAML frontmatter search & facet filters, 11 governed templates, visual diffs & Study decks)
+  5. **Automations & Background Jobs** (unified `TriggerPolicy` routines supporting `manual`, `scheduled`, and `on_idle` with configurable time windows, Departures Board & Human Approvals Queue)
+  6. **Customizations & Settings** (3-Tier `Skills`, verified Python `DAGSpec` workflows, Federated MCP Hub, Multi-Provider LLM Router, Zero-Reveal Blind Credential Vault, SSH/WinRM/HTTP Endpoints & 7-Stage System Doctor)
 
 ---
 
@@ -30,7 +30,7 @@ python harness.py --web
 ```
 
 Open **`http://127.0.0.1:8000`** in your browser!
-- On first boot, click the **Welcome Banner** (or the top-left **Companion** header / `System -> Identity & Profile`) to name your Companion, set its tone, and tell it a bit about yourself.
+- On first boot, click **Settings** in the bottom-left rail (or type `/identity`) to name your Companion, set its tone, and tell it a bit about yourself.
 - Prefer the terminal? Run `python harness.py` for the interactive CLI REPL, or `pythonw harness.py --tray` on Windows for a silent System Tray icon.
 
 ---
@@ -75,20 +75,20 @@ docker compose up -d
   # Remove anytime (preserves your user data):
   powershell -ExecutionPolicy Bypass -File deploy\windows\uninstall-startup-service.ps1
   ```
-- **Build a standalone `CompanionSetup-v3.4.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
+- **Build a standalone `CompanionSetup-v3.5.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
   ```powershell
   powershell -ExecutionPolicy Bypass -File deploy\windows\build-installer.ps1
   ```
 
 ### Option 3: Linux `systemd` Background Daemon
-Supports both a rootless per-user `systemd` service (`~/.local/share/companion/data`) and a system-wide `/opt/companion` daemon (`/var/lib/companion`):
+Supports both a rootless per-user `systemd` service (`~/.local/share/companion/data`) and a system-wide `/opt/companion` daemon (`/var/lib/companion`), preserving your `--host` and `--port` settings across upgrades:
 
 ```bash
 # Option 3A — Rootless per-user background service (no sudo required):
-bash deploy/linux/install-service.sh --user
+bash deploy/linux/install-service.sh --user [--host 0.0.0.0] [--port 8000]
 
 # Option 3B — System-wide daemon under dedicated 'companion' user:
-sudo bash deploy/linux/install-service.sh
+sudo bash deploy/linux/install-service.sh [--host 0.0.0.0] [--port 8000]
 
 # Uninstall anytime while preserving your user data folder:
 bash deploy/linux/uninstall-service.sh --user   # or: sudo bash deploy/linux/uninstall-service.sh
@@ -98,10 +98,10 @@ bash deploy/linux/uninstall-service.sh --user   # or: sudo bash deploy/linux/uni
 
 ## Safety & Privacy Architecture
 
-1. **Mechanical `local_only` Privacy Lock (Default)**: Out of the box, Companion blocks outbound cloud LLM/embedding requests at the wire layer unless you explicitly switch `System -> Models & Tiers` to `hybrid` or `cloud_allowed`.
+1. **Mechanical `local_only` Privacy Lock (Default)**: Out of the box, Companion blocks outbound cloud LLM/embedding requests at the wire layer unless you explicitly switch `Settings -> Models & Routing` to `hybrid` or `cloud_allowed`.
 2. **Loopback-Default Web Studio + Token-Gated LAN/Tailscale**: By default, `COMPANION_WEB_HOST` binds strictly to `127.0.0.1` (`localhost`) with unconditional `Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF` enforcement. When bound to a LAN/Tailnet IP (`--host 0.0.0.0`), non-loopback requests require `COMPANION_WEB_TOKEN` (`Authorization: Bearer`, cookie, or `?token=` pairing).
-3. **Read-Only Application Core by Default (`Self-Dev Mode = OFF`)**: By default (`ADR-019`), Companion can freely manage your `data/` Wiki, Boards, Calendar, Custom User Skills (`data/skills/`), and external `/project` folders, while its own core source code is mechanically locked read-only. Only a human can enable `Self-Dev Mode` (`System -> Autonomy & Hobbies` or `/selfdev on`), and container/service deployments lock it off via `COMPANION_SELF_DEV_LOCKED=1`.
-4. **Zero-Reveal Blind Credential Vault**: API keys, SSH keys, and tokens entered in `System -> Vault & Endpoints` are sealed in `data/secrets.env`, never returned to the browser or LLM context, injected just-in-time into approved connectors, and scrubbed from tool outputs.
+3. **Read-Only Application Core by Default (`Self-Dev Mode = OFF`)**: By default (`ADR-019`), Companion can freely manage your `data/` Wiki, Boards, Calendar, Custom User Skills (`data/skills/`), and external `/project` folders, while its own core source code is mechanically locked read-only. Only a human can enable `Self-Dev Mode` (`Settings -> Safety & Operations` or `/selfdev on`), and container/service deployments lock it off via `COMPANION_SELF_DEV_LOCKED=1`.
+4. **Zero-Reveal Blind Credential Vault**: API keys, SSH keys, and tokens entered in `Settings -> Vault & Endpoints` are sealed in `data/secrets.env`, never returned to the browser or LLM context, injected just-in-time into approved connectors, and scrubbed from tool outputs.
 5. **7-Stage System Doctor**: Run `python harness.py --doctor` anytime to verify configuration, Python & JS AST syntax, A-Frame layer boundaries, 4-file Spec-Driven Development (`specs/`), dead-code/line-ceiling hygiene (`<=700` lines/module, `<=100` lines/function), SQLite WAL integrity, and the full automated test suite.
 
 ---
@@ -117,7 +117,7 @@ python harness.py --status         # Show live status HUD
 python harness.py --project ./app  # Work inside an isolated external project folder
 ```
 
-Inside Forever Chat or the CLI REPL, type `/help` to explore `/identity`, `/providers`, `/model`, `/plan`, `/approve`, `/goal`, `/wiki`, `/board`, `/sprint`, `/calendar`, `/study`, `/jobs`, `/vault`, `/endpoints`, `/mcp`, `/routines`, `/hobby`, `/selfdev`, `/backup`, and `/doctor`.
+Inside Forever Chat or the CLI REPL, type `/help` to explore `/identity`, `/providers`, `/model`, `/plan`, `/approve`, `/goal`, `/wiki`, `/board`, `/sprint`, `/calendar`, `/study`, `/jobs`, `/vault`, `/endpoints`, `/mcp`, `/routines`, `/customizations`, `/selfdev`, `/backup`, and `/doctor`.
 
 ---
 
