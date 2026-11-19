@@ -2,7 +2,7 @@
 Exposes Companion AI OS over `ThreadingHTTPServer` (`127.0.0.1:<port>` default, token-gated on LAN) with CSRF, SSE streaming, and WAL status APIs.
 """
 
-import contextvars, copy, io, ipaddress, json, os, secrets, socket, sys, threading, time, urllib.parse
+import contextlib, contextvars, copy, io, ipaddress, json, os, secrets, socket, sys, threading, time, urllib.parse
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -419,6 +419,9 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         if hasattr(self.request, "settimeout"):
             self.request.settimeout(30.0)
+        if hasattr(self.request, "setsockopt"):
+            with contextlib.suppress(OSError):
+                self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         super().setup()
 
     def log_message(self, fmt: str, *args: Any) -> None:

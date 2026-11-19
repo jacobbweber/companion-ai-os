@@ -61,6 +61,9 @@ class CancelScope:
         with contextlib.suppress(Exception):
             sock_obj.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(Exception):
+            if hasattr(sock_obj, "_real_close"):
+                sock_obj._real_close()
+        with contextlib.suppress(Exception):
             sock_obj.close()
 
     @staticmethod
@@ -125,10 +128,8 @@ class CancelScope:
             procs = list(self._procs)
         for s in socks:
             self._abort_socket_obj(s)
-        for rs, resp in resps:
+        for rs, _resp in resps:
             self._abort_socket_obj(rs)
-            with contextlib.suppress(Exception):
-                resp.close()
         for p in procs:
             self._terminate_proc(p)
 

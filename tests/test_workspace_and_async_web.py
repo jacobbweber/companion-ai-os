@@ -298,6 +298,60 @@ class TestWorkspaceAndAsyncWeb(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_cancel_scope_wakes_blocked_socket_under_100ms(self) -> None:
+        """Verify `CancelScope.cancel()` aborts a blocked `urllib.request.urlopen` `readline()` socket in `<100ms`."""
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        import time
+        import urllib.request
+        from companion.streaming import CancelScope
+
+        release_srv = threading.Event()
+
+        class _FrozenSSEHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: ping\n\n")
+                self.wfile.flush()
+                release_srv.wait(timeout=10.0)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _FrozenSSEHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        scope = CancelScope()
+        blocked = threading.Event()
+        woke = threading.Event()
+
+        def _reader() -> None:
+            with urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/", timeout=15) as resp:
+                with scope.track_response(resp):
+                    _ = resp.readline()
+                    _ = resp.readline()
+                    blocked.set()
+                    try:
+                        _ = resp.readline()
+                    except OSError:
+                        pass
+            woke.set()
+
+        try:
+            threading.Thread(target=_reader, daemon=True).start()
+            self.assertTrue(blocked.wait(timeout=2.0))
+            time.sleep(0.03)
+            t0 = time.perf_counter()
+            scope.cancel()
+            self.assertTrue(woke.wait(timeout=1.0))
+            wake_ms = (time.perf_counter() - t0) * 1000.0
+            self.assertLess(wake_ms, 100.0)
+        finally:
+            release_srv.set()
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
