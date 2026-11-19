@@ -326,7 +326,7 @@ def _handle_git_remote(action: str, repo_root: Path, args: Dict[str, Any]) -> st
             allowed, apr = get_approval_queue(get_memory_store()).check_or_enqueue(
                 category="git_push", action_name="git_push", target=f"{remote}/{cur_br}",
                 summary=f"Push branch `{cur_br}` to `{remote}` in `{repo_root.name}` (`delivery_policy='ask_me'`).",
-                payload={"repo_path": str(repo_root), "remote": remote, "branch": cur_br},
+                payload={"repo_path": str(repo_root), "remote": remote, "branch": cur_br, "project_id": str(proj.get("project_id") or "")},
                 requester="companion", confirmed=False, always_require_in_autonomous=True,
             )
             if not allowed:

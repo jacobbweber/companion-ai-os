@@ -216,7 +216,7 @@ def _handle_skill_forge_action(action: str, args: Dict[str, Any]) -> str:
                 scope=eff_scope,
             )["summary"]
         )
-    raw_sa = args.get("script_args")
+    raw_sa = args.get("script_args") if args.get("script_args") is not None else args.get("args")
     return run_skill_script(
         skill_name=str_arg(args, "skill"),
         script_name=str_arg(args, "script"),
@@ -289,7 +289,7 @@ def tool_workflow_manage(args: Dict[str, Any]) -> str:
     if action in ("check_skill", "bootstrap_skill", "promote_skill", "run_script"):
         return _handle_skill_forge_action(action, args)
     if action in ("run_dag", "run_recipe"):
-        dag_name = str_arg(args, "dag") or str_arg(args, "recipe") or str_arg(args, "recipe_name") or str_arg(args, "goal")
+        dag_name = str_arg(args, "dag") or str_arg(args, "dag_name") or str_arg(args, "recipe") or str_arg(args, "recipe_name") or str_arg(args, "goal")
         if not dag_name:
             return "error: dag is required for run_dag"
         from companion.agent import ensure_dag_runtime_bound

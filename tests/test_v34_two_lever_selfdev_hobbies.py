@@ -25,6 +25,7 @@ from companion.config import (
     settings,
     workspace_context,
 )
+from companion.core_actions import execute_core_action
 from companion.dag_runtime import execute_dag_by_name, resume_dag_run
 from companion.intake import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
@@ -342,6 +343,45 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
                 finally:
                     srv.session.idle_watcher.stop()
                     srv.server_close()
+
+    def test_sdlc_workflow_aliases_and_git_push_approval_execution(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            bare = base / "remote.git"
+            repo = base / "clone"
+            subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@companion.local"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.name", "Companion Test"], cwd=str(repo), check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=str(repo), check=True)
+            (repo / "hello.py").write_text("val = 42\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True)
+
+            with contextlib.closing(MemoryStore(db_path=base / "apr_git.db")) as store:
+                set_trust_mode("balanced", store=store)
+                pg = get_project_graph(store=store)
+                proj = pg.create_project(title="AskMe Repo", workspace_path=str(repo), delivery_policy="ask_me")
+                with workspace_context(repo, proj["project_id"]), memory_store_context(store):
+                    tool_git_manage({"action": "branch", "branch": "feat/approved-push"})
+                    (repo / "hello.py").write_text("val = 99\n", encoding="utf-8")
+                    tool_git_manage({"action": "commit", "files": ["hello.py"], "message": "feat: bump val"})
+
+                    dag_out = dispatch("workflow_manage", {"action": "run_dag", "dag_name": "pre-commit-verify", "params": {"repo_path": str(repo)}})
+                    self.assertIn("pre-commit-verify", dag_out.lower())
+                    scr_out = dispatch("workflow_manage", {"action": "run_script", "skill": "devops-ops", "script": "safe_deploy_ops.py", "args": ["--self-test"]})
+                    self.assertIn("pass", scr_out.lower())
+
+                    with agent_tool_turn_context():
+                        paused = tool_git_manage({"action": "push", "remote": "origin", "branch": "feat/approved-push"})
+                    self.assertIn("AWAITING_USER_APPROVAL", paused)
+                    waiting = ApprovalQueue(store=store).list_requests(status="waiting")
+                    self.assertEqual(len(waiting), 1)
+                    apr_res = execute_core_action("approvals", {"subaction": "approve", "approval_id": waiting[0]["approval_id"]}, actor="web", store=store)
+                    self.assertTrue(apr_res.get("ok"), apr_res)
+                    self.assertTrue(apr_res.get("execution_ok"), apr_res)
+                    refs = subprocess.run(["git", "branch", "--list"], cwd=str(bare), check=True, capture_output=True, text=True).stdout
+                    self.assertIn("feat/approved-push", refs)
 
 
 if __name__ == "__main__":

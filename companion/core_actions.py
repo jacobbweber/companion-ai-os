@@ -14,7 +14,7 @@ from companion.archive_and_approvals import (
 )
 from companion.background_jobs import get_job_manager
 from companion.calendar_engine import execute_calendar_action
-from companion.config import agent_tool_turn_context, is_in_agent_tool_turn
+from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, workspace_context
 from companion.context import execute_identity_action
 from companion.dag_runtime import resume_dag_run
 from companion.education_engine import execute_education_action
@@ -156,6 +156,15 @@ def _apply_approved_request(req: Dict[str, Any], mem: MemoryStore, skip_dag_resu
         return {"executed": True, "ok": ok_d, "summary": str(r.get("summary") or f"Resumed DAG `{payload['run_id']}`.") if ok_d else "", "error": "" if ok_d else str(r.get("error") or r.get("summary") or "DAG failed.")}
     if cat == "routine_enable" and act == "enable_routine" and payload.get("routine_id"):
         return _exec_out(get_routine_manager(store=mem).create_or_update_routine(routine_id=str(payload["routine_id"]), schedule_expr=str(payload.get("schedule") or ""), target_kind=str(payload.get("target_kind") or ""), title=str(payload.get("title") or ""), target_name=str(payload.get("target_name") or ""), inputs=payload.get("inputs") if isinstance(payload.get("inputs"), dict) else None, trigger_policy=payload.get("trigger_policy") if isinstance(payload.get("trigger_policy"), dict) else None, enabled=True, catch_up=_as_bool(payload.get("catch_up")), actor="user", confirmed=True))
+    if cat == "git_push" and payload.get("repo_path"):
+        from pathlib import Path
+        from companion.sdlc_tools import tool_git_manage
+
+        rp = Path(str(payload["repo_path"]))
+        with memory_store_context(mem), workspace_context(rp, str(payload.get("project_id") or rp.name)):
+            out_g = tool_git_manage({"action": "push", "repo_path": str(rp), "remote": str(payload.get("remote") or "origin"), "branch": str(payload.get("branch") or ""), "confirmed": True})
+        bad_g = out_g.startswith(("error:", "SAFETY GUARD REJECTED"))
+        return {"executed": True, "ok": not bad_g, "summary": "" if bad_g else out_g[:400], "error": out_g[:400] if bad_g else ""}
     return {"executed": False, "ok": True, "summary": "", "error": ""}
 
 

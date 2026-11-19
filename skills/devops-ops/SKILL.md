@@ -1,7 +1,7 @@
 ---
 name: devops-ops
 description: Safe-by-default release promotion, packaged app/ runtime sync, Blind-Vault remote endpoint operations, pre-deploy snapshot backups, human approval gates, /api/health + 7/7 Doctor verification, and automatic rollback.
-required_tools: [workflow_manage, endpoint_manage, vault_manage, backup_manage, system_doctor]
+required_tools: [workflow_manage, endpoint_manage, vault_manage, system_doctor]
 ---
 
 # Safe Deployment & Infrastructure Operations (`devops-ops`)
