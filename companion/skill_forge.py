@@ -233,10 +233,10 @@ def stage_and_promote_skill(
     eff_scope = (scope or "core").strip().lower()
     target_root = (root or settings.root).resolve()
     is_user_scope = eff_scope == "user"
-    if not is_user_scope and target_root == settings.root.resolve() and not settings.is_self_dev_enabled():
+    if not is_user_scope and target_root == settings.root.resolve():
         msg = (
-            "SAFETY GUARD REJECTED: Promoting skills into Companion core (`skills/`) requires `Self-Dev Mode = ON` "
-            "(`/selfdev on`), or pass `scope='user'` to save an update-safe user skill inside `data/skills/`."
+            "SAFETY GUARD REJECTED: Companion's installed `app/` (`skills/`) is permanently IMMUTABLE (`ADR-019`). "
+            "Pass `scope='user'` to save an update-safe skill inside `data/skills/`, or promote into an external Project clone (`workspace_path`)."
         )
         return {"promoted": False, "error": msg, "summary": msg}
     skills_parent = (settings.user_skills_dir if root is None else (target_root / "data" / "skills")) if is_user_scope else (target_root / "skills")

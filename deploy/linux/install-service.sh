@@ -79,8 +79,8 @@ WorkingDirectory=${APP_DIR}
 EnvironmentFile=-${DATA_DIR}/.env
 Environment="PYTHONUNBUFFERED=1"
 Environment="COMPANION_DATA_DIR=${DATA_DIR}"
-Environment="COMPANION_SELF_DEV_LOCKED=1"
-ExecStart=${PY_BIN} ${APP_DIR}/harness.py --data-dir "${DATA_DIR}" --locked --web --host ${HOST} --port ${PORT}
+Environment="COMPANION_IMMUTABLE_APP=1"
+ExecStart=${PY_BIN} ${APP_DIR}/harness.py --data-dir "${DATA_DIR}" --immutable --web --host ${HOST} --port ${PORT}
 Restart=always
 RestartSec=3
 

@@ -14,7 +14,7 @@ from companion.archive_and_approvals import (
 )
 from companion.background_jobs import get_job_manager
 from companion.calendar_engine import execute_calendar_action
-from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, settings
+from companion.config import agent_tool_turn_context, is_in_agent_tool_turn
 from companion.context import execute_identity_action
 from companion.dag_runtime import resume_dag_run
 from companion.education_engine import execute_education_action
@@ -24,8 +24,8 @@ from companion.memory_store import MemoryStore, get_memory_store, memory_store_c
 from companion.model_registry import execute_model_registry_action
 from companion.project_graph import get_project_graph
 from companion.routines import (
-    cleanup_sandbox_clone, create_sandbox_clone, diff_sandbox_clone, execute_autonomy_mode_action,
-    get_routine_manager, list_sandbox_clones, verify_sandbox_clone,
+    execute_autonomy_mode_action,
+    get_routine_manager,
 )
 from companion.skill_forge import execute_customizations_action
 from companion.tool_schemas import r3_approval_context
@@ -472,7 +472,7 @@ def _act_routines(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, 
     sub = str(p.get("subaction") or "list").lower()
     if sub in ("create", "save", "update"):
         tp_in = dict(p.get("trigger_policy") or {}) if isinstance(p.get("trigger_policy"), dict) else {}
-        for k in ("mode", "schedule_expr", "idle_min_seconds", "allowed_window", "cooldown_seconds", "precheck_name", "requires_self_dev"):
+        for k in ("mode", "schedule_expr", "idle_min_seconds", "allowed_window", "cooldown_seconds", "precheck_name"):
             if p.get(k) is not None and k not in tp_in:
                 tp_in[k] = p[k]
         raw_inputs = p.get("inputs") if isinstance(p.get("inputs"), dict) else (p.get("variables") if isinstance(p.get("variables"), dict) else None)
@@ -497,23 +497,6 @@ def _act_routines(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, 
         or ["  (No routines configured.)"]
     )
     return {"ok": True, "routines": items, "summary": "\n".join(lines)}
-
-
-def _act_sandbox(p: Dict[str, Any], _actor: str, _mem: MemoryStore) -> Dict[str, Any]:
-    sub = str(p.get("subaction") or "list").lower()
-    if sub == "create":
-        if not settings.is_self_dev_enabled():
-            return {"ok": False, "error": "SAFETY GUARD REJECTED: Self-development sandbox clone creation requires `Self-Dev Mode = ON` (`/selfdev on` or Web System Studio)."}
-        return create_sandbox_clone(label=str(p.get("label") or "experiment"))
-    if sub == "verify":
-        return verify_sandbox_clone(str(p.get("sandbox_id") or ""), run_tests=_as_bool(p.get("run_tests"), False))
-    if sub == "diff":
-        return diff_sandbox_clone(str(p.get("sandbox_id") or ""))
-    if sub == "cleanup":
-        return cleanup_sandbox_clone(str(p.get("sandbox_id") or ""))
-    items = list_sandbox_clones()
-    lines = ["=== Isolated Self-Development Sandbox Clones ==="] + ([f"  * `{s['sandbox_id']}` ({s['copied_files']} files) -> `{s['path']}`" for s in items] or ["  (No active sandbox clones.)"])
-    return {"ok": True, "sandboxes": items, "summary": "\n".join(lines)}
 
 
 _EFFORT_MINS = {"quick": 15, "half_day": 180, "full_day": 360, "multi_day": 720}
@@ -564,14 +547,20 @@ def _act_agile(p: Dict[str, Any], _actor: str, mem: MemoryStore) -> Dict[str, An
         return q_res
     if sub in ("create_board", "save_board", "create_project", "upsert_project"):
         tp_in = p.get("trigger_policy") if isinstance(p.get("trigger_policy"), dict) else None
-        proj = mgr.create_project(title=str(p.get("title") or p.get("name") or "New Goal"), goal_summary=str(p.get("goal_summary") or p.get("description") or ""), slug=str(p.get("slug") or "") or None, kind=str(p.get("kind") or "goal"), workspace_path=str(p.get("workspace_path") or ""), trigger_policy=tp_in, project_id=pid or None)
-        return {"ok": True, "project": proj, "board": proj, "summary": f"Saved project/goal `{proj['title']}` (`{proj['project_id']}`)."}
+        proj = mgr.create_project(
+            title=str(p.get("title") or p.get("name") or "New Goal"), goal_summary=str(p.get("goal_summary") or p.get("description") or ""),
+            slug=str(p.get("slug") or "") or None, kind=str(p.get("kind") or "goal"), workspace_path=str(p.get("workspace_path") or ""),
+            delivery_policy=str(p.get("delivery_policy") or "local_only"), git_credential_ref=str(p.get("git_credential_ref") or ""),
+            test_command=str(p.get("test_command") or ""), preview_command=str(p.get("preview_command") or ""),
+            trigger_policy=tp_in, project_id=pid or None,
+        )
+        return {"ok": True, "project": proj, "board": proj, "summary": f"Saved project/goal `{proj['title']}` (`{proj['project_id']}`, delivery_policy=`{proj['delivery_policy']}`)."}
     if sub == "update_project":
-        proj_upd = {k: v for k, v in p.items() if k in ("title", "goal_summary", "status", "wiki_hub_path", "workspace_path", "trigger_policy", "metadata")}
+        proj_upd = {k: v for k, v in p.items() if k in ("title", "goal_summary", "status", "wiki_hub_path", "workspace_path", "delivery_policy", "git_credential_ref", "test_command", "preview_command", "trigger_policy", "metadata")}
         if "goal_summary" not in proj_upd and "description" in p:
             proj_upd["goal_summary"] = str(p.get("description") or "")
         proj = mgr.update_project(pid or mgr.resolve_project_id(), **proj_upd)
-        return {"ok": True, "project": proj, "summary": f"Updated project `{proj['project_id']}`."}
+        return {"ok": True, "project": proj, "summary": f"Updated project `{proj['project_id']}` (delivery_policy=`{proj['delivery_policy']}`)."}
     if sub in ("create_card", "save_card", "add_card", "create_item"):
         ref = str(p.get("item_id") or p.get("card_id") or "").strip()
         if ref:
@@ -631,7 +620,7 @@ def _act_agile(p: Dict[str, Any], _actor: str, mem: MemoryStore) -> Dict[str, An
 
 CORE_ACTIONS: Dict[str, ActionSpec] = {
     "trust": ActionSpec("trust", "governance", "Inspect or set the 3-tier global Trust Mode (`strict`, `balanced`, `autonomous`).", False, _act_trust),
-    "autonomy": ActionSpec("autonomy", "governance", "Manage Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`), Idle Routines, and Morning Journal.", False, lambda p, a, m: execute_autonomy_mode_action(p, actor=a, store=m)),
+    "autonomy": ActionSpec("autonomy", "governance", "Manage Background Autonomy posture, Idle Routines, and Morning Journal.", False, lambda p, a, m: execute_autonomy_mode_action(p, actor=a, store=m)),
     "customizations": ActionSpec("customizations", "skills", "Inspect Capability Packs (`skills/` & `data/skills/`), Verified Python DAGs, and `dag_runs`, or run/resume DAGs.", False, execute_customizations_action),
     "approvals": ActionSpec("approvals", "governance", "Inspect or resolve pending human-in-the-loop approval requests.", False, _act_approvals),
     "archive": ActionSpec("archive", "memory", "Search Forever Chat (Hot + Cold Archive) or archive conversations >90d.", False, _act_archive),
@@ -644,7 +633,6 @@ CORE_ACTIONS: Dict[str, ActionSpec] = {
     "mcp": ActionSpec("mcp", "mcp", "Manage outbound MCP servers, propose/harvest Capability Packs, Hosted MCP, and Federated Partners.", False, _act_mcp),
     "partners": ActionSpec("partners", "mcp", "Register, handshake, inspect, and delegate jobs across Federated Companion Partners.", False, _act_partners),
     "routines": ActionSpec("routines", "routines", "Schedule and execute unified `manual`, `scheduled`, and windowed `on_idle` routines.", False, _act_routines),
-    "sandbox": ActionSpec("sandbox", "routines", "Create, Doctor-verify, diff, and clean up isolated self-development clones.", False, _act_sandbox),
     "agile": ActionSpec("agile", "agile", "Operate Universal Project & Goal Graph (`companion` | `human` | `collaborative`), Milestones, Timeboxes, and Kanban/Roadmap views.", False, _act_agile),
     "calendar": ActionSpec("calendar", "calendar", "Operate Unified Calendar timeline merging events, active timeboxes, task dates, routines, and due SRS reviews.", False, lambda p, _a, m: execute_calendar_action(p, store=m)),
     "education": ActionSpec("education", "education", "Operate Headless Education courses, pedagogical stages, spaced repetition, and inline Chat flashcard decks.", False, lambda p, a, m: execute_education_action({**p, "actor": a}, store=m)),
@@ -653,8 +641,8 @@ CORE_ACTIONS: Dict[str, ActionSpec] = {
 }
 
 HARVEST_SLASH_VERBS = (
-    "/jobs", "/wiki", "/vault", "/endpoints", "/mcp", "/partners", "/routines", "/approvals", "/trust", "/selfdev",
-    "/prompts", "/backup", "/archive", "/sandbox", "/board", "/boards", "/sprint", "/calendar", "/study", "/providers", "/identity",
+    "/jobs", "/wiki", "/vault", "/endpoints", "/mcp", "/partners", "/routines", "/approvals", "/trust",
+    "/prompts", "/backup", "/archive", "/board", "/boards", "/sprint", "/calendar", "/study", "/providers", "/identity",
 )
 
 

@@ -100,7 +100,7 @@ bash deploy/linux/uninstall-service.sh --user   # or: sudo bash deploy/linux/uni
 
 1. **Mechanical `local_only` Privacy Lock (Default)**: Out of the box, Companion blocks outbound cloud LLM/embedding requests at the wire layer unless you explicitly switch `Settings -> Models & Routing` to `hybrid` or `cloud_allowed`.
 2. **Loopback-Default Web Studio + Token-Gated LAN/Tailscale**: By default, `COMPANION_WEB_HOST` binds strictly to `127.0.0.1` (`localhost`) with unconditional `Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF` enforcement. When bound to a LAN/Tailnet IP (`--host 0.0.0.0`), non-loopback requests require `COMPANION_WEB_TOKEN` (`Authorization: Bearer`, cookie, or `?token=` pairing).
-3. **Read-Only Application Core by Default (`Self-Dev Mode = OFF`)**: By default (`ADR-019`), Companion can freely manage your `data/` Wiki, Boards, Calendar, Custom User Skills (`data/skills/`), and external `/project` folders, while its own core source code is mechanically locked read-only. Only a human can enable `Self-Dev Mode` (`Settings -> Safety & Operations` or `/selfdev on`), and container/service deployments lock it off via `COMPANION_SELF_DEV_LOCKED=1`.
+3. **Permanent Installed-App Immutability & Per-Project Delivery Policy (`COMPANION_IMMUTABLE_APP=1`, `ADR-019`)**: Companion's own installed `app/` runtime is permanently immutable while `data/`, `data/scratch/`, Wiki, Boards, Calendar, User Skills (`data/skills/`), and external Board Project clones (`workspace_path`) stay writable, governed by each Project's `delivery_policy` (`local_only` | `remote_branch_pr` | `ask_me`).
 4. **Zero-Reveal Blind Credential Vault**: API keys, SSH keys, and tokens entered in `Settings -> Vault & Endpoints` are sealed in `data/secrets.env`, never returned to the browser or LLM context, injected just-in-time into approved connectors, and scrubbed from tool outputs.
 5. **7-Stage System Doctor**: Run `python harness.py --doctor` anytime to verify configuration, Python & JS AST syntax, A-Frame layer boundaries, 4-file Spec-Driven Development (`specs/`), dead-code/line-ceiling hygiene (`<=700` lines/module, `<=100` lines/function), SQLite WAL integrity, and the full automated test suite.
 
@@ -117,7 +117,7 @@ python harness.py --status         # Show live status HUD
 python harness.py --project ./app  # Work inside an isolated external project folder
 ```
 
-Inside Forever Chat or the CLI REPL, type `/help` to explore `/identity`, `/providers`, `/model`, `/plan`, `/approve`, `/goal`, `/wiki`, `/board`, `/sprint`, `/calendar`, `/study`, `/jobs`, `/vault`, `/endpoints`, `/mcp`, `/routines`, `/customizations`, `/selfdev`, `/backup`, and `/doctor`.
+Inside Forever Chat or the CLI REPL, type `/help` to explore `/identity`, `/providers`, `/model`, `/plan`, `/approve`, `/goal`, `/wiki`, `/board`, `/sprint`, `/calendar`, `/study`, `/jobs`, `/vault`, `/endpoints`, `/mcp`, `/routines`, `/customizations`, `/autonomy`, `/backup`, and `/doctor`.
 
 ---
 
@@ -154,7 +154,7 @@ Companion/
 │   ├── CONTRACTS.md             # 3. Bounded Subsystem Contracts (SPEC-01..SPEC-08) & Test Map
 │   └── DECISIONS.md             # 4. Self-Compacting Architecture Decision Records (ADRs)
 ├── skills/                      # Built-in 3-Tier Progressive-Disclosure Skill Packs (`skills/<name>/SKILL.md`)
-├── companion/                   # Headless Core A-Frame Engine (45 modules; `<=700L/module`, `<=100L/function`)
+├── companion/                   # Headless Core A-Frame Engine (46 modules; `<=700L/module`, `<=100L/function`)
 │   ├── config.py, telemetry.py, streaming.py, llm_wire.py, llm.py
 │   ├── checkpoints.py, safety.py, semantic_memory.py, memory_store.py, trigger_policy.py, project_graph.py
 │   ├── disciplines.py, grounding.py, archive_and_approvals.py, vault.py, model_registry.py, wiki_templates.py
@@ -162,7 +162,7 @@ Companion/
 │   ├── hygiene.py, sdd.py, workflow_graph.py, workflow_dag.py, dag_runtime.py
 │   ├── intake.py, skill_forge.py, compaction.py, tool_schemas.py, background_jobs.py
 │   ├── endpoints.py, mcp_hub.py, routines.py, calendar_engine.py, core_actions.py, harvest_tools.py
-│   └── os_tools.py, tools.py, context.py, autonomy.py, blueprint.py, eval_harness.py, agent.py
+│   └── sdlc_tools.py, os_tools.py, tools.py, context.py, autonomy.py, blueprint.py, eval_harness.py, agent.py
 ├── frontend/                    # React 19 + TypeScript + Vite Multi-Studio UI source (-> surfaces/static/)
 ├── surfaces/                    # Presentation Layer: web_assets.py, api_extensions.py, web_server.py, windows_tray.py
 ├── configs/                     # Executable A-Frame Architecture component registry (architecture.py)

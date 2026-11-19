@@ -47,7 +47,6 @@ class TriggerPolicy:
     allowed_window: str = ""
     cooldown_seconds: int = 1800
     precheck_name: str = ""
-    requires_self_dev: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -57,7 +56,6 @@ class TriggerPolicy:
             "allowed_window": self.allowed_window,
             "cooldown_seconds": int(self.cooldown_seconds),
             "precheck_name": self.precheck_name,
-            "requires_self_dev": bool(self.requires_self_dev),
         }
 
     @classmethod
@@ -83,7 +81,6 @@ class TriggerPolicy:
             allowed_window=window,
             cooldown_seconds=max(0, int(data.get("cooldown_seconds", settings.hobby_cooldown_minutes * 60))),
             precheck_name=str(data.get("precheck_name") or "").strip(),
-            requires_self_dev=bool(data.get("requires_self_dev", False)),
         )
 
 
@@ -294,7 +291,6 @@ def evaluate_trigger_eligibility(
     idle_seconds: float,
     last_run_at: str = "",
     next_run_at: str = "",
-    self_dev_enabled: bool = False,
     background_autonomy_enabled: bool = False,
     now_utc: Optional[datetime] = None,
     now_local: Optional[datetime] = None,
@@ -303,8 +299,6 @@ def evaluate_trigger_eligibility(
     """Evaluate whether a `TriggerPolicy` should fire right now without spending LLM tokens."""
     cur_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     cur_local = now_local or cur_utc.astimezone()
-    if policy.requires_self_dev and not self_dev_enabled:
-        return False, "self_dev_mode_off"
     if policy.mode == "manual":
         return False, "manual_only"
     if policy.allowed_window and not is_within_allowed_window(policy.allowed_window, now_local=cur_local):
@@ -378,23 +372,6 @@ def _precheck_warn_or_slow_spans(store: MemoryStore, last_run_at: str = "") -> T
     return False, "telemetry_clean"
 
 
-def _precheck_self_dev_work_available(store: MemoryStore, last_run_at: str = "") -> Tuple[bool, str]:
-    pending = store.get_pending_tasks()
-    backlog = store.get_backlog(status="pending")
-    if pending or backlog:
-        return True, "pending_tasks_or_backlog"
-    last_dt = parse_iso_utc(last_run_at)
-    if last_dt is None:
-        return True, "initial_hygiene_audit"
-    last_epoch = last_dt.timestamp()
-    for pkg in ("companion", "surfaces"):
-        pkg_dir = settings.root / pkg
-        if pkg_dir.is_dir() and any(p.stat().st_mtime > last_epoch for p in pkg_dir.glob("*.py")):
-            return True, "code_modified_since_last_run"
-    return False, "workspace_unchanged"
-
-
 register_trigger_precheck("wiki_inbox_or_stale", _precheck_wiki_inbox_or_stale)
 register_trigger_precheck("recent_unconsolidated_chat", _precheck_recent_chat)
 register_trigger_precheck("recent_warn_or_slow_spans", _precheck_warn_or_slow_spans)
-register_trigger_precheck("workspace_hygiene_or_sdd_drift", _precheck_self_dev_work_available)

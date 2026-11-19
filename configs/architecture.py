@@ -288,8 +288,15 @@ CORE_COMPONENTS: List[ComponentSpec] = [
         name="Rich Tool Schemas & Phase Tool Gate",
         layer=ArchitectureLayer.APPLICATION,
         module_path="companion/tool_schemas.py",
-        description="26 rich OpenAI tool schemas with per-parameter descriptions and mechanical PHASE_ALLOWED_TOOLS gating",
+        description="28 rich OpenAI tool schemas with per-parameter descriptions and mechanical PHASE_ALLOWED_TOOLS gating",
         dependencies=[],
+    ),
+    ComponentSpec(
+        name="Orthogonal Local SDLC, Git/Worktree & Preview Tools",
+        layer=ArchitectureLayer.APPLICATION,
+        module_path="companion/sdlc_tools.py",
+        description="Repo rulebook/stack discovery, secret-shielded git_manage (branches, worktrees, Blind-Vault SSH/PAT auth, delivery_policy gates), and PreviewProcessManager (dev_preview)",
+        dependencies=["Configuration & .env Loader", "Universal Headless Project & Goal Graph", "Zero-Reveal Blind Credential Vault & Snapshot Backups", "Safety, Inline Micro-Linter & System Doctor"],
     ),
     ComponentSpec(
         name="OS State & Governance Tools",
@@ -302,8 +309,8 @@ CORE_COMPONENTS: List[ComponentSpec] = [
         name="Tool Registry & Safe Dispatch",
         layer=ArchitectureLayer.APPLICATION,
         module_path="companion/tools.py",
-        description="26 deterministic tools covering WorkspaceContext I/O, AST symbol reads, inline linting, Python/shell runners, native MCP schemas, and phase-gated dispatch",
-        dependencies=["Configuration & .env Loader", "OS State & Governance Tools", "Safety, Inline Micro-Linter & System Doctor"],
+        description="28 deterministic tools covering WorkspaceContext I/O, AST symbol reads, inline linting, Python/shell runners, SDLC git_manage/dev_preview, native MCP schemas, and phase-gated dispatch",
+        dependencies=["Configuration & .env Loader", "OS State & Governance Tools", "Orthogonal Local SDLC, Git/Worktree & Preview Tools", "Safety, Inline Micro-Linter & System Doctor"],
     ),
     ComponentSpec(
         name="Dynamic Context & Compaction Engine",
@@ -368,7 +375,7 @@ CORE_COMPONENTS: List[ComponentSpec] = [
         name="Unified TriggerPolicy Routines, Idle Autonomy & Clone Sandboxes",
         layer=ArchitectureLayer.APPLICATION,
         module_path="companion/routines.py",
-        description="Unified scheduled & on_idle routines (retiring hobbies), IdleAutonomyWatcher, Morning Briefing, downtime reconciliation, and isolated self-dev clone sandboxes",
+        description="Unified scheduled & on_idle routines (retiring hobbies), IdleAutonomyWatcher, Morning Briefing, and downtime reconciliation",
         dependencies=["Unified TriggerPolicy & Precheck Registry", "Universal Headless Project & Goal Graph", "Forever-Chat Background Job Dispatcher", "Universal SSH, WinRM & HTTP Endpoint Connector", "Zero-Reveal Blind Credential Vault & Snapshot Backups"],
     ),
     ComponentSpec(

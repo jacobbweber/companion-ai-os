@@ -45,8 +45,8 @@ def tool_memory_manage(args: Dict[str, Any]) -> str:
         notes = store.get_system_notes(category=str_arg(args, "category") or None, limit=int_arg(args, "limit", 20))
         return "\n".join(f"- [{c} | {ts}] {n}" for n, c, ts in notes) if notes else "No system notes found."
     if action == "add_adr":
-        if settings.get_workspace().is_self_project and not settings.is_self_dev_enabled():
-            return "SAFETY GUARD REJECTED: `add_adr` modifies `specs/DECISIONS.md` and requires `Self-Dev Mode = ON` (`/selfdev on`)."
+        if settings.get_workspace().is_self_project:
+            return "SAFETY GUARD REJECTED: `add_adr` modifies `specs/DECISIONS.md` inside Companion's immutable `app/` runtime. Focus an external Project clone (`workspace_path`) instead."
         title, decision = str_arg(args, "title"), str_arg(args, "decision")
         if not title or not decision:
             return "error: title and decision are required for add_adr"
@@ -57,7 +57,7 @@ def tool_memory_manage(args: Dict[str, Any]) -> str:
             consequences=str_arg(args, "consequences", "Clean modular evolution") or "Clean modular evolution",
         )
         store.sync_memory_md()
-        sync_decisions_md(store=store)
+        sync_decisions_md(root=settings.active_project_root, store=store)
         return f"Recorded ADR #{aid} ('{title}') and synced MEMORY.md & specs/DECISIONS.md."
     if action == "get_adrs":
         adrs = store.get_adrs()
@@ -101,9 +101,9 @@ def tool_memory_manage(args: Dict[str, Any]) -> str:
         return "\n".join(f"[{ts} {role}]: {c[:300]}" for role, c, ts in reversed(msgs)) if msgs else "No messages."
     if action == "sync":
         md_path = store.sync_memory_md()
-        if settings.get_workspace().is_self_project and not settings.is_self_dev_enabled():
-            return f"Synchronized SQLite memory to {md_path} (`specs/DECISIONS.md` remains read-only while Self-Dev Mode is OFF)."
-        return f"Synchronized SQLite memory to {md_path} and {sync_decisions_md(store=store)}."
+        if settings.get_workspace().is_self_project:
+            return f"Synchronized SQLite memory to {md_path} (`specs/DECISIONS.md` inside installed `app/` remains immutable)."
+        return f"Synchronized SQLite memory to {md_path} and {sync_decisions_md(root=settings.active_project_root, store=store)}."
     return f"error: unknown memory_manage action '{action}'."
 
 
@@ -201,8 +201,9 @@ def _handle_skill_forge_action(action: str, args: Dict[str, Any]) -> str:
             src = str(raw_scripts[fname])
             if "DAGSpec(" in src and "--self-test" not in src:
                 raw_dags.setdefault(fname, raw_scripts.pop(fname))
-        default_scope = "core" if settings.is_self_dev_enabled() else "user"
+        default_scope = "user" if settings.get_workspace().is_self_project else "core"
         eff_scope = str_arg(args, "scope", default_scope) or default_scope
+        target_root = None if eff_scope == "user" else settings.active_project_root
         return str(
             stage_and_promote_skill(
                 name=str_arg(args, "skill"),
@@ -211,6 +212,7 @@ def _handle_skill_forge_action(action: str, args: Dict[str, Any]) -> str:
                 dags=raw_dags or None,
                 references=_dict_arg(args, "references"),
                 overwrite=bool_arg(args, "overwrite", False),
+                root=target_root,
                 scope=eff_scope,
             )["summary"]
         )
@@ -229,12 +231,11 @@ def _handle_workflow_state_action(action: str, args: Dict[str, Any]) -> str:
         if not goal:
             return "error: goal is required to start a workflow"
         wf_type = str_arg(args, "workflow_type", "engineering_feature") or "engineering_feature"
-        if settings.get_workspace().is_self_project and not settings.is_self_dev_enabled():
+        if settings.get_workspace().is_self_project:
             return (
-                f"SAFETY GUARD REJECTED: `workflow_manage(action='start', workflow_type='{wf_type}')` is strictly for software/codebase engineering builds "
-                "and Companion core is read-only while `Self-Dev Mode = OFF` (`/selfdev on`). "
-                "For the user's personal, home, or career long-running goals/projects, use `agile_manage(action='save_epic')` and `agile_manage(action='save_card', epic_id=...)` on Boards instead "
-                "(or switch to an external coding workspace via `project_manage`)."
+                f"SAFETY GUARD REJECTED: `workflow_manage(action='start', workflow_type='{wf_type}')` is strictly for external repository builds "
+                "and Companion's installed `app/` runtime is permanently immutable. "
+                "For personal/work goals use `agile_manage` on Boards, or bind a Project `workspace_path` to a repository clone."
             )
         res = workflow_engine.start_workflow(
             goal=goal,
@@ -363,10 +364,10 @@ def tool_sdd_manage(args: Dict[str, Any]) -> str:
     if action in ("verify", "status"):
         return f"{verify_sdd().format_summary()}\n\n{analyze_workspace_hygiene().format_summary()}"
     if action == "sync":
-        if settings.get_workspace().is_self_project and not settings.is_self_dev_enabled():
-            return "SAFETY GUARD REJECTED: `sdd_manage(action='sync')` writes `specs/DECISIONS.md` and requires `Self-Dev Mode = ON` (`/selfdev on`)."
+        if settings.get_workspace().is_self_project:
+            return "SAFETY GUARD REJECTED: `sdd_manage(action='sync')` writes `specs/DECISIONS.md` and Companion's installed `app/` runtime is permanently immutable. Focus an external Project clone (`workspace_path`) instead."
         store = get_memory_store()
-        return f"Synchronized & compacted ADRs to {sync_decisions_md(store=store)} and memory to {store.sync_memory_md()}."
+        return f"Synchronized & compacted ADRs to {sync_decisions_md(root=settings.active_project_root, store=store)} and memory to {store.sync_memory_md()}."
     if action in ("add_adr", "get_adrs"):
         return tool_memory_manage(args)
     if action == "read_spec":

@@ -387,7 +387,7 @@ class CheckpointManager:
                 reverted.append(f"{rel} (restored deleted file)")
         if not reverted:
             return None
-        why = "because `Self-Dev Mode` is OFF (`ADR-019`)" if settings.get_workspace().is_self_project else "while working on an external project (`ADR-007`)"
+        why = "permanently (`ADR-019` installed `app/` immutability)" if settings.get_workspace().is_self_project else "while working on an external project (`ADR-007`)"
         return f"SAFETY GUARD REJECTED subprocess mutation: Companion core (`{self.root}`) is mechanically locked READ-ONLY {why}. Reverted {len(reverted)} unauthorized change(s): {', '.join(reverted[:5])}."
 
     def _run_git(self, args: List[str], timeout: int = 20) -> Tuple[int, str]:

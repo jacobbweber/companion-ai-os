@@ -17,7 +17,7 @@ from companion.autonomy import (
     run_autonomous_goal,
 )
 from companion.compaction import build_lossless_phase_handoff
-from companion.config import SKIP_DIRS, Settings, self_dev_override_context, settings, workspace_context
+from companion.config import SKIP_DIRS, Settings, settings, workspace_context
 from companion.context import build_system_prompt
 from companion.disciplines import verify_repository_syntax, walk_pruned_files
 from companion.hygiene import analyze_workspace_hygiene, build_repo_headroom_map, extract_python_symbol
@@ -108,11 +108,15 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
         self.assertIn(f"/{settings.max_module_lines}L]", radar)
 
         with tempfile.TemporaryDirectory() as tmp:
+            ext_repo = Path(tmp) / "ext_repo"
+            (ext_repo / "companion").mkdir(parents=True)
+            (ext_repo / "companion" / "mod.py").write_text('"""Mod."""\nx = 1\n', encoding="utf-8")
             store = MemoryStore(db_path=Path(tmp) / "radar.db")
             try:
-                runtime_p = build_system_prompt(store=store)
-                self.assertNotIn("[CODEBASE AST & LINE-BUDGET RADAR", runtime_p)
-                with self_dev_override_context(True):
+                with workspace_context(settings.root, "companion-self"):
+                    runtime_p = build_system_prompt(store=store)
+                    self.assertNotIn("[CODEBASE AST & LINE-BUDGET RADAR", runtime_p)
+                with workspace_context(ext_repo, "ext-repo"):
                     sys_p = build_system_prompt(store=store)
                     self.assertIn("[CODEBASE AST & LINE-BUDGET RADAR", sys_p)
             finally:
@@ -177,8 +181,8 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             self.assertNotIn("INLINE LINT WARNING", res_e)
 
     def test_upgrade5_rich_tool_parameter_schemas_and_phase_tool_gating(self) -> None:
-        """Verify every parameter across all 26 tools has a description and `DESIGN`/`PLAN` lock out file writes."""
-        self.assertEqual(len(TOOLS), 26)
+        """Verify every parameter across all 28 tools has a description and `DESIGN`/`PLAN` lock out file writes."""
+        self.assertEqual(len(TOOLS), 28)
         for tool_spec in TOOLS:
             fn_name = tool_spec["function"]["name"]
             props = tool_spec["function"]["parameters"]["properties"]
@@ -340,8 +344,8 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
                         self.assertIn("PHASE TOOL GATE REJECTED", dispatch("sdd_manage", {"action": "add_adr", "title": "T", "decision": "D"}))
                     with phase_tool_context("IMPLEMENT"):
                         sync_out = dispatch("sdd_manage", {"action": "sync"})
-                        self.assertIn(str(Path(tmp) / "specs" / "DECISIONS.md"), sync_out)
-                        self.assertTrue((Path(tmp) / "specs" / "DECISIONS.md").is_file())
+                        self.assertIn(str(ws / "specs" / "DECISIONS.md"), sync_out)
+                        self.assertTrue((ws / "specs" / "DECISIONS.md").is_file())
                     self.assertEqual(store.query_knowledge_facts("reflect:lesson")[0]["value"], "verified")
             finally:
                 store.close()
@@ -398,7 +402,7 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             self.assertNotIn(".rglob(", py_f.read_text(encoding="utf-8"), f"Unpruned `.rglob(` left in {py_f.name}")
 
         stems = sorted(p.stem for p in (settings.root / "companion").glob("*.py") if p.name != "__init__.py")
-        self.assertEqual(len(stems), 45)
+        self.assertEqual(len(stems), 46)
         readme_txt = (settings.root / "README.md").read_text(encoding="utf-8")
         sdd_skill_txt = (settings.root / "skills" / "sdd-compliance" / "SKILL.md").read_text(encoding="utf-8")
         patterns_txt = (settings.root / "skills" / "knowledge-wiki" / "references" / "agentic-patterns.md").read_text(encoding="utf-8")

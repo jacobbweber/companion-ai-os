@@ -53,7 +53,6 @@ export const AutomationsSurface: React.FC<AutomationsSurfaceProps> = ({
   }, [refreshNonce]);
 
   const bgAutonomy = status?.background_autonomy === 'on';
-  const selfDev = Boolean(status?.self_dev_enabled);
 
   const toggleBg = async () => {
     const res = await callAction('autonomy', {
@@ -63,16 +62,6 @@ export const AutomationsSurface: React.FC<AutomationsSurfaceProps> = ({
     await onRefreshStatus();
     await loadAll();
     onToast(res.summary || `Background Autonomy ${!bgAutonomy ? 'ON' : 'OFF'}.`);
-  };
-
-  const toggleSelfDev = async () => {
-    const res = await callAction('autonomy', {
-      subaction: 'set_self_dev',
-      enabled: !selfDev,
-    });
-    await onRefreshStatus();
-    await loadAll();
-    onToast(res.summary || res.error || `Self-Dev Mode ${!selfDev ? 'ON' : 'OFF'}.`);
   };
 
   const toggleRoutineEnabled = async (rt: RoutineItem) => {
@@ -134,7 +123,7 @@ export const AutomationsSurface: React.FC<AutomationsSurfaceProps> = ({
           </button>
         </div>
 
-        {/* Two-Lever Operating Bar */}
+        {/* Operating Posture Bar */}
         <div className="card-group">
           <div className="card-row">
             <div className="card-row-info">
@@ -149,22 +138,6 @@ export const AutomationsSurface: React.FC<AutomationsSurfaceProps> = ({
               className={`switch-toggle ${bgAutonomy ? 'on' : ''}`}
               onClick={() => void toggleBg()}
               aria-label="Toggle Background Autonomy"
-            />
-          </div>
-          <div className="card-row">
-            <div className="card-row-info">
-              <div className="card-row-title">Self-Dev Core Unlock</div>
-              <div className="card-row-desc">
-                Required only for self-development routines (such as core codebase hygiene audits).
-              </div>
-            </div>
-            <button
-              type="button"
-              data-testid="automations-selfdev-switch"
-              disabled={Boolean(status?.self_dev_locked)}
-              className={`switch-toggle ${selfDev ? 'on' : ''}`}
-              onClick={() => void toggleSelfDev()}
-              aria-label="Toggle Self-Dev Mode"
             />
           </div>
         </div>
@@ -216,7 +189,6 @@ export const AutomationsSurface: React.FC<AutomationsSurfaceProps> = ({
                       <span className={`badge ${tp.mode === 'on_idle' ? 'accent' : ''}`}>
                         <Clock size={10} /> {modeBadge}
                       </span>
-                      {tp.requires_self_dev && <span className="badge warn">Self-Dev</span>}
                     </div>
                     <div className="card-row-desc">
                       Target: <span className="mono">{rt.target_kind}</span>

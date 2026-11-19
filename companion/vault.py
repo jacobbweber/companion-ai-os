@@ -330,6 +330,7 @@ class VaultManager:
             ("mcp_servers", "SELECT server_id, credential_ref FROM mcp_servers WHERE credential_ref != ''"),
             ("federated_partners", "SELECT partner_id, credential_ref FROM federated_partners WHERE credential_ref != ''"),
             ("llm_providers", "SELECT provider_id, credential_ref FROM llm_providers WHERE credential_ref != ''"),
+            ("projects", "SELECT project_id, git_credential_ref FROM projects WHERE git_credential_ref != ''"),
         )
         with self.store._lock:
             existing_tables = {r[0] for r in self.store.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}

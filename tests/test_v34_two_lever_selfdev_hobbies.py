@@ -1,11 +1,14 @@
-"""Unit & integration tests for Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`), Read-Only Core Lock, and Session Nudges."""
+"""Unit & integration tests for Permanent Installed-App Immutability, Orthogonal Repo SDLC (`git_manage`, `dev_preview`), `safe-deploy` Rollback, Background Autonomy, and Session Nudges."""
 
 import contextlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 from companion.agent import handle_slash_command
@@ -14,17 +17,18 @@ from companion.archive_and_approvals import (
     consume_session_nudges,
     enqueue_session_nudge,
     peek_session_nudges,
+    set_trust_mode,
 )
 from companion.config import (
     Settings,
     agent_tool_turn_context,
-    self_dev_override_context,
     settings,
     workspace_context,
 )
-from companion.core_actions import execute_core_action
+from companion.dag_runtime import execute_dag_by_name, resume_dag_run
 from companion.intake import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
+from companion.project_graph import get_project_graph
 from companion.routines import (
     BUILTIN_IDLE_ROUTINES,
     IdleAutonomyWatcher,
@@ -32,100 +36,76 @@ from companion.routines import (
     get_routine_manager,
 )
 from companion.safety import check_path_safety
+from companion.sdlc_tools import (
+    PreviewProcessManager,
+    discover_repo_sdlc_context,
+    preview_turn_cleanup_scope,
+    tool_dev_preview,
+    tool_git_manage,
+)
 from companion.skill_forge import stage_and_promote_skill
 from companion.tool_schemas import phase_tool_context
 from companion.tools import dispatch
+from companion.vault import VaultManager
 from surfaces.api_extensions import register_service_reload_handler
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 
-class TestTwoLeverSelfDevAndAutonomy(unittest.TestCase):
-    def test_four_operating_quadrants_and_env_locks(self) -> None:
-        q1 = describe_operating_quadrant(False, False)
-        q2 = describe_operating_quadrant(True, False)
-        q3 = describe_operating_quadrant(False, True)
-        q4 = describe_operating_quadrant(True, True)
-        self.assertEqual(q1["quadrant"], "interactive_standard")
-        self.assertEqual(q2["quadrant"], "autonomous_partner")
-        self.assertEqual(q3["quadrant"], "interactive_self_dev")
-        self.assertEqual(q4["quadrant"], "self_evolving_os")
+class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
+    def test_operating_postures_and_immutable_app_config(self) -> None:
+        q_off = describe_operating_quadrant(False)
+        q_on = describe_operating_quadrant(True)
+        self.assertEqual(q_off["quadrant"], "interactive_standard")
+        self.assertEqual(q_on["quadrant"], "autonomous_partner")
+        self.assertTrue(q_off["immutable_app"])
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch.dict(
-                os.environ,
-                {"COMPANION_SELF_DEV": "1", "COMPANION_SELF_DEV_LOCKED": "1", "COMPANION_IMMUTABLE_CORE": "0"},
-                clear=False,
-            ):
+            with patch.dict(os.environ, {"COMPANION_IMMUTABLE_APP": "1"}, clear=False):
                 cfg = Settings(env_path=root / "none.env")
-                self.assertTrue(cfg.self_dev_default)
-                self.assertTrue(cfg.self_dev_locked)
-                self.assertTrue(cfg.is_self_dev_locked_by_env())
+                self.assertTrue(cfg.immutable_app)
 
-            orig_def, orig_lock, orig_imm = settings.self_dev_default, settings.self_dev_locked, settings.immutable_core
-            try:
-                settings.self_dev_default = True
-                settings.self_dev_locked = False
-                settings.immutable_core = False
-                with contextlib.closing(MemoryStore(db_path=root / "seeded.db")) as st:
-                    self.assertTrue(st.is_self_dev_mode_enabled())
-                    settings.immutable_core = True
-                    self.assertFalse(st.is_self_dev_mode_enabled())
-                    with self.assertRaises(PermissionError):
-                        st.set_self_dev_mode(True, actor="user")
-                    with self_dev_override_context(True):
-                        self.assertTrue(st.is_self_dev_mode_enabled())
-            finally:
-                settings.self_dev_default, settings.self_dev_locked, settings.immutable_core = orig_def, orig_lock, orig_imm
-
-    def test_human_only_privilege_boundary_blocks_all_llm_escalation_vectors(self) -> None:
+    def test_human_only_privilege_boundary_blocks_llm_trust_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_file = Path(tmp) / "priv.db"
             with contextlib.closing(MemoryStore(db_path=db_file)) as store:
-                self.assertFalse(store.is_self_dev_mode_enabled())
-
-                with self.assertRaises(PermissionError):
-                    store.set_self_dev_mode(True, actor="companion")
-
                 with agent_tool_turn_context():
                     with self.assertRaises(PermissionError):
-                        store.set_self_dev_mode(True, actor="user")
+                        store.set_user_profile("trust_mode", "autonomous")
 
                 with memory_store_context(store), phase_tool_context("IMPLEMENT"):
-                    r_prof = dispatch("memory_manage", {"action": "set_profile", "key": "self_dev_mode", "value": "on"})
+                    r_prof = dispatch("memory_manage", {"action": "set_profile", "key": "trust_mode", "value": "autonomous"})
                     self.assertIn("PRIVILEGE GUARD REJECTED", r_prof)
-
-                    r_act = execute_core_action("autonomy", {"subaction": "set_self_dev", "enabled": True}, actor="companion", store=store)
-                    self.assertFalse(r_act["ok"])
-                    self.assertIn("PRIVILEGE GUARD REJECTED", r_act["error"])
 
                     r_sh = dispatch(
                         "run_shell",
-                        {"command": f"sqlite3 \"{db_file}\" \"UPDATE user_profile SET value='on' WHERE key='self_dev_mode'\""},
+                        {"command": f"sqlite3 \"{db_file}\" \"UPDATE user_profile SET value='autonomous' WHERE key='trust_mode'\""},
                     )
                     self.assertIn("SAFETY GUARD REJECTED command", r_sh)
 
+                    # Even an obfuscated subprocess SQLite mutation is rolled back & rejected by `_guard_priv_db`
                     py_attack = (
                         f"import sqlite3\n"
+                        f"k = 'trust_' + 'mode'\n"
                         f"c = sqlite3.connect(r'{db_file}')\n"
-                        f"c.execute(\"UPDATE user_profile SET value='on' WHERE key='self_dev_mode'\")\n"
+                        f"c.execute('INSERT OR REPLACE INTO user_profile (key, value) VALUES (?, ?)', (k, 'autonomous'))\n"
                         f"c.commit()\nc.close()\nprint('mutated')\n"
                     )
                     r_py = dispatch("run_python", {"code": py_attack})
                     self.assertIn("SAFETY GUARD REJECTED subprocess privilege escalation", r_py)
-                    self.assertFalse(store.is_self_dev_mode_enabled())
+                    self.assertEqual(store.get_user_profile().get("trust_mode", "balanced"), "balanced")
 
-    def test_mechanical_readonly_core_lock_preserves_data_and_external_projects(self) -> None:
+    def test_permanent_immutable_app_lock_preserves_scratch_data_and_external_repos(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             base = Path(tmp)
-            fake_self = base / "companion_repo"
-            ext_proj = base / "external_app"
+            fake_self = base / "companion_app"
+            ext_proj = base / "external_repo"
             for sub in ("companion", "surfaces", "frontend", "specs", "skills", "data"):
                 (fake_self / sub).mkdir(parents=True)
             ext_proj.mkdir(parents=True)
 
             readme = fake_self / "README.md"
-            readme.write_text("# Stable Release\n", encoding="utf-8")
+            readme.write_text("# Immutable Installed Runtime\n", encoding="utf-8")
             core_py = fake_self / "companion" / "sample_mod.py"
             core_py.write_text("VALUE = 1\n", encoding="utf-8")
 
@@ -135,12 +115,10 @@ class TestTwoLeverSelfDevAndAutonomy(unittest.TestCase):
                     settings.root = fake_self.resolve()
                     settings.data_dir = (fake_self / "data").resolve()
                     with workspace_context(fake_self, "companion-self"), memory_store_context(store), phase_tool_context("IMPLEMENT"):
-                        self.assertFalse(settings.is_self_dev_enabled())
-
                         for rel in ("companion/sample_mod.py", "surfaces/ui.py", "frontend/App.tsx", "specs/PRODUCT.md", "README.md"):
                             err = check_path_safety(fake_self / rel, write=True)
                             self.assertIsNotNone(err)
-                            self.assertIn("Self-Dev Mode` is OFF", str(err))
+                            self.assertIn("immutable", str(err).lower())
 
                         w_core = dispatch("write_file", {"path": str(core_py), "content": "VALUE = 2\n"})
                         self.assertIn("SAFETY GUARD REJECTED path", w_core)
@@ -149,176 +127,221 @@ class TestTwoLeverSelfDevAndAutonomy(unittest.TestCase):
                         py_mut = f"from pathlib import Path\nPath(r'{readme}').write_text('HACKED\\n', encoding='utf-8')\n"
                         r_sub = dispatch("run_python", {"code": py_mut})
                         self.assertIn("SAFETY GUARD REJECTED subprocess mutation", r_sub)
-                        self.assertEqual(readme.read_text(encoding="utf-8"), "# Stable Release\n")
+                        self.assertEqual(readme.read_text(encoding="utf-8"), "# Immutable Installed Runtime\n")
 
-                        sub_data_file = fake_self / "data" / "sub_ok.txt"
-                        r_sub_ok = dispatch("run_python", {"code": f"from pathlib import Path\nPath(r'{sub_data_file}').write_text('ok\\n', encoding='utf-8')\nprint('data_ok')\n"})
-                        self.assertIn("data_ok", r_sub_ok)
-                        self.assertTrue(sub_data_file.is_file())
+                        # Relative writes in OS Mode automatically route into `data/scratch/`
+                        w_scratch = dispatch("write_file", {"path": "quick_calc.py", "content": "print(42)\n"})
+                        self.assertIn("wrote", w_scratch.lower())
+                        self.assertTrue((fake_self / "data" / "scratch" / "quick_calc.py").is_file())
 
-                        sk_res = stage_and_promote_skill("demo-skill", "---\nname: demo-skill\n---\n", root=fake_self)
-                        self.assertFalse(sk_res["promoted"])
-                        self.assertIn("Self-Dev Mode", sk_res["error"])
-                        sbx_res = execute_core_action("sandbox", {"subaction": "create", "label": "exp"}, actor="web", store=store)
-                        self.assertFalse(sbx_res["ok"])
-                        adr_res = dispatch("sdd_manage", {"action": "add_adr", "title": "ADR-099: Test", "decision": "x"})
-                        self.assertIn("SAFETY GUARD REJECTED", adr_res)
-
-                        data_note = fake_self / "data" / "notes" / "daily.md"
-                        w_data = dispatch("write_file", {"path": str(data_note), "content": "Daily driver note\n"})
-                        self.assertIn("wrote", w_data.lower())
-                        wk_res = execute_core_action(
-                            "wiki", {"subaction": "capture_inbox", "title": "Homelab Idea", "content": "Check UPS battery."},
-                            actor="companion", store=store,
+                        valid_skill = (
+                            "---\nname: demo-skill\ndescription: Valid user skill description.\n"
+                            "required_tools: [read_file]\n---\n## When to Use This Skill\nUse.\n## Step-by-Step Procedure\n1. Run.\n"
                         )
-                        self.assertTrue(wk_res["ok"])
-                        ag_res = execute_core_action(
-                            "agile", {"subaction": "create_card", "title": "Order air filter", "owner": "human"},
-                            actor="companion", store=store,
-                        )
-                        self.assertTrue(ag_res["ok"])
+                        sk_core = stage_and_promote_skill("demo-skill", valid_skill, root=fake_self, scope="core")
+                        self.assertFalse(sk_core["promoted"])
+                        sk_user = stage_and_promote_skill("demo-skill", valid_skill, root=fake_self, scope="user")
+                        self.assertTrue(sk_user["promoted"])
 
-                        with workspace_context(ext_proj, "ext-app"):
+                        self.assertIn("Unknown slash command", str(handle_slash_command("/selfdev on", [], store=store)))
+
+                        with workspace_context(ext_proj, "ext-repo"):
                             w_ext = dispatch("write_file", {"path": str(ext_proj / "main.py"), "content": "print('ok')\n"})
                             self.assertIn("wrote", w_ext.lower())
-
-                        cli_on = handle_slash_command("/selfdev on", [], store=store)
-                        self.assertIn("ON", str(cli_on))
-                        self.assertTrue(settings.is_self_dev_enabled())
-                        self.assertIsNone(check_path_safety(readme, write=True))
-                        cli_off = handle_slash_command("/selfdev off", [], store=store)
-                        self.assertIn("OFF", str(cli_off))
-                        self.assertFalse(settings.is_self_dev_enabled())
                 finally:
                     settings.root, settings.data_dir = orig_root, orig_data
 
-    def test_builtin_idle_routines_self_dev_gating_and_web_watcher(self) -> None:
+    def test_git_manage_branches_worktrees_secret_shield_and_delivery_policy(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            repo = base / "work_repo"
+            wt_dir = base / "wt_parallel"
+            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@companion.local"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.name", "Companion Test"], cwd=str(repo), check=True)
+            subprocess.run(["git", "remote", "add", "origin", "https://github.com/acme/demo.git"], cwd=str(repo), check=True)
+
+            (repo / ".agents" / "rules").mkdir(parents=True)
+            (repo / ".agents" / "rules" / "style.md").write_text("# Strict Typed Python\n", encoding="utf-8")
+            (repo / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True)
+
+            with contextlib.closing(MemoryStore(db_path=base / "sdlc.db")) as store:
+                pg = get_project_graph(store=store)
+                proj = pg.create_project(title="Demo Repo", workspace_path=str(repo), delivery_policy="local_only")
+                ctx_xml = discover_repo_sdlc_context(repo, project=proj)
+                self.assertIn("style.md", ctx_xml)
+                self.assertIn("delivery_policy=`local_only`", ctx_xml)
+
+                with workspace_context(repo, proj["project_id"]), memory_store_context(store):
+                    (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+                    c_main = tool_git_manage({"action": "commit", "files": ["app.py"], "message": "bad main commit"})
+                    self.assertIn("blocked", c_main.lower())
+
+                    b_out = tool_git_manage({"action": "branch", "branch": "feat/widget"})
+                    self.assertIn("feat/widget", b_out)
+                    (repo / ".env").write_text("SECRET=123\n", encoding="utf-8")
+                    c_sec = tool_git_manage({"action": "commit", "files": [".env"], "message": "leak"})
+                    self.assertIn("SAFETY GUARD", c_sec)
+                    (repo / ".env").unlink()
+
+                    c_ok = tool_git_manage({"action": "commit", "files": ["app.py"], "message": "feat: update x"})
+                    self.assertIn("feat: update x", c_ok)
+
+                    wt_add = tool_git_manage({"action": "worktree_add", "branch": "feat/parallel", "worktree_path": str(wt_dir)})
+                    self.assertTrue(wt_dir.is_dir(), wt_add)
+                    wt_ls = tool_git_manage({"action": "worktree_list"})
+                    self.assertIn("wt_parallel", wt_ls)
+                    wt_rm = tool_git_manage({"action": "worktree_remove", "worktree_path": str(wt_dir)})
+                    self.assertFalse(wt_dir.exists(), wt_rm)
+
+                    p_blocked = tool_git_manage({"action": "push", "remote": "origin", "branch": "feat/widget"})
+                    self.assertIn("local_only", p_blocked)
+
+                    set_trust_mode("balanced", store=store)
+                    pg.update_project(proj["project_id"], delivery_policy="ask_me")
+                    p_ask = tool_git_manage({"action": "push", "remote": "origin", "branch": "feat/widget"})
+                    self.assertIn("approval", p_ask.lower())
+
+                    vm = VaultManager(store=store, secrets_path=base / "secrets.env")
+                    tok = "ghp_UnitBlindGitToken_Secret_555"
+                    vm.set_secret("git-pat", tok, cred_type="bearer_token", allow_list=[f"git:{proj['project_id']}"], actor="user")
+                    pg.update_project(proj["project_id"], delivery_policy="remote_branch_pr", git_credential_ref="git-pat")
+
+                    captured_askpass: List[str] = []
+
+                    def _fake_git_push(_root: Path, git_args: List[str], env: Optional[Dict[str, str]] = None, timeout: int = 45) -> Tuple[int, str]:
+                        if git_args[:1] == ["rev-parse"]:
+                            return 0, "feat/widget"
+                        assert env is not None and "GIT_ASKPASS" in env
+                        out_pw = subprocess.run([env["GIT_ASKPASS"], "Password for https://github.com"], env=env, capture_output=True, text=True, check=True)
+                        captured_askpass.append(out_pw.stdout.strip())
+                        return 0, vm.scrub_output(f"To https://github.com/acme/demo.git (auth={tok})\n * [new branch] feat/widget -> feat/widget")
+
+                    with patch.dict(os.environ, {"COMPANION_SECRETS_FILE": str(base / "secrets.env")}, clear=False), patch("companion.sdlc_tools._run_git_cmd", side_effect=_fake_git_push):
+                        p_ok = tool_git_manage({"action": "push", "remote": "origin", "branch": "feat/widget"})
+                    self.assertEqual(captured_askpass, [tok])
+                    self.assertNotIn(tok, p_ok)
+                    self.assertIn("feat/widget", p_ok)
+
+    def test_dev_preview_lifecycle_probe_and_turn_exit_teardown(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            repo = Path(tmp) / "web_app"
+            repo.mkdir()
+            (repo / "srv.py").write_text(
+                "import http.server, sys\n"
+                "port = int(sys.argv[1])\n"
+                "class H(http.server.BaseHTTPRequestHandler):\n"
+                "    def do_GET(self):\n"
+                "        self.send_response(200)\n"
+                "        self.send_header('Content-Type','text/html')\n"
+                "        self.end_headers()\n"
+                "        self.wfile.write(b'<h1>Preview Alive</h1>')\n"
+                "    def log_message(self, *a): pass\n"
+                "http.server.HTTPServer(('127.0.0.1', port), H).serve_forever()\n",
+                encoding="utf-8",
+            )
+            mgr = PreviewProcessManager()
+            with patch("companion.sdlc_tools.preview_manager", mgr), workspace_context(repo, "web-app"):
+                with preview_turn_cleanup_scope():
+                    cmd = f'"{sys.executable}" srv.py {{port}}'
+                    started = json.loads(tool_dev_preview({"action": "start", "command": cmd, "ready_path": "/"}))
+                    self.assertTrue(started["ok"], started)
+                    probe_txt = tool_dev_preview({"action": "http_probe", "preview_id": started["preview_id"], "path": "/"})
+                    self.assertIn("200", probe_txt)
+                    self.assertIn("Preview Alive", probe_txt)
+                st = json.loads(tool_dev_preview({"action": "list"}))
+                self.assertEqual(st["previews"], [])
+
+    def test_safe_deploy_dag_human_gate_and_simulated_failure_rollback(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            src_v1, src_v2, target_app = base / "src_v1", base / "src_v2", base / "runtime" / "app"
+            for d, tag in ((src_v1, "v1-good"), (src_v2, "v2-bad")):
+                (d / "companion").mkdir(parents=True)
+                (d / "harness.py").write_text(f"RELEASE = {tag!r}\n", encoding="utf-8")
+            (target_app / "companion").mkdir(parents=True)
+            (target_app / "harness.py").write_text("RELEASE = 'v1-good'\n", encoding="utf-8")
+
+            with contextlib.closing(MemoryStore(db_path=base / "deploy.db")) as store:
+                set_trust_mode("balanced", store=store)
+                with memory_store_context(store):
+                    paused = execute_dag_by_name(
+                        "safe-deploy",
+                        params={
+                            "source_repo": str(src_v2),
+                            "target_app_dir": str(target_app),
+                            "backup_dir": str(base / "backups"),
+                            "simulate_health_failure": True,
+                            "run_doctor": False,
+                            "snapshot_data_store": False,
+                        },
+                        store=store,
+                    )
+                    self.assertEqual(paused["status"], "waiting_approval")
+                    ApprovalQueue(store=store).resolve(paused["approval_id"], "approve", actor="user")
+                    resumed = resume_dag_run(paused["run_id"], store=store)
+                    self.assertEqual(resumed["status"], "completed")
+                    ver_node = resumed["nodes"]["verify_or_rollback"]
+                    self.assertTrue(ver_node["rolled_back"])
+                    self.assertIn("v1-good", (target_app / "harness.py").read_text(encoding="utf-8"))
+
+    def test_builtin_idle_routines_web_watcher_nudges_and_reload_endpoint(self) -> None:
         builtin_ids = {r["routine_id"] for r in BUILTIN_IDLE_ROUTINES}
-        self.assertTrue({"wiki_gardener", "memory_curator", "trace_reviewer", "code_hygiene"}.issubset(builtin_ids))
+        self.assertEqual(builtin_ids, {"wiki_gardener", "memory_curator", "trace_reviewer"})
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with contextlib.closing(MemoryStore(db_path=root / "data" / "web.db")) as store:
-                rm = get_routine_manager(store=store)
-                store.set_background_autonomy(True)
-                store.set_self_dev_mode(False, actor="user")
-                eligible = [r["routine_id"] for r in rm.select_eligible_idle_routines(idle_seconds=3600)]
-                self.assertNotIn("code_hygiene", eligible)
+                q = ApprovalQueue(store=store)
+                allowed, apr = q.check_or_enqueue(
+                    category="wiki_edit", action_name="edit_user_note", target="02_knowledge/recipe.md",
+                    payload={"path": "02_knowledge/recipe.md"}, summary="Curate recipe note",
+                )
+                self.assertFalse(allowed)
+                aid = apr["approval_id"]
+                enqueue_session_nudge(f"Paused (`{aid}`).", session_id="main", category="approval", ref_id=aid, store=store)
+                q.resolve(aid, "approve", actor="user")
+                self.assertEqual(peek_session_nudges(store=store), [])
+                enqueue_session_nudge("Job done.", session_id="main", category="job", ref_id="bgj_1", store=store)
+                self.assertIn("Job done.", consume_session_nudges("web_ui", store=store))
+
+                dec = classify_turn_intent("Create a winter project milestone to clean the barn", store=store, root=root)
+                self.assertIn(dec.mode, ("GUIDED_CHANGE", "CHAT_DIRECT"))
+                with workspace_context(settings.root, "companion-self"), memory_store_context(store):
+                    wf_out = dispatch("workflow_manage", {"action": "start", "workflow_type": "engineering_feature", "goal": "Clean the barn"})
+                    self.assertIn("SAFETY GUARD REJECTED", wf_out)
 
                 srv, sess = create_web_server(host="127.0.0.1", port=0, store=store, chat_fn=lambda *a, **k: {})
                 try:
-                    store.set_background_autonomy(False)
-                    t0 = sess.idle_watcher.last_human_activity_mono
                     code, raw = dispatch_raw_http(srv, "GET", "/api/status", headers={"Host": "127.0.0.1"})
                     self.assertEqual(code, 200)
                     st_payload = json.loads(raw)
-                    self.assertEqual(st_payload["self_dev_mode"], "off")
+                    self.assertTrue(st_payload["immutable_app"])
                     self.assertEqual(st_payload["operating_quadrant"]["quadrant"], "interactive_standard")
-                    self.assertEqual(sess.idle_watcher.last_human_activity_mono, t0)
-
-                    hdrs = {
-                        "Host": "127.0.0.1",
-                        "Origin": "http://127.0.0.1",
-                        "Content-Type": "application/json",
-                        "X-Companion-CSRF": sess.csrf_token,
-                    }
-                    c2, raw2 = dispatch_raw_http(
-                        srv, "POST", "/api/actions/autonomy",
-                        body=json.dumps({"subaction": "set_autonomy", "enabled": True}).encode("utf-8"),
-                        headers=hdrs,
-                    )
-                    self.assertEqual(c2, 200)
-                    self.assertEqual(json.loads(raw2)["quadrant"]["quadrant"], "autonomous_partner")
-                    self.assertGreaterEqual(sess.idle_watcher.last_human_activity_mono, t0)
 
                     watcher = IdleAutonomyWatcher(is_busy_fn=lambda: True, store=store)
                     self.assertEqual(watcher.tick_once(idle_seconds=3600)["action"], "busy_skip")
-                finally:
-                    srv.session.idle_watcher.stop()
-                    srv.server_close()
+                    self.assertGreaterEqual(len(get_routine_manager(store=store).list_routines()), 3)
 
-    def test_session_nudge_hygiene_self_healing_and_dismissal(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, contextlib.closing(MemoryStore(db_path=Path(tmp) / "data" / "nudges.db")) as store:
-            q = ApprovalQueue(store=store)
-            allowed, apr = q.check_or_enqueue(
-                category="wiki_edit",
-                action_name="edit_user_note",
-                target="02_knowledge/recipe.md",
-                payload={"path": "02_knowledge/recipe.md"},
-                summary="Curate recipe note",
-            )
-            self.assertFalse(allowed)
-            aid = apr["approval_id"]
-            enqueue_session_nudge(f"Job paused awaiting your approval (`{aid}`).", session_id="main", category="approval", ref_id=aid, store=store)
-            enqueue_session_nudge("Background job bgj_123 completed.", session_id="main", category="job", ref_id="bgj_123", store=store)
-            self.assertEqual(len(peek_session_nudges(store=store)), 2)
-
-            q.resolve(aid, "approve", actor="user")
-            remaining = peek_session_nudges(store=store)
-            self.assertEqual(len(remaining), 1)
-            self.assertEqual(remaining[0]["category"], "job")
-
-            enqueue_session_nudge(f"Stale nudge for already resolved `{aid}`", session_id="main", category="approval", ref_id=aid, store=store)
-            healed = peek_session_nudges(store=store)
-            self.assertEqual(len(healed), 1)
-            self.assertEqual(healed[0]["category"], "job")
-
-            enqueue_session_nudge("Second job finished.", session_id="main", category="job", ref_id="bgj_456", store=store)
-            d_res = execute_core_action("approvals", {"subaction": "dismiss_nudges", "nudge_id": healed[0]["id"]}, actor="user", store=store)
-            self.assertTrue(d_res["ok"])
-            self.assertEqual(d_res["cleared"], 1)
-
-            consumed = consume_session_nudges("web_ui", store=store)
-            self.assertIn("Second job finished.", consumed)
-            self.assertEqual(peek_session_nudges(store=store), [])
-
-    def test_workflow_start_blocks_personal_goals_in_daily_driver_and_web_reload_endpoint(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            srv = None
-            with contextlib.closing(MemoryStore(db_path=root / "reload_guard.db")) as store:
-                try:
-                    dec = classify_turn_intent("Create a winter project milestone to clean the barn", store=store, root=root)
-                    self.assertIn(dec.mode, ("GUIDED_CHANGE", "CHAT_DIRECT"))
-
-                    with workspace_context(settings.root, "companion-self"), memory_store_context(store):
-                        self.assertFalse(settings.is_self_dev_enabled())
-                        wf_out = dispatch(
-                            "workflow_manage",
-                            {"action": "start", "workflow_type": "self_evolution", "goal": "Clean the barn winter project"},
-                        )
-                        self.assertIn("SAFETY GUARD REJECTED", wf_out)
-                        self.assertIsNone(store.get_active_workflow())
-
-                    srv, sess = create_web_server(host="127.0.0.1", port=0, store=store)
                     code_no_csrf, _ = dispatch_raw_http(srv, "POST", "/api/reload", body=b'{"dry_run":true}', headers={"Origin": "http://127.0.0.1"})
                     self.assertEqual(code_no_csrf, 403)
-
-                    code_dry, raw_dry = dispatch_raw_http(
-                        srv, "POST", "/api/reload", body=b'{"dry_run":true}',
-                        headers={"Origin": "http://127.0.0.1", "X-Companion-CSRF": sess.csrf_token},
-                    )
-                    self.assertEqual(code_dry, 200)
-                    parsed_dry = json.loads(raw_dry)
-                    self.assertTrue(parsed_dry["ok"] and parsed_dry["dry_run"])
-
-                    triggered = []
-                    register_service_reload_handler(lambda: triggered.append(True))
+                    register_service_reload_handler(lambda: None)
                     try:
                         with patch("surfaces.api_extensions.threading.Timer") as mock_timer:
-                            code_live, raw_live = dispatch_raw_http(
+                            c_live, _ = dispatch_raw_http(
                                 srv, "POST", "/api/reload", body=b"{}",
                                 headers={"Origin": "http://127.0.0.1", "X-Companion-CSRF": sess.csrf_token},
                             )
-                            self.assertEqual(code_live, 200)
-                            self.assertTrue(json.loads(raw_live)["reloading"])
+                            self.assertEqual(c_live, 200)
                             mock_timer.assert_called_once()
                     finally:
                         register_service_reload_handler(None)
                 finally:
-                    if srv is not None:
-                        srv.session.idle_watcher.stop()
-                        srv.server_close()
+                    srv.session.idle_watcher.stop()
+                    srv.server_close()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from companion.llm import format_model_tiers_status
 from companion.mcp_hub import format_connected_partners_hud
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.project_graph import format_project_graph_hud, get_project_graph
+from companion.sdlc_tools import discover_repo_sdlc_context
 from companion.workflow_graph import WorkflowEngine, workflow_engine
 
 __all__ = [
@@ -118,9 +119,9 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
     verb, rest = (parts[0].lower() if parts else "status"), (parts[1].strip() if len(parts) > 1 else "")
 
     if verb in ("status", "current", ""):
-        ws, sd_on = settings.get_workspace(), mem.is_self_dev_mode_enabled()
-        lock = (("UNLOCKED (Self-Dev Mode ON — Core Self-Evolution Active)" if sd_on else "READ-ONLY LOCKED (Self-Dev Mode OFF per ADR-019 — `data/` writable; enable via `/selfdev on`)") if ws.is_self_project else f"READ-ONLY LOCKED (`{ws.self_root}` protected per ADR-007)")
-        return f"=== Active WorkspaceContext ===\nProject ID    : `{ws.project_id}`\nProject Root  : {ws.project_root}\nCompanion Core: {lock}\n(Use `/project list`, `/project init <name|path>`, `/project switch <name|path>`, `/project self`, or `/selfdev on|off`.)"
+        ws = settings.get_workspace()
+        lock = "PERMANENTLY IMMUTABLE (`ADR-019` — `data/` & `data/scratch/` writable)" if ws.is_self_project else f"IMMUTABLE (`{ws.self_root}` protected per `ADR-007` / `ADR-019`)"
+        return f"=== Active WorkspaceContext ===\nProject ID    : `{ws.project_id}`\nProject Root  : {ws.project_root}\nCompanion Core: {lock}\n(Use `/project list`, `/project init <name|path>`, `/project switch <name|path>`, or `/project self`.)"
     if verb == "list":
         ws = settings.get_workspace()
         lines = ["=== Registered Workspaces ===", f"  * `{SELF_PROJECT_ID}` -> {settings.root.resolve()}{' [ACTIVE]' if ws.is_self_project else ''}"]
@@ -130,8 +131,7 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
     if verb in ("self", SELF_PROJECT_ID, "reset", "home"):
         ws = settings.reset_workspace()
         _persist_workspace_selection(mem, ws.project_id, ws.project_root, known)
-        core_state = "Companion core unlocked (`Self-Dev Mode = ON`)." if mem.is_self_dev_mode_enabled() else "Companion core remains READ-ONLY (`Self-Dev Mode = OFF`; `data/` writable)."
-        return f"Switched active WorkspaceContext back to `{ws.project_id}` ({ws.project_root}). {core_state}"
+        return f"Switched active WorkspaceContext back to `{ws.project_id}` ({ws.project_root}). Installed `app/` remains immutable (`data/` & `data/scratch/` writable)."
     if verb in ("init", "create", "new"):
         if not rest:
             return "error: project name or path is required for `init` (e.g., `/project init my-app`)."
@@ -361,12 +361,11 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
     if not default_md.is_file():
         mem.sync_memory_md(target_path=default_md)
     prof, ws = mem.get_user_profile(), settings.get_workspace()
-    self_dev_on = settings.is_self_dev_enabled() if mem.db_path.resolve() == settings.db_path.resolve() else (settings.get_self_dev_override() if settings.get_self_dev_override() is not None else mem.is_self_dev_mode_enabled())
     identity_text, host_hud = _format_identity_hud_block(prof), _format_host_runtime_hud()
     ws_lock = (
-        ("Self-Evolution (`companion-self` | `Self-Dev=ON`)" if self_dev_on else "Daily-Driver Runtime (`companion-self` | `Self-Dev=OFF`, core read-only; `data/`, Wiki & external projects writable)")
+        f"OS Daily-Driver Runtime (`{ws.project_id}` | installed `app/` immutable; `data/`, `data/scratch/`, Wiki & external Project workspaces writable)"
         if ws.is_self_project
-        else f"External Workspace (`{ws.project_id}` -> `{ws.project_root}`; Companion core read-only)"
+        else f"External Workspace (`{ws.project_id}` -> `{ws.project_root}`; Companion installed `app/` immutable)"
     )
     trust_mode, partners_hud = get_trust_mode(store=mem), format_connected_partners_hud(store=mem)
     partners_section = f"\n{partners_hud}\n" if partners_hud else ""
@@ -381,13 +380,10 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
         if grounding.known_facts:
             known_block = "\n[KNOWN FACTS]\n" + "\n".join(f"  - [{e.source}] `{e.key}`: {e.content}" for e in grounding.known_facts[:5]) + "\n"
 
-    self_dev_block = ""
-    if ws.is_self_project and self_dev_on:
+    ext_radar_block = ""
+    if not ws.is_self_project and (ws.project_root / "companion").is_dir():
         repo_radar = build_workspace_radar(ws.project_root)
-        self_dev_block = (
-            f"\n[CODEBASE AST & LINE-BUDGET RADAR (`{ws.project_id}`)]\n{repo_radar}\n"
-            "- SDD & Ring-0 Rules: Keep Ring-0 100% Python stdlib, modules <=700L, functions <=100L, and sync `specs/` (`sdd_manage` / `system_doctor`).\n"
-        )
+        ext_radar_block = f"\n[CODEBASE AST & LINE-BUDGET RADAR (`{ws.project_id}`)]\n{repo_radar}\n"
 
     os_rule = (
         "- Windows Host: Use PowerShell-compatible commands in `run_shell`, and prefer `run_python` for Python scripts (never bash heredocs)."
@@ -399,11 +395,11 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
         f"[RUNTIME & GOVERNANCE]\n"
         f"- Runtime  : {host_hud}\n"
         f"- Workspace: {ws_lock}\n"
-        f"- Paths    : data=`{settings.effective_data_dir}` | wiki=`{settings.wiki_dir}` | trust=`{trust_mode}` | privacy=`{settings.effective_privacy_mode()}`\n"
+        f"- Paths    : data=`{settings.effective_data_dir}` | scratch=`{settings.scratch_dir}` | wiki=`{settings.wiki_dir}` | trust=`{trust_mode}` | privacy=`{settings.effective_privacy_mode()}`\n"
         f"{partners_section}\n"
         f"{agile_hud}\n\n"
         f"{edu_hud}\n"
-        f"{known_block}{self_dev_block}\n"
+        f"{known_block}{ext_radar_block}\n"
         f"[AVAILABLE SKILLS — PROGRESSIVE DISCLOSURE RUNBOOKS (L2)]\n"
         f"Read `skills/<name>/SKILL.md` via `read_file` when a domain runbook applies: {skill_names}\n\n"
         f"[EXECUTION REMINDERS]\n"
@@ -430,6 +426,10 @@ def build_turn_context(
     pending_tasks = mem.get_pending_tasks()[:3]
     if pending_tasks:
         lines.append("focus_tasks: " + "; ".join(f"#{tid}({st}) {desc[:60]}" for tid, desc, st, _ in pending_tasks))
+    if not ws.is_self_project and ws.project_root.is_dir():
+        proj_rec = get_project_graph(mem).get_project()
+        if sdlc_ctx := discover_repo_sdlc_context(ws.project_root, project=proj_rec):
+            lines.append(sdlc_ctx)
     if user_query.strip():
         skills = discover_skills(settings.root)
         grounding = build_epistemic_grounding(user_query, store=mem, root=ws.project_root, skills=skills, top_k=3)

@@ -90,7 +90,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
     { key: 'nav_cust', group: 'Navigation & Settings', label: 'Customizations', sub: 'Skills, Verified Python DAGs & MCP Harvester', icon: <Wrench size={14} />, run: () => onSelectSurface('customizations') },
     { key: 'set_models', group: 'Navigation & Settings', label: 'Settings: Models & Tiers', sub: 'Providers, capability tiers & context window', icon: <Settings size={14} />, run: () => onOpenSettings('models') },
     { key: 'set_vault', group: 'Navigation & Settings', label: 'Settings: Blind Credential Vault & Endpoints', sub: 'Secrets, SSH, WinRM & HTTP endpoints', icon: <Settings size={14} />, run: () => onOpenSettings('vault') },
-    { key: 'set_ops', group: 'Navigation & Settings', label: 'Settings: Backups, Sandboxes & System Doctor', sub: 'Snapshots, self-dev clones & 7-stage diagnostics', icon: <Settings size={14} />, run: () => onOpenSettings('ops') },
+    { key: 'set_ops', group: 'Navigation & Settings', label: 'Settings: Backups & System Doctor', sub: 'Snapshots, service reload & 7-stage diagnostics', icon: <Settings size={14} />, run: () => onOpenSettings('ops') },
   ].filter((a) => !low || a.label.toLowerCase().includes(low) || a.sub.toLowerCase().includes(low));
 
   const projectEntries: PaletteEntry[] = projects

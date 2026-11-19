@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from companion.calendar_engine import get_calendar_manager
-from companion.config import self_dev_override_context, workspace_context
+from companion.config import settings, workspace_context
 from companion.context import build_system_prompt
 from companion.core_actions import execute_core_action, handle_harvest_slash
 from companion.education_engine import get_education_engine
@@ -263,15 +263,27 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
             self.assertIn("Fix GDM Black Screen", ws_out)
             self.assertIn("https://example.com/gdm", ws_out)
 
-            # Scoped repo-internal tools: hidden in daily-driver mode, exposed when Self-Dev ON
-            with self_dev_override_context(False):
+            # Scoped repo-internal tools: hidden in daily OS mode, exposed when focused on an external repo workspace
+            with workspace_context(settings.root, "companion-self"):
                 daily_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
                 self.assertNotIn("sdd_manage", daily_names)
                 self.assertNotIn("system_doctor", daily_names)
-            with self_dev_override_context(True):
+                self.assertNotIn("git_manage", daily_names)
+                self.assertNotIn("dev_preview", daily_names)
+            ext_ws = self.tmp_path / "ext_sdlc_repo"
+            (ext_ws / ".git").mkdir(parents=True, exist_ok=True)
+            with workspace_context(ext_ws, "ext-sdlc-repo"):
                 dev_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
-                self.assertIn("sdd_manage", dev_names)
-                self.assertIn("system_doctor", dev_names)
+                self.assertIn("git_manage", dev_names)
+                self.assertIn("dev_preview", dev_names)
+                self.assertNotIn("sdd_manage", dev_names)
+            (ext_ws / "companion").mkdir(parents=True, exist_ok=True)
+            (ext_ws / "specs").mkdir(parents=True, exist_ok=True)
+            (ext_ws / "specs" / "ARCHITECTURE.md").write_text("# architecture\n", encoding="utf-8")
+            with workspace_context(ext_ws, "ext-companion-clone"):
+                comp_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
+                self.assertIn("sdd_manage", comp_names)
+                self.assertIn("system_doctor", comp_names)
 
 
 if __name__ == "__main__":

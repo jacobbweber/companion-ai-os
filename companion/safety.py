@@ -59,7 +59,7 @@ _DESTRUCTIVE_CMD_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:del|erase|rd|rmdir)\s+[^\n;&|]*/s[^\n;&|]*/q\s+['\"]?(?:[a-zA-Z]:\\|\*|\\)", re.I), "destructive Windows drive/wildcard wipe"),
     (re.compile(r"\b(?:Remove-Item|ri|rm|del|rd|rmdir)\b[^\n;&|]*(?:-Recurse|-r\b)[^\n;&|]*(?:[a-zA-Z]:\\|/(?:\s|$|[a-zA-Z])|~|\.\.(?:/|\\|\s|$)|\*(?:\s|$))", re.I), "destructive recursive PowerShell item wipe on root/home/parent/wildcard"),
     (re.compile(r"\b(?:DROP\s+TABLE|TRUNCATE\s+TABLE)\b", re.I), "destructive SQL table drop/truncate"),
-    (re.compile(r"(?:UPDATE\s+user_profile|INSERT\s+[^\n;]*user_profile|REPLACE\s+INTO\s+user_profile|set_self_dev_mode)\b[^\n;]*self_dev_mode|self_dev_mode[^\n;]*(?:UPDATE\s+user_profile|INSERT\s+INTO\s+user_profile)", re.I), "privilege-escalation mutation of human-only `self_dev_mode`"),
+    (re.compile(r"(?:UPDATE\s+user_profile|INSERT\s+[^\n;]*user_profile|REPLACE\s+INTO\s+user_profile)\b[^\n;]*(?:trust_mode|immutable_app|immutable_core|self_dev_mode)|(?:trust_mode|immutable_app|immutable_core|self_dev_mode)[^\n;]*(?:UPDATE\s+user_profile|INSERT\s+INTO\s+user_profile)", re.I), "privilege-escalation mutation of protected `user_profile` governance keys"),
     (re.compile(r"\b(?:pkill|killall)\b[^\n;&|]*\b(?:systemd|init|launchd|sshd)\b", re.I), "signaling OS/session init or SSH supervisor daemon"),
     (re.compile(r"\bsystemctl\b[^\n;&|]*\b(?:stop|kill|disable|mask)\b[^\n;&|]*\bcompanion(?:\.service)?\b", re.I), "stopping or disabling Companion's own service unit"),
     (re.compile(r"(?:secrets\.env|\.comp_ssh_|\.secrets_|\.ssh_tmp|(?:^|[\s'\"/\\])\.env(?!\.(?:example|sample|template))\b)", re.I), "reading or mutating Blind Vault / `.env` secret stores from subprocess"),
@@ -120,9 +120,8 @@ def check_path_safety(path: Path, write: bool = False, allowed_roots: Optional[L
         elif write:
             if resolved.is_relative_to(ws.self_root) and not resolved.is_relative_to(ws.project_root):
                 return (
-                    f"SAFETY GUARD REJECTED path: Companion core (`{ws.self_root}`) is mechanically locked READ-ONLY "
-                    f"while working on external project `{ws.project_id}` (`{ws.project_root}`). "
-                    "Switch back via `/project self` or `project_manage(action='self')` to self-edit."
+                    f"SAFETY GUARD REJECTED path: Companion's installed `app/` runtime (`{ws.self_root}`) is permanently IMMUTABLE / READ-ONLY (`ADR-007` / `ADR-019`) "
+                    f"while working on external project `{ws.project_id}` (`{ws.project_root}`)."
                 )
             roots = [ws.project_root, tmp_root]
         else:
@@ -155,13 +154,14 @@ def check_path_safety(path: Path, write: bool = False, allowed_roots: Optional[L
                 "Use `wiki_manage` so Knowledge Wiki co-ownership and curation rules are enforced."
             )
         ws_chk = settings.get_workspace()
-        if ws_chk.is_self_project and not settings.is_self_dev_enabled() and resolved.is_relative_to(ws_chk.self_root):
-            data_roots = [(ws_chk.self_root / "data").resolve(), settings.effective_data_dir.resolve()]
+        if ws_chk.is_self_project and resolved.is_relative_to(ws_chk.self_root):
+            data_roots = [settings.effective_data_dir.resolve()]
+            if not settings.immutable_app or settings.data_dir is None:
+                data_roots.append((ws_chk.self_root / "data").resolve())
             if not any(resolved.is_relative_to(dr) for dr in data_roots):
                 return (
-                    f"SAFETY GUARD REJECTED path: Companion core (`{ws_chk.self_root}`) is mechanically locked READ-ONLY "
-                    "because `Self-Dev Mode` is OFF (`ADR-019`). Enable `/selfdev on` (or toggle `Self-Dev Mode` in "
-                    "Web UI `Settings -> General & Autonomy`), or write inside `data/` or an external `/project` workspace."
+                    f"SAFETY GUARD REJECTED path: Companion's installed `app/` runtime (`{ws_chk.self_root}`) is permanently IMMUTABLE (`ADR-019`). "
+                    "Write inside `data/` (`data/scratch/`) or focus an external Project clone (`workspace_path`)."
                 )
     return None
 
@@ -391,6 +391,7 @@ def run_unit_tests(root: Optional[Path] = None, timeout: int = 90, pattern: str 
     env = {
         **os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
         "PYTHONPATH": str(target_root), "COMPANION_IN_DOCTOR_TESTS": "1", "COMPANION_TEST_MODE": "1",
+        "NO_PROXY": "127.0.0.1,localhost,::1", "no_proxy": "127.0.0.1,localhost,::1",
     }
     try:
         proc = subprocess.run(
@@ -459,7 +460,7 @@ def run_system_doctor(root: Optional[Path] = None, run_tests: bool = True) -> Di
     db_name, adr_cnt, profile = _inspect_doctor_db(target_root)
     checks.append({
         "check": "6. SQLite Memory, ADRs & Autonomy Store", "passed": adr_cnt > 0 and len(profile) > 0,
-        "details": f"DB healthy ({db_name}): {adr_cnt} ADRs, {len(profile)} profile keys, background_autonomy={profile.get('background_autonomy', profile.get('hobby_mode', 'off'))}, self_dev_mode={profile.get('self_dev_mode', 'off')}.",
+        "details": f"DB healthy ({db_name}): {adr_cnt} ADRs, {len(profile)} profile keys, background_autonomy={profile.get('background_autonomy', 'off')}, immutable_app={settings.immutable_app}.",
     })
 
     if run_tests:

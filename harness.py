@@ -54,8 +54,8 @@ if os.name == "nt" and (sys.stdout is None or Path(sys.executable).name.lower().
 
 
 def _emergency_boot_rollback(root_dir: Path, err: Exception) -> bool:
-    """If an autonomous self-dev edit breaks boot imports, restore touched files from a fresh CoW checkpoint without deleting untracked files."""
-    if "--doctor" in sys.argv or os.environ.get("COMPANION_TEST_MODE") == "1" or os.environ.get("COMPANION_SELF_DEV_MODE", "").strip().lower() not in ("1", "true", "on", "yes"):
+    """If an emergency boot recovery flag is set and imports fail, restore touched files from a fresh CoW checkpoint."""
+    if "--doctor" in sys.argv or os.environ.get("COMPANION_TEST_MODE") == "1" or os.environ.get("COMPANION_BOOT_ROLLBACK", "").strip().lower() not in ("1", "true", "on", "yes"):
         return False
     raw_data = os.environ.get("COMPANION_DATA_DIR", "").strip()
     data_base = (Path(raw_data) if Path(raw_data).is_absolute() else (root_dir / raw_data)).resolve() if raw_data else (root_dir / "data")
@@ -119,7 +119,7 @@ def _extract_boot_env_flags(raw_argv: List[str]) -> List[str]:
             os.environ["COMPANION_DATA_DIR"] = tok.split("=", 1)[1].strip()
             idx += 1
         elif tok in ("--locked", "--immutable"):
-            os.environ["COMPANION_SELF_DEV_LOCKED"] = "1"
+            os.environ["COMPANION_IMMUTABLE_APP"] = "1"
             idx += 1
         else:
             cleaned.append(raw_argv[idx])
@@ -139,11 +139,10 @@ for _boot_attempt in range(2):
         from companion.memory_store import get_memory_store
         from companion.routines import IdleAutonomyWatcher, reconcile_startup_missed_runs
         from companion.safety import checkpoint_manager, run_system_doctor
-        from companion.sdd import sync_decisions_md
         from companion.tools import (
             TOOL_IMPLS, TOOLS, dispatch, resolve,
-            tool_agile_manage, tool_calendar_manage, tool_checkpoint_manage, tool_edit_file,
-            tool_education_manage, tool_endpoint_manage,
+            tool_agile_manage, tool_calendar_manage, tool_checkpoint_manage, tool_dev_preview, tool_edit_file,
+            tool_education_manage, tool_endpoint_manage, tool_git_manage,
             tool_job_manage, tool_list_dir, tool_mcp_manage, tool_memory_manage, tool_project_manage,
             tool_read_file, tool_routine_manage, tool_run_python, tool_run_shell, tool_sdd_manage,
             tool_search, tool_system_doctor, tool_task_manage, tool_telemetry_manage,
@@ -302,7 +301,7 @@ def _handle_cli_args(argv: List[str], store) -> None:
         "--goal": "/goal", "-g": "/goal",
         "--backlog": "/backlog", "-b": "/backlog",
         "--specs": "/specs", "--skills": "/skills", "--subagent": "/subagent", "--hygiene": "/hygiene",
-        "--autonomy": "/autonomy", "--selfdev": "/selfdev", "--self-dev": "/selfdev", "--morning": "/morning",
+        "--autonomy": "/autonomy", "--morning": "/morning",
         "--memory": "/memory", "--checkpoint": "/checkpoint",
         "--rollback": "/rollback", "--reset": "/reset",
         "--identity": "/identity", "--tone": "/tone", "--model": "/model", "--models": "/model", "--providers": "/providers", "--onboard": "/onboard",
@@ -311,7 +310,7 @@ def _handle_cli_args(argv: List[str], store) -> None:
         "--compact": "/compact",
         "--jobs": "/jobs", "--wiki": "/wiki", "--vault": "/vault", "--endpoints": "/endpoints",
         "--mcp": "/mcp", "--partners": "/partners", "--routines": "/routines", "--approvals": "/approvals",
-        "--trust": "/trust", "--prompts": "/prompts", "--backup": "/backup", "--archive": "/archive", "--sandbox": "/sandbox",
+        "--trust": "/trust", "--prompts": "/prompts", "--backup": "/backup", "--archive": "/archive",
         "--board": "/board", "--boards": "/boards", "--sprint": "/sprint", "--calendar": "/calendar", "--study": "/study",
         "--help": "/help", "-h": "/help",
     }
@@ -355,8 +354,6 @@ def main() -> None:
         return
     store = get_memory_store()
     store.sync_memory_md()
-    if settings.is_self_dev_enabled():
-        sync_decisions_md(store=store)
     reconcile_startup_missed_runs(store=store)
 
     if argv:
@@ -364,9 +361,8 @@ def main() -> None:
         return
 
     autonomy_badge = "ON" if store.is_background_autonomy_enabled() else "OFF"
-    sd_badge = "ON" if store.is_self_dev_mode_enabled() else "OFF(RO)"
-    print(f"Companion AI OS v{__version__[:3]}  |  model={settings.model}  |  project={settings.get_workspace().project_id}  |  autonomy={autonomy_badge}  |  self_dev={sd_badge}")
-    print("Commands: /status, /selfdev, /autonomy, /jobs, /wiki, /vault, /endpoints, /mcp, /routines, /trust, /goal, /doctor, /help, exit")
+    print(f"Companion AI OS v{__version__[:3]}  |  model={settings.model}  |  project={settings.get_workspace().project_id}  |  autonomy={autonomy_badge}  |  app=IMMUTABLE")
+    print("Commands: /status, /autonomy, /jobs, /wiki, /vault, /endpoints, /mcp, /routines, /trust, /goal, /doctor, /help, exit")
     if not is_identity_bootstrapped(store=store) and sys.stdin.isatty():
         run_first_boot_onboarding(store=store)
     unseen = store.get_autonomy_journal(unseen_only=True, mark_seen=False)

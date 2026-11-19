@@ -56,7 +56,6 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
   const [rtIdleSec, setRtIdleSec] = useState(900);
   const [rtCoolSec, setRtCoolSec] = useState(3600);
   const [rtPrecheck, setRtPrecheck] = useState('');
-  const [rtSelfDev, setRtSelfDev] = useState(false);
   const [rtKind, setRtKind] = useState('snapshot_backup');
   const [rtTargetName, setRtTargetName] = useState('');
 
@@ -90,7 +89,6 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
         setRtIdleSec(900);
         setRtCoolSec(3600);
         setRtPrecheck('');
-        setRtSelfDev(false);
         setRtKind('snapshot_backup');
         setRtTargetName('');
       } else {
@@ -105,7 +103,6 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
             setRtIdleSec(found.trigger_policy?.idle_min_seconds ?? 900);
             setRtCoolSec(found.trigger_policy?.cooldown_seconds ?? 3600);
             setRtPrecheck(found.trigger_policy?.precheck_name || '');
-            setRtSelfDev(Boolean(found.trigger_policy?.requires_self_dev));
             setRtKind(found.target_kind);
             setRtTargetName(found.target_name || '');
           }
@@ -206,7 +203,6 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
       idle_min_seconds: rtIdleSec,
       cooldown_seconds: rtCoolSec,
       precheck_name: rtPrecheck,
-      requires_self_dev: rtSelfDev,
       target_kind: rtKind,
       target_name: rtTargetName.trim(),
       enabled: true,
@@ -329,7 +325,6 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                     <option value="wiki_inbox_or_stale">wiki_inbox_or_stale</option>
                     <option value="recent_unconsolidated_chat">recent_unconsolidated_chat</option>
                     <option value="recent_warn_or_slow_spans">recent_warn_or_slow_spans</option>
-                    <option value="workspace_hygiene_or_sdd_drift">workspace_hygiene_or_sdd_drift</option>
                     <option value="active_goal_has_ready_items">active_goal_has_ready_items</option>
                   </select>
                 </div>
@@ -354,11 +349,6 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                 <input className="input mono" placeholder="e.g. release-check" value={rtTargetName} onChange={(e) => setRtTargetName(e.target.value)} />
               </div>
             </div>
-
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5 }}>
-              <input type="checkbox" checked={rtSelfDev} onChange={(e) => setRtSelfDev(e.target.checked)} />
-              <span>Requires Self-Dev Mode = ON</span>
-            </label>
 
             <button type="button" className="btn btn-primary" onClick={() => void saveRoutine()}>
               Save Routine

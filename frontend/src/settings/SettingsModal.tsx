@@ -106,22 +106,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const bgAutonomy = status?.background_autonomy === 'on';
-  const selfDev = Boolean(status?.self_dev_enabled);
   const trustMode = status?.trust_mode || 'balanced';
   const privacyMode = status?.privacy_mode || 'local_only';
 
-  const setOperatingLevers = async (nextBg: boolean, nextSelfDev: boolean) => {
+  const setOperatingLevers = async (nextBg: boolean) => {
     if (nextBg !== bgAutonomy) {
       const rBg = await callAction('autonomy', { subaction: 'set_autonomy', enabled: nextBg });
       if (rBg.ok === false) {
         onToast(rBg.error || 'Could not update Background Autonomy.');
-        return;
-      }
-    }
-    if (nextSelfDev !== selfDev) {
-      const r = await callAction('autonomy', { subaction: 'set_self_dev', enabled: nextSelfDev });
-      if (r.ok === false) {
-        onToast(r.error || 'Could not update Self-Dev Mode.');
         return;
       }
     }
@@ -169,8 +161,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       sub: 'Configure inbound MCP order counter and paired remote Companion instances.',
     },
     ops: {
-      title: 'Backups, Sandboxes & System Doctor',
-      sub: 'Secret-free snapshots, isolated Self-Dev clones, 7-stage System Doctor, and service reload.',
+      title: 'Backups & System Doctor',
+      sub: 'Secret-free snapshots, 7-stage System Doctor, and service reload.',
     },
   };
 
@@ -266,7 +258,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     type="button"
                     className={`posture-choice-card ${!bgAutonomy ? 'selected' : ''}`}
-                    onClick={() => void setOperatingLevers(false, selfDev)}
+                    onClick={() => void setOperatingLevers(false)}
                   >
                     <div style={{ fontWeight: 600, marginBottom: 4 }}>Interactive Partner</div>
                     <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
@@ -276,7 +268,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     type="button"
                     className={`posture-choice-card ${bgAutonomy ? 'selected' : ''}`}
-                    onClick={() => void setOperatingLevers(true, selfDev)}
+                    onClick={() => void setOperatingLevers(true)}
                   >
                     <div style={{ fontWeight: 600, marginBottom: 4 }}>Autonomous Partner</div>
                     <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
@@ -297,28 +289,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       type="button"
                       data-testid="toggle-background-autonomy"
                       className={`switch-toggle ${bgAutonomy ? 'on' : ''}`}
-                      onClick={() => void setOperatingLevers(!bgAutonomy, selfDev)}
+                      onClick={() => void setOperatingLevers(!bgAutonomy)}
                       aria-label="Toggle Background Autonomy"
                     />
                   </div>
 
                   <div className="card-row">
                     <div className="card-row-info">
-                      <div className="card-row-title">Self-Development Core Unlock</div>
+                      <div className="card-row-title">Installed App Runtime</div>
                       <div className="card-row-desc">
-                        {status?.self_dev_locked
-                          ? `Locked by environment: ${status.self_dev_lock_reason}`
-                          : 'When OFF (default), Companion core source is mechanically read-only while data/ and user skills stay writable.'}
+                        Companion&apos;s own runtime directory is permanently immutable; software projects run in external Git repositories or data/scratch/.
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      data-testid="toggle-self-dev"
-                      disabled={Boolean(status?.self_dev_locked)}
-                      className={`switch-toggle ${selfDev ? 'on' : ''}`}
-                      onClick={() => void setOperatingLevers(bgAutonomy, !selfDev)}
-                      aria-label="Toggle Self-Dev Mode"
-                    />
+                    <span className="badge ok" data-testid="immutable-app-badge">Immutable</span>
                   </div>
 
                   <div className="card-row">

@@ -2,7 +2,7 @@
 Persistent SQLite State & Memory Store (`companion/memory_store.py` — Domain Layer).
 
 Thread-safe WAL SQLite store managing conversation history (with FTS5 + semantic RRF),
-user profile & two-lever autonomy state (`background_autonomy` x `self_dev_mode`),
+user profile & Background Autonomy state (`background_autonomy`),
 ADRs, state-machine workflows, knowledge facts, autonomy journal, and the canonical
 Universal Project & Goal Graph (`projects`, `milestones`, `project_timeboxes`, `work_items`).
 """
@@ -74,7 +74,6 @@ DEFAULT_USER_PROFILE: Dict[str, str] = {
     "operating_mode": "Spec-Driven, state-machine & Python-DAG governed execution with AST syntax guards, dead-code hygiene checks, and checkpoint rollback protection.",
     "platform": _detect_runtime_platform(),
     "background_autonomy": "off",
-    "self_dev_mode": "off",
     "active_project_id": SELF_PROJECT_ID,
 }
 
@@ -97,7 +96,7 @@ FOUNDATIONAL_ADRS: List[Tuple[str, str, str, str]] = [
     ("ADR-016: Companion 3.0 Harvest Backend — Shared CoreActions, Forever-Chat Jobs, Co-Owned Wiki 2.0, Blind Vault, Universal Endpoints, Partner-Aware Federated MCP & Respectful Routines", "Extracting capabilities from legacy homelab/agent systems risked mixing UI/core concerns, leaking secrets in a zero-login LAN environment, cluttering primary chat, or causing downtime cron storms.", "Introduce `CORE_ACTIONS` (`companion/core_actions.py`), Zero-Identity Background Jobs with <=200-token Wiki Inbox overflow (`companion/background_jobs.py`), 4-folder Dual-Author Knowledge Wiki (`companion/wiki_engine.py`), write-only Zero-Reveal `secrets.env` Vault + secret-free backups (`companion/vault.py`), SSH/WinRM/HTTP Connectors (`companion/endpoints.py`), Outbound + Inbound 'Order Counter' MCP Hub with Partner-Aware Federation (`companion/mcp_hub.py`), and Hardware-Gated Routines + Clone Sandboxes (`companion/routines.py`).", "Complete headless multi-machine & knowledge operating system honoring strict downward A-Frame boundaries and zero-reveal LAN security."),
     ("ADR-017: Stage 6 Multi-Studio React + TypeScript Frontend (`frontend/`) Compiling into Zero-Node Stdlib `surfaces/static/`", "Surfacing all 6 Companion 3.0 Harvest studios in raw vanilla JS strings would cause unmaintainable UI sprawl, while adding a runtime Node server would violate `ADR-001`.", "Author a modular React 19 + TypeScript + Vite frontend in `frontend/` with a Matte Brutalist Sci-Fi / Obsidian 4-preset theme system (`obsidian`, `orbital`, `graphite`, `daylight` + 1-click Light/Dark toggle) that compiles deterministically (`iife`) into `surfaces/static/{index.html,styles.css,app.js}` served directly by stdlib `surfaces/web_server.py` (`python harness.py --web`).", "Typed, self-maintainable 6-Studio AI workstation UI with zero runtime Node dependency, 100% offline LAN execution, and strict Ring-0 Python stdlib purity."),
     ("ADR-018: Multi-Provider LLM Registry, Pure-Stdlib Wire Dialects, Blind Vault Key Binding & Mechanical LAN Privacy Lock", "Supporting both local LAN servers (Ollama, vLLM, LM Studio, llama.cpp) and frontier cloud APIs (Gemini, Anthropic Claude, OpenAI, xAI Grok, OpenRouter, DeepSeek, Groq) via static `.env` edits forced restarts, risked API key leakage, and lost provider-native reasoning/multimodal capabilities.", "Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`-by-default/`hybrid`/`cloud_allowed` outbound privacy lock).", "Instant hot-reload routing across local LAN and frontier models from Web UI and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy."),
-    ("ADR-019: Independent Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`) & Mechanical Read-Only Core Lock", "Running a daily-driver Companion release with background execution risked unrequested code mutations, while coupling idle autonomy to self-evolution prevented quiet knowledge/routine/goal execution on stable builds.", "Maintain `Background Autonomy` (`on`/`off`) and `Self-Dev Mode` (`on`/`off`, seedable/lockable via `COMPANION_SELF_DEV`, `COMPANION_SELF_DEV_LOCKED`, `COMPANION_IMMUTABLE_CORE`) as two independent levers; mechanically lock Companion core files read-only (`safety.py`, `checkpoints.py`, `grounding.py`, `skill_forge.py`) while keeping `data/` and external `/project` workspaces writable when `Self-Dev Mode = OFF`; and gate self-dev routines (`code_hygiene`) behind `Self-Dev Mode = ON`.", "Safe stable daily-driver operation with quiet `on_idle` routines and windowed autonomous Goal slices alongside deliberate Lab/VM self-evolution when `Self-Dev Mode` is explicitly enabled by the human partner."),
+    ("ADR-019: Permanent Installed-App Immutability, Orthogonal SDLC & Per-Project Delivery Policy", "In-place self-editing of a live service risked runtime corruption and coupled coding to GitHub assumptions.", "Enforce permanent installed-app immutability (`COMPANION_IMMUTABLE_APP`, locking `settings.root` read-only outside `data/` while keeping `data/scratch/` and external Project clones writable); retire legacy `Self-Dev` toggles and `.sandbox_meta.json` clones; and govern external repo work via per-project `delivery_policy` (`local_only` | `remote_branch_pr` | `ask_me`), `git_credential_ref`, `git_manage`, `dev_preview`, and modular SDLC/Browser/GitHub/DevOps skills.", "Unbrickable daily-driver OS runtime paired with air-gap-safe local SDLC, visual browser dogfooding, Blind-Vault remote Git, and rollback-verified deployments."),
     ("ADR-020: Agent-Native Headless Core Consolidation — Unified TriggerPolicy, Code-Controlled Python DAG Runtime, Universal Project & Goal Graph, Cognitive Triage & MCP Capability Harvesting", "Separate Hobbies vs. Routines subsystems, rigid 20-step JSON workflow recipes, human-chore-coupled Agile boards vs. flat task tables, regex keyword-spotting intake, and manual-only MCP/endpoint wiring prevented true multi-session agent autonomy.", "Consolidate all time/idle triggers into `TriggerPolicy` (`companion/trigger_policy.py`) and `Routines` (`companion/routines.py`); introduce pure-stdlib Python `DAGSpec` execution with `foreach` fan-out/fan-in and SQLite node checkpointing (`companion/dag_runtime.py`); unify tasks, backlog, `/plan`, `/goal`, and Kanban projections onto the domain-blind Universal Project & Goal Graph (`companion/project_graph.py`) with `skills/personal-agile-coach/` in Ring-1; replace regex intake with Cognitive Triage (`companion/intake.py`); and add ApprovalQueue-staged endpoint/MCP self-wiring, MCP-to-Skill harvesting, and pluggable `VerificationSpec` domain validators.", "Cohesive, domain-blind headless core capable of forging deterministic Python DAGs, wiring external tools via human approval, and advancing multi-session Companion + Human goals safely."),
 ]
 
@@ -110,7 +109,7 @@ SCHEMA_SQL = (
     "CREATE TABLE IF NOT EXISTS workflow_transitions (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, summary TEXT NOT NULL, verification_passed INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS autonomy_journal (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_name TEXT NOT NULL, entry_kind TEXT DEFAULT 'routine', status TEXT NOT NULL, checkpoint_id TEXT DEFAULT '', doctor_passed INTEGER DEFAULT 1, summary TEXT NOT NULL, seen_by_user INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS knowledge_facts (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT DEFAULT 'companion-self', key TEXT NOT NULL, value TEXT NOT NULL, source TEXT DEFAULT 'agent', confidence REAL DEFAULT 1.0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE(project_id, key))",
-    "CREATE TABLE IF NOT EXISTS projects (project_id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title TEXT NOT NULL, goal_summary TEXT DEFAULT '', kind TEXT DEFAULT 'project', status TEXT DEFAULT 'active', workspace_id TEXT DEFAULT 'companion-self', workspace_path TEXT DEFAULT '', wiki_hub_path TEXT DEFAULT '', risk_ceiling TEXT DEFAULT 'R2', trigger_policy_json TEXT DEFAULT '{}', metadata_json TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS projects (project_id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title TEXT NOT NULL, goal_summary TEXT DEFAULT '', kind TEXT DEFAULT 'project', status TEXT DEFAULT 'active', workspace_id TEXT DEFAULT 'companion-self', workspace_path TEXT DEFAULT '', delivery_policy TEXT DEFAULT 'local_only', git_credential_ref TEXT DEFAULT '', wiki_hub_path TEXT DEFAULT '', risk_ceiling TEXT DEFAULT 'R2', trigger_policy_json TEXT DEFAULT '{}', metadata_json TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS milestones (milestone_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT DEFAULT '', stage_kind TEXT DEFAULT 'DELIVER_AND_VERIFY', status TEXT DEFAULT 'active', sort_order INTEGER DEFAULT 0, target_date TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS project_timeboxes (timebox_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, goal TEXT DEFAULT '', start_date TEXT NOT NULL, end_date TEXT NOT NULL, status TEXT DEFAULT 'planning', metadata_json TEXT DEFAULT '{}', retro_notes TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS work_items (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL UNIQUE, project_id TEXT NOT NULL DEFAULT 'companion-self', milestone_id TEXT DEFAULT '', timebox_id TEXT DEFAULT '', workflow_id INTEGER, item_kind TEXT NOT NULL DEFAULT 'task', title TEXT NOT NULL, description TEXT DEFAULT '', category TEXT DEFAULT 'general', status TEXT NOT NULL DEFAULT 'pending', owner TEXT NOT NULL DEFAULT 'companion', stage_kind TEXT NOT NULL DEFAULT 'DELIVER_AND_VERIFY', priority INTEGER DEFAULT 3, depends_on_json TEXT DEFAULT '[]', verification_json TEXT DEFAULT '{}', dag_name TEXT DEFAULT '', checkpoint_id TEXT DEFAULT '', acceptance_criteria TEXT DEFAULT '', verification_result TEXT DEFAULT '', estimated_effort TEXT DEFAULT '', actual_effort TEXT DEFAULT '', estimate_minutes INTEGER DEFAULT 30, planned_date TEXT DEFAULT '', due_date TEXT DEFAULT '', checklist_json TEXT DEFAULT '[]', tags_json TEXT DEFAULT '[]', position INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, completed_at DATETIME)",
@@ -180,6 +179,10 @@ class MemoryStore:
             proj_cols = {str(r[1]) for r in cursor.execute("PRAGMA table_info(projects)").fetchall()}
             if "workspace_path" not in proj_cols:
                 cursor.execute("ALTER TABLE projects ADD COLUMN workspace_path TEXT DEFAULT ''")
+            if "delivery_policy" not in proj_cols:
+                cursor.execute("ALTER TABLE projects ADD COLUMN delivery_policy TEXT DEFAULT 'local_only'")
+            if "git_credential_ref" not in proj_cols:
+                cursor.execute("ALTER TABLE projects ADD COLUMN git_credential_ref TEXT DEFAULT ''")
             conv_cols = {str(r[1]) for r in cursor.execute("PRAGMA table_info(conversations)").fetchall()}
             if "meta_json" not in conv_cols:
                 cursor.execute("ALTER TABLE conversations ADD COLUMN meta_json TEXT DEFAULT '{}'")
@@ -207,8 +210,7 @@ class MemoryStore:
                     self.conn.backup(bconn)
             for key, val in DEFAULT_USER_PROFILE.items():
                 if key not in existing_map:
-                    seed_val = ("on" if settings.self_dev_default else "off") if key == "self_dev_mode" else val
-                    cursor.execute("INSERT INTO user_profile (key, value) VALUES (?, ?)", (key, seed_val))
+                    cursor.execute("INSERT INTO user_profile (key, value) VALUES (?, ?)", (key, val))
             if prev_ver != __version__:
                 cursor.execute("INSERT OR REPLACE INTO user_profile (key, value) VALUES ('app_version', ?)", (__version__,))
             existing_by_code = {
@@ -275,8 +277,8 @@ class MemoryStore:
 
     def set_user_profile(self, key: str, value: str) -> None:
         k_clean = key.strip()
-        if k_clean.lower() in ("self_dev_mode", "self_dev_locked", "immutable_core"):
-            raise PermissionError("PRIVILEGE GUARD REJECTED: `self_dev_mode` can only be changed via explicit human surfaces (`/selfdev` or Web System Studio), never via `set_user_profile`.")
+        if k_clean.lower() in ("immutable_app", "immutable_core", "self_dev_mode", "self_dev_locked") or (k_clean.lower() == "trust_mode" and is_in_agent_tool_turn()):
+            raise PermissionError(f"PRIVILEGE GUARD REJECTED: `{k_clean}` is protected and cannot be modified via `set_user_profile`.")
         with self._lock:
             self.conn.execute("INSERT INTO user_profile (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP", (k_clean, value.strip()))
             self.conn.commit()
@@ -291,26 +293,6 @@ class MemoryStore:
 
     def set_background_autonomy(self, enabled: bool) -> None:
         self.set_user_profile("background_autonomy", "on" if enabled else "off")
-
-    def is_self_dev_mode_enabled(self) -> bool:
-        override = settings.get_self_dev_override()
-        if override is not None:
-            return bool(override)
-        if settings.immutable_core:
-            return False
-        if settings.self_dev_locked:
-            return bool(settings.self_dev_default)
-        default_str = "on" if settings.self_dev_default else "off"
-        return self.get_user_profile().get("self_dev_mode", default_str).strip().lower() in ("on", "true", "1", "enabled")
-
-    def set_self_dev_mode(self, enabled: bool, actor: str = "user") -> None:
-        if is_in_agent_tool_turn() or (actor or "").strip().lower() not in ("user", "cli", "web"):
-            raise PermissionError("PRIVILEGE GUARD REJECTED: Companion LLM/tools cannot toggle `Self-Dev Mode`; only explicit human CLI (`/selfdev`) or Web System Studio actions may change it.")
-        if settings.is_self_dev_locked_by_env():
-            raise PermissionError(f"DEPLOYMENT LOCK REJECTED: `Self-Dev Mode` cannot be changed at runtime ({settings.self_dev_lock_reason()}).")
-        with self._lock:
-            self.conn.execute("INSERT INTO user_profile (key, value, updated_at) VALUES ('self_dev_mode', ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP", ("on" if enabled else "off",))
-            self.conn.commit()
 
     def add_task(self, description: str, status: str = "pending", priority: int = 5, acceptance_criteria: Optional[str] = None, workflow_id: Optional[int] = None, project_id: Optional[str] = None, owner: str = "companion", stage_kind: str = "DELIVER_AND_VERIFY") -> int:
         pid = _eff_pid(project_id)
@@ -542,7 +524,7 @@ class MemoryStore:
         profile, adrs, active_wf = self.get_user_profile(), self.get_adrs(), self.get_active_workflow()
         pending_tasks, backlog_items, notes = self.get_pending_tasks()[:5], self.get_backlog()[:4], self.get_system_notes(limit=5)
         facts = self.query_knowledge_facts(limit=6)
-        core_keys = ("companion_name", "user_name", "role", "companion_tone", "background_autonomy", "self_dev_mode", "active_project_id")
+        core_keys = ("companion_name", "user_name", "role", "companion_tone", "background_autonomy", "active_project_id")
         prof_lines = [f"- **{k}**: {profile[k][:90]}" for k in core_keys if k in profile]
         lines: List[str] = ["# Companion AI OS — Persistent Memory", "", "## 1. User Profile & Partnership Ethos", *prof_lines, "", "## 2. Active Workflow"]
         lines.append(f"- **Workflow #{active_wf['id']}** (`{active_wf['current_state']}`): {active_wf['goal'][:90]}" if active_wf else "- **State**: `IDLE`")
@@ -678,6 +660,3 @@ def get_memory_store(db_path: Optional[Path] = None) -> MemoryStore:
     with _store_lock:
         _store_instance = fresh
         return fresh
-
-
-settings.register_self_dev_resolver(lambda _d: get_memory_store().is_self_dev_mode_enabled())

@@ -71,6 +71,14 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
+    let prevW = window.innerWidth;
+    const onResize = () => {
+      const nextW = window.innerWidth;
+      if (prevW > 768 && nextW <= 768) setRailCollapsed(true);
+      prevW = nextW;
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
   }, []);
 
   const refreshStatusAndProjects = async () => {

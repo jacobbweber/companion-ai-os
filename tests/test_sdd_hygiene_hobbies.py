@@ -96,21 +96,20 @@ class TestSDDHygieneAndIdleRoutines(unittest.TestCase):
                 self.assertTrue(store.is_background_autonomy_enabled())
 
                 store.log_autonomy_run(
-                    "code_hygiene",
+                    "trace_reviewer",
                     "completed",
-                    "Verified zero dead code and synced specs.",
+                    "Reviewed recent slow spans and logged recommendations.",
                     checkpoint_id="cp_test_1",
                     doctor_passed=True,
                 )
                 briefing = format_morning_briefing(store=store, mark_seen=True)
                 self.assertIn("Morning Autonomy Briefing", briefing)
-                self.assertIn("code_hygiene", briefing)
+                self.assertIn("trace_reviewer", briefing)
 
                 rm = get_routine_manager(store=store)
                 by_id = {r["routine_id"]: r for r in rm.list_routines()}
                 self.assertIn("trace_reviewer", by_id)
-                self.assertIn("code_hygiene", by_id)
-                self.assertTrue(by_id["code_hygiene"]["trigger_policy"]["requires_self_dev"])
+                self.assertNotIn("code_hygiene", by_id)
 
                 with memory_store_context(store):
                     out = dispatch("routine_manage", {"action": "autonomy_status"})

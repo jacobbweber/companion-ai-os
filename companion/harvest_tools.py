@@ -19,7 +19,6 @@ from companion.core_actions import execute_core_action
 from companion.education_engine import parse_education_slash
 from companion.memory_store import MemoryStore
 from companion.model_registry import parse_providers_slash
-from companion.routines import parse_selfdev_slash
 
 __all__ = [
     "dispatch_harvest_slash",
@@ -98,13 +97,11 @@ def tool_mcp_manage(args: Dict[str, Any]) -> str:
 
 
 def tool_routine_manage(args: Dict[str, Any]) -> str:
-    """Manage Unified `TriggerPolicy` Routines, Background Autonomy, isolated self-dev sandbox clones, saved prompts, and pending approvals."""
+    """Manage Unified `TriggerPolicy` Routines, Background Autonomy, saved prompts, and pending approvals."""
     sub = str(args.get("action") or "list").strip().lower()
     if sub in ("autonomy_status", "autonomy_on", "autonomy_off", "morning"):
         auto_sub = sub.removeprefix("autonomy_")
         return _format_tool_result(execute_core_action("autonomy", _clean_agent_params(args, auto_sub), actor="companion"))
-    if sub.startswith("sandbox_"):
-        return _format_tool_result(execute_core_action("sandbox", _clean_agent_params(args, sub.removeprefix("sandbox_")), actor="companion"))
     if sub.startswith("prompt_"):
         return _format_tool_result(execute_core_action("prompts", _clean_agent_params(args, sub.removeprefix("prompt_")), actor="companion"))
     if sub == "list_approvals":
@@ -201,15 +198,12 @@ def dispatch_harvest_slash(verb: str, arg: str, store: Optional[MemoryStore] = N
         p = {"subaction": "run", "older_than_days": int(rest[0]) if rest else 90} if sub == "run" else {"subaction": "search", "query": arg}
     elif v in ("/board", "/boards", "/sprint"):
         act_name, p = "agile", _parse_agile_slash(v, parts)
-    elif v in ("/calendar", "/study", "/providers", "/selfdev"):
-        slash_map = {"/calendar": ("calendar", parse_calendar_slash), "/study": ("education", parse_education_slash), "/providers": ("models", parse_providers_slash), "/selfdev": ("autonomy", parse_selfdev_slash)}
+    elif v in ("/calendar", "/study", "/providers"):
+        slash_map = {"/calendar": ("calendar", parse_calendar_slash), "/study": ("education", parse_education_slash), "/providers": ("models", parse_providers_slash)}
         act_name, fn = slash_map[v]
         p = fn(parts)
-    elif v == "/identity":
-        act_name, p = "identity", {"subaction": "get"}
     else:
-        act_name = "sandbox"
-        p = {"subaction": sub, "sandbox_id": rest[0] if rest else "", "label": rest[0] if rest else "experiment"} if sub in ("create", "verify", "diff", "cleanup") else {"subaction": "list"}
+        act_name, p = "identity", {"subaction": "get"}
     res = execute_core_action(act_name, p, actor="cli", store=store)
     if res.get("markdown_block"):
         return f"{res.get('summary', '')}\n\n{res['markdown_block']}".strip()

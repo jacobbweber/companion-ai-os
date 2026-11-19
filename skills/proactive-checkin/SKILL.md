@@ -22,6 +22,6 @@ Use this runbook when the user asks for a check-in, asks "where do we stand?", s
    - Call `memory_manage(action="get_notes", limit=5)` to recall recent user preferences, architectural notes, or rollback lessons.
 4. **Synthesize in Plain Executive English**:
    - Present a warm, concise 3-part summary (never dumping raw database tables):
-     1. **Where We Are**: System health, Background Autonomy / Self-Dev posture, and anything accomplished since last check-in.
+     1. **Where We Are**: System health, Background Autonomy posture, and anything accomplished since last check-in.
      2. **Top Priorities**: The top 1–2 ready or blocked work items in plain English.
      3. **Clear Recommendation**: One concrete, high-value next step you recommend tackling right now.

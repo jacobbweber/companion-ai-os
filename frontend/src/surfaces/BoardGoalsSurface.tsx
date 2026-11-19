@@ -168,18 +168,29 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
             </select>
 
             {proj && (
-              <button
-                type="button"
-                className="btn btn-sm"
-                data-testid="configure-project-trigger-btn"
-                onClick={() => onInspect({ kind: 'project', projectId: proj.project_id })}
-                title="Configure Goal Description & Autonomous Idle Window"
-              >
-                <SlidersHorizontal size={12} />
-                <span>
-                  Trigger: {tp?.mode === 'on_idle' ? `On Idle (${tp.allowed_window || 'anytime'})` : 'Manual'}
-                </span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  data-testid="configure-project-trigger-btn"
+                  onClick={() => onInspect({ kind: 'project', projectId: proj.project_id })}
+                  title="Configure Repository Workspace, Delivery Policy & Idle Window"
+                >
+                  <SlidersHorizontal size={12} />
+                  <span>
+                    Trigger: {tp?.mode === 'on_idle' ? `On Idle (${tp.allowed_window || 'anytime'})` : 'Manual'}
+                  </span>
+                </button>
+                {(proj.workspace_path || (proj.delivery_policy && proj.delivery_policy !== 'local_only')) && (
+                  <span className="badge" data-testid="project-delivery-badge" title={proj.workspace_path || 'OS Mode'}>
+                    {proj.delivery_policy === 'remote_branch_pr'
+                      ? 'Branch + PR'
+                      : proj.delivery_policy === 'ask_me'
+                        ? 'Ask Before Push'
+                        : 'Local Only'}
+                  </span>
+                )}
+              </>
             )}
 
             {counts && (

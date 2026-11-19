@@ -1,4 +1,4 @@
-"""Comprehensive, Self-Guarded Tool Registry (A-Frame Application Layer, 26 tools)."""
+"""Comprehensive, Self-Guarded Tool Registry (A-Frame Application Layer, 28 tools)."""
 
 import fnmatch
 import json
@@ -31,6 +31,7 @@ from companion.safety import (
     check_command_safety, check_path_safety, lint_single_file_edit,
     normalize_windows_shell_command, try_indent_shifted_replace, validate_python_syntax,
 )
+from companion.sdlc_tools import tool_dev_preview, tool_git_manage
 from companion.streaming import emit_stream_event
 from companion.telemetry import telemetry
 from companion.tool_schemas import (
@@ -41,8 +42,8 @@ from companion.tool_schemas import (
 __all__ = [
     "PHASE_ALLOWED_TOOLS", "TOOLS", "TOOL_IMPLS", "check_phase_tool_permission", "current_workflow_phase", "dispatch",
     "filter_tools_for_phase", "phase_tool_context", "r3_approval_context", "resolve", "tool_agile_manage", "tool_calendar_manage",
-    "tool_checkpoint_manage", "tool_edit_file", "tool_education_manage", "tool_endpoint_manage",
-    "tool_job_manage", "tool_list_dir", "tool_mcp_manage", "tool_memory_manage", "tool_project_manage", "tool_read_file",
+    "tool_checkpoint_manage", "tool_dev_preview", "tool_edit_file", "tool_education_manage", "tool_endpoint_manage",
+    "tool_git_manage", "tool_job_manage", "tool_list_dir", "tool_mcp_manage", "tool_memory_manage", "tool_project_manage", "tool_read_file",
     "tool_routine_manage", "tool_run_python", "tool_run_shell", "tool_sdd_manage", "tool_search", "tool_system_doctor",
     "tool_task_manage", "tool_telemetry_manage", "tool_vault_manage", "tool_web_fetch", "tool_web_search", "tool_wiki_manage", "tool_workflow_manage", "tool_write_file",
 ]
@@ -58,6 +59,11 @@ def resolve(p: str, for_write: bool = False) -> Path:
     if ws.is_self_project and (norm == "data" or norm.startswith("data/")):
         sub = norm[5:] if norm.startswith("data/") else ""
         return (settings.effective_data_dir / sub) if sub else settings.effective_data_dir
+    if ws.is_self_project and (norm == "scratch" or norm.startswith("scratch/")):
+        sub = norm[8:] if norm.startswith("scratch/") else ""
+        return (settings.scratch_dir / sub) if sub else settings.scratch_dir
+    if for_write and ws.is_self_project and not norm.startswith(("companion/", "surfaces/", "frontend/", "specs/", "skills/", "configs/", "memory/", "tests/", ".env", "secrets.env")) and norm not in ("README.md", "harness.py", ".gitignore", "Dockerfile", "docker-compose.yml"):
+        return settings.scratch_dir / norm
     if not for_write and not ws.is_self_project:
         if (ws.project_root / p).exists():
             return ws.project_root / p
@@ -135,7 +141,7 @@ def tool_write_file(args: Dict[str, Any]) -> str:
         return path_err
     if p.is_dir():
         return f"error: target path is an existing directory, not a file: {p}"
-    hard_err, lint_warn = lint_single_file_edit(p, norm_content, op_name="write_file", governed_root=settings.root)
+    hard_err, lint_warn = lint_single_file_edit(p, norm_content, op_name="write_file", governed_root=settings.active_project_root)
     if hard_err:
         return hard_err
     get_execution_target().write_text(p, norm_content, backup=True)
@@ -187,7 +193,7 @@ def tool_edit_file(args: Dict[str, Any]) -> str:
             if validate_python_syntax(cand, filename=str(p))[0]:
                 updated_text = cand
                 break
-    hard_err, lint_warn = lint_single_file_edit(p, updated_text, op_name="edit_file", governed_root=settings.root)
+    hard_err, lint_warn = lint_single_file_edit(p, updated_text, op_name="edit_file", governed_root=settings.active_project_root)
     if hard_err:
         return hard_err
     target.write_text(p, updated_text, backup=True)
@@ -254,7 +260,7 @@ def tool_run_python(args: Dict[str, Any]) -> str:
     """Execute Python code directly in the active `ExecutionTarget` with UTF-8 encoding."""
     code = str(args.get("code") or "")
     cmd_err = check_command_safety(code)
-    if cmd_err and "self_dev_mode" not in cmd_err:
+    if cmd_err:
         return cmd_err
     return get_execution_target().run_python_code(code, timeout=settings.shell_timeout)
 
@@ -415,6 +421,7 @@ TOOL_IMPLS: Dict[str, Callable[[Dict[str, Any]], str]] = {
     "job_manage": tool_job_manage, "wiki_manage": tool_wiki_manage, "vault_manage": tool_vault_manage,
     "endpoint_manage": tool_endpoint_manage, "mcp_manage": tool_mcp_manage, "routine_manage": tool_routine_manage,
     "agile_manage": tool_agile_manage, "calendar_manage": tool_calendar_manage, "education_manage": tool_education_manage,
+    "git_manage": tool_git_manage, "dev_preview": tool_dev_preview,
 }
 
 _GUARD_PREFIXES = (

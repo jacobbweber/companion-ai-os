@@ -83,7 +83,7 @@ class TestPhase1UnifiedTriggerPolicyAndRoutines(unittest.TestCase):
         self.assertTrue(matches_cron_5field("30 23 * * 1", dt_2330))
         self.assertFalse(matches_cron_5field("30 23 * * 2", dt_2330))
 
-    def test_trigger_eligibility_precheck_cooldown_and_self_dev_guard(self) -> None:
+    def test_trigger_eligibility_precheck_cooldown_and_window_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, contextlib.closing(MemoryStore(db_path=Path(tmp) / "p1.db")) as store:
             calls = {"count": 0}
 
@@ -98,7 +98,6 @@ class TestPhase1UnifiedTriggerPolicyAndRoutines(unittest.TestCase):
                 allowed_window="22:00-06:00",
                 cooldown_seconds=1800,
                 precheck_name="unit_test_precheck",
-                requires_self_dev=True,
             )
             now_utc = datetime(2026, 11, 16, 4, 0, tzinfo=timezone.utc)
             now_inside = datetime(2026, 11, 16, 23, 30)
@@ -106,21 +105,21 @@ class TestPhase1UnifiedTriggerPolicyAndRoutines(unittest.TestCase):
 
             ok, reason = evaluate_trigger_eligibility(
                 policy, idle_seconds=600, background_autonomy_enabled=False,
-                self_dev_enabled=True, now_utc=now_utc, now_local=now_inside, store=store,
+                now_utc=now_utc, now_local=now_inside, store=store,
             )
             self.assertFalse(ok)
             self.assertIn("background_autonomy", reason)
 
             ok, reason = evaluate_trigger_eligibility(
-                policy, idle_seconds=600, background_autonomy_enabled=True,
-                self_dev_enabled=False, now_utc=now_utc, now_local=now_inside, store=store,
+                policy, idle_seconds=120, background_autonomy_enabled=True,
+                now_utc=now_utc, now_local=now_inside, store=store,
             )
             self.assertFalse(ok)
-            self.assertIn("self_dev", reason)
+            self.assertIn("idle", reason)
 
             ok, reason = evaluate_trigger_eligibility(
                 policy, idle_seconds=600, background_autonomy_enabled=True,
-                self_dev_enabled=True, now_utc=now_utc, now_local=now_outside, store=store,
+                now_utc=now_utc, now_local=now_outside, store=store,
             )
             self.assertFalse(ok)
             self.assertIn("window", reason)
@@ -128,7 +127,7 @@ class TestPhase1UnifiedTriggerPolicyAndRoutines(unittest.TestCase):
             t0 = time.perf_counter()
             ok, reason = evaluate_trigger_eligibility(
                 policy, idle_seconds=600, background_autonomy_enabled=True,
-                self_dev_enabled=True, now_utc=now_utc, now_local=now_inside, store=store,
+                now_utc=now_utc, now_local=now_inside, store=store,
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self.assertTrue(ok)
@@ -139,7 +138,7 @@ class TestPhase1UnifiedTriggerPolicyAndRoutines(unittest.TestCase):
             recent_iso = (now_utc - timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
             ok_cd, reason_cd = evaluate_trigger_eligibility(
                 policy, idle_seconds=600, last_run_at=recent_iso,
-                background_autonomy_enabled=True, self_dev_enabled=True,
+                background_autonomy_enabled=True,
                 now_utc=now_utc, now_local=now_inside, store=store,
             )
             self.assertFalse(ok_cd)
@@ -149,14 +148,14 @@ class TestPhase1UnifiedTriggerPolicyAndRoutines(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, contextlib.closing(MemoryStore(db_path=Path(tmp) / "p1_routines.db")) as store:
             mgr = get_routine_manager(store=store)
             routines = {r["routine_id"]: r for r in mgr.list_routines()}
-            for rid in ("wiki_gardener", "memory_curator", "trace_reviewer", "code_hygiene"):
+            for rid in ("wiki_gardener", "memory_curator", "trace_reviewer"):
                 self.assertIn(rid, routines)
-            self.assertTrue(routines["code_hygiene"]["trigger_policy"]["requires_self_dev"])
+            self.assertNotIn("code_hygiene", routines)
 
-            store.set_background_autonomy(True)
-            store.set_self_dev_mode(False, actor="user")
+            store.set_background_autonomy(False)
             eligible_off = [r["routine_id"] for r in mgr.select_eligible_idle_routines(idle_seconds=3600)]
-            self.assertNotIn("code_hygiene", eligible_off)
+            self.assertEqual(eligible_off, [])
+            store.set_background_autonomy(True)
 
             watcher_busy = IdleAutonomyWatcher(is_busy_fn=lambda: True, store=store)
             res_busy = watcher_busy.tick_once(idle_seconds=3600)

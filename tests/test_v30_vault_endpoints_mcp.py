@@ -22,10 +22,9 @@ from companion.core_actions import execute_core_action
 from companion.endpoints import EndpointManager
 from companion.mcp_hub import MCPHub, format_connected_partners_hud
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.routines import (
-    RoutineManager, cleanup_sandbox_clone, compute_next_run_utc,
-    create_sandbox_clone, diff_sandbox_clone, verify_sandbox_clone,
-)
+from companion.project_graph import get_project_graph
+from companion.routines import RoutineManager, compute_next_run_utc
+from companion.sdlc_tools import check_git_stage_safety
 from companion.tools import dispatch, filter_tools_for_phase, phase_tool_context
 from companion.trigger_policy import evaluate_trigger_eligibility, TriggerPolicy
 from companion.vault import VaultManager, create_snapshot_backup, restore_snapshot_backup
@@ -273,19 +272,24 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
         nudges = peek_session_nudges(store=self.primary_store)
         self.assertTrue(any("no thundering herd" in n["message"] for n in nudges))
 
-        sbx_root = self.base / "sandboxes"
-        created = create_sandbox_clone("unit-exp", sandboxes_dir=sbx_root)
-        self.assertTrue(created["ok"])
-        sid = created["sandbox_id"]
-        clone_cfg = Path(created["path"]) / "companion" / "config.py"
-        clone_cfg.write_text(clone_cfg.read_text(encoding="utf-8") + "\n# sandbox-isolated-comment\n", encoding="utf-8")
-        diff_res = diff_sandbox_clone(sid, sandboxes_dir=sbx_root)
-        self.assertIn("companion/config.py", diff_res["changed_files"])
-        self.assertIn("sandbox-isolated-comment", diff_res["diff"])
-        ver_res = verify_sandbox_clone(sid, run_tests=False, sandboxes_dir=sbx_root)
-        self.assertTrue(ver_res["ok"], ver_res)
-        cleanup_sandbox_clone(sid, sandboxes_dir=sbx_root)
-        self.assertFalse(Path(created["path"]).exists())
+        pg = get_project_graph(store=self.primary_store)
+        proj = pg.create_project(
+            title="External SDLC Repo",
+            workspace_path=str(self.base / "ext_repo"),
+            delivery_policy="remote_branch_pr",
+            git_credential_ref="github-repo-pat",
+        )
+        self.assertEqual(proj["delivery_policy"], "remote_branch_pr")
+        vm = VaultManager(store=self.primary_store, secrets_path=self.base / "secrets.env")
+        missing_names = {m["name"] for m in vm.list_missing_secrets()}
+        self.assertIn("github-repo-pat", missing_names)
+
+        ext_repo = self.base / "ext_repo"
+        ext_repo.mkdir(parents=True, exist_ok=True)
+        (ext_repo / "secrets.env").write_text("TOK=123\n", encoding="utf-8")
+        (ext_repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        self.assertIsNotNone(check_git_stage_safety(ext_repo, ["secrets.env"]))
+        self.assertIsNone(check_git_stage_safety(ext_repo, ["app.py"]))
 
     def test_dogfood_regressions_url_port_ssh_alias_and_partners_action(self) -> None:
         em = EndpointManager(store=self.primary_store)

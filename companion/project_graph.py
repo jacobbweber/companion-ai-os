@@ -25,8 +25,10 @@ from companion.trigger_policy import (
     evaluate_trigger_eligibility,
     register_trigger_precheck,
 )
+from companion.vault import normalize_secret_name
 
 VALID_ITEM_OWNERS = ("companion", "human", "collaborative")
+VALID_DELIVERY_POLICIES = ("local_only", "remote_branch_pr", "ask_me")
 VALID_STAGE_KINDS = ("OBSERVE_DATA", "CURATE_DIKW", "FORGE_CAPABILITY", "DELIVER_AND_VERIFY")
 STAGE_ORDER: Dict[str, int] = {name: idx for idx, name in enumerate(VALID_STAGE_KINDS)}
 DONE_STATUSES = ("done", "completed")
@@ -89,6 +91,22 @@ def _hydrate_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _clean_delivery_policy(raw: Optional[str]) -> str:
+    dp = (raw or "local_only").strip().lower()
+    if dp not in VALID_DELIVERY_POLICIES:
+        raise ValueError(f"delivery_policy must be one of {VALID_DELIVERY_POLICIES}, got '{raw}'.")
+    return dp
+
+
+def _clean_git_cred_ref(raw: Optional[str]) -> str:
+    val = (raw or "").strip()
+    if not val:
+        return ""
+    if "-----BEGIN " in val or val.startswith(("ghp_", "github_pat_", "glpat-", "sk-")):
+        raise ValueError("VAULT GUARD REJECTED: Pass a symbolic Blind Vault slug in `git_credential_ref`, never a raw token or key.")
+    return normalize_secret_name(val)
+
+
 def _hydrate_project(raw: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(raw)
     try:
@@ -99,6 +117,11 @@ def _hydrate_project(raw: Dict[str, Any]) -> Dict[str, Any]:
         meta = json.loads(out.get("metadata_json") or "{}")
     except Exception:
         meta = {}
+    dp = str(out.get("delivery_policy") or meta.get("delivery_policy") or "local_only").strip().lower()
+    out["delivery_policy"] = dp if dp in VALID_DELIVERY_POLICIES else "local_only"
+    out["git_credential_ref"] = str(out.get("git_credential_ref") or meta.get("git_credential_ref") or "").strip()
+    out["test_command"] = str(meta.get("test_command") or "").strip()
+    out["preview_command"] = str(meta.get("preview_command") or "").strip()
     out["trigger_policy"] = TriggerPolicy.from_dict(tp_raw).to_dict() if tp_raw else TriggerPolicy(mode="manual").to_dict()
     out["metadata"] = meta
     out["board_id"] = out["project_id"]
@@ -115,10 +138,19 @@ class ProjectGraphManager:
     def _ensure_default_projects(self) -> None:
         ws = settings.get_workspace()
         with self.store._lock:
-            for pid, title in ((SELF_PROJECT_ID, "Companion Self & Core"), (ws.project_id, ws.project_id.replace("-", " ").title())):
+            self.store.conn.execute(
+                "INSERT OR IGNORE INTO projects (project_id, slug, title, kind, workspace_id) VALUES (?, ?, ?, 'project', ?)",
+                (SELF_PROJECT_ID, _slugify(SELF_PROJECT_ID), "Companion Self & Core", SELF_PROJECT_ID),
+            )
+            alt_ws_id = ws.project_id.replace("-", "_")
+            has_ws = self.store.conn.execute(
+                "SELECT 1 FROM projects WHERE project_id IN (?, ?) OR workspace_path = ? LIMIT 1",
+                (ws.project_id, alt_ws_id, str(ws.project_root.resolve())),
+            ).fetchone()
+            if not has_ws and ws.project_id:
                 self.store.conn.execute(
                     "INSERT OR IGNORE INTO projects (project_id, slug, title, kind, workspace_id) VALUES (?, ?, ?, 'project', ?)",
-                    (pid, _slugify(pid), title, pid),
+                    (ws.project_id, _slugify(ws.project_id), ws.project_id.replace("-", " ").title(), ws.project_id),
                 )
             self.store.conn.commit()
 
@@ -127,11 +159,13 @@ class ProjectGraphManager:
         if not raw:
             focused = self.store.get_user_profile().get("active_goal_project_id", "").strip()
             if focused:
-                f_row = self.store._fetch_rows("SELECT project_id FROM projects WHERE project_id = ? OR slug = ? LIMIT 1", (focused, focused))
+                f_row = self.store._fetch_rows("SELECT project_id FROM projects WHERE project_id IN (?, ?) OR slug = ? LIMIT 1", (focused, focused.replace("-", "_"), focused))
                 if f_row:
                     return str(f_row[0][0])
-            return settings.get_workspace().project_id or SELF_PROJECT_ID
-        row = self.store._fetch_rows("SELECT project_id FROM projects WHERE project_id = ? OR slug = ? LIMIT 1", (raw, raw))
+            ws = settings.get_workspace()
+            w_row = self.store._fetch_rows("SELECT project_id FROM projects WHERE project_id IN (?, ?) OR workspace_path = ? LIMIT 1", (ws.project_id, ws.project_id.replace("-", "_"), str(ws.project_root.resolve())))
+            return str(w_row[0][0]) if w_row else (ws.project_id or SELF_PROJECT_ID)
+        row = self.store._fetch_rows("SELECT project_id FROM projects WHERE project_id IN (?, ?) OR slug = ? LIMIT 1", (raw, raw.replace("-", "_"), raw))
         return str(row[0][0]) if row else raw
 
     def set_focus_project(self, project_id: str) -> Dict[str, Any]:
@@ -166,18 +200,11 @@ class ProjectGraphManager:
             yield
 
     def create_project(
-        self,
-        title: str,
-        goal_summary: str = "",
-        slug: Optional[str] = None,
-        kind: str = "goal",
-        workspace_id: Optional[str] = None,
-        workspace_path: str = "",
-        wiki_hub_path: str = "",
-        risk_ceiling: str = "R2",
-        trigger_policy: Optional[Union[TriggerPolicy, Dict[str, Any]]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        project_id: Optional[str] = None,
+        self, title: str, goal_summary: str = "", slug: Optional[str] = None, kind: str = "goal",
+        workspace_id: Optional[str] = None, workspace_path: str = "", delivery_policy: str = "local_only",
+        git_credential_ref: str = "", test_command: str = "", preview_command: str = "", wiki_hub_path: str = "",
+        risk_ceiling: str = "R2", trigger_policy: Optional[Union[TriggerPolicy, Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None, project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         clean_title = (title or "").strip()
         if not clean_title:
@@ -187,24 +214,33 @@ class ProjectGraphManager:
         tp = trigger_policy if isinstance(trigger_policy, TriggerPolicy) else TriggerPolicy.from_dict(trigger_policy)
         ws_id = (workspace_id or settings.get_workspace().project_id or SELF_PROJECT_ID).strip()
         ws_p = str(Path(workspace_path).resolve()) if (workspace_path or "").strip() else ""
+        dp_clean = _clean_delivery_policy(delivery_policy)
+        cred_clean = _clean_git_cred_ref(git_credential_ref)
+        eff_meta = dict(metadata or {})
+        if test_command.strip():
+            eff_meta["test_command"] = test_command.strip()
+        if preview_command.strip():
+            eff_meta["preview_command"] = preview_command.strip()
         with self.store._lock:
             final_slug = base_slug
             if self.store.conn.execute("SELECT 1 FROM projects WHERE slug = ? AND project_id != ?", (final_slug, pid)).fetchone():
                 final_slug = f"{base_slug}-{uuid.uuid4().hex[:4]}"
             self.store.conn.execute(
-                "INSERT INTO projects (project_id, slug, title, goal_summary, kind, status, workspace_id, workspace_path, wiki_hub_path, risk_ceiling, trigger_policy_json, metadata_json) "
-                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO projects (project_id, slug, title, goal_summary, kind, status, workspace_id, workspace_path, delivery_policy, git_credential_ref, wiki_hub_path, risk_ceiling, trigger_policy_json, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET title = excluded.title, goal_summary = excluded.goal_summary, kind = excluded.kind, "
                 "workspace_path = CASE WHEN excluded.workspace_path != '' THEN excluded.workspace_path ELSE projects.workspace_path END, "
+                "delivery_policy = excluded.delivery_policy, "
+                "git_credential_ref = CASE WHEN excluded.git_credential_ref != '' THEN excluded.git_credential_ref ELSE projects.git_credential_ref END, "
                 "wiki_hub_path = excluded.wiki_hub_path, risk_ceiling = excluded.risk_ceiling, trigger_policy_json = excluded.trigger_policy_json, metadata_json = excluded.metadata_json, updated_at = CURRENT_TIMESTAMP",
-                (pid, final_slug, clean_title, goal_summary.strip(), kind, ws_id, ws_p, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(metadata or {})),
+                (pid, final_slug, clean_title, goal_summary.strip(), kind, ws_id, ws_p, dp_clean, cred_clean, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(eff_meta)),
             )
             self.store.conn.commit()
         return self.get_project(pid)
 
     def get_project(self, project_id: Optional[str] = None) -> Dict[str, Any]:
         pid = self.resolve_project_id(project_id)
-        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
+        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "delivery_policy", "git_credential_ref", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
         rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM projects WHERE project_id = ?", (pid,))
         if not rows:
             with self.store._lock:
@@ -214,7 +250,7 @@ class ProjectGraphManager:
         return _hydrate_project(rows[0])
 
     def list_projects(self, status: Optional[str] = None, kind: Optional[str] = None) -> List[Dict[str, Any]]:
-        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
+        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "delivery_policy", "git_credential_ref", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
         clauses: List[Tuple[str, Any]] = []
         if status:
             clauses.append(("status = ?", status))
@@ -232,16 +268,21 @@ class ProjectGraphManager:
             raw_tp = updates["trigger_policy"]
             tp_dict = raw_tp.to_dict() if isinstance(raw_tp, TriggerPolicy) else TriggerPolicy.from_dict({**tp_dict, **dict(raw_tp)}).to_dict()
         meta = {**dict(proj["metadata"]), **dict(updates.get("metadata") or {})}
+        for cmd_k in ("test_command", "preview_command"):
+            if cmd_k in updates and updates[cmd_k] is not None:
+                meta[cmd_k] = str(updates[cmd_k]).strip()
         title = str(updates.get("title") or proj["title"]).strip()
         goal_s = str(updates.get("goal_summary") if updates.get("goal_summary") is not None else proj["goal_summary"]).strip()
         status = str(updates.get("status") or proj["status"]).strip()
         wiki_p = str(updates.get("wiki_hub_path") if updates.get("wiki_hub_path") is not None else proj["wiki_hub_path"]).strip()
         raw_ws_p = updates.get("workspace_path")
         ws_p = (str(Path(str(raw_ws_p).strip()).resolve()) if str(raw_ws_p).strip() else "") if raw_ws_p is not None else str(proj.get("workspace_path") or "")
+        dp_clean = _clean_delivery_policy(str(updates["delivery_policy"])) if updates.get("delivery_policy") is not None else str(proj.get("delivery_policy") or "local_only")
+        cred_clean = _clean_git_cred_ref(str(updates["git_credential_ref"])) if updates.get("git_credential_ref") is not None else str(proj.get("git_credential_ref") or "")
         with self.store._lock:
             self.store.conn.execute(
-                "UPDATE projects SET title = ?, goal_summary = ?, status = ?, workspace_path = ?, wiki_hub_path = ?, trigger_policy_json = ?, metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
-                (title, goal_s, status, ws_p, wiki_p, json.dumps(tp_dict), json.dumps(meta), pid),
+                "UPDATE projects SET title = ?, goal_summary = ?, status = ?, workspace_path = ?, delivery_policy = ?, git_credential_ref = ?, wiki_hub_path = ?, trigger_policy_json = ?, metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
+                (title, goal_s, status, ws_p, dp_clean, cred_clean, wiki_p, json.dumps(tp_dict), json.dumps(meta), pid),
             )
             self.store.conn.commit()
         return self.get_project(pid)
@@ -481,7 +522,6 @@ class ProjectGraphManager:
     ) -> List[Dict[str, Any]]:
         """Return active `on_idle` Goals/Projects whose `TriggerPolicy` window/cooldown is open and have ready Companion items."""
         bg_on = self.store.is_background_autonomy_enabled()
-        sd_on = self.store.is_self_dev_mode_enabled()
         eligible: List[Dict[str, Any]] = []
         for proj in self.list_projects(status="active"):
             tp = TriggerPolicy.from_dict(proj.get("trigger_policy"))
@@ -489,14 +529,8 @@ class ProjectGraphManager:
                 continue
             last_slice_at = str(proj.get("metadata", {}).get("last_slice_at") or "")
             ok, _reason = evaluate_trigger_eligibility(
-                tp,
-                idle_seconds=idle_seconds,
-                last_run_at=last_slice_at,
-                self_dev_enabled=sd_on,
-                background_autonomy_enabled=bg_on,
-                now_utc=now_utc,
-                now_local=now_local,
-                store=self.store,
+                tp, idle_seconds=idle_seconds, last_run_at=last_slice_at,
+                background_autonomy_enabled=bg_on, now_utc=now_utc, now_local=now_local, store=self.store,
             )
             if ok and self.next_ready_companion_items(project_id=proj["project_id"], limit=1):
                 eligible.append(proj)
@@ -638,10 +672,13 @@ def format_project_graph_hud(store: Optional[MemoryStore] = None) -> str:
         for it in view.get("cards", [])
         if it.get("column_key") != "done"
     ][:5]
+    dp_seg = f" | delivery=`{proj.get('delivery_policy', 'local_only')}`"
+    ws_seg = f" | repo=`{proj['workspace_path']}`" if proj.get("workspace_path") else ""
+    cred_seg = f" | git_auth=`vault://{proj['git_credential_ref']}`" if proj.get("git_credential_ref") else ""
     goal_line = f"\n  Goal : {proj['goal_summary']}" if proj.get("goal_summary") else ""
     items_block = ("\n" + "\n".join(open_rows)) if open_rows else ""
     return (
-        f"[PROJECT & GOAL GRAPH (`{proj['title']}` | project_id=`{proj['project_id']}` | slug=`{proj['slug']}` | trigger=`{tp['mode']}{win}` | timebox={tb_txt})]{goal_line}\n"
+        f"[PROJECT & GOAL GRAPH (`{proj['title']}` | project_id=`{proj['project_id']}` | slug=`{proj['slug']}` | trigger=`{tp['mode']}{win}`{dp_seg}{ws_seg}{cred_seg} | timebox={tb_txt})]{goal_line}\n"
         f"  Items: total={cnt['total']} | companion_ready={cnt['companion_ready']} | human_pending={cnt['human_pending']} | blocked={cnt['blocked']} | done={cnt['done']}{items_block}"
     )
 

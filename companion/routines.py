@@ -1,31 +1,23 @@
 """
-Unified Respectful Routines, `TriggerPolicy` Idle Autonomy Watcher & Self-Dev Clone Sandbox
+Unified Respectful Routines & `TriggerPolicy` Idle Autonomy Watcher
 (`companion/routines.py` — A-Frame Application Layer).
 
 Consolidates scheduled routines, idle-triggered maintenance routines (retiring `hobbies.py`),
-Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`), `/morning` Autonomy
-Journal, and isolated Clone-Based Self-Development Sandboxes under one `TriggerPolicy` contract.
+Background Autonomy posture, and `/morning` Autonomy Journal under one `TriggerPolicy` contract.
 """
 
-import difflib
 import json
-import os
 import re
-import shutil
-import subprocess
-import sys
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from companion.archive_and_approvals import archive_aged_conversations, enqueue_session_nudge, get_approval_queue
 from companion.autonomy import run_autonomous_goal_slice
 from companion.background_jobs import get_job_manager
-from companion.config import execution_origin_context, settings
+from companion.config import execution_origin_context
 from companion.dag_runtime import execute_dag_by_name
-from companion.disciplines import walk_pruned_files
 from companion.endpoints import get_endpoint_manager
 from companion.llm import chat, model_gate
 from companion.memory_store import MemoryStore, get_memory_store
@@ -36,9 +28,8 @@ from companion.wiki_engine import get_wiki_engine
 
 __all__ = [
     "BUILTIN_IDLE_ROUTINES", "IdleAutonomyWatcher", "RoutineManager", "VALID_ROUTINE_TARGETS",
-    "cleanup_sandbox_clone", "compute_next_run_utc", "create_sandbox_clone", "describe_operating_quadrant",
-    "diff_sandbox_clone", "execute_autonomy_mode_action", "format_morning_briefing", "get_routine_manager",
-    "list_sandbox_clones", "parse_selfdev_slash", "reconcile_startup_missed_runs", "verify_sandbox_clone",
+    "compute_next_run_utc", "describe_operating_quadrant", "execute_autonomy_mode_action",
+    "format_morning_briefing", "get_routine_manager", "reconcile_startup_missed_runs",
 ]
 
 VALID_ROUTINE_TARGETS: Tuple[str, ...] = (
@@ -60,22 +51,17 @@ BUILTIN_IDLE_ROUTINES: Tuple[Dict[str, Any], ...] = (
     {
         "routine_id": "wiki_gardener", "title": "Wiki Inbox Gardener & Link Auditor",
         "target_kind": "wiki_inbox_triage", "target_name": "wiki_gardener",
-        "trigger_policy": {"mode": "on_idle", "idle_min_seconds": 900, "cooldown_seconds": 3600, "precheck_name": "wiki_inbox_or_stale", "requires_self_dev": False},
+        "trigger_policy": {"mode": "on_idle", "idle_min_seconds": 900, "cooldown_seconds": 3600, "precheck_name": "wiki_inbox_or_stale"},
     },
     {
         "routine_id": "memory_curator", "title": "Episodic Memory Fact Consolidator",
         "target_kind": "maintenance_agent", "target_name": "memory_curator",
-        "trigger_policy": {"mode": "on_idle", "idle_min_seconds": 900, "cooldown_seconds": 3600, "precheck_name": "recent_unconsolidated_chat", "requires_self_dev": False},
+        "trigger_policy": {"mode": "on_idle", "idle_min_seconds": 900, "cooldown_seconds": 3600, "precheck_name": "recent_unconsolidated_chat"},
     },
     {
         "routine_id": "trace_reviewer", "title": "Telemetry Anomaly & Slow-Span Reviewer",
         "target_kind": "maintenance_agent", "target_name": "trace_reviewer",
-        "trigger_policy": {"mode": "on_idle", "idle_min_seconds": 900, "cooldown_seconds": 3600, "precheck_name": "recent_warn_or_slow_spans", "requires_self_dev": False},
-    },
-    {
-        "routine_id": "code_hygiene", "title": "Self-Dev Hygiene & SDD Drift Auditor",
-        "target_kind": "maintenance_agent", "target_name": "code_hygiene",
-        "trigger_policy": {"mode": "on_idle", "idle_min_seconds": 1200, "cooldown_seconds": 7200, "precheck_name": "workspace_hygiene_or_sdd_drift", "requires_self_dev": True},
+        "trigger_policy": {"mode": "on_idle", "idle_min_seconds": 900, "cooldown_seconds": 3600, "precheck_name": "recent_warn_or_slow_spans"},
     },
 )
 
@@ -87,10 +73,6 @@ _MAINTENANCE_BRIEFS: Dict[str, Tuple[str, List[str]]] = {
     "trace_reviewer": (
         "Inspect recent warning/error telemetry spans and slow traces; capture concise root-cause notes into `01_inbox/` via `wiki_manage` if anomalies exist.",
         ["system_doctor", "wiki_manage", "read_file"],
-    ),
-    "code_hygiene": (
-        "Run `system_doctor` to audit code hygiene, SDD parity, and skill compliance; capture actionable findings into `01_inbox/`.",
-        ["system_doctor", "read_file", "search", "wiki_manage"],
     ),
 }
 
@@ -126,21 +108,19 @@ def compute_next_run_utc(schedule_expr: str, after_dt: Optional[datetime] = None
     return parsed
 
 
-def describe_operating_quadrant(bg_autonomy_on: bool, self_dev_on: bool) -> Dict[str, Any]:
-    """Describe the active Two-Lever Operating Quadrant (`Background Autonomy` x `Self-Dev Mode`)."""
-    table = {
-        (False, False): ("interactive_standard", "Interactive Partner", "Foreground-only assistance; Ring-0 self-modification locked."),
-        (False, True): ("interactive_self_dev", "Interactive Self-Dev", "Foreground assistance with explicit Ring-0 self-development unlocked."),
-        (True, False): ("autonomous_partner", "Autonomous Partner", "Scheduled & windowed `on_idle` routines and goal slices active; Ring-0 locked."),
-        (True, True): ("self_evolving_os", "Self-Evolving OS", "Full windowed `on_idle` routines, goal slices, and sandbox-verified self-evolution active."),
-    }
-    qid, label, desc = table[(bool(bg_autonomy_on), bool(self_dev_on))]
+def describe_operating_quadrant(bg_autonomy_on: bool) -> Dict[str, Any]:
+    """Describe the active Operating Posture (`Background Autonomy` ON/OFF with immutable installed `app/`)."""
+    qid, label, desc = (
+        ("autonomous_partner", "Autonomous Partner", "Scheduled & windowed `on_idle` routines and Goal slices active; installed `app/` immutable.")
+        if bg_autonomy_on
+        else ("interactive_standard", "Interactive Partner", "Foreground-only assistance; installed `app/` immutable.")
+    )
     return {
         "quadrant": qid,
         "label": label,
         "background_autonomy": bool(bg_autonomy_on),
-        "self_dev_mode": bool(self_dev_on),
-        "summary": f"{label} (`Background Autonomy={'ON' if bg_autonomy_on else 'OFF'}`, `Self-Dev={'ON' if self_dev_on else 'OFF'}`) — {desc}",
+        "immutable_app": True,
+        "summary": f"{label} (`Background Autonomy={'ON' if bg_autonomy_on else 'OFF'}`) — {desc}",
     }
 
 
@@ -148,7 +128,7 @@ def format_morning_briefing(store: Optional[MemoryStore] = None, mark_seen: bool
     """Format the `/morning` briefing over recent `autonomy_journal` routine and goal-slice runs."""
     mem = store or get_memory_store()
     entries = mem.get_autonomy_journal(limit=limit, unseen_only=False, mark_seen=mark_seen)
-    quad = describe_operating_quadrant(mem.is_background_autonomy_enabled(), mem.is_self_dev_mode_enabled())
+    quad = describe_operating_quadrant(mem.is_background_autonomy_enabled())
     lines = [f"=== Morning Autonomy Briefing ({quad['label']}) ==="]
     if not entries:
         lines.append("  (No background routine or goal-slice runs recorded yet.)")
@@ -304,8 +284,6 @@ class RoutineManager:
         if self._is_overlapping(rt):
             return {"ok": True, "skipped_overlap": True, "routine_id": rt["routine_id"]}
         tp = TriggerPolicy.from_dict(rt.get("trigger_policy"))
-        if tp.requires_self_dev and not self.store.is_self_dev_mode_enabled():
-            return {"ok": False, "skipped_self_dev": True, "routine_id": rt["routine_id"], "error": f"Routine `{rt['routine_id']}` requires `Self-Dev Mode = ON`."}
 
         tkind, inputs = rt["target_kind"], rt.get("inputs") or {}
         jm = get_job_manager(store=self.store, chat_fn=chat_fn)
@@ -380,15 +358,15 @@ class RoutineManager:
     def select_eligible_idle_routines(
         self, idle_seconds: float, now_utc: Optional[datetime] = None, now_local: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """Return enabled `on_idle` routines passing `TriggerPolicy` window, cooldown, self-dev, and `<5ms` prechecks."""
-        bg_on, sd_on = self.store.is_background_autonomy_enabled(), self.store.is_self_dev_mode_enabled()
+        """Return enabled `on_idle` routines passing `TriggerPolicy` window, cooldown, and `<5ms` prechecks."""
+        bg_on = self.store.is_background_autonomy_enabled()
         eligible: List[Dict[str, Any]] = []
         for rt in self.list_routines(mode="on_idle"):
             if not rt["enabled"]:
                 continue
             ok, reason = evaluate_trigger_eligibility(
                 TriggerPolicy.from_dict(rt.get("trigger_policy")), idle_seconds=idle_seconds,
-                last_run_at=rt.get("last_run_at") or "", self_dev_enabled=sd_on,
+                last_run_at=rt.get("last_run_at") or "",
                 background_autonomy_enabled=bg_on, now_utc=now_utc, now_local=now_local, store=self.store,
             )
             if ok:
@@ -530,18 +508,9 @@ class IdleAutonomyWatcher:
         self._stop_event.set()
 
 
-def parse_selfdev_slash(parts: List[str]) -> Dict[str, Any]:
-    """Parse `/selfdev [on|off|status]` into `execute_autonomy_mode_action` params."""
-    tok = parts[0].strip().lower() if parts else "status"
-    if tok in ("on", "enable", "true", "1"):
-        return {"subaction": "set_self_dev", "enabled": True}
-    if tok in ("off", "disable", "false", "0"):
-        return {"subaction": "set_self_dev", "enabled": False}
-    return {"subaction": "status"}
-
-
 def execute_autonomy_mode_action(p: Dict[str, Any], actor: str = "user", store: Optional[MemoryStore] = None) -> Dict[str, Any]:
-    """CoreAction handler for Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`)."""
+    """CoreAction handler for Background Autonomy, Idle Routines, and Morning Journal."""
+    _ = actor
     mem = store or get_memory_store()
     rm = get_routine_manager(store=mem)
     sub = str(p.get("subaction") or p.get("action") or "status").strip().lower()
@@ -549,12 +518,6 @@ def execute_autonomy_mode_action(p: Dict[str, Any], actor: str = "user", store: 
     if sub in ("set_autonomy", "on", "off", "toggle"):
         val = True if sub == "on" else (False if sub == "off" else (not mem.is_background_autonomy_enabled() if sub == "toggle" else bool(p.get("enabled", True))))
         mem.set_background_autonomy(val)
-    elif sub == "set_self_dev":
-        if actor.strip().lower() not in ("user", "cli", "web"):
-            return {"ok": False, "error": "PRIVILEGE GUARD REJECTED: Self-Dev Mode can only be toggled directly by the human operator."}
-        if settings.is_self_dev_locked_by_env() and bool(p.get("enabled")):
-            return {"ok": False, "error": f"PRIVILEGE GUARD REJECTED: Self-Dev Mode is locked by environment: {settings.self_dev_lock_reason()}"}
-        mem.set_self_dev_mode(bool(p.get("enabled")), actor=actor)
     elif sub in ("run", "run_now"):
         rid = str(p.get("routine_id") or "wiki_gardener")
         return rm.run_routine_now(rid, run_in_background=bool(p.get("run_in_background", False)))
@@ -562,13 +525,12 @@ def execute_autonomy_mode_action(p: Dict[str, Any], actor: str = "user", store: 
         entries = mem.get_autonomy_journal(limit=int(p.get("limit") or 15), mark_seen=bool(p.get("mark_seen", True)))
         return {"ok": True, "journal": entries, "summary": format_morning_briefing(store=mem, mark_seen=False, limit=int(p.get("limit") or 15))}
 
-    bg_on, sd_on = mem.is_background_autonomy_enabled(), mem.is_self_dev_mode_enabled()
-    quad = describe_operating_quadrant(bg_on, sd_on)
+    bg_on = mem.is_background_autonomy_enabled()
+    quad = describe_operating_quadrant(bg_on)
     routines = rm.list_routines()
     journal = mem.get_autonomy_journal(limit=10, mark_seen=False)
     return {
-        "ok": True, "background_autonomy": bg_on,
-        "self_dev_mode": "on" if sd_on else "off", "self_dev_locked": settings.is_self_dev_locked_by_env(),
+        "ok": True, "background_autonomy": bg_on, "immutable_app": True,
         "operating_quadrant": quad, "quadrant": quad, "routines": routines, "journal": journal, "summary": quad["summary"],
     }
 
@@ -584,98 +546,3 @@ def reconcile_startup_missed_runs(store: Optional[MemoryStore] = None) -> Dict[s
 
 def get_routine_manager(store: Optional[MemoryStore] = None) -> RoutineManager:
     return RoutineManager(store=store)
-
-
-# --- Clone-Based Self-Development Sandbox (Isolated from Live Companion Process) ---
-
-_SANDBOX_COPY_DIRS = ("companion", "configs", "memory", "skills", "specs", "surfaces", "tests")
-_SANDBOX_COPY_FILES = ("harness.py", "README.md")
-
-
-def create_sandbox_clone(label: str = "experiment", src_root: Optional[Path] = None, sandboxes_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Clone Companion's tracked source tree into `data/sandboxes/<id>/` without copying `data/` or `secrets.env`."""
-    src = Path(src_root or settings.root).resolve()
-    dst_base = Path(sandboxes_dir or settings.sandboxes_dir).resolve()
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-    sid = f"sbx_{stamp}_{_slug(label or 'exp')[:24]}"
-    clone_dir = dst_base / sid
-    clone_dir.mkdir(parents=True, exist_ok=True)
-    copied = 0
-    for dname in _SANDBOX_COPY_DIRS:
-        sdir = src / dname
-        if not sdir.is_dir():
-            continue
-        for p in walk_pruned_files(sdir):
-            rel = p.relative_to(src)
-            target = clone_dir / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p, target)
-            copied += 1
-    for fname in _SANDBOX_COPY_FILES:
-        if (src / fname).is_file():
-            shutil.copy2(src / fname, clone_dir / fname)
-            copied += 1
-    (clone_dir / ".sandbox_meta.json").write_text(json.dumps({"sandbox_id": sid, "label": label, "source_root": str(src), "copied_files": copied}), encoding="utf-8")
-    return {"ok": True, "sandbox_id": sid, "path": str(clone_dir), "copied_files": copied, "summary": f"Created isolated self-dev clone `{sid}` ({copied} files)."}
-
-
-def list_sandbox_clones(sandboxes_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
-    base = Path(sandboxes_dir or settings.sandboxes_dir).resolve()
-    if not base.is_dir():
-        return []
-    out: List[Dict[str, Any]] = []
-    for d in sorted(base.iterdir(), key=lambda p: p.name, reverse=True):
-        mf = d / ".sandbox_meta.json"
-        if d.is_dir() and mf.is_file():
-            out.append({**json.loads(mf.read_text(encoding="utf-8")), "path": str(d)})
-    return out
-
-
-def verify_sandbox_clone(sandbox_id: str, run_tests: bool = False, sandboxes_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Run System Doctor in an isolated child process against a sandbox clone without touching live state."""
-    clone_dir = Path(sandboxes_dir or settings.sandboxes_dir).resolve() / (sandbox_id or "").strip()
-    if not clone_dir.is_dir():
-        return {"ok": False, "error": f"Sandbox clone `{sandbox_id}` not found."}
-    snippet = (
-        "import json, sys; from pathlib import Path; from companion.safety import run_system_doctor; "
-        "print(json.dumps(run_system_doctor(root=Path('.').resolve(), run_tests=(sys.argv[1]=='1'))))"
-    )
-    env = {**os.environ, "PYTHONPATH": str(clone_dir), "COMPANION_DATA_DIR": str(clone_dir / ".sandbox_data")}
-    proc = subprocess.run([sys.executable, "-B", "-c", snippet, "1" if run_tests else "0"], cwd=str(clone_dir), env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
-    if proc.returncode != 0 or not proc.stdout.strip():
-        err = (proc.stderr or proc.stdout or "Sandbox Doctor subprocess failed.").strip()[-500:]
-        return {"ok": False, "sandbox_id": sandbox_id, "error": err, "summary": f"Sandbox `{sandbox_id}` Doctor: FAIL ({err[:160]})."}
-    rep = json.loads(proc.stdout.strip().splitlines()[-1])
-    ok = bool(rep.get("healthy"))
-    return {"ok": ok, "sandbox_id": sandbox_id, "doctor": rep, "summary": f"Sandbox `{sandbox_id}` Doctor: {'PASS' if ok else 'FAIL'}."}
-
-
-def diff_sandbox_clone(sandbox_id: str, src_root: Optional[Path] = None, sandboxes_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Generate a unified diff between an isolated sandbox clone and the live Companion workspace."""
-    live = Path(src_root or settings.root).resolve()
-    clone = Path(sandboxes_dir or settings.sandboxes_dir).resolve() / (sandbox_id or "").strip()
-    if not clone.is_dir():
-        return {"ok": False, "error": f"Sandbox clone `{sandbox_id}` not found."}
-    diffs: List[str] = []
-    changed_files: List[str] = []
-    for dname in _SANDBOX_COPY_DIRS:
-        cdir = clone / dname
-        if not cdir.is_dir():
-            continue
-        for cp in (p for p in walk_pruned_files(cdir) if p.suffix.lower() == ".py"):
-            rel = str(cp.relative_to(clone)).replace("\\", "/")
-            lp = live / rel
-            old_lns = lp.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True) if lp.is_file() else []
-            new_lns = cp.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-            if old_lns != new_lns:
-                changed_files.append(rel)
-                diffs.extend(difflib.unified_diff(old_lns, new_lns, fromfile=f"live/{rel}", tofile=f"sandbox/{rel}", n=2))
-    return {"ok": True, "sandbox_id": sandbox_id, "changed_files": changed_files, "diff": "".join(diffs)[:12000]}
-
-
-def cleanup_sandbox_clone(sandbox_id: str, sandboxes_dir: Optional[Path] = None) -> Dict[str, Any]:
-    clone = Path(sandboxes_dir or settings.sandboxes_dir).resolve() / (sandbox_id or "").strip()
-    if not clone.is_dir():
-        return {"ok": False, "error": f"Sandbox clone `{sandbox_id}` not found."}
-    shutil.rmtree(clone, ignore_errors=True)
-    return {"ok": True, "sandbox_id": sandbox_id, "summary": f"Deleted sandbox clone `{sandbox_id}`."}

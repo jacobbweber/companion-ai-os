@@ -327,7 +327,8 @@ class TestWorkspaceAndAsyncWeb(unittest.TestCase):
         woke = threading.Event()
 
         def _reader() -> None:
-            with urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/", timeout=15) as resp:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://127.0.0.1:{srv.server_address[1]}/", timeout=15) as resp:
                 with scope.track_response(resp):
                     _ = resp.readline()
                     _ = resp.readline()

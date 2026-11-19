@@ -40,6 +40,7 @@ from companion.project_graph import get_project_graph
 from companion.routines import execute_autonomy_mode_action, format_morning_briefing
 from companion.safety import LoopGuard, run_system_doctor
 from companion.sdd import verify_sdd
+from companion.sdlc_tools import preview_turn_cleanup_scope
 from companion.streaming import check_cancelled, clean_subagent_wire_context, emit_stream_event, turn_context_scope
 from companion.telemetry import telemetry
 from companion.tools import TOOLS, current_workflow_phase, dispatch, filter_tools_for_phase, phase_tool_context
@@ -366,7 +367,8 @@ def run_agent_turn(
     bp_action = classify_blueprint_reply(user_text) if awaiting_bp else None
     intent = triage_turn(user_text, store=mem, root=settings.active_project_root) if is_top else triage_turn("")
     can_orchestrate = is_top and not awaiting_bp and (auto_promote is True or (auto_promote is None and max_iters is None and mem.get_active_workflow() is None))
-    code_build_allowed = (not settings.get_workspace().is_self_project) or settings.is_self_dev_enabled() or intent.risk_tier == "R3"
+    has_ext_ws = (not settings.get_workspace().is_self_project) or bool(get_project_graph(store=mem).get_project().get("workspace_path"))
+    code_build_allowed = has_ext_ws or intent.risk_tier == "R3"
     should_blueprint = is_top and not awaiting_bp and auto_promote is True and intent.needs_blueprint and code_build_allowed
     should_promote = is_top and not awaiting_bp and auto_promote is True and not should_blueprint and intent.mode == "AUTONOMOUS_BUILD" and code_build_allowed
 
@@ -394,10 +396,10 @@ def run_agent_turn(
             phase_tier = session_tag.split(":")[2] if automated_tag and (session_tag or "").count(":") >= 2 else None
             top_tier = phase_tier or (mem.get_user_profile().get("active_model_tier", "auto") if sub_depth == 0 else current_tier_name())
             can_escalate = (not top_tier or top_tier.strip().lower() == "auto") or automated_tag or sub_depth > 0
-            turn_ctx = build_turn_context(store=mem, user_query=user_text if is_top else "", nudge_banner=nudge_banner)
             if should_compact(messages, tier=top_tier):
                 compact_messages_if_needed(messages, store=mem, tier=top_tier, active_turn_start_idx=max(1, len(messages) - 1))
-            with get_project_graph(store=mem).project_workspace_scope(), tier_context(top_tier), memory_store_context(mem), session_id_context(session_tag or "main"):
+            with get_project_graph(store=mem).project_workspace_scope(), preview_turn_cleanup_scope(), tier_context(top_tier), memory_store_context(mem), session_id_context(session_tag or "main"):
+                turn_ctx = build_turn_context(store=mem, user_query=user_text if is_top else "", nudge_banner=nudge_banner)
                 _st, reply, _meta = _run_step_loop(
                     messages, iter_limit, user_text, intent.mode, top_tier, chat_fn, mem, session_tag, tid, verbose,
                     suggested_tier=intent.suggested_tier, allow_error_escalation=can_escalate, turn_ctx=turn_ctx, log_to_conversations=log_conv,
@@ -493,12 +495,11 @@ def check_in(store: Optional[MemoryStore] = None) -> str:
     wf, spr, edu = mem.get_active_workflow(), get_project_graph(store=mem).get_active_timebox(), get_education_engine(store=mem).get_progress_summary()
     ac = edu.get("active_course")
     bg_lbl = "ON" if mem.is_background_autonomy_enabled() else "OFF"
-    sd_lbl = "ON" if mem.is_self_dev_mode_enabled() else "OFF (Core Read-Only)"
     spr_line = f"`{spr['title']}` ({spr['start_date']}..{spr['end_date']})" if spr else "(None active)"
     edu_line = f"`{ac['title']}` ({ac['mastery_pct']}% mastery, {edu['due_total']} due)" if ac else f"(None active, {edu['due_total']} due)"
     return (
         f"=== Proactive Check-In ===\nActive Project  : `{ws.project_id}` ({ws.project_root})\n"
-        f"Autonomy Levers : Background Autonomy={bg_lbl} | Self-Dev Mode={sd_lbl}\n"
+        f"Autonomy Posture: Background Autonomy={bg_lbl} | Installed App=IMMUTABLE\n"
         f"Workflow State  : `{wf['current_state'] if wf else 'IDLE'}`\n"
         f"Active Timebox  : {spr_line}\n"
         f"Study Course    : {edu_line}\n"
@@ -516,7 +517,7 @@ SLASH_HELP_TEXT = (
     "  /identity | /tone | /onboard — Soul & User Identity cards, tone (`concise|balanced|elaborate`), First-Boot setup\n"
     "  /telemetry | /traces | /logs — Live KPI scorecard, Waterfall execution traces & structured app logs\n"
     "  /doctor | /specs | /hygiene  — 7-stage System Doctor, 4-File Canonical SDD sync & AST Dead-Code scan\n"
-    "  /autonomy | /selfdev | /morning — Background Autonomy, Human-Only Self-Dev Mode & Morning Briefing\n"
+    "  /autonomy | /morning   — Background Autonomy controls & Morning Briefing\n"
     "  /skills [name]          — List Progressive-Disclosure `SKILL.md` runbooks or read a skill\n"
     "  /plan <obj> | /approve  — Draft/revise read-only Blueprint (`DISCOVER -> DESIGN -> PLAN`) & approve build\n"
     "  /goal <obj|resume>      — Execute or resume a multi-phase autonomous SDD build with doctor gates\n"
@@ -525,7 +526,7 @@ SLASH_HELP_TEXT = (
     "  /memory | /compact      — Sync/display MEMORY.md or view/trigger 2-stage context compaction\n"
     "  /jobs | /wiki | /vault  — Background Job Departures Board, Knowledge Wiki Warehouse & Blind Credential Vault\n"
     "  /endpoints | /mcp | /partners — SSH/WinRM/HTTP Registry, Outbound MCP Client & Federated Partners\n"
-    "  /routines | /approvals | /trust | /backup | /sandbox — Routines, ApprovalQueue, Trust Mode & Backups\n"
+    "  /routines | /approvals | /trust | /backup — Routines, ApprovalQueue, Trust Mode & Secret-Free Backups\n"
     "  /board | /sprint | /calendar | /study — Multi-Board Kanban, Weekly Sprints, Spatial Calendar & Socratic Tutor\n"
     "  /checkpoint | /rollback | /reset | exit — Checkpoints, Git save-points, rollback, clear window, or exit"
 )
@@ -625,7 +626,7 @@ def handle_slash_command(cmd_str: str, messages: List[Dict[str, Any]], store: Op
         code_seg = f" | coding=`{c_cfg.model}` (temp={c_cfg.temperature})" if c_cfg.is_dedicated else ""
         spr_s = f"`{spr['title']}` ({spr['start_date']}..{spr['end_date']})" if spr else "(none)"
         edu_s = f"`{ac['title']}` ({ac['mastery_pct']}%, {edu['due_total']} due)" if ac else "(none)"
-        return f"=== Companion AI OS v3.5 Status ===\nProject    : `{ws.project_id}` ({ws.project_root})\nRouting    : mode=`{mode}` | fast=`{f_cfg.model}` (temp={f_cfg.temperature}){code_seg} | reasoning=`{r_cfg.model}` (temp={r_cfg.temperature})\nTwo-Lever  : Background Autonomy={'ON' if mem.is_background_autonomy_enabled() else 'OFF'} | Self-Dev Mode={'ON' if mem.is_self_dev_mode_enabled() else 'OFF (Core Read-Only)'} (Idle: {settings.idle_minutes}m | Cooldown: {settings.hobby_cooldown_minutes}m)\nTimebox/Edu: Timebox={spr_s} | Study={edu_s}\n\n{hud}\n\nPending Tasks: {len(tasks)} | Pending Backlog: {len(backlog)}"
+        return f"=== Companion AI OS v3.5 Status ===\nProject    : `{ws.project_id}` ({ws.project_root})\nRouting    : mode=`{mode}` | fast=`{f_cfg.model}` (temp={f_cfg.temperature}){code_seg} | reasoning=`{r_cfg.model}` (temp={r_cfg.temperature})\nPosture    : Background Autonomy={'ON' if mem.is_background_autonomy_enabled() else 'OFF'} | Installed App=IMMUTABLE (Idle: {settings.idle_minutes}m | Cooldown: {settings.hobby_cooldown_minutes}m)\nTimebox/Edu: Timebox={spr_s} | Study={edu_s}\n\n{hud}\n\nPending Tasks: {len(tasks)} | Pending Backlog: {len(backlog)}"
     if verb in ("doctor", "doc"):
         return str(run_system_doctor(run_tests=True)["summary"])
     if verb in ("plan", "blueprint"):
@@ -675,7 +676,7 @@ def handle_slash_command(cmd_str: str, messages: List[Dict[str, Any]], store: Op
         return dispatch("checkpoint_manage", {"action": "rollback", "checkpoint_id": arg or None})
     if f"/{verb}" in HARVEST_SLASH_VERBS:
         out = handle_harvest_slash(f"/{verb}", arg, store=mem)
-        if verb in ("trust", "selfdev", "partners", "mcp", "board", "boards", "sprint", "study", "providers") and messages and messages[0].get("role") == "system":
+        if verb in ("trust", "partners", "mcp", "board", "boards", "sprint", "study", "providers") and messages and messages[0].get("role") == "system":
             messages[0]["content"] = build_system_prompt(store=mem)
         return out
     return f"Unknown slash command '/{verb}'. Type `/help` to see all available commands." if (cleaned.startswith("/") and "/" not in verb and "\\" not in verb) else None

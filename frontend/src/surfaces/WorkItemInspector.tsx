@@ -47,11 +47,13 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
   // Project fields
   const [projTitle, setProjTitle] = useState('');
   const [projGoal, setProjGoal] = useState('');
+  const [projWsPath, setProjWsPath] = useState('');
+  const [projDelivery, setProjDelivery] = useState('local_only');
+  const [projGitCred, setProjGitCred] = useState('');
   const [tpMode, setTpMode] = useState('manual');
   const [tpWindow, setTpWindow] = useState('22:00-06:00');
   const [tpIdleSec, setTpIdleSec] = useState(900);
   const [tpCooldownSec, setTpCooldownSec] = useState(3600);
-  const [tpReqSelfDev, setTpReqSelfDev] = useState(false);
 
   useEffect(() => {
     void Promise.all([
@@ -68,11 +70,13 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
         if (p) {
           setProjTitle(p.title);
           setProjGoal(p.goal_summary || '');
+          setProjWsPath(p.workspace_path || '');
+          setProjDelivery(p.delivery_policy || 'local_only');
+          setProjGitCred(p.git_credential_ref || '');
           setTpMode(p.trigger_policy?.mode || 'manual');
           setTpWindow(p.trigger_policy?.allowed_window || '22:00-06:00');
           setTpIdleSec(p.trigger_policy?.idle_min_seconds ?? 900);
           setTpCooldownSec(p.trigger_policy?.cooldown_seconds ?? 3600);
-          setTpReqSelfDev(Boolean(p.trigger_policy?.requires_self_dev));
         }
         if (mode === 'work_item' && itemId) {
           const found = (view.cards || []).find((c) => c.item_id === itemId);
@@ -106,13 +110,15 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
         project_id: board.project.project_id,
         title: projTitle.trim(),
         goal_summary: projGoal.trim(),
+        workspace_path: projWsPath.trim(),
+        delivery_policy: projDelivery,
+        git_credential_ref: projGitCred.trim(),
         trigger_policy: {
           mode: tpMode,
           allowed_window: tpMode === 'on_idle' ? tpWindow.trim() : '',
           idle_min_seconds: tpIdleSec,
           cooldown_seconds: tpCooldownSec,
           precheck_name: tpMode === 'on_idle' ? 'active_goal_has_ready_items' : '',
-          requires_self_dev: tpReqSelfDev,
         },
       });
       if (res.ok) {
@@ -132,6 +138,41 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
         <div>
           <label className="field-label">Goal Summary &amp; Outcome</label>
           <textarea className="textarea" rows={3} value={projGoal} onChange={(e) => setProjGoal(e.target.value)} />
+        </div>
+        <div>
+          <label className="field-label">Workspace Repository Path (Optional Git Clone)</label>
+          <input
+            className="input mono"
+            data-testid="project-workspace-path-input"
+            placeholder="e.g. D:/Projects/MyApp or leave blank for OS scratch"
+            value={projWsPath}
+            onChange={(e) => setProjWsPath(e.target.value)}
+          />
+        </div>
+        <div className="form-grid-2">
+          <div>
+            <label className="field-label">Git Delivery Policy</label>
+            <select
+              className="select"
+              data-testid="project-delivery-policy-select"
+              value={projDelivery}
+              onChange={(e) => setProjDelivery(e.target.value)}
+            >
+              <option value="local_only">Local Only (Default — No Push/PR)</option>
+              <option value="ask_me">Ask Me Before Push / PR</option>
+              <option value="remote_branch_pr">Remote Branch + PR</option>
+            </select>
+          </div>
+          <div>
+            <label className="field-label">Git Credential Ref (Blind Vault)</label>
+            <input
+              className="input mono"
+              data-testid="project-git-cred-input"
+              placeholder="Optional secret slug (e.g. github-pat)"
+              value={projGitCred}
+              onChange={(e) => setProjGitCred(e.target.value)}
+            />
+          </div>
         </div>
         <div>
           <label className="field-label">Autonomous Execution Policy</label>
@@ -156,13 +197,9 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
                 <input type="number" className="input" value={tpCooldownSec} onChange={(e) => setTpCooldownSec(Number(e.target.value))} />
               </div>
             </div>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5 }}>
-              <input type="checkbox" checked={tpReqSelfDev} onChange={(e) => setTpReqSelfDev(e.target.checked)} />
-              <span>Requires Self-Dev Mode = ON (mutates Companion core)</span>
-            </label>
           </>
         )}
-        <button type="button" className="btn btn-primary" onClick={() => void saveProject()}>
+        <button type="button" className="btn btn-primary" data-testid="save-project-policy-btn" onClick={() => void saveProject()}>
           Save Goal Policy
         </button>
       </div>

@@ -106,7 +106,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
             try:
                 result = check_in(store=store)
                 self.assertIsInstance(result, str)
-                self.assertIn("Autonomy Levers", result)
+                self.assertIn("Autonomy Posture", result)
                 self.assertIn("Workflow State", result)
                 self.assertIn("Pending Tasks", result)
                 self.assertIn("Pending Backlog", result)

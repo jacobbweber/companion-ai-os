@@ -114,11 +114,11 @@
 - **Decision**: Introduce `companion/llm_wire.py` (3 pure-stdlib wire/SSE translators: `openai_compat`, `anthropic_messages`, `gemini_native`) and `companion/model_registry.py` (`llm_providers` + `llm_tier_routes` with Zero-Reveal Blind Vault `credential_ref` binding, hot-reload 8-slot capability tier matrix, and mechanical `local_only`-by-default/`hybrid`/`cloud_allowed` outbound privacy lock).
 - **Consequences**: Instant hot-reload routing across local LAN and frontier models from Web UI and CLI (`/providers`) with zero third-party SDK bloat, zero API key exposure, and prompt-injection-proof LAN privacy.
 
-### ADR-019: Independent Two-Lever Operating Architecture (`Background Autonomy` x `Self-Dev Mode`) & Mechanical Read-Only Core Lock
+### ADR-019: Permanent Installed-App Immutability, Orthogonal SDLC & Per-Project Delivery Policy
 - **Status**: `accepted`
-- **Context**: Running a daily-driver Companion release with background execution risked unrequested code mutations, while coupling idle autonomy to self-evolution prevented quiet knowledge/routine/goal execution on stable builds.
-- **Decision**: Maintain `Background Autonomy` (`on`/`off`) and `Self-Dev Mode` (`on`/`off`, seedable/lockable via `COMPANION_SELF_DEV`, `COMPANION_SELF_DEV_LOCKED`, `COMPANION_IMMUTABLE_CORE`) as two independent levers; mechanically lock Companion core files read-only (`safety.py`, `checkpoints.py`, `grounding.py`, `skill_forge.py`) while keeping `data/` and external `/project` workspaces writable when `Self-Dev Mode = OFF`; and gate self-dev routines (`code_hygiene`) behind `Self-Dev Mode = ON`.
-- **Consequences**: Safe stable daily-driver operation with quiet `on_idle` routines and windowed autonomous Goal slices alongside deliberate Lab/VM self-evolution when `Self-Dev Mode` is explicitly enabled by the human partner.
+- **Context**: In-place self-editing of a live service risked runtime corruption and coupled coding to GitHub assumptions.
+- **Decision**: Enforce permanent installed-app immutability (`COMPANION_IMMUTABLE_APP`, locking `settings.root` read-only outside `data/` while keeping `data/scratch/` and external Project clones writable); retire legacy `Self-Dev` toggles and `.sandbox_meta.json` clones; and govern external repo work via per-project `delivery_policy` (`local_only` | `remote_branch_pr` | `ask_me`), `git_credential_ref`, `git_manage`, `dev_preview`, and modular SDLC/Browser/GitHub/DevOps skills.
+- **Consequences**: Unbrickable daily-driver OS runtime paired with air-gap-safe local SDLC, visual browser dogfooding, Blind-Vault remote Git, and rollback-verified deployments.
 
 ### ADR-020: Agent-Native Headless Core Consolidation — Unified TriggerPolicy, Code-Controlled Python DAG Runtime, Universal Project & Goal Graph, Cognitive Triage & MCP Capability Harvesting
 - **Status**: `accepted`

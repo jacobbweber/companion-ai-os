@@ -180,7 +180,7 @@ def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
     ac = edu_prog.get("active_course")
     sp = agile_view.get("active_sprint")
     m_snap = get_model_matrix_snapshot(store=store)
-    bg_on, self_dev_on = store.is_background_autonomy_enabled(), store.is_self_dev_mode_enabled()
+    bg_on = store.is_background_autonomy_enabled()
     unseen_journal = store.get_autonomy_journal(unseen_only=True, mark_seen=False, limit=20)
     waiting_approvals = get_approval_queue(store=store).list_requests(status="waiting")
     return {
@@ -192,11 +192,8 @@ def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
         "trust_mode": get_trust_mode(store=store),
         "privacy_mode": settings.effective_privacy_mode(),
         "background_autonomy": "on" if bg_on else "off",
-        "self_dev_mode": "on" if self_dev_on else "off",
-        "self_dev_enabled": self_dev_on,
-        "self_dev_locked": settings.is_self_dev_locked_by_env(),
-        "self_dev_lock_reason": settings.self_dev_lock_reason(),
-        "operating_quadrant": describe_operating_quadrant(bg_on, self_dev_on),
+        "immutable_app": settings.immutable_app,
+        "operating_quadrant": describe_operating_quadrant(bg_on),
         "unseen_autonomy_count": len(unseen_journal),
         "provider_count": len(m_snap["providers"]),
         "pending_approvals_count": len(waiting_approvals),

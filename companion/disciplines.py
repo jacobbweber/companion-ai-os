@@ -92,6 +92,7 @@ MODULE_LAYER_MAP: Dict[str, ArchitectureLayer] = {
     "companion.mcp_hub": ArchitectureLayer.APPLICATION, "companion.routines": ArchitectureLayer.APPLICATION,
     "companion.calendar_engine": ArchitectureLayer.APPLICATION, "companion.core_actions": ArchitectureLayer.APPLICATION,
     "companion.harvest_tools": ArchitectureLayer.APPLICATION, "companion.os_tools": ArchitectureLayer.APPLICATION,
+    "companion.sdlc_tools": ArchitectureLayer.APPLICATION,
     "companion.tools": ArchitectureLayer.APPLICATION, "companion.context": ArchitectureLayer.APPLICATION,
     "companion.agent": ArchitectureLayer.APPLICATION,
     "configs": ArchitectureLayer.DOMAIN, "configs.architecture": ArchitectureLayer.DOMAIN,
@@ -564,8 +565,10 @@ _R0_ACTIONS: Dict[str, FrozenSet[str]] = {
     "vault_manage": frozenset({"", "list", "check_secret", "list_missing", "audit"}),
     "endpoint_manage": frozenset({"", "list", "test", "inspect_host", "ssh_read_file"}),
     "mcp_manage": frozenset({"", "list", "discover", "list_partners", "handshake_partner", "check_partner_job"}),
-    "routine_manage": frozenset({"", "list", "autonomy_status", "morning", "list_approvals", "sandbox_list", "sandbox_diff", "prompt_list"}),
+    "routine_manage": frozenset({"", "list", "autonomy_status", "morning", "list_approvals", "prompt_list"}),
     "agile_manage": frozenset({"", "board_view", "list_items", "roadmap", "list_boards", "list_epics", "list_sprints", "capacity"}),
+    "git_manage": frozenset({"", "status", "diff", "log", "worktree_list"}),
+    "dev_preview": frozenset({"", "status", "list", "logs", "http_probe"}),
 }
 
 

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Activity, ArchiveRestore, ChevronDown, ChevronRight, Plus, RefreshCw, RotateCw, ShieldCheck, Trash2 } from 'lucide-react';
 import { apiPost, callAction, fetchTelemetry, reloadCompanionService } from '../api';
-import type { FederatedPartner, RemoteEndpoint, SandboxClone, SnapshotBackup, TelemetryPayload, VaultAuditEntry, VaultSecretMeta } from '../types';
+import type { FederatedPartner, RemoteEndpoint, SnapshotBackup, TelemetryPayload, VaultAuditEntry, VaultSecretMeta } from '../types';
 
 interface SettingsInfraPanelProps {
   section: 'vault' | 'federation' | 'ops';
@@ -37,10 +37,9 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
   const [pUrl, setPUrl] = useState('');
   const [pCred, setPCred] = useState('');
 
-  // Backups, Sandboxes, Telemetry & System Doctor
+  // Backups, Telemetry & System Doctor
   const [backups, setBackups] = useState<SnapshotBackup[]>([]);
   const [confirmRestoreId, setConfirmRestoreId] = useState('');
-  const [sandboxes, setSandboxes] = useState<SandboxClone[]>([]);
   const [doctorReport, setDoctorReport] = useState('');
   const [runningDoctor, setRunningDoctor] = useState(false);
   const [reloading, setReloading] = useState(false);
@@ -69,13 +68,11 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
       if (typeof res.hosted_mcp_enabled === 'boolean') setHostedEnabled(res.hosted_mcp_enabled);
       if (res.hosted_mcp_token_ref) setHostedTokenRef(res.hosted_mcp_token_ref);
     } else {
-      const [bRes, sRes, tRes] = await Promise.all([
+      const [bRes, tRes] = await Promise.all([
         callAction<{ snapshots?: SnapshotBackup[] }>('backup', { subaction: 'list' }),
-        callAction<{ sandboxes?: SandboxClone[] }>('sandbox', { subaction: 'list' }),
         fetchTelemetry().catch(() => null),
       ]);
       if (bRes.snapshots) setBackups(bRes.snapshots);
-      if (sRes.sandboxes) setSandboxes(sRes.sandboxes);
       if (tRes && tRes.ok) setTelemetry(tRes);
     }
   };
@@ -540,46 +537,6 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
                   <ArchiveRestore size={12} /> Restore
                 </button>
               )}
-            </div>
-          ))
-        )}
-      </div>
-
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-        <span className="field-label" style={{ margin: 0 }}>Isolated Self-Dev Sandbox Clones</span>
-        <button type="button" className="btn btn-sm" onClick={async () => {
-          const r = await callAction('sandbox', { subaction: 'create', label: 'experiment' });
-          await loadSection();
-          onToast(r.summary || r.error || 'Created sandbox clone.');
-        }}>
-          <Plus size={12} /> New Sandbox Clone
-        </button>
-      </div>
-
-      <div className="card-group">
-        {sandboxes.length === 0 ? (
-          <div className="card-row"><span style={{ color: 'var(--text-muted)' }}>No active sandbox clones.</span></div>
-        ) : (
-          sandboxes.map((s) => (
-            <div key={s.sandbox_id} className="card-row">
-              <div className="card-row-info">
-                <div className="card-row-title mono">{s.sandbox_id}</div>
-                <div className="card-row-desc">{s.copied_files} files</div>
-              </div>
-              <div style={{ display: 'inline-flex', gap: 6 }}>
-                <button type="button" className="btn btn-sm" onClick={async () => {
-                  const r = await callAction('sandbox', { subaction: 'verify', sandbox_id: s.sandbox_id });
-                  onToast(r.summary || r.error || 'Verified sandbox.');
-                }}>
-                  <ShieldCheck size={12} /> Verify
-                </button>
-                <button type="button" className="btn btn-danger btn-sm" onClick={async () => {
-                  await callAction('sandbox', { subaction: 'cleanup', sandbox_id: s.sandbox_id });
-                  await loadSection();
-                }}>
-                  <Trash2 size={12} /> Clean Up
-                </button>
-              </div>
             </div>
           ))
         )}

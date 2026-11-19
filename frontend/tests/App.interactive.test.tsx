@@ -160,9 +160,16 @@ async function flushUi(ms = 60): Promise<void> {
   });
 }
 
-function setInputValue(el: HTMLInputElement | HTMLTextAreaElement, val: string): void {
+function setInputValue(
+  el: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+  val: string
+): void {
   const proto =
-    el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : el instanceof HTMLSelectElement
+        ? HTMLSelectElement.prototype
+        : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
   setter?.call(el, val);
   el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -349,6 +356,29 @@ describe('Companion v3.5 Progressive-Disclosure UI & Headless Core Parity', () =
     await flushUi(120);
     expect(container.querySelector('[data-testid="aux-split-pane"]')).toBeTruthy();
     expect(container.querySelector('[data-testid="work-item-inspector"]')).toBeTruthy();
+
+    // Open Project Inspector and configure SDLC Delivery Policy + Blind Vault Git Credential Ref
+    const cfgProjBtn = container.querySelector('[data-testid="configure-project-trigger-btn"]') as HTMLButtonElement;
+    expect(cfgProjBtn).toBeTruthy();
+    await act(async () => {
+      cfgProjBtn.click();
+    });
+    await flushUi(120);
+    const delivSelect = container.querySelector('[data-testid="project-delivery-policy-select"]') as HTMLSelectElement;
+    const gitCredInput = container.querySelector('[data-testid="project-git-cred-input"]') as HTMLInputElement;
+    expect(delivSelect).toBeTruthy();
+    expect(gitCredInput).toBeTruthy();
+    await act(async () => {
+      setInputValue(delivSelect, 'ask_me');
+      setInputValue(gitCredInput, 'github-pat');
+    });
+    const saveProjBtn = container.querySelector('[data-testid="save-project-policy-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      saveProjBtn.click();
+    });
+    await flushUi(150);
+    await flushUi(150);
+    expect(container.querySelector('[data-testid="project-delivery-badge"]')?.textContent).toContain('Ask Before Push');
   });
 
   it('exercises Automations (on_idle + 22:00-06:00 window), Customizations (Skills & Python DAGs), and Settings Modal', async () => {
@@ -476,6 +506,8 @@ describe('Companion v3.5 Progressive-Disclosure UI & Headless Core Parity', () =
     });
     await flushUi(80);
     expect(container.querySelector('[data-testid="settings-modal"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="toggle-self-dev"]')).toBeNull();
+    expect(container.querySelector('[data-testid="immutable-app-badge"]')?.textContent).toBe('Immutable');
 
     const appTab = container.querySelector('[data-testid="settings-tab-appearance"]') as HTMLButtonElement;
     await act(async () => {

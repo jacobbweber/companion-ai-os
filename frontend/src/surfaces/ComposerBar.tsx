@@ -67,7 +67,6 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
   const activeTier = status?.active_model_tier || 'auto';
   const trustMode = status?.trust_mode || 'balanced';
   const bgAutonomy = status?.background_autonomy === 'on';
-  const selfDev = Boolean(status?.self_dev_enabled);
 
   const currentProj =
     projects.find((p) => p.project_id === selectedProjectId || p.slug === selectedProjectId) ||
@@ -152,12 +151,6 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
     const res = await callAction('autonomy', { subaction: 'set_autonomy', enabled: !bgAutonomy });
     await onRefreshStatus();
     onToast(res.summary || res.error || `Background Autonomy ${!bgAutonomy ? 'ON' : 'OFF'}.`);
-  };
-
-  const toggleSelfDev = async () => {
-    const res = await callAction('autonomy', { subaction: 'set_self_dev', enabled: !selfDev });
-    await onRefreshStatus();
-    onToast(res.summary || res.error || `Self-Dev Mode ${!selfDev ? 'ON' : 'OFF'}.`);
   };
 
   const submit = async () => {
@@ -482,13 +475,12 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
               className="composer-chip-trigger"
               data-testid="composer-posture-btn"
               onClick={() => setOpenMenu(openMenu === 'posture' ? 'none' : 'posture')}
-              title="Trust, Background Autonomy & Self-Dev Posture"
+              title="Trust & Background Autonomy Posture"
             >
-              <Shield size={13} style={{ color: selfDev ? 'var(--status-warn)' : undefined }} />
+              <Shield size={13} />
               <span style={{ textTransform: 'capitalize' }}>
                 {trustMode}
                 {bgAutonomy ? ' • Idle On' : ''}
-                {selfDev ? ' • Self-Dev' : ''}
               </span>
               <ChevronDown size={12} />
             </button>
@@ -513,10 +505,6 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
                     <Sparkles size={13} /> Background Autonomy
                   </span>
                   <span className={`badge ${bgAutonomy ? 'ok' : ''}`}>{bgAutonomy ? 'ON' : 'OFF'}</span>
-                </div>
-                <div className="popover-row" onClick={() => void toggleSelfDev()}>
-                  <span>Self-Dev Core Unlock</span>
-                  <span className={`badge ${selfDev ? 'warn' : ''}`}>{selfDev ? 'ON' : 'OFF (RO)'}</span>
                 </div>
               </div>
             )}

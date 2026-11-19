@@ -30,14 +30,13 @@ export interface TriggerPolicySpec {
   allowed_window?: string;
   cooldown_seconds?: number;
   precheck_name?: string;
-  requires_self_dev?: boolean;
 }
 
 export interface OperatingQuadrant {
-  quadrant: 'interactive_standard' | 'interactive_self_dev' | 'autonomous_partner' | 'self_evolving_os' | string;
+  quadrant: 'interactive_standard' | 'autonomous_partner' | string;
   label: string;
   background_autonomy: boolean;
-  self_dev_mode: boolean;
+  immutable_app?: boolean;
   summary: string;
 }
 
@@ -113,10 +112,7 @@ export interface WebStatus {
   fast_model: string;
   reasoning_model: string;
   background_autonomy?: 'on' | 'off' | string;
-  self_dev_mode?: 'on' | 'off' | string;
-  self_dev_enabled?: boolean;
-  self_dev_locked?: boolean;
-  self_dev_lock_reason?: string;
+  immutable_app?: boolean;
   operating_quadrant?: OperatingQuadrant;
   unseen_autonomy_count?: number;
   focus_project_id?: string;
@@ -599,8 +595,7 @@ export interface AutonomyJournalEntry {
 export interface AutonomySnapshot {
   ok: boolean;
   background_autonomy: boolean;
-  self_dev_mode: 'on' | 'off' | string;
-  self_dev_locked: boolean;
+  immutable_app?: boolean;
   operating_quadrant: OperatingQuadrant;
   routines: RoutineItem[];
   journal: AutonomyJournalEntry[];
@@ -615,14 +610,6 @@ export interface SnapshotBackup {
   wiki_files: number;
   declared_secrets: string[];
   path: string;
-}
-
-export interface SandboxClone {
-  sandbox_id: string;
-  label: string;
-  copied_files: number;
-  path: string;
-  source_root?: string;
 }
 
 export interface TelemetryPayload {
@@ -672,6 +659,11 @@ export interface ProjectGraphEntry {
   goal_summary: string;
   kind: 'goal' | 'project' | 'life' | 'work' | 'software' | string;
   status: string;
+  workspace_path?: string;
+  delivery_policy?: 'local_only' | 'remote_branch_pr' | 'ask_me' | string;
+  git_credential_ref?: string;
+  test_command?: string;
+  preview_command?: string;
   trigger_policy: TriggerPolicySpec;
   wiki_hub_path?: string;
   metadata?: Record<string, unknown>;

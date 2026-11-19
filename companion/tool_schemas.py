@@ -2,7 +2,7 @@
 Rich OpenAI Tool Schemas & Phase-Scoped `AllowedTools` Gating (A-Frame Application Layer).
 
 Provides:
-1. All 26 deterministic tool schemas with explicit 1-line parameter descriptions so local
+1. All 28 deterministic tool schemas with explicit 1-line parameter descriptions so local
    open-weight models (`Qwen`, `DeepSeek`, `Llama`, `Mistral`) never guess argument semantics.
 2. Mechanical `PHASE_ALLOWED_TOOLS` & fine-grained `(tool, action)` gating (`phase_tool_context`,
    `filter_tools_for_phase`, `check_phase_tool_permission`) locking out file/state mutations in read-only phases.
@@ -104,7 +104,7 @@ TOOLS: List[Dict[str, Any]] = [
     }, ["action"]),
     _tool("workflow_manage", "Drive the Software Engineering State-Machine Workflow (`INTAKE..COMPLETE` with code snapshots & unit-test gates), draft/approve code Blueprints, run `/goal` software builds, forge/run 3-Tier Capability Packs, spawn subagents, or execute/resume code-controlled Python DAGs (`dags/*.py`). NEVER use `start`/`autonomy`/`blueprint` for personal, home, or work goals — use `agile_manage` instead.", {
         "action": _p("string", "Workflow state-machine, Skill Forge, or code-controlled DAG runtime action.", enum=["start", "status", "transition", "recover", "blueprint", "approve", "autonomy", "http_smoke", "subagent", "list_dags", "run_dag", "resume_dag", "check_skill", "bootstrap_skill", "promote_skill", "run_script", "abort", "complete"]),
-        "workflow_type": _p("string", "Software workflow classification (`self_evolution` requires `Self-Dev Mode = ON`; never use for personal goals).", enum=["self_evolution", "engineering_feature", "bug_fix", "architecture_refactor"]),
+        "workflow_type": _p("string", "Software workflow classification (never use for personal goals — use `agile_manage` instead).", enum=["self_evolution", "engineering_feature", "bug_fix", "architecture_refactor"]),
         "goal": _p("string", "Objective text (pass `'resume'` with `action='autonomy'` to resume an interrupted goal)."),
         "module": _p("string", "Target Python web server module for `http_smoke` (default `surfaces.web_server`)."),
         "endpoints": _p("array", "URL paths to probe during `http_smoke` (e.g. `['/','/api/status']`).", items_type="string"),
@@ -116,7 +116,7 @@ TOOLS: List[Dict[str, Any]] = [
         "dags": _p("object", "Map of `filename.py` -> Python `DAGSpec` module (`from companion.dag_runtime import DAGNode, DAGSpec; DAG = DAGSpec(name='...', description='...', input_schema={'x': 'list'}, nodes=[DAGNode(node_id='step1', kind='python_step', output_schema={'n': 'int'}, fn=lambda ctx: ...)], self_test_fn=lambda: True)`) for `bootstrap_skill`."),
         "references": _p("object", "Map of `doc.md` -> Markdown reference text for `bootstrap_skill`."),
         "overwrite": _p("boolean", "Set true on `bootstrap_skill` to overwrite an existing skill directory."),
-        "scope": _p("string", "Skill promotion target (`user` saves update-safe skill in `data/skills/`; `core` requires `Self-Dev Mode = ON`).", enum=["core", "user"]),
+        "scope": _p("string", "Skill promotion target (`user` saves update-safe skill in `data/skills/`; `core` targets external project `skills/`).", enum=["core", "user"]),
         "tier": _p("string", "Model tier for `subagent`.", enum=["default", "fast", "coding", "reasoning", "audio", "image", "video"]),
         "dag": _p("string", "Code-controlled `DAGSpec` name (for `run_dag`)."),
         "run_id": _p("string", "Persisted SQLite DAG run ID (`dagrun_...`) for `resume_dag`."),
@@ -240,8 +240,8 @@ TOOLS: List[Dict[str, Any]] = [
         "goal": _p("string", "Task goal to delegate to a remote Federated Partner when `action='delegate_partner'`."),
         "job_id": _p("string", "Remote background job ID when `action='check_partner_job'`."),
     }, ["action"]),
-    _tool("routine_manage", "Manage Unified `TriggerPolicy` Routines (`manual`, `scheduled`, `on_idle` with time-slot windows), Background Autonomy (`autonomy_status`, `autonomy_on`, `autonomy_off`, `morning`), isolated self-dev sandbox clones, saved prompts, and pending approvals.", {
-        "action": _p("string", "Routine, Background Autonomy, sandbox clone, saved prompt, or approval inspection action.", enum=["list", "create", "enable", "disable", "delete", "tick", "run_now", "autonomy_status", "autonomy_on", "autonomy_off", "morning", "list_approvals", "sandbox_list", "sandbox_create", "sandbox_verify", "sandbox_diff", "sandbox_cleanup", "prompt_list", "prompt_save", "prompt_render"]),
+    _tool("routine_manage", "Manage Unified `TriggerPolicy` Routines (`manual`, `scheduled`, `on_idle` with time-slot windows), Background Autonomy (`autonomy_status`, `autonomy_on`, `autonomy_off`, `morning`), saved prompts, and pending approvals.", {
+        "action": _p("string", "Routine, Background Autonomy, saved prompt, or approval inspection action.", enum=["list", "create", "enable", "disable", "delete", "tick", "run_now", "autonomy_status", "autonomy_on", "autonomy_off", "morning", "list_approvals", "prompt_list", "prompt_save", "prompt_render"]),
         "routine_id": _p("string", "Kebab-case identifier for `create`, `enable`, `disable`, `delete`, or `run_now`."),
         "title": _p("string", "Optional human-readable title when creating or updating a routine."),
         "mode": _p("string", "TriggerPolicy mode (`manual`, `scheduled`, or `on_idle`).", enum=["manual", "scheduled", "on_idle"]),
@@ -249,13 +249,11 @@ TOOLS: List[Dict[str, Any]] = [
         "allowed_window": _p("string", "Optional local time window when `mode='on_idle'` (e.g. `22:00-06:00` or `Mon-Fri 22:00-06:00`)."),
         "idle_min_seconds": _p("integer", "Minimum idle seconds before an `on_idle` routine fires (default 900)."),
         "cooldown_seconds": _p("integer", "Minimum cooldown seconds between `on_idle` runs (default 3600)."),
-        "precheck_name": _p("string", "Optional deterministic `<5ms` precheck (`wiki_inbox_or_stale`, `recent_unconsolidated_chat`, `recent_warn_or_slow_spans`, `workspace_hygiene_or_sdd_drift`, `active_goal_has_ready_items`)."),
-        "requires_self_dev": _p("boolean", "Set true if the routine mutates Companion core and requires `Self-Dev Mode = ON`."),
+        "precheck_name": _p("string", "Optional deterministic `<5ms` precheck (`wiki_inbox_or_stale`, `recent_unconsolidated_chat`, `recent_warn_or_slow_spans`, `active_goal_has_ready_items`)."),
         "target_kind": _p("string", "Verified routine target category (free-form prompts are forbidden).", enum=["dag", "maintenance_agent", "goal_slice", "wiki_inbox_triage", "wiki_deep_curate", "snapshot_backup", "endpoint_pulse", "chat_archive"]),
         "target_name": _p("string", "Code-controlled DAG name or maintenance target name."),
         "inputs": _p("object", "Optional key-value input dictionary passed to the routine target."),
         "variables": _p("object", "Optional template variable dictionary for `prompt_render` or `create`."),
-        "sandbox_id": _p("string", "Sandbox clone ID (`sbx_...`) for `sandbox_verify`, `sandbox_diff`, or `sandbox_cleanup`."),
         "name": _p("string", "Template slug for `prompt_save` or `prompt_render`."),
         "template": _p("string", "Reusable prompt text (with optional `{{var}}` placeholders) for `prompt_save`."),
     }, ["action"]),
@@ -285,6 +283,11 @@ TOOLS: List[Dict[str, Any]] = [
         "weekday_capacity_slots": _p("integer", "Weekly weekday slot budget when starting/updating a timebox (default 10)."),
         "weekend_capacity_slots": _p("integer", "Weekly weekend slot budget when starting/updating a timebox (default 6)."),
         "kind": _p("string", "Project category when `action='create_project'`/`'save_board'`.", enum=["life", "work", "project", "software", "general"]),
+        "workspace_path": _p("string", "Optional local Git repository directory bound to this project (`create_project` or `update_project`)."),
+        "delivery_policy": _p("string", "Per-project Git delivery posture (`local_only` default, `remote_branch_pr`, or `ask_me`).", enum=["local_only", "remote_branch_pr", "ask_me"]),
+        "git_credential_ref": _p("string", "Optional symbolic Blind Vault slug (`vault://...`) for authenticated Git SSH/PAT operations."),
+        "test_command": _p("string", "Optional custom test command override for this project."),
+        "preview_command": _p("string", "Optional custom `dev_preview` startup command template (supports `{port}`)."),
     }, ["action"]),
     _tool("calendar_manage", "Inspect or schedule across the Unified Calendar (appointments, focus blocks, sprint task dates, deadlines, routines, and due SRS study reviews).", {
         "action": _p("string", "Calendar sub-action.", enum=["window", "today", "week", "month", "list_events", "add_event", "delete_event"]),
@@ -321,6 +324,34 @@ TOOLS: List[Dict[str, Any]] = [
         "mermaid_diagram": _p("string", "Optional Mermaid diagram body (without fences) for dual-coding `curate_note`."),
         "limit": _p("integer", "Max items to return in `due` or `flashcard_deck` (default 6 for decks)."),
     }, ["action"]),
+    _tool("git_manage", "Execute safe local Git, parallel `git worktree`, secret-shielded commit, and Blind-Vault-authenticated remote operations governed by project `delivery_policy`.", {
+        "action": _p("string", "Git or worktree sub-action.", enum=["status", "diff", "log", "branch", "worktree_add", "worktree_list", "worktree_remove", "commit", "fetch", "pull", "push"]),
+        "repo_path": _p("string", "Optional repository or worktree directory path (defaults to active project root)."),
+        "branch": _p("string", "Feature/fix branch name (`feat/<slug>` or `fix/<slug>`) for `branch`, `worktree_add`, `pull`, or `push`."),
+        "slug": _p("string", "Short kebab-case feature slug used when `worktree_add` auto-names `feat/<slug>`."),
+        "worktree_path": _p("string", "Optional custom worktree checkout path (for `worktree_add` or `worktree_remove`)."),
+        "message": _p("string", "Descriptive commit subject line when `action='commit'`."),
+        "paths": _p("array", "Optional explicit relative file paths to stage on `commit` (secret/DB files are blocked).", items_type="string"),
+        "staged": _p("boolean", "Set true on `diff` to inspect staged (`--cached`) changes."),
+        "path": _p("string", "Optional single relative path filter for `diff`."),
+        "remote": _p("string", "Git remote name (default `origin`) for `fetch`, `pull`, or `push`."),
+        "credential_ref": _p("string", "Optional symbolic Blind Vault slug overriding the project's `git_credential_ref`."),
+        "limit": _p("integer", "Number of recent commits to show for `log` (default 10)."),
+    }, ["action"]),
+    _tool("dev_preview", "Manage isolated local preview servers (`127.0.0.1:<port>`) in dedicated OS process groups with scrubbed temp env/DB, ring-buffer logs, HTTP probes, vision critique, and guaranteed teardown.", {
+        "action": _p("string", "Preview server lifecycle or inspection sub-action.", enum=["start", "status", "list", "logs", "http_probe", "vision_critique", "stop", "stop_all"]),
+        "preview_id": _p("string", "Preview instance ID (`prev_...`) returned by `start` (defaults to active preview)."),
+        "cwd": _p("string", "Optional working directory for `start` (defaults to active project root or worktree)."),
+        "command": _p("string", "Optional startup command override (supports `{port}`; auto-detected when omitted)."),
+        "port": _p("integer", "Optional preferred loopback port (0 allocates a free `127.0.0.1` port automatically)."),
+        "health_path": _p("string", "Readiness URL path to poll on `start` (e.g. `/api/health` or `/`)."),
+        "timeout": _p("integer", "Maximum seconds to wait for preview server readiness on `start` (default 20)."),
+        "tail": _p("integer", "Number of recent stdout/stderr ring-buffer lines to return on `logs` (default 60)."),
+        "path": _p("string", "Loopback URL path to request on `http_probe` (e.g. `/api/health`)."),
+        "method": _p("string", "HTTP method (`GET` or `POST`) for `http_probe` (default `GET`)."),
+        "screenshot_paths": _p("array", "Captured Desktop/Mobile PNG file paths for `vision_critique`.", items_type="string"),
+        "prompt": _p("string", "Optional visual QA prompt passed to the `image` vision tier on `vision_critique`."),
+    }, ["action"]),
 ]
 
 ALL_TOOL_NAMES: FrozenSet[str] = frozenset(t["function"]["name"] for t in TOOLS)
@@ -328,9 +359,9 @@ _READ_ORIENT_TOOLS: Tuple[str, ...] = (
     "read_file", "list_dir", "search", "web_fetch", "web_search", "memory_manage", "task_manage",
     "workflow_manage", "checkpoint_manage", "sdd_manage", "telemetry_manage", "project_manage",
     "system_doctor", "job_manage", "wiki_manage", "vault_manage", "endpoint_manage", "mcp_manage",
-    "routine_manage", "agile_manage", "calendar_manage", "education_manage",
+    "routine_manage", "agile_manage", "calendar_manage", "education_manage", "git_manage", "dev_preview",
 )
-_REPO_INTERNAL_TOOLS: FrozenSet[str] = frozenset({"sdd_manage", "checkpoint_manage", "task_manage", "system_doctor"})
+_REPO_INTERNAL_TOOLS: FrozenSet[str] = frozenset({"sdd_manage", "checkpoint_manage", "task_manage", "system_doctor", "git_manage", "dev_preview"})
 _CODE_MARKERS: FrozenSet[str] = frozenset({".git", "pyproject.toml", "package.json", "cargo.toml", "go.mod", "makefile", "requirements.txt"})
 _CODE_EXTS: FrozenSet[str] = frozenset({".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".cs", ".csproj", ".sln", ".java", ".c", ".cpp", ".sh", ".ps1"})
 
@@ -380,7 +411,7 @@ def r3_approval_context(approved: bool = True) -> Iterator[bool]:
 def _workspace_hidden_tools(eff_phase: str) -> FrozenSet[str]:
     ws = settings.get_workspace()
     if ws.is_self_project:
-        return frozenset() if (eff_phase or settings.is_self_dev_enabled()) else _REPO_INTERNAL_TOOLS
+        return frozenset() if eff_phase else _REPO_INTERNAL_TOOLS
     root = ws.project_root
     if (root / "companion").is_dir() and (root / "specs" / "ARCHITECTURE.md").is_file():
         return frozenset()
@@ -427,14 +458,19 @@ _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "vault_manage": frozenset({"declare", "request_scope"}),
     "endpoint_manage": frozenset({"propose", "register", "remove", "ssh_exec", "winrm_exec", "api_request"}),
     "mcp_manage": frozenset({"propose_server", "register_server", "call_tool", "harvest_skill", "register_partner", "delegate_partner"}),
-    "routine_manage": frozenset({"create", "enable", "disable", "delete", "tick", "run_now", "autonomy_on", "autonomy_off", "sandbox_create", "sandbox_cleanup", "prompt_save"}),
+    "routine_manage": frozenset({"create", "enable", "disable", "delete", "tick", "run_now", "autonomy_on", "autonomy_off", "prompt_save"}),
     "agile_manage": frozenset({"create_project", "update_project", "save_board", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "create_timebox", "start_sprint", "rollover_sprint", "create_item", "create_card", "update_item", "update_card", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker"}),
     "calendar_manage": frozenset({"add_event", "delete_event"}),
     "education_manage": frozenset({"save_course", "set_active", "advance_stage", "upsert_items", "grade_item", "curate_note"}),
+    "git_manage": frozenset({"branch", "worktree_add", "worktree_remove", "commit", "fetch", "pull", "push"}),
+    "dev_preview": frozenset({"start", "vision_critique", "stop", "stop_all"}),
 }
 
 _PHASE_ACTION_EXCEPTIONS: Dict[str, FrozenSet[Tuple[str, str]]] = {
-    "VERIFY": frozenset({("workflow_manage", "run_script")}),
+    "VERIFY": frozenset({
+        ("workflow_manage", "run_script"), ("dev_preview", "start"), ("dev_preview", "vision_critique"),
+        ("dev_preview", "stop"), ("dev_preview", "stop_all"),
+    }),
     "REFLECT": frozenset({("memory_manage", "upsert_fact"), ("memory_manage", "add_note"), ("wiki_manage", "capture_inbox")}),
 }
 

@@ -27,7 +27,7 @@ SELF_PROJECT_ID = "companion-self"
 __all__ = [
     "CAPABILITY_TIERS", "DEFAULT_ROOT", "MODEL_TIERS", "SELF_PROJECT_ID", "SKIP_DIRS", "Settings", "TierConfig",
     "WorkspaceContext", "agent_tool_turn_context", "execution_origin_context", "get_execution_origin",
-    "is_in_agent_tool_turn", "self_dev_override_context", "settings", "slugify_project_id", "workspace_context",
+    "is_in_agent_tool_turn", "settings", "slugify_project_id", "workspace_context",
 ]
 
 _DEFAULT_TIER_TEMPS: Dict[str, float] = {"fast": 0.15, "coding": 0.15, "reasoning": 0.6}
@@ -73,7 +73,6 @@ class WorkspaceContext:
 
 _WORKSPACE_OVERRIDE: contextvars.ContextVar[Optional[WorkspaceContext]] = contextvars.ContextVar("companion_workspace_override", default=None)
 _TIER_OVERRIDE_MAP: contextvars.ContextVar[Optional[Dict[str, TierConfig]]] = contextvars.ContextVar("companion_tier_override_map", default=None)
-_SELF_DEV_OVERRIDE: contextvars.ContextVar[Optional[bool]] = contextvars.ContextVar("companion_self_dev_override", default=None)
 _IN_AGENT_TOOL_TURN: contextvars.ContextVar[bool] = contextvars.ContextVar("companion_in_agent_tool_turn", default=False)
 _EXECUTION_ORIGIN: contextvars.ContextVar[str] = contextvars.ContextVar("companion_execution_origin", default="direct")
 
@@ -106,16 +105,6 @@ def agent_tool_turn_context() -> Iterator[None]:
 def is_in_agent_tool_turn() -> bool:
     """Return True when code is currently executing inside an LLM tool call (`tools.dispatch`)."""
     return bool(_IN_AGENT_TOOL_TURN.get())
-
-
-@contextlib.contextmanager
-def self_dev_override_context(enabled: bool) -> Iterator[None]:
-    """Temporarily override `is_self_dev_enabled()` inside a `ContextVar` scope for deterministic testing."""
-    tok = _SELF_DEV_OVERRIDE.set(bool(enabled))
-    try:
-        yield
-    finally:
-        _SELF_DEV_OVERRIDE.reset(tok)
 
 
 def slugify_project_id(raw: str) -> str:
@@ -242,9 +231,7 @@ class Settings:
     privacy_mode: str = "local_only"
     web_host: str = "127.0.0.1"
     web_token: str = ""
-    self_dev_default: bool = False
-    immutable_core: bool = False
-    self_dev_locked: bool = False
+    immutable_app: bool = True
     companion_name: str = ""
     companion_soul: str = ""
     user_name: str = ""
@@ -306,9 +293,7 @@ class Settings:
         self.privacy_mode = raw_priv if raw_priv in ("hybrid", "local_only", "cloud_allowed") else "local_only"
         self.web_host = os.environ.get("COMPANION_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
         self.web_token = os.environ.get("COMPANION_WEB_TOKEN", "").strip()
-        self.self_dev_default = _env_bool("COMPANION_SELF_DEV", False)
-        self.immutable_core = _env_bool("COMPANION_IMMUTABLE_CORE", False)
-        self.self_dev_locked = self.immutable_core or _env_bool("COMPANION_SELF_DEV_LOCKED", False)
+        self.immutable_app = _env_bool("COMPANION_IMMUTABLE_APP", True) or _env_bool("COMPANION_IMMUTABLE_CORE", False)
         self.companion_name = os.environ.get("COMPANION_NAME", "").strip()[:60]
         self.companion_soul = os.environ.get("COMPANION_SOUL", "").strip()[:300]
         self.user_name = os.environ.get("COMPANION_USER_NAME", "").strip()[:60]
@@ -316,7 +301,6 @@ class Settings:
         self._ws_lock = threading.RLock()
         self._runtime_tier_resolver: Optional[Callable[[str, Dict[str, TierConfig]], Optional[TierConfig]]] = None
         self._runtime_privacy_resolver: Optional[Callable[[str], str]] = None
-        self._runtime_self_dev_resolver: Optional[Callable[[bool], bool]] = None
         self._workspace = WorkspaceContext(
             project_id=SELF_PROJECT_ID,
             project_root=self.root.resolve(),
@@ -366,38 +350,6 @@ class Settings:
         if self._runtime_privacy_resolver is not None:
             return self._runtime_privacy_resolver(self.privacy_mode)
         return self.privacy_mode
-
-    def register_self_dev_resolver(self, resolver_fn: Callable[[bool], bool]) -> None:
-        """Bind Domain-layer `MemoryStore` resolver for `Self-Dev Mode` without upward A-Frame imports."""
-        self._runtime_self_dev_resolver = resolver_fn
-
-    def get_self_dev_override(self) -> Optional[bool]:
-        return _SELF_DEV_OVERRIDE.get()
-
-    def is_self_dev_locked_by_env(self) -> bool:
-        """Return True when deployment env (`COMPANION_IMMUTABLE_CORE=1` or `COMPANION_SELF_DEV_LOCKED=1`) pins Self-Dev Mode."""
-        return bool(self.immutable_core or self.self_dev_locked)
-
-    def self_dev_lock_reason(self) -> str:
-        """Describe active deployment env lock on `Self-Dev Mode` (or empty string when runtime-toggleable)."""
-        if self.immutable_core:
-            return "Pinned OFF by COMPANION_IMMUTABLE_CORE=1"
-        if self.self_dev_locked:
-            return f"Pinned {'ON' if self.self_dev_default else 'OFF'} by COMPANION_SELF_DEV_LOCKED=1"
-        return ""
-
-    def is_self_dev_enabled(self) -> bool:
-        """Return effective `Self-Dev Mode` honoring ContextVar overrides, immutable/locked deployment envs, and SQLite."""
-        override = _SELF_DEV_OVERRIDE.get()
-        if override is not None:
-            return bool(override)
-        if self.immutable_core:
-            return False
-        if self.self_dev_locked:
-            return bool(self.self_dev_default)
-        if self._runtime_self_dev_resolver is not None:
-            return bool(self._runtime_self_dev_resolver(self.self_dev_default))
-        return bool(self.self_dev_default)
 
     def update_compaction_watermarks(self, trigger_pct: float, target_pct: float) -> None:
         """Hot-reload global context compaction trigger/target percentages in memory."""
@@ -524,8 +476,8 @@ class Settings:
         return self.effective_data_dir / "snapshots"
 
     @property
-    def sandboxes_dir(self) -> Path:
-        return self.effective_data_dir / "sandboxes"
+    def scratch_dir(self) -> Path:
+        return self.effective_data_dir / "scratch"
 
     @property
     def compact_trigger_tokens(self) -> int:
@@ -567,9 +519,8 @@ class Settings:
             "active_project_id": ws.project_id,
             "active_project_root": str(ws.project_root),
             "is_self_project": ws.is_self_project,
-            "self_dev_enabled": self.is_self_dev_enabled(),
-            "self_dev_locked": self.is_self_dev_locked_by_env(),
-            "self_dev_lock_reason": self.self_dev_lock_reason(),
+            "immutable_app": self.immutable_app,
+            "scratch_dir": str(self.scratch_dir),
             "max_iters": self.max_iters,
             "temperature": self.temperature,
             "fast_temperature": self.resolve_tier("fast").temperature,
