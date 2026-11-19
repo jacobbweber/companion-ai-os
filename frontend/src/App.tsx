@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Inbox, PanelLeftOpen, PanelRight } from 'lucide-react';
-import { apiPost, callAction, fetchStatus } from './api';
+import { Inbox, KeyRound, PanelLeftOpen, PanelRight } from 'lucide-react';
+import { apiPost, callAction, fetchStatus, pairLanToken } from './api';
 import { SettingsModal } from './settings/SettingsModal';
 import { ActivityPopover } from './shell/ActivityPopover';
 import { AuxSplitPane } from './shell/AuxSplitPane';
@@ -48,8 +48,11 @@ export const App: React.FC = () => {
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>('general');
   const [searchOpen, setSearchOpen] = useState(false);
   const [wikiInitialPath, setWikiInitialPath] = useState('');
+  const [wikiOpenNonce, setWikiOpenNonce] = useState(0);
   const [knowledgeInitialMode, setKnowledgeInitialMode] = useState<'notes' | 'mindmap' | 'study'>('notes');
   const [dataRefreshNonce, setDataRefreshNonce] = useState(0);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [lanTokenInput, setLanTokenInput] = useState('');
   const [toast, setToast] = useState('');
   const activityAnchorRef = useRef<HTMLDivElement | null>(null);
 
@@ -72,17 +75,20 @@ export const App: React.FC = () => {
 
   const refreshStatusAndProjects = async () => {
     try {
-      const [st, bRes] = await Promise.all([
-        fetchStatus(),
-        callAction<{ boards?: ProjectGraphEntry[] }>('agile', { subaction: 'list_boards' }),
-      ]);
+      const st = await fetchStatus();
+      if (st.auth_required) {
+        setAuthRequired(true);
+        return;
+      }
       if (st.ok) {
+        setAuthRequired(false);
         setStatus(st);
         const initialFocus = st.focus_project_id || st.workspace?.project_id || '';
         if (!selectedProjectId && initialFocus) {
           setSelectedProjectId(initialFocus);
         }
       }
+      const bRes = await callAction<{ boards?: ProjectGraphEntry[] }>('agile', { subaction: 'list_boards' });
       if (bRes.boards) {
         setProjects(bRes.boards);
         if (!selectedProjectId && bRes.boards.length > 0) {
@@ -99,11 +105,26 @@ export const App: React.FC = () => {
     const timer = window.setInterval(() => {
       if (document.visibilityState !== 'hidden') {
         void fetchStatus().then((s) => {
-          if (s.ok) setStatus(s);
-        }).catch(() => {});
+          if (s.auth_required) setAuthRequired(true);
+          else if (s.ok) {
+            setAuthRequired(false);
+            setStatus(s);
+          }
+        });
       }
     }, 5000);
-    return () => window.clearInterval(timer);
+    const onWakeOrOnline = () => {
+      if (document.visibilityState !== 'hidden') {
+        void refreshStatusAndProjects();
+      }
+    };
+    document.addEventListener('visibilitychange', onWakeOrOnline);
+    window.addEventListener('online', onWakeOrOnline);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onWakeOrOnline);
+      window.removeEventListener('online', onWakeOrOnline);
+    };
   }, []);
 
   useEffect(() => {
@@ -175,7 +196,7 @@ export const App: React.FC = () => {
     status?.workspace?.project_id ||
     'Companion';
 
-  const pendingApprovalsCount = status?.pending_approvals?.length || 0;
+  const pendingApprovalsCount = status?.pending_approvals_count ?? (status?.pending_approvals?.length || 0);
   const passiveNudgeCount = (status?.session_nudges || []).filter((n) => n.category !== 'approval').length;
   const unseenAutonomy = status?.unseen_autonomy_count || 0;
   const activityBadgeCount = pendingApprovalsCount + passiveNudgeCount + unseenAutonomy;
@@ -332,6 +353,7 @@ export const App: React.FC = () => {
           {surface === 'knowledge' && (
             <KnowledgeSurface
               initialNotePath={wikiInitialPath}
+              openNonce={wikiOpenNonce}
               initialMode={knowledgeInitialMode}
               onRefreshStatus={refreshStatusAndProjects}
               onToast={showToast}
@@ -368,12 +390,56 @@ export const App: React.FC = () => {
           onToast={showToast}
           onJumpToWiki={(notePath) => {
             setWikiInitialPath(notePath);
+            setWikiOpenNonce((n) => n + 1);
             setAuxTarget(null);
             handleSelectSurface('knowledge');
           }}
           onSelectSurface={handleSelectSurface}
         />
       </div>
+
+      {authRequired && (
+        <div className="modal-backdrop" data-testid="lan-token-modal">
+          <div className="cmd-palette-modal" style={{ maxWidth: 420, padding: 20 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <KeyRound size={16} style={{ color: 'var(--accent-primary)' }} />
+              <strong style={{ fontSize: 15 }}>LAN Access Token Required</strong>
+            </div>
+            <p style={{ margin: '0 0 12px', fontSize: 12.5, color: 'var(--text-secondary)' }}>
+              Enter your <code className="mono">COMPANION_WEB_TOKEN</code> to pair this browser for 30 days.
+            </p>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!lanTokenInput.trim()) return;
+                const r = await pairLanToken(lanTokenInput);
+                if (r.ok && !r.auth_required && r.csrf_token) {
+                  setLanTokenInput('');
+                  setAuthRequired(false);
+                  await refreshStatusAndProjects();
+                  showToast('LAN session paired.');
+                } else {
+                  showToast('Invalid COMPANION_WEB_TOKEN.');
+                }
+              }}
+              style={{ display: 'flex', gap: 8 }}
+            >
+              <input
+                type="password"
+                className="input mono"
+                data-testid="lan-token-input"
+                placeholder="Paste COMPANION_WEB_TOKEN..."
+                value={lanTokenInput}
+                onChange={(e) => setLanTokenInput(e.target.value)}
+                autoFocus
+              />
+              <button type="submit" className="btn btn-primary">
+                Pair
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Centered Two-Column Settings Modal */}
       {settingsOpen && (
@@ -402,6 +468,11 @@ export const App: React.FC = () => {
           onClose={() => setSearchOpen(false)}
           onSelectSurface={handleSelectSurface}
           onSelectProject={handleSelectProject}
+          onJumpToWiki={(notePath) => {
+            setWikiInitialPath(notePath);
+            setWikiOpenNonce((n) => n + 1);
+            handleSelectSurface('knowledge');
+          }}
           onOpenSettings={(sec) => {
             if (sec) setSettingsSection(sec);
             setSettingsOpen(true);

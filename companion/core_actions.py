@@ -4,7 +4,6 @@ Canonical `CORE_ACTIONS` registry with `actor` provenance (`user`, `cli`, `web`,
 """
 
 import json
-import shlex
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -14,26 +13,27 @@ from companion.archive_and_approvals import (
     save_prompt_template, search_forever_history, set_trust_mode,
 )
 from companion.background_jobs import get_job_manager
-from companion.calendar_engine import execute_calendar_action, parse_calendar_slash
-from companion.config import is_in_agent_tool_turn, settings
+from companion.calendar_engine import execute_calendar_action
+from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, settings
 from companion.context import execute_identity_action
 from companion.dag_runtime import resume_dag_run
-from companion.education_engine import execute_education_action, parse_education_slash
+from companion.education_engine import execute_education_action
 from companion.endpoints import get_endpoint_manager
 from companion.mcp_hub import format_connected_partners_hud, get_mcp_hub, harvest_mcp_capability_pack
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
-from companion.model_registry import execute_model_registry_action, parse_providers_slash
+from companion.model_registry import execute_model_registry_action
 from companion.project_graph import get_project_graph
 from companion.routines import (
     cleanup_sandbox_clone, create_sandbox_clone, diff_sandbox_clone, execute_autonomy_mode_action,
-    get_routine_manager, list_sandbox_clones, parse_selfdev_slash, verify_sandbox_clone,
+    get_routine_manager, list_sandbox_clones, verify_sandbox_clone,
 )
 from companion.skill_forge import execute_customizations_action
+from companion.tool_schemas import r3_approval_context
 from companion.vault import create_snapshot_backup, get_vault_manager, list_snapshot_backups, restore_snapshot_backup
 from companion.wiki_curation import commit_curation_plan, inspect_graduation, list_curation_history, revert_curation, validate_curation_plan
 from companion.wiki_engine import get_wiki_engine
 from companion.wiki_maintenance import execute_wiki_maintenance_subaction
-from companion.wiki_templates import get_template, list_templates, load_tag_authority, save_template
+from companion.wiki_templates import get_template, list_templates, load_tag_authority, save_template, slugify_wiki
 
 __all__ = ["CORE_ACTIONS", "HARVEST_SLASH_VERBS", "ActionSpec", "execute_core_action", "handle_harvest_slash", "list_core_actions"]
 
@@ -70,95 +70,93 @@ def _act_trust(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
     return {"ok": True, "trust_mode": cur, "modes": TRUST_MODES, "summary": f"Active Trust Mode: `{cur}` — {TRUST_MODES[cur]}"}
 
 
-def _apply_wiki_approved(act: str, payload: Dict[str, Any], mem: MemoryStore) -> Optional[str]:
+def _exec_out(r: Dict[str, Any], default_sum: str = "Executed.") -> Dict[str, Any]:
+    ok = bool(r.get("ok"))
+    msg = str(r.get("summary") or r.get("output") or (default_sum if ok else r.get("error") or "Execution failed."))
+    return {"executed": True, "ok": ok, "summary": msg if ok else "", "error": "" if ok else str(r.get("error") or msg)}
+
+
+def _apply_wiki_approved(act: str, payload: Dict[str, Any], mem: MemoryStore) -> Dict[str, Any]:
     wk = get_wiki_engine(store=mem)
     if act == "graduate_note" and payload.get("from") and payload.get("to"):
         to_parts = [x for x in str(payload["to"]).split("/") if x]
         dom, top = (to_parts[1] if len(to_parts) >= 3 else "general"), (to_parts[2] if len(to_parts) >= 4 else "")
         slug = to_parts[-1].removesuffix(".md") if to_parts else ""
-        r = wk.graduate_note(str(payload["from"]), domain=dom, topic=top, new_slug=slug, actor="user", confirmed=True, template=str(payload.get("template") or ""), summary=str(payload.get("summary") or ""), ontology=_as_list(payload.get("ontology")))
-        return r.get("summary") if r.get("ok") else None
+        return _exec_out(wk.graduate_note(str(payload["from"]), domain=dom, topic=top, new_slug=slug, actor="user", confirmed=True, template=str(payload.get("template") or ""), summary=str(payload.get("summary") or ""), ontology=_as_list(payload.get("ontology"))))
     if act == "commit_curation" and payload.get("curation_id"):
-        r = commit_curation_plan(wk, str(payload["curation_id"]), actor="user", confirmed=True)
-        return r.get("summary") if r.get("ok") else None
+        return _exec_out(commit_curation_plan(wk, str(payload["curation_id"]), actor="user", confirmed=True))
     if act == "revert_curation" and payload.get("tx_id"):
-        r = revert_curation(wk, str(payload["tx_id"]), actor="user", confirmed=True)
-        return r.get("summary") if r.get("ok") else None
+        return _exec_out(revert_curation(wk, str(payload["tx_id"]), actor="user", confirmed=True))
     if act == "edit_user_note" and payload.get("path") and "content" in payload:
-        r = wk.save_or_update_note(str(payload["path"]), str(payload["content"]), title=str(payload.get("title") or ""), tags=_as_list(payload.get("tags")), actor="companion", confirmed=True, summary=str(payload.get("summary") or ""), template=str(payload.get("template") or ""), ontology=_as_list(payload.get("ontology")))
-        return r.get("summary") if r.get("ok") else None
+        return _exec_out(wk.save_or_update_note(str(payload["path"]), str(payload["content"]), title=str(payload.get("title") or ""), tags=_as_list(payload.get("tags")), actor="companion", confirmed=True, summary=str(payload.get("summary") or ""), template=str(payload.get("template") or ""), ontology=_as_list(payload.get("ontology"))))
     if act == "trash_note" and payload.get("path"):
-        r = wk.trash_note(str(payload["path"]), actor="user", confirmed=True)
-        return r.get("summary") if r.get("ok") else None
-    return None
+        return _exec_out(wk.trash_note(str(payload["path"]), actor="user", confirmed=True))
+    return {"executed": False, "ok": True, "summary": "", "error": ""}
 
 
-def _apply_approved_request(req: Dict[str, Any], mem: MemoryStore) -> Optional[str]:
-    """Immediately execute structured pending actions (`wiki_edit`, `vault_scope`, `endpoint_*`, `mcp_server`, `dag_gate`, `routine_enable`) upon user approval."""
+def _apply_mcp_approved(act: str, payload: Dict[str, Any], mem: MemoryStore) -> Dict[str, Any]:
+    hub = get_mcp_hub(store=mem)
+    if act == "register_mcp_server" and payload.get("server_id"):
+        sid = str(payload["server_id"])
+        r = hub.register_server(server_id=sid, transport=str(payload.get("transport") or "stdio"), label=str(payload.get("label") or ""), command=str(payload.get("command") or ""), args=_as_list(payload.get("args")), url=str(payload.get("url") or ""), credential_ref=str(payload.get("credential_ref") or ""), allowed_tools=_as_list(payload.get("allowed_tools")), actor="user", confirmed=True)
+        disc = hub.discover_server(sid, actor="user") if r.get("ok") else {}
+        return _exec_out(disc if disc.get("ok") else r)
+    if act == "approve_mcp_tools" and payload.get("server_id"):
+        return _exec_out(hub.approve_server(str(payload["server_id"]), actor="user", expected_fingerprint=str(payload.get("fingerprint") or "")))
+    if act == "enable_hosted_mcp":
+        return _exec_out(hub.configure_hosted_mcp(True, token_ref=str(payload.get("token_ref") or "hosted-mcp-token"), allow_wiki_read=_as_bool(payload.get("allow_wiki_read")), actor="user", confirmed=True))
+    if act == "call_mcp_tool" and payload.get("server_id") and payload.get("tool_name"):
+        return _exec_out(hub.call_mcp_tool(str(payload["server_id"]), str(payload["tool_name"]), arguments=payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}, actor="user", confirmed=True))
+    return {"executed": False, "ok": True, "summary": "", "error": ""}
+
+
+def _apply_approved_request(req: Dict[str, Any], mem: MemoryStore, skip_dag_resume: bool = False) -> Dict[str, Any]:
+    """Execute structured pending actions (`r3_tool`, `wiki_edit`, `vault_scope`, `endpoint_*`, `mcp_*`, `dag_gate`, `routine_enable`) upon approval."""
     cat, act = str(req.get("category") or ""), str(req.get("action_name") or "")
     try:
         payload = json.loads(req.get("payload_json") or "{}")
     except Exception:
         payload = {}
+    if cat == "r3_tool":
+        from companion.tools import TOOL_IMPLS
+
+        t_name, t_args = str(payload.get("tool") or act), {k: v for k, v in payload.items() if k != "tool"}
+        fn = TOOL_IMPLS.get(t_name)
+        if fn is None:
+            return {"executed": True, "ok": False, "summary": "", "error": f"Unknown R3 tool `{t_name}`."}
+        with r3_approval_context(True), agent_tool_turn_context():
+            out_s = fn(t_args)
+        bad = out_s.startswith(("error:", "exit=1", "SAFETY GUARD REJECTED", "RISK GATE REJECTED", "PHASE TOOL GATE REJECTED"))
+        return {"executed": True, "ok": not bad, "summary": "" if bad else out_s[:400], "error": out_s[:400] if bad else ""}
     if cat == "wiki_edit":
         return _apply_wiki_approved(act, payload, mem)
     sec_name = str(payload.get("name") or payload.get("secret") or "")
     if cat == "vault_scope" and act == "grant_scope" and sec_name and payload.get("caller_scope"):
-        r = get_vault_manager(store=mem).grant_scope(sec_name, str(payload["caller_scope"]), actor="user", confirmed=True)
-        return r.get("summary") if r.get("ok") else None
+        return _exec_out(get_vault_manager(store=mem).grant_scope(sec_name, str(payload["caller_scope"]), actor="user", confirmed=True))
     if cat == "endpoint_register" and act == "register_endpoint" and payload.get("endpoint_id"):
-        r = get_endpoint_manager(store=mem).register_endpoint(
-            endpoint_id=str(payload["endpoint_id"]), protocol=str(payload.get("protocol") or ""), host=str(payload.get("host") or ""),
-            label=str(payload.get("label") or ""), port=int(payload.get("port") or 0), username=str(payload.get("username") or ""),
-            auth_mode=str(payload.get("auth_mode") or ""), credential_ref=str(payload.get("credential_ref") or ""),
-            auth_header=str(payload.get("auth_header") or "X-API-Key"), os_hint=str(payload.get("os_hint") or ""),
-            verify_tls=_as_bool(payload.get("verify_tls"), True), tags=_as_list(payload.get("tags")), actor="user", confirmed=True,
-        )
-        return r.get("summary") if r.get("ok") else None
+        return _exec_out(get_endpoint_manager(store=mem).register_endpoint(endpoint_id=str(payload["endpoint_id"]), protocol=str(payload.get("protocol") or ""), host=str(payload.get("host") or ""), label=str(payload.get("label") or ""), port=int(payload.get("port") or 0), username=str(payload.get("username") or ""), auth_mode=str(payload.get("auth_mode") or ""), credential_ref=str(payload.get("credential_ref") or ""), auth_header=str(payload.get("auth_header") or "X-API-Key"), os_hint=str(payload.get("os_hint") or ""), verify_tls=_as_bool(payload.get("verify_tls"), True), tags=_as_list(payload.get("tags")), actor="user", confirmed=True))
     if cat == "endpoint_exec" and payload.get("endpoint_id"):
         em, eid = get_endpoint_manager(store=mem), str(payload["endpoint_id"])
         if act == "ssh_exec" and payload.get("command"):
-            r = em.ssh_exec(eid, str(payload["command"]), actor="user", confirmed=True)
-            return str(r.get("output") or r.get("summary") or "SSH command executed.") if r.get("ok") else None
+            return _exec_out(em.ssh_exec(eid, str(payload["command"]), actor="user", confirmed=True), "SSH command executed.")
         if act == "winrm_exec" and payload.get("command"):
-            r = em.winrm_exec(eid, str(payload["command"]), actor="user", confirmed=True)
-            return str(r.get("output") or r.get("summary") or "WinRM command executed.") if r.get("ok") else None
+            return _exec_out(em.winrm_exec(eid, str(payload["command"]), actor="user", confirmed=True), "WinRM command executed.")
         if act.startswith("http_"):
             verb = str(payload.get("method") or act.removeprefix("http_").upper())
-            r = em.api_request(eid, method=verb, path=str(payload.get("path") or "/"), json_body=payload.get("json_body") if isinstance(payload.get("json_body"), dict) else None, actor="user", confirmed=True)
-            return f"HTTP {r.get('status_code')}" if r.get("ok") else None
-    if cat == "mcp_server":
-        hub = get_mcp_hub(store=mem)
-        if act == "register_mcp_server" and payload.get("server_id"):
-            sid = str(payload["server_id"])
-            r = hub.register_server(
-                server_id=sid, transport=str(payload.get("transport") or "stdio"),
-                label=str(payload.get("label") or ""), command=str(payload.get("command") or ""),
-                args=_as_list(payload.get("args")), url=str(payload.get("url") or ""),
-                credential_ref=str(payload.get("credential_ref") or ""), allowed_tools=_as_list(payload.get("allowed_tools")),
-                actor="user", confirmed=True,
-            )
-            disc = hub.discover_server(sid, actor="user") if r.get("ok") else {}
-            return (disc.get("summary") if disc.get("ok") else r.get("summary")) if r.get("ok") else None
-        if act == "approve_mcp_tools" and payload.get("server_id"):
-            r = hub.approve_server(str(payload["server_id"]), actor="user")
-            return r.get("summary") if r.get("ok") else None
-        if act == "enable_hosted_mcp":
-            r = hub.configure_hosted_mcp(True, token_ref=str(payload.get("token_ref") or "hosted-mcp-token"), allow_wiki_read=_as_bool(payload.get("allow_wiki_read")), actor="user", confirmed=True)
-            return r.get("summary") if r.get("ok") else None
+            hdrs = payload.get("headers") if isinstance(payload.get("headers"), dict) else None
+            r = em.api_request(eid, method=verb, path=str(payload.get("path") or "/"), json_body=payload.get("json_body") if isinstance(payload.get("json_body"), dict) else None, headers=hdrs, actor="user", confirmed=True)
+            return _exec_out(r, f"HTTP {r.get('status_code')}")
+    if cat in ("mcp_server", "mcp_tool"):
+        return _apply_mcp_approved(act, payload, mem)
     if cat == "dag_gate" and act in ("approve_dag_node", "resume_dag_run") and payload.get("run_id"):
+        if skip_dag_resume:
+            return {"executed": True, "ok": True, "summary": f"Approved DAG node `{payload.get('node_id')}` on background job `{payload['run_id']}`.", "error": ""}
         r = resume_dag_run(str(payload["run_id"]), approved_node_id=str(payload.get("node_id") or ""), store=mem)
-        return str(r.get("summary") or f"Resumed DAG `{payload['run_id']}`.") if r.get("ok") or r.get("status") == "waiting_approval" else None
+        ok_d = bool(r.get("ok") or r.get("status") == "waiting_approval")
+        return {"executed": True, "ok": ok_d, "summary": str(r.get("summary") or f"Resumed DAG `{payload['run_id']}`.") if ok_d else "", "error": "" if ok_d else str(r.get("error") or r.get("summary") or "DAG failed.")}
     if cat == "routine_enable" and act == "enable_routine" and payload.get("routine_id"):
-        r = get_routine_manager(store=mem).create_or_update_routine(
-            routine_id=str(payload["routine_id"]), schedule_expr=str(payload.get("schedule") or ""),
-            target_kind=str(payload.get("target_kind") or ""), title=str(payload.get("title") or ""),
-            target_name=str(payload.get("target_name") or ""), inputs=payload.get("inputs") if isinstance(payload.get("inputs"), dict) else None,
-            trigger_policy=payload.get("trigger_policy") if isinstance(payload.get("trigger_policy"), dict) else None,
-            enabled=True, catch_up=_as_bool(payload.get("catch_up")), actor="user", confirmed=True,
-        )
-        return r.get("summary") if r.get("ok") else None
-    return None
+        return _exec_out(get_routine_manager(store=mem).create_or_update_routine(routine_id=str(payload["routine_id"]), schedule_expr=str(payload.get("schedule") or ""), target_kind=str(payload.get("target_kind") or ""), title=str(payload.get("title") or ""), target_name=str(payload.get("target_name") or ""), inputs=payload.get("inputs") if isinstance(payload.get("inputs"), dict) else None, trigger_policy=payload.get("trigger_policy") if isinstance(payload.get("trigger_policy"), dict) else None, enabled=True, catch_up=_as_bool(payload.get("catch_up")), actor="user", confirmed=True))
+    return {"executed": False, "ok": True, "summary": "", "error": ""}
 
 
 def _act_approvals(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
@@ -168,19 +166,37 @@ def _act_approvals(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str,
         raw_ids = p.get("nudge_ids") if isinstance(p.get("nudge_ids"), list) else ([p["nudge_id"]] if p.get("nudge_id") is not None else None)
         return dismiss_session_nudges(nudge_ids=[int(x) for x in raw_ids] if raw_ids else None, category=str(p.get("category") or ""), store=mem)
     if sub in ("approve", "deny", "reject", "resolve", "decide"):
+        aid = str(p.get("approval_id") or "").strip()
         dec = str(p.get("decision") or ("approve" if sub == "approve" else "deny"))
-        res = aq.resolve(str(p.get("approval_id") or ""), decision=dec, actor=actor, note=str(p.get("note") or ""))
+        res = aq.resolve(aid, decision=dec, actor=actor, note=str(p.get("note") or ""))
         if res.get("ok") and dec.strip().lower() in ("approve", "approved", "yes", "allow"):
+            jm = get_job_manager(store=mem)
+            waiting_jobs = [j for j in jm.list_jobs(status="waiting_approval", limit=30) if j.get("approval_id") == aid]
+            apr_obj = res.get("approval") or {}
+            try:
+                apr_payload = json.loads(apr_obj.get("payload_json") or "{}")
+            except Exception:
+                apr_payload = {}
+            res_note = ""
             if _as_bool(p.get("apply_action"), True):
-                applied_msg = _apply_approved_request(res.get("approval") or {}, mem)
-                if applied_msg:
-                    aq.mark_executed(str((res.get("approval") or {}).get("approval_id") or p.get("approval_id") or ""))
-                    res["applied_summary"] = applied_msg
-                    res["summary"] = f"{res['summary']} -> Executed: {applied_msg}"
+                has_dag_job = any(j.get("kind") in ("dag", "recipe") for j in waiting_jobs)
+                app_res = _apply_approved_request(apr_obj, mem, skip_dag_resume=has_dag_job)
+                if app_res["executed"]:
+                    res["execution_ok"] = app_res["ok"]
+                    if app_res["ok"]:
+                        aq.mark_executed(str(apr_obj.get("approval_id") or aid))
+                        res_note = app_res["summary"]
+                        res["applied_summary"] = res_note
+                        res["summary"] = f"{res['summary']} -> Executed: {res_note}"
+                    else:
+                        res["ok"] = False
+                        res["execution_error"] = app_res["error"]
+                        res["error"] = f"Approved `{aid}`, but execution failed: {app_res['error']}"
+                        return res
             if _as_bool(p.get("resume_job"), True):
-                for j in get_job_manager(store=mem).list_jobs(status="waiting_approval", limit=20):
-                    if j.get("approval_id") == p.get("approval_id"):
-                        get_job_manager(store=mem).resume_job(j["job_id"])
+                node_id = str(apr_payload.get("node_id") or "")
+                for j in waiting_jobs:
+                    jm.resume_job(j["job_id"], resolution_note=res_note or f"Approved `{aid}`.", approved_node_id=node_id)
         return res
     st = str(p.get("status") or "waiting")
     return {"ok": True, "approvals": aq.list_requests(status=st), "summary": aq.format_board(status=st)}
@@ -212,15 +228,16 @@ def _act_jobs(p: Dict[str, Any], _actor: str, mem: MemoryStore) -> Dict[str, Any
     jm = get_job_manager(store=mem)
     sub = str(p.get("subaction") or "list").lower()
     if sub == "dispatch":
-        return jm.dispatch_job(
-            goal=str(p.get("goal") or ""), title=str(p.get("title") or ""), kind=str(p.get("kind") or "worker"),
-            starter=str(p.get("starter") or "chat"), session_id=str(p.get("session_id") or current_session_id() or "main"),
-            tier=str(p.get("tier") or "fast"), allowed_tools=_as_list(p.get("allowed_tools")),
-            max_iters=int(p.get("max_iters") or 8), timeout_sec=int(p.get("timeout_sec") or 600),
-            run_in_background=_as_bool(p.get("run_in_background"), True),
-            dag_name=str(p.get("dag_name") or p.get("recipe_name") or ""),
-            dag_params=p.get("dag_params") if isinstance(p.get("dag_params"), dict) else (p.get("recipe_params") if isinstance(p.get("recipe_params"), dict) else None),
-        )
+        if pid := str(p.get("project_id") or "").strip():
+            get_project_graph(store=mem).set_focus_project(pid)
+        goal_txt = str(p.get("goal") or "")
+        if isinstance(p.get("attachment_ids"), list) and p["attachment_ids"]:
+            from companion.attachments import prepare_turn_attachments
+
+            prep = prepare_turn_attachments(goal_txt, [str(x) for x in p["attachment_ids"]], store=mem)
+            goal_txt = f"{prep.display_message}\n\n{prep.wire_doc_context}".strip() if prep.wire_doc_context else prep.display_message
+        dp = p.get("dag_params") if isinstance(p.get("dag_params"), dict) else (p.get("recipe_params") if isinstance(p.get("recipe_params"), dict) else None)
+        return jm.dispatch_job(goal=goal_txt, title=str(p.get("title") or ""), kind=str(p.get("kind") or "worker"), starter=str(p.get("starter") or "chat"), session_id=str(p.get("session_id") or current_session_id() or "main"), tier=str(p.get("tier") or "fast"), allowed_tools=_as_list(p.get("allowed_tools")), max_iters=int(p.get("max_iters") or 8), timeout_sec=int(p.get("timeout_sec") or 600), run_in_background=_as_bool(p.get("run_in_background"), True), dag_name=str(p.get("dag_name") or p.get("recipe_name") or ""), dag_params=dp)
     if sub in ("status", "get", "result"):
         row = jm.get_job(str(p.get("job_id") or ""))
         return {"ok": False, "error": f"Background job `{p.get('job_id')}` not found."} if not row else {"ok": True, "job": row, "summary": f"`{row['job_id']}` [{row['status'].upper()}] {row['title']}\n{row.get('envelope_summary') or row.get('partial_output') or row.get('error') or '(in progress)'}"}
@@ -266,6 +283,13 @@ def _act_wiki_templates_and_curation(wk: Any, sub: str, p: Dict[str, Any], actor
     return None
 
 
+def _wiki_body(p: Dict[str, Any], default: Optional[str] = "") -> Optional[str]:
+    for k in ("content", "body", "markdown", "text"):
+        if p.get(k) is not None:
+            return str(p[k])
+    return default
+
+
 def _act_wiki(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
     wk = get_wiki_engine(store=mem)
     sub = str(p.get("subaction") or "list").lower()
@@ -274,15 +298,21 @@ def _act_wiki(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]
     if maint_res := execute_wiki_maintenance_subaction(wk, sub, p, actor):
         return maint_res
     if sub == "capture_inbox":
-        return wk.capture_inbox(title=str(p.get("title") or ""), content=str(p.get("content") or ""), tags=_as_list(p.get("tags")), source=str(p.get("source") or actor), slug=str(p.get("slug") or ""), actor=actor, template=str(p.get("template") or ""), summary=str(p.get("summary") or ""), ontology=_as_list(p.get("ontology")), domain_hint=str(p.get("domain") or ""))
+        return wk.capture_inbox(title=str(p.get("title") or ""), content=str(_wiki_body(p, "") or ""), tags=_as_list(p.get("tags")), source=str(p.get("source") or actor), slug=str(p.get("slug") or ""), actor=actor, template=str(p.get("template") or ""), summary=str(p.get("summary") or ""), ontology=_as_list(p.get("ontology")), domain_hint=str(p.get("domain") or ""))
     if sub in ("read", "read_note"):
         res = wk.read_note(str(p.get("path") or ""))
         if res.get("ok"):
             res["note_summary"] = str(res.get("note_summary") or res.get("summary") or "")
             res["summary"] = f"`{res['path']}` (`author: {res['author']}`, tpl=`{res.get('template', '')}`, hash=`{res['content_hash']}`, ontology={res.get('ontology', [])}, backlinks={res['backlinks']})\n\n{res['raw']}"
         return res
-    if sub in ("save", "update", "save_note"):
-        return wk.save_or_update_note(rel_path=str(p.get("path") or ""), content=str(p.get("content") or ""), title=str(p.get("title") or ""), tags=_as_list(p.get("tags")), actor=actor, expected_hash=str(p.get("expected_hash") or ""), confirmed=_human_confirmed(p, actor), summary=str(p.get("summary") or ""), template=str(p.get("template") or ""), ontology=_as_list(p.get("ontology")), status=str(p.get("status") or ""))
+    if sub in ("save", "update", "save_note", "curate"):
+        rel = str(p.get("path") or "").strip()
+        if not rel and sub == "curate":
+            dom = slugify_wiki(str(p.get("domain") or "general"))
+            top = slugify_wiki(str(p.get("topic") or "")) if p.get("topic") else ""
+            sl = slugify_wiki(str(p.get("slug") or p.get("title") or "note"))
+            rel = f"02_knowledge/{dom}/{top + '/' if top else ''}{sl}.md"
+        return wk.save_or_update_note(rel_path=rel, content=_wiki_body(p, None), title=str(p.get("title") or ""), tags=_as_list(p.get("tags")), actor=actor, expected_hash=str(p.get("expected_hash") or ""), confirmed=_human_confirmed(p, actor), summary=str(p.get("summary") or ""), template=str(p.get("template") or ""), ontology=_as_list(p.get("ontology")), status=str(p.get("status") or ""))
     if sub == "graduate":
         return wk.graduate_note(inbox_path=str(p.get("path") or ""), domain=str(p.get("domain") or ""), topic=str(p.get("topic") or ""), new_slug=str(p.get("new_slug") or ""), actor=actor, confirmed=_human_confirmed(p, actor), template=str(p.get("template") or ""), summary=str(p.get("summary") or ""), ontology=_as_list(p.get("ontology")))
     if sub == "trash":
@@ -317,12 +347,13 @@ def _act_wiki(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]
 def _act_vault(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
     vm = get_vault_manager(store=mem)
     sub = str(p.get("subaction") or "list").lower()
+    scopes = _as_list(p.get("allow_list") if p.get("allow_list") is not None else p.get("caller_scope"))
     if sub == "set":
-        return vm.set_secret(name=str(p.get("name") or ""), raw_value=str(p.get("value") or ""), cred_type=str(p.get("cred_type") or "api_key"), description=str(p.get("description") or ""), allow_list=_as_list(p.get("allow_list")), expires_at=str(p.get("expires_at") or ""), actor=actor)
+        return vm.set_secret(name=str(p.get("name") or ""), raw_value=str(p.get("value") or ""), cred_type=str(p.get("cred_type") or "api_key"), description=str(p.get("description") or ""), allow_list=scopes, expires_at=str(p.get("expires_at") or ""), actor=actor)
     if sub == "delete":
         return vm.delete_secret(name=str(p.get("name") or ""), remove_metadata=_as_bool(p.get("remove_metadata")), actor=actor)
     if sub == "declare":
-        return vm.declare_placeholder(name=str(p.get("name") or ""), cred_type=str(p.get("cred_type") or "api_key"), description=str(p.get("description") or ""), allow_list=_as_list(p.get("allow_list")), actor=actor)
+        return vm.declare_placeholder(name=str(p.get("name") or ""), cred_type=str(p.get("cred_type") or "api_key"), description=str(p.get("description") or ""), allow_list=scopes, actor=actor)
     if sub in ("check", "check_secret", "metadata"):
         meta = vm.get_metadata(str(p.get("name") or ""))
         return {"ok": True, "exists": False, "is_set": False, "summary": f"Vault credential `{p.get('name')}` is not registered (`is_set=False`)."} if not meta else {"ok": True, "exists": True, "secret": meta, "summary": f"Vault `{meta['name']}`: is_set={meta['is_set']}, type={meta['cred_type']}, scopes={meta['allow_list']}."}
@@ -352,9 +383,10 @@ def _act_backup(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, An
 def _act_endpoints(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
     em = get_endpoint_manager(store=mem)
     sub = str(p.get("subaction") or "list").lower()
-    if sub == "register":
+    is_human = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
+    if sub == "register" and is_human:
         return em.register_endpoint(endpoint_id=str(p.get("endpoint_id") or ""), protocol=str(p.get("protocol") or ""), host=str(p.get("host") or ""), label=str(p.get("label") or ""), port=int(p.get("port") or 0), username=str(p.get("username") or ""), auth_mode=str(p.get("auth_mode") or ""), credential_ref=str(p.get("credential_ref") or ""), auth_header=str(p.get("auth_header") or "X-API-Key"), os_hint=str(p.get("os_hint") or ""), verify_tls=_as_bool(p.get("verify_tls"), True), tags=_as_list(p.get("tags")), actor=actor, confirmed=_human_confirmed(p, actor))
-    if sub in ("propose", "propose_endpoint"):
+    if sub in ("propose", "propose_endpoint", "register"):
         return em.propose_endpoint(endpoint_id=str(p.get("endpoint_id") or ""), protocol=str(p.get("protocol") or ""), host=str(p.get("host") or ""), label=str(p.get("label") or ""), port=int(p.get("port") or 0), username=str(p.get("username") or ""), auth_mode=str(p.get("auth_mode") or ""), credential_ref=str(p.get("credential_ref") or ""), auth_header=str(p.get("auth_header") or "X-API-Key"), os_hint=str(p.get("os_hint") or ""), verify_tls=_as_bool(p.get("verify_tls"), True), tags=_as_list(p.get("tags")), actor=actor)
     if sub == "remove":
         return em.remove_endpoint(str(p.get("endpoint_id") or ""), actor=actor)
@@ -372,7 +404,8 @@ def _act_endpoints(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str,
         body = p.get("json_body")
         if isinstance(body, str) and body.strip():
             body = json.loads(body)
-        return em.api_request(str(p.get("endpoint_id") or ""), method=str(p.get("method") or "GET"), path=str(p.get("path") or "/"), json_body=body if isinstance(body, dict) else None, actor=actor, confirmed=_human_confirmed(p, actor))
+        hdrs = p.get("headers") if isinstance(p.get("headers"), dict) else None
+        return em.api_request(str(p.get("endpoint_id") or ""), method=str(p.get("method") or "GET"), path=str(p.get("path") or "/"), json_body=body if isinstance(body, dict) else None, headers=hdrs, actor=actor, confirmed=_human_confirmed(p, actor))
     return {"ok": True, "endpoints": em.list_endpoints(protocol=str(p.get("protocol") or "")), "summary": em.format_status()}
 
 
@@ -388,7 +421,7 @@ def _act_mcp(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
     if sub == "discover":
         return hub.discover_server(str(p.get("server_id") or ""), actor=actor)
     if sub == "approve_server":
-        return hub.approve_server(str(p.get("server_id") or ""), actor=actor)
+        return hub.approve_server(str(p.get("server_id") or ""), actor=actor, expected_fingerprint=str(p.get("expected_fingerprint") or ""))
     if sub == "remove_server":
         return hub.remove_server(str(p.get("server_id") or ""), actor=actor)
     if sub == "call_tool":
@@ -397,7 +430,8 @@ def _act_mcp(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
             args_in = json.loads(args_in)
         return hub.call_mcp_tool(str(p.get("server_id") or ""), str(p.get("tool_name") or ""), arguments=args_in if isinstance(args_in, dict) else {}, actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "configure_hosted":
-        return hub.configure_hosted_mcp(enabled=_as_bool(p.get("enabled"), True), token_ref=str(p.get("token_ref") or "hosted-mcp-token"), allow_wiki_read=_as_bool(p.get("allow_wiki_read")), actor=actor, confirmed=_human_confirmed(p, actor))
+        t_ref = str(p.get("token_ref") or p.get("hosted_mcp_token_ref") or "hosted-mcp-token")
+        return hub.configure_hosted_mcp(enabled=_as_bool(p.get("enabled"), True), token_ref=t_ref, allow_wiki_read=_as_bool(p.get("allow_wiki_read")), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub == "register_partner":
         return hub.register_partner(partner_id=str(p.get("partner_id") or ""), url=str(p.get("url") or ""), label=str(p.get("label") or ""), credential_ref=str(p.get("credential_ref") or ""), enabled=_as_bool(p.get("enabled"), True), actor=actor)
     if sub == "remove_partner":
@@ -412,13 +446,12 @@ def _act_mcp(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
         pts = hub.list_partners()
         hud = format_connected_partners_hud(store=mem) or "=== Federated Partners ===\n  (No federated partners registered yet.)"
         return {"ok": True, "partners": pts, "summary": hud}
-    srvs = hub.list_servers()
-    prof = mem.get_user_profile()
+    srvs, prof = hub.list_servers(), mem.get_user_profile()
     lines = [f"=== Federated MCP Hub (Inbound Order Counter: `{prof.get('hosted_mcp_enabled', 'off').upper()}`) ==="]
     lines.extend([f"  * `{s['server_id']}` [{s['transport']} | tools={len(s['discovered_tools'])} | approved={s['is_approved']}]" for s in srvs] or ["  (No outbound MCP servers registered.)"])
     if p_hud := format_connected_partners_hud(store=mem):
         lines.append("\n" + p_hud)
-    return {"ok": True, "servers": srvs, "partners": hub.list_partners(), "hosted_mcp_enabled": prof.get("hosted_mcp_enabled", "off") == "on", "summary": "\n".join(lines)}
+    return {"ok": True, "servers": srvs, "partners": hub.list_partners(), "hosted_mcp_enabled": prof.get("hosted_mcp_enabled", "off") == "on", "hosted_mcp_token_ref": prof.get("hosted_mcp_token_ref") or "hosted-mcp-token", "hosted_mcp_wiki_read": prof.get("hosted_mcp_wiki_read", "off") == "on", "summary": "\n".join(lines)}
 
 
 def _act_partners(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
@@ -442,10 +475,11 @@ def _act_routines(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, 
         for k in ("mode", "schedule_expr", "idle_min_seconds", "allowed_window", "cooldown_seconds", "precheck_name", "requires_self_dev"):
             if p.get(k) is not None and k not in tp_in:
                 tp_in[k] = p[k]
+        raw_inputs = p.get("inputs") if isinstance(p.get("inputs"), dict) else (p.get("variables") if isinstance(p.get("variables"), dict) else None)
         return rm.create_or_update_routine(
             routine_id=str(p.get("routine_id") or ""), schedule_expr=str(p.get("schedule_expr") or ""),
             target_kind=str(p.get("target_kind") or "dag"), title=str(p.get("title") or ""),
-            target_name=str(p.get("target_name") or ""), inputs=p.get("inputs") if isinstance(p.get("inputs"), dict) else None,
+            target_name=str(p.get("target_name") or ""), inputs=raw_inputs,
             trigger_policy=tp_in or None, enabled=_as_bool(p.get("enabled"), True), catch_up=_as_bool(p.get("catch_up"), False),
             actor=actor, confirmed=_human_confirmed(p, actor),
         )
@@ -482,6 +516,43 @@ def _act_sandbox(p: Dict[str, Any], _actor: str, _mem: MemoryStore) -> Dict[str,
     return {"ok": True, "sandboxes": items, "summary": "\n".join(lines)}
 
 
+_EFFORT_MINS = {"quick": 15, "half_day": 180, "full_day": 360, "multi_day": 720}
+
+
+def _resolve_item_updates(p: Dict[str, Any]) -> Dict[str, Any]:
+    upd = {k: v for k, v in p.items() if k not in ("subaction", "action", "item_id", "card_id")}
+    if "estimate_minutes" not in upd and p.get("effort_size") in _EFFORT_MINS:
+        upd["estimate_minutes"] = _EFFORT_MINS[str(p["effort_size"])]
+    return upd
+
+
+def _act_agile_queries(mgr: Any, sub: str, pid: str, p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if sub == "list_items":
+        items = mgr.list_items(project_id=pid or None, owner=str(p.get("owner") or "") or None, status=str(p.get("status") or "") or None, timebox_id=str(p.get("sprint_id") or p.get("timebox_id") or "") or None)
+        rows = [f"  - `{it['item_id']}` [`{it['owner']}` | `{it['status']}`]: {it['title']}" for it in items[:20]]
+        return {"ok": True, "items": items, "cards": items, "summary": f"Listed {len(items)} work item(s)." + ("\n" + "\n".join(rows) if rows else "")}
+    if sub in ("list_epics", "list_milestones"):
+        eps = mgr.list_milestones(pid or None)
+        return {"ok": True, "epics": eps, "milestones": eps, "summary": f"Listed {len(eps)} milestone(s): " + (", ".join(f"`{e['milestone_id']}` ({e['title']})" for e in eps) or "(none)")}
+    if sub in ("list_sprints", "list_timeboxes"):
+        tbs = mgr.list_timeboxes(pid or None)
+        return {"ok": True, "sprints": tbs, "timeboxes": tbs, "summary": f"Listed {len(tbs)} timebox(es)."}
+    if sub == "rollover_sprint":
+        cur_tb = mgr.get_active_timebox(pid or None)
+        if cur_tb:
+            mgr.update_timebox_status(cur_tb["timebox_id"], "completed", retro_notes=str(p.get("retro_notes") or "Rolled over unfinished items."))
+        new_tb = mgr.update_timebox_status(mgr.create_timebox(pid or None, str(p.get("title") or "Next Sprint"), goal=str(p.get("goal") or ""))["timebox_id"], "active")
+        carried = [mgr.update_item(it["item_id"], timebox_id=new_tb["timebox_id"])["item_id"] for it in mgr.list_items(project_id=pid or None) if cur_tb and it.get("timebox_id") == cur_tb["timebox_id"] and it.get("column_key") != "done"]
+        return {"ok": True, "sprint": new_tb, "timebox": new_tb, "carried_items": carried, "summary": f"Rolled sprint into `{new_tb['timebox_id']}` ({len(carried)} item(s) carried)."}
+    if sub == "capacity":
+        items = [it for it in mgr.list_items(project_id=pid or None) if it.get("column_key") != "done"]
+        total_min = sum(int(it.get("estimate_minutes") or 30) for it in items)
+        wd, we = int(p.get("weekday_capacity_slots") or 10), int(p.get("weekend_capacity_slots") or 6)
+        used_slots = round(total_min / 30.0, 1)
+        return {"ok": True, "open_items": len(items), "total_minutes": total_min, "used_slots": used_slots, "capacity_slots": wd + we, "summary": f"Capacity: {used_slots}/{wd + we} slots ({total_min} min across {len(items)} open item(s))."}
+    return None
+
+
 def _act_agile(p: Dict[str, Any], _actor: str, mem: MemoryStore) -> Dict[str, Any]:
     """Project `agile` CoreActions cleanly over the Universal Project & Goal Graph (`ProjectGraphManager`)."""
     mgr = get_project_graph(store=mem)
@@ -489,45 +560,47 @@ def _act_agile(p: Dict[str, Any], _actor: str, mem: MemoryStore) -> Dict[str, An
     pid = str(p.get("project_id") or p.get("board_id") or "").strip()
     if pid == "all-active-sprint":
         pid = ""
+    if q_res := _act_agile_queries(mgr, sub, pid, p):
+        return q_res
     if sub in ("create_board", "save_board", "create_project", "upsert_project"):
-        proj = mgr.create_project(
-            title=str(p.get("title") or p.get("name") or "New Goal"), goal_summary=str(p.get("goal_summary") or p.get("description") or ""),
-            slug=str(p.get("slug") or "") or None, kind=str(p.get("kind") or "goal"),
-            trigger_policy=p.get("trigger_policy") if isinstance(p.get("trigger_policy"), dict) else None,
-            project_id=pid or None,
-        )
+        tp_in = p.get("trigger_policy") if isinstance(p.get("trigger_policy"), dict) else None
+        proj = mgr.create_project(title=str(p.get("title") or p.get("name") or "New Goal"), goal_summary=str(p.get("goal_summary") or p.get("description") or ""), slug=str(p.get("slug") or "") or None, kind=str(p.get("kind") or "goal"), workspace_path=str(p.get("workspace_path") or ""), trigger_policy=tp_in, project_id=pid or None)
         return {"ok": True, "project": proj, "board": proj, "summary": f"Saved project/goal `{proj['title']}` (`{proj['project_id']}`)."}
     if sub == "update_project":
-        proj = mgr.update_project(pid or mgr.resolve_project_id(), **{k: v for k, v in p.items() if k in ("title", "goal_summary", "status", "wiki_hub_path", "trigger_policy", "metadata")})
+        proj_upd = {k: v for k, v in p.items() if k in ("title", "goal_summary", "status", "wiki_hub_path", "workspace_path", "trigger_policy", "metadata")}
+        if "goal_summary" not in proj_upd and "description" in p:
+            proj_upd["goal_summary"] = str(p.get("description") or "")
+        proj = mgr.update_project(pid or mgr.resolve_project_id(), **proj_upd)
         return {"ok": True, "project": proj, "summary": f"Updated project `{proj['project_id']}`."}
     if sub in ("create_card", "save_card", "add_card", "create_item"):
         ref = str(p.get("item_id") or p.get("card_id") or "").strip()
         if ref:
-            it = mgr.update_item(ref, **{k: v for k, v in p.items() if k not in ("subaction", "action", "item_id", "card_id")})
+            it = mgr.update_item(ref, **_resolve_item_updates(p))
         else:
-            it = mgr.create_item(
-                project_id=pid or None, title=str(p.get("title") or ""), description=str(p.get("description") or ""),
-                owner=str(p.get("owner") or "companion"), stage_kind=str(p.get("stage_kind") or "DELIVER_AND_VERIFY"),
-                status=str(p.get("status") or p.get("column_key") or "ready"), priority=int(p.get("priority") or 3),
-                depends_on=_as_list(p.get("depends_on")), milestone_id=str(p.get("milestone_id") or p.get("epic_id") or ""),
-                timebox_id=str(p.get("timebox_id") or p.get("sprint_id") or ""),
-                verification=p.get("verification") if isinstance(p.get("verification"), dict) else None,
-                dag_name=str(p.get("dag_name") or ""), acceptance_criteria=str(p.get("acceptance_criteria") or ""),
-                estimate_minutes=int(p.get("estimate_minutes") or 30), planned_date=str(p.get("planned_date") or ""),
-                due_date=str(p.get("due_date") or ""), tags=_as_list(p.get("tags")),
-            )
+            est = int(p["estimate_minutes"]) if p.get("estimate_minutes") is not None else _EFFORT_MINS.get(str(p.get("effort_size") or ""), 30)
+            ver = p.get("verification") if isinstance(p.get("verification"), dict) else None
+            chk = p.get("checklist") if isinstance(p.get("checklist"), list) else None
+            it = mgr.create_item(project_id=pid or None, title=str(p.get("title") or ""), description=str(p.get("description") or ""), owner=str(p.get("owner") or "companion"), stage_kind=str(p.get("stage_kind") or "DELIVER_AND_VERIFY"), status=str(p.get("status") or p.get("column_key") or "ready"), priority=int(p.get("priority") or 3), depends_on=_as_list(p.get("depends_on")), milestone_id=str(p.get("milestone_id") or p.get("epic_id") or ""), timebox_id=str(p.get("timebox_id") or p.get("sprint_id") or ""), verification=ver, dag_name=str(p.get("dag_name") or ""), acceptance_criteria=str(p.get("acceptance_criteria") or ""), estimate_minutes=est, planned_date=str(p.get("planned_date") or ""), due_date=str(p.get("due_date") or ""), checklist=chk, tags=_as_list(p.get("tags")))
         return {"ok": True, "card": it, "item": it, "summary": f"Saved work item `{it['item_id']}` (`{it['owner']}` | `{it['status']}`): {it['title']}"}
     if sub in ("move_card", "update_card", "update_item"):
         ref = str(p.get("item_id") or p.get("card_id") or "").strip()
-        it = mgr.update_item(ref, **{k: v for k, v in p.items() if k not in ("subaction", "action", "item_id", "card_id")})
+        it = mgr.update_item(ref, **_resolve_item_updates(p))
         return {"ok": True, "card": it, "item": it, "summary": f"Updated `{it['item_id']}` -> `{it['status']}`."}
+    if sub == "slice_unblocker":
+        ref = str(p.get("item_id") or p.get("card_id") or "").strip()
+        ub = mgr.slice_unblocker(ref, title=str(p.get("title") or ""), description=str(p.get("description") or ""), owner=str(p.get("owner") or ""))
+        return {"ok": True, "card": ub, "item": ub, "unblocker": ub, "summary": f"Sliced 15m unblocker `{ub['item_id']}`: {ub['title']}"}
     if sub in ("delete_card", "delete_item"):
         ref = str(p.get("item_id") or p.get("card_id") or "").strip()
         ok = mgr.delete_item(ref)
         return {"ok": ok, "item_id": ref, "summary": f"Deleted `{ref}`."}
     if sub in ("create_epic", "save_epic", "create_milestone"):
-        ms = mgr.create_milestone(pid or mgr.resolve_project_id(), str(p.get("title") or ""), description=str(p.get("description") or ""), stage_kind=str(p.get("stage_kind") or "DELIVER_AND_VERIFY"), target_date=str(p.get("target_date") or ""))
-        return {"ok": True, "epic": ms, "milestone": ms, "summary": f"Created milestone `{ms['title']}` (`{ms['milestone_id']}`)."}
+        ms = mgr.create_milestone(pid or mgr.resolve_project_id(), str(p.get("title") or ""), description=str(p.get("description") or ""), stage_kind=str(p.get("stage_kind") or "DELIVER_AND_VERIFY"), target_date=str(p.get("target_date") or ""), milestone_id=str(p.get("epic_id") or p.get("milestone_id") or ""))
+        return {"ok": True, "epic": ms, "milestone": ms, "summary": f"Saved milestone `{ms['title']}` (`{ms['milestone_id']}`)."}
+    if sub in ("delete_epic", "delete_milestone"):
+        mid = str(p.get("epic_id") or p.get("milestone_id") or "").strip()
+        ok = mgr.delete_milestone(mid)
+        return {"ok": ok, "epic_id": mid, "milestone_id": mid, "summary": f"Deleted milestone `{mid}`." if ok else f"Milestone `{mid}` not found.", **({} if ok else {"error": f"Milestone `{mid}` not found."})}
     if sub == "seed_dikw":
         seeded = mgr.seed_dikw_goal_milestones(pid or mgr.resolve_project_id())
         return {"ok": True, "milestones": seeded, "summary": f"Seeded 4 DIKW prerequisite milestones: {seeded}"}
@@ -546,24 +619,14 @@ def _act_agile(p: Dict[str, Any], _actor: str, mem: MemoryStore) -> Dict[str, An
     if sub == "list_boards":
         projs = mgr.list_projects()
         return {"ok": True, "boards": projs, "projects": projs, "summary": "Projects & Goals: " + ", ".join(f"`{x['slug']}` ({x['kind']})" for x in projs)}
+    if sub not in ("", "board_view", "view", "status", "get"):
+        return {"ok": False, "error": f"Unknown agile subaction `{sub}`."}
     view = mgr.get_board_projection(pid or None, timebox_id=str(p.get("sprint_id") or p.get("timebox_id") or "") or None, owner_filter=str(p.get("owner") or "") or None)
     cnt, rows = view["counts"], [f"  - `{it['item_id']}` [`{it['owner']}` | `{it['status']}`]: {it['title']}" for it in view.get("items", [])[:15]]
     return {
         "ok": True, **view, "boards": mgr.list_projects(), "aging_cards": [],
         "summary": f"Project `{view['project']['title']}`: total={cnt['total']}, companion_ready={cnt['companion_ready']}, human_pending={cnt['human_pending']}, blocked={cnt['blocked']}, done={cnt['done']}." + ("\n" + "\n".join(rows) if rows else ""),
     }
-
-
-def _parse_agile_slash(verb: str, parts: List[str]) -> Dict[str, Any]:
-    if verb == "/boards":
-        return {"subaction": "list_boards"}
-    if verb == "/sprint":
-        if parts and parts[0].lower() == "create" and len(parts) >= 2:
-            return {"subaction": "create_sprint", "title": " ".join(parts[1:])}
-        return {"subaction": "board_view"}
-    if parts and parts[0].lower() == "add" and len(parts) >= 2:
-        return {"subaction": "create_card", "title": " ".join(parts[1:])}
-    return {"subaction": "roadmap"} if (parts and parts[0].lower() == "roadmap") else {"subaction": "board_view", "project_id": parts[0] if parts else ""}
 
 
 CORE_ACTIONS: Dict[str, ActionSpec] = {
@@ -584,7 +647,7 @@ CORE_ACTIONS: Dict[str, ActionSpec] = {
     "sandbox": ActionSpec("sandbox", "routines", "Create, Doctor-verify, diff, and clean up isolated self-development clones.", False, _act_sandbox),
     "agile": ActionSpec("agile", "agile", "Operate Universal Project & Goal Graph (`companion` | `human` | `collaborative`), Milestones, Timeboxes, and Kanban/Roadmap views.", False, _act_agile),
     "calendar": ActionSpec("calendar", "calendar", "Operate Unified Calendar timeline merging events, active timeboxes, task dates, routines, and due SRS reviews.", False, lambda p, _a, m: execute_calendar_action(p, store=m)),
-    "education": ActionSpec("education", "education", "Operate Headless Education courses, pedagogical stages, spaced repetition, and inline Chat flashcard decks.", False, lambda p, a, m: execute_education_action({**p, "actor": p.get("actor") or a}, store=m)),
+    "education": ActionSpec("education", "education", "Operate Headless Education courses, pedagogical stages, spaced repetition, and inline Chat flashcard decks.", False, lambda p, a, m: execute_education_action({**p, "actor": a}, store=m)),
     "models": ActionSpec("models", "models", "Manage Multi-Provider LLM Registry, Blind Vault API key bindings, Capability Tier Matrix, and LAN Privacy Lock.", False, execute_model_registry_action),
     "identity": ActionSpec("identity", "governance", "Inspect or customize Companion Soul, User Identity & Profile, Communication Tone, and Active Workspace Project.", False, execute_identity_action),
 }
@@ -618,79 +681,7 @@ def execute_core_action(action_name: str, params: Optional[Dict[str, Any]] = Non
 
 
 def handle_harvest_slash(verb: str, arg: str, store: Optional[MemoryStore] = None) -> str:
-    """Unified CLI/REPL slash handler routing `/jobs`, `/wiki`, `/vault`, `/endpoints`, `/mcp`, `/partners`, etc. through `CORE_ACTIONS`."""
-    v, parts = verb.strip().lower(), (shlex.split(arg) if arg.strip() else [])
-    sub, rest = (parts[0].lower() if parts else "list"), parts[1:]
-    act_name = v.lstrip("/")
-    if v == "/trust":
-        p: Dict[str, Any] = {"subaction": "set", "mode": sub} if parts else {"subaction": "get"}
-    elif v == "/approvals":
-        p = {"subaction": sub, "approval_id": rest[0] if rest else "", "note": " ".join(rest[1:])} if sub in ("approve", "deny") else {"subaction": "list", "status": sub if parts else "waiting"}
-    elif v == "/jobs":
-        p = {"subaction": "dispatch", "goal": " ".join(rest)} if sub == "dispatch" else ({"subaction": sub, "job_id": rest[0] if rest else ""} if sub in ("status", "cancel", "resume") else {"subaction": "list", "status": sub if parts and sub != "list" else ""})
-    elif v == "/wiki":
-        if sub in ("read", "trash", "restore", "inspect", "verify", "verify_note", "diff"):
-            mapped = "inspect_graduation" if sub == "inspect" else ("verify_note" if sub == "verify" else sub)
-            p = {"subaction": mapped, "path": rest[0] if rest else "", "compare_to": rest[1] if len(rest) > 1 else ""}
-        elif sub in ("stale", "list_stale", "consolidate", "consolidate_ontology"):
-            p = {"subaction": "list_stale" if sub in ("stale", "list_stale") else "consolidate_ontology", "aliases": " ".join(rest)}
-        elif sub in ("templates", "list_templates"):
-            p = {"subaction": "read_template", "template": rest[0]} if rest else {"subaction": "list_templates"}
-        elif sub in ("history", "curation_history"):
-            p = {"subaction": "curation_history"}
-        elif sub in ("revert", "revert_curation"):
-            p = {"subaction": "revert_curation", "tx_id": rest[0] if rest else ""}
-        elif sub == "search":
-            p = {"subaction": "search", "query": " ".join(rest)}
-        elif sub == "capture":
-            p = {"subaction": "capture_inbox", "title": rest[0] if rest else "Quick Note", "content": " ".join(rest[1:]) if len(rest) > 1 else (rest[0] if rest else "")}
-        elif sub == "graduate":
-            p = {"subaction": "graduate", "path": rest[0] if rest else "", "domain": rest[1] if len(rest) > 1 else "general", "topic": rest[2] if len(rest) > 2 else ""}
-        else:
-            p = {"subaction": sub if sub in ("graph", "reindex", "export_chat", "tag_authority", "list") else "list", "folder": sub if sub.startswith("0") else ""}
-    elif v == "/vault":
-        if sub == "set" and len(rest) >= 3:
-            p = {"subaction": "set", "name": rest[0], "cred_type": rest[1], "value": " ".join(rest[2:])}
-        elif sub in ("delete", "check") and rest:
-            p = {"subaction": sub, "name": rest[0]}
-        elif sub == "grant" and len(rest) >= 2:
-            p = {"subaction": "grant_scope", "name": rest[0], "caller_scope": rest[1]}
-        else:
-            p = {"subaction": sub if sub in ("list", "list_missing", "audit") else "list"}
-    elif v == "/backup":
-        p = {"subaction": "create", "label": rest[0] if rest else "manual"} if sub == "create" else ({"subaction": "restore", "snapshot_id": rest[0] if rest else ""} if sub == "restore" else {"subaction": "list"})
-    elif v == "/endpoints":
-        p = {"subaction": "register", "endpoint_id": rest[0], "protocol": rest[1], "host": rest[2], "credential_ref": rest[3] if len(rest) > 3 else ""} if sub == "add" and len(rest) >= 3 else ({"subaction": sub, "endpoint_id": rest[0]} if sub in ("test", "inspect_host", "remove") and rest else {"subaction": "list"})
-    elif v in ("/mcp", "/partners"):
-        act_name = "mcp"
-        if v == "/partners":
-            p = {"subaction": "register_partner", "partner_id": rest[0], "url": rest[1], "credential_ref": rest[2] if len(rest) > 2 else ""} if sub == "add" and len(rest) >= 2 else ({"subaction": "handshake_partner", "partner_id": rest[0]} if sub in ("handshake", "ping") and rest else {"subaction": "list_partners"})
-        elif sub in ("discover", "approve_server", "remove_server", "harvest_skill") and rest:
-            p = {"subaction": sub, "server_id": rest[0]}
-        elif sub == "hosted":
-            p = {"subaction": "configure_hosted", "enabled": (rest[0].lower() == "on") if rest else True, "token_ref": rest[1] if len(rest) > 1 else "hosted-mcp-token"}
-        else:
-            p = {"subaction": "list"}
-    elif v == "/routines":
-        p = {"subaction": "tick"} if sub == "tick" else ({"subaction": "run_now", "routine_id": rest[0]} if sub == "run" and rest else ({"subaction": "delete", "routine_id": rest[0]} if sub == "delete" and rest else {"subaction": "list"}))
-    elif v == "/prompts":
-        p = {"subaction": "save", "name": rest[0], "template": " ".join(rest[1:])} if sub == "save" and len(rest) >= 2 else ({"subaction": "delete", "name": rest[0]} if sub == "delete" and rest else {"subaction": "list"})
-    elif v == "/archive":
-        p = {"subaction": "run", "older_than_days": int(rest[0]) if rest else 90} if sub == "run" else {"subaction": "search", "query": arg}
-    elif v in ("/board", "/boards", "/sprint"):
-        act_name, p = "agile", _parse_agile_slash(v, parts)
-    elif v in ("/calendar", "/study", "/providers", "/selfdev"):
-        slash_map = {"/calendar": ("calendar", parse_calendar_slash), "/study": ("education", parse_education_slash), "/providers": ("models", parse_providers_slash), "/selfdev": ("autonomy", parse_selfdev_slash)}
-        act_name, fn = slash_map[v]
-        p = fn(parts)
-    elif v == "/identity":
-        act_name, p = "identity", {"subaction": "get"}
-    else:
-        act_name = "sandbox"
-        p = {"subaction": sub, "sandbox_id": rest[0] if rest else "", "label": rest[0] if rest else "experiment"} if sub in ("create", "verify", "diff", "cleanup") else {"subaction": "list"}
-    res = execute_core_action(act_name, p, actor="cli", store=store)
-    if res.get("markdown_block"):
-        return f"{res.get('summary', '')}\n\n{res['markdown_block']}".strip()
-    if res.get("summary") and res.get("output"):
-        return f"{res['summary']}\n{res['output']}"
-    return str(res.get("summary") or res.get("output") or res.get("error") or json.dumps(res, indent=2))
+    """Unified CLI/REPL slash handler delegating to `companion.harvest_tools.dispatch_harvest_slash`."""
+    from companion.harvest_tools import dispatch_harvest_slash
+
+    return dispatch_harvest_slash(verb, arg, store=store)

@@ -30,6 +30,11 @@ from companion.memory_store import MemoryStore, get_memory_store
 from companion.telemetry import telemetry
 
 VALID_DAG_NODE_KINDS = ("python_step", "tool_or_script_step", "mcp_step", "bounded_llm_step", "human_gate")
+__all__ = [
+    "DAGNodeSpec", "DAGRuntimeBindings", "DAGSpec", "VALID_DAG_NODE_KINDS", "dag_node",
+    "discover_dags", "execute_dag_by_name", "execute_dag_spec", "get_dag_run", "list_dag_runs",
+    "register_dag_runtime_bindings", "resume_dag_run", "validate_dag_spec",
+]
 _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _TYPE_MAP: Dict[str, Tuple[type, ...]] = {
     "str": (str,),
@@ -658,11 +663,17 @@ def get_dag_run(run_id: str, store: Optional[MemoryStore] = None) -> Optional[Di
     if not rows:
         return None
     out = dict(rows[0])
-    out["node_runs"] = mem._fetch_dicts(
+    node_rows = mem._fetch_dicts(
         ["node_id", "status", "attempts", "output_json", "error", "duration_ms", "updated_at"],
         "SELECT node_id, status, attempts, output_json, error, duration_ms, updated_at FROM dag_node_runs WHERE run_id = ? ORDER BY rowid ASC",
         (run_id.strip(),),
     )
+    for nr in node_rows:
+        try:
+            nr["output"] = json.loads(nr.get("output_json") or "{}")
+        except Exception:
+            nr["output"] = nr.get("output_json")
+    out["node_runs"] = node_rows
     return out
 
 

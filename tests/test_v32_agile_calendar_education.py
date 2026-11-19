@@ -9,23 +9,27 @@ Unified Multi-Source Calendar, Headless Education Engine, and `personal-agile-co
 """
 
 import json
+import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+import unittest.mock
+from datetime import datetime
 from pathlib import Path
 
 from companion.calendar_engine import get_calendar_manager
+from companion.config import self_dev_override_context, workspace_context
 from companion.context import build_system_prompt
 from companion.core_actions import execute_core_action, handle_harvest_slash
 from companion.education_engine import get_education_engine
 from companion.grounding import discover_skills, rank_relevant_skills
-from companion.harvest_tools import tool_education_manage
+from companion.harvest_tools import tool_agile_manage, tool_education_manage
 from companion.intake import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
 from companion.routines import get_routine_manager
 from companion.skill_forge import run_skill_script
-from companion.tool_schemas import check_phase_tool_permission
+from companion.tool_schemas import check_phase_tool_permission, filter_tools_for_phase
+from companion.tools import tool_search, tool_web_search
 from companion.wiki_templates import list_templates
 from surfaces.api_extensions import enrich_web_status
 
@@ -91,7 +95,7 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
         self.assertTrue(any("[WF #" in c["title"] and c["column_key"] == "done" for c in view["cards"]))
 
     def test_unified_calendar_aggregates_events_items_milestones_routines_and_srs(self) -> None:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         cal = get_calendar_manager(store=self.store)
         pg = get_project_graph(store=self.store)
         rm = get_routine_manager(store=self.store)
@@ -200,6 +204,74 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
         self.assertIn("socratic-tutoring", top_tutor)
         top_agile = [s["name"] for s in rank_relevant_skills("Plan my weekend kanban capacity and slice a 15m chore unblocker", skills, top_k=4)]
         self.assertIn("personal-agile-coach", top_agile)
+
+    def test_dom2_agile_subactions_search_glob_web_search_and_scoped_repo_tools(self) -> None:
+        with memory_store_context(self.store):
+            p_res = execute_core_action("agile", {"subaction": "create_project", "title": "Home Ops", "description": "Initial summary"}, actor="user", store=self.store)
+            pid = p_res["project"]["project_id"]
+            u_res = execute_core_action("agile", {"subaction": "update_project", "project_id": pid, "description": "Updated goal summary"}, actor="user", store=self.store)
+            self.assertEqual(u_res["project"]["goal_summary"], "Updated goal summary")
+
+            ep1 = execute_core_action("agile", {"subaction": "save_epic", "project_id": pid, "title": "NAS Upgrade"}, actor="companion", store=self.store)
+            mid = ep1["epic"]["milestone_id"]
+            ep2 = execute_core_action("agile", {"subaction": "save_epic", "project_id": pid, "epic_id": mid, "title": "NAS 10GbE Upgrade"}, actor="companion", store=self.store)
+            self.assertEqual(ep2["epic"]["title"], "NAS 10GbE Upgrade")
+            self.assertEqual(len(execute_core_action("agile", {"subaction": "list_epics", "project_id": pid}, store=self.store)["epics"]), 1)
+
+            c_res = execute_core_action("agile", {
+                "subaction": "create_item", "project_id": pid, "epic_id": mid, "title": "Install SFP+ card",
+                "status": "sprint_todo", "effort_size": "half_day", "checklist": ["Power down NAS", "Seat NIC"],
+            }, actor="companion", store=self.store)
+            cid = c_res["item"]["item_id"]
+            self.assertEqual(c_res["item"]["estimate_minutes"], 180)
+            self.assertEqual(len(c_res["item"]["checklist"]), 2)
+            self.assertEqual(len(get_project_graph(self.store).next_ready_companion_items(pid)), 1)
+
+            ub = execute_core_action("agile", {"subaction": "slice_unblocker", "card_id": cid, "title": "Order DAC cable"}, actor="companion", store=self.store)
+            self.assertTrue(ub["ok"])
+            self.assertEqual(ub["unblocker"]["estimate_minutes"], 15)
+            self.assertEqual(get_project_graph(self.store).get_item(cid)["status"], "blocked")
+            self.assertEqual(len(execute_core_action("agile", {"subaction": "list_items", "project_id": pid}, store=self.store)["items"]), 2)
+            self.assertTrue(execute_core_action("agile", {"subaction": "delete_epic", "epic_id": mid}, store=self.store)["ok"])
+            bad_sub = execute_core_action("agile", {"subaction": "nonexistent_subaction"}, store=self.store)
+            self.assertFalse(bad_sub["ok"])
+            self.assertIn("error:", tool_agile_manage({"action": "nonexistent_subaction"}))
+
+            # Search file_glob + surfaces/static skipping
+            s_dir = self.tmp_path / "search_ws"
+            (s_dir / "surfaces" / "static").mkdir(parents=True)
+            (s_dir / "surfaces" / "static" / "app.js").write_text("UNIQUE_NEEDLE_XYZ", encoding="utf-8")
+            (s_dir / "notes.md").write_text("UNIQUE_NEEDLE_XYZ in markdown", encoding="utf-8")
+            (s_dir / "code.py").write_text("UNIQUE_NEEDLE_XYZ in python", encoding="utf-8")
+            with workspace_context(s_dir):
+                s_all = tool_search({"pattern": "UNIQUE_NEEDLE_XYZ", "path": str(s_dir)})
+                self.assertNotIn("app.js", s_all)
+                self.assertIn("notes.md", s_all)
+                s_py = tool_search({"pattern": "UNIQUE_NEEDLE_XYZ", "path": str(s_dir), "file_glob": "*.py"})
+                self.assertIn("code.py", s_py)
+                self.assertNotIn("notes.md", s_py)
+
+            # web_search privacy lock + HTML Lite parsing
+            with unittest.mock.patch("companion.os_tools.settings.effective_privacy_mode", return_value="local_only"), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
+                self.assertIn("PRIVACY LOCK", tool_web_search({"query": "Ubuntu GDM black screen"}))
+            fake_html = b'<html><body><a class="result__a" href="https://example.com/gdm">Fix GDM Black Screen</a><a class="result__snippet">Restart gdm service.</a></body></html>'
+            fake_resp = unittest.mock.MagicMock()
+            fake_resp.read.return_value = fake_html
+            fake_resp.__enter__.return_value = fake_resp
+            with unittest.mock.patch("companion.os_tools.settings.effective_privacy_mode", return_value="hybrid"), unittest.mock.patch("companion.os_tools.urlopen_safe", return_value=fake_resp), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
+                ws_out = tool_web_search({"query": "Ubuntu GDM", "max_results": 3})
+            self.assertIn("Fix GDM Black Screen", ws_out)
+            self.assertIn("https://example.com/gdm", ws_out)
+
+            # Scoped repo-internal tools: hidden in daily-driver mode, exposed when Self-Dev ON
+            with self_dev_override_context(False):
+                daily_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
+                self.assertNotIn("sdd_manage", daily_names)
+                self.assertNotIn("system_doctor", daily_names)
+            with self_dev_override_context(True):
+                dev_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
+                self.assertIn("sdd_manage", dev_names)
+                self.assertIn("system_doctor", dev_names)
 
 
 if __name__ == "__main__":

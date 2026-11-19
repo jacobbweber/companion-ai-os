@@ -208,20 +208,38 @@ class ApprovalQueue:
         if trust == "autonomous" and not always_require_in_autonomous:
             return True, {"status": "approved", "fingerprint": fp, "decided_by": "autonomous_trust_mode"}
 
-        waiting = [r for r in self.list_requests(status="waiting", limit=100) if r["fingerprint"] == fp]
-        if waiting:
-            return False, waiting[0]
-
-        aid = f"apr_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+        cat_clean, act_clean, tgt_clean = category.strip().lower(), action_name.strip().lower(), target.strip()
         safe_json = redact_secrets(json.dumps(payload or {}, sort_keys=True, default=str))
         safe_sum = redact_secrets(summary.strip())[:300]
         with mem._lock:
-            mem.conn.execute(
-                """INSERT INTO approval_requests
-                   (approval_id, category, action_name, target, summary, fingerprint, payload_json, requester, session_id, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting')""",
-                (aid, category.strip().lower(), action_name.strip().lower(), target.strip(), safe_sum, fp, safe_json, requester, session_id or "main"),
-            )
+            cols = [
+                "approval_id", "category", "action_name", "target", "summary", "fingerprint",
+                "payload_json", "requester", "session_id", "status", "decided_by", "decision_note", "created_at", "decided_at",
+            ]
+            fp_row = mem.conn.execute(
+                f"SELECT {', '.join(cols)} FROM approval_requests WHERE status = 'waiting' AND fingerprint = ? ORDER BY rowid DESC LIMIT 1",
+                (fp,),
+            ).fetchone()
+            if fp_row:
+                return False, dict(zip(cols, fp_row))
+            dup_row = mem.conn.execute(
+                "SELECT approval_id FROM approval_requests WHERE status = 'waiting' AND category = ? AND action_name = ? AND target = ? ORDER BY rowid DESC LIMIT 1",
+                (cat_clean, act_clean, tgt_clean),
+            ).fetchone()
+            if dup_row:
+                aid = str(dup_row[0])
+                mem.conn.execute(
+                    "UPDATE approval_requests SET summary = ?, fingerprint = ?, payload_json = ?, requester = ?, session_id = ? WHERE approval_id = ?",
+                    (safe_sum, fp, safe_json, requester, session_id or "main", aid),
+                )
+            else:
+                aid = f"apr_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+                mem.conn.execute(
+                    """INSERT INTO approval_requests
+                       (approval_id, category, action_name, target, summary, fingerprint, payload_json, requester, session_id, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting')""",
+                    (aid, cat_clean, act_clean, tgt_clean, safe_sum, fp, safe_json, requester, session_id or "main"),
+                )
             mem.conn.commit()
         created = self.get_request(aid) or {"approval_id": aid, "status": "waiting", "fingerprint": fp, "summary": safe_sum}
         return False, created

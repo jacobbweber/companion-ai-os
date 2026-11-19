@@ -40,6 +40,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
   const [dagName, setDagName] = useState('');
   const [verKind, setVerKind] = useState('assertion');
   const [verTarget, setVerTarget] = useState('');
+  const [origVerExtra, setOrigVerExtra] = useState<Record<string, unknown>>({});
   const [plannedDate, setPlannedDate] = useState('');
   const [dueDate, setDueDate] = useState('');
 
@@ -87,6 +88,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
             setDagName(found.dag_name || '');
             setVerKind(found.verification?.kind || 'assertion');
             setVerTarget(found.verification?.target || '');
+            setOrigVerExtra({ ...(found.verification || {}) } as Record<string, unknown>);
             setPlannedDate(found.planned_date || '');
             setDueDate(found.due_date || '');
           }
@@ -189,7 +191,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
       priority,
       depends_on: dependsOn,
       dag_name: dagName,
-      verification: { kind: verKind, target: verTarget.trim() },
+      verification: { ...origVerExtra, kind: verKind, target: verTarget.trim() },
       planned_date: plannedDate,
       due_date: dueDate,
     });

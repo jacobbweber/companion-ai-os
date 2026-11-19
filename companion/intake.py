@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.config import settings
 from companion.dag_runtime import discover_dags
-from companion.disciplines import ActionRiskTier, classify_action_risk
+from companion.disciplines import ActionRiskTier
 from companion.grounding import EpistemicGrounding, build_epistemic_grounding
 from companion.memory_store import MemoryStore, has_memory_store_override
 from companion.project_graph import get_project_graph
@@ -192,8 +192,8 @@ def assess_turn_readiness(
     has_mutation = bool(words & _MUTATION_VERBS)
     risk = ActionRiskTier.R1_LOCAL_REVERSIBLE if has_mutation else ActionRiskTier.R0_READ_ONLY
 
-    high_blast = bool((words & _DESTRUCTIVE_VERBS) and (words & _PRODUCTION_NOUNS))
-    if high_blast or classify_action_risk("run_shell", {"command": clean}) == ActionRiskTier.R3_HIGH_IMPACT_MUTATION:
+    high_blast = bool((words & _DESTRUCTIVE_VERBS) and (words & _PRODUCTION_NOUNS)) and "```" not in clean
+    if high_blast:
         risk = ActionRiskTier.R3_HIGH_IMPACT_MUTATION
         reasons.append("high-impact stateful or external operation detected (`R3`)")
 
@@ -351,21 +351,21 @@ def select_turn_step_tier(
     suggested_tier: Optional[str] = None,
     allow_error_escalation: Optional[bool] = None,
 ) -> Optional[str]:
-    """Select the right model tier for the cognitive job without downgrading `reasoning` on shared GPUs."""
+    """Lock one model tier per turn at Step 0 (preserving KV-cache), escalating mid-turn only on `>=2` consecutive errors."""
+    _ = tiers_share_endpoint
     m_tier = _resolve_active_media_tier()
     if m_tier:
         return m_tier
     is_auto = not top_tier or top_tier.strip().lower() == "auto"
     can_escalate = is_auto if allow_error_escalation is None else bool(allow_error_escalation)
-    shared = settings.tiers_share_endpoint("fast", "reasoning") if tiers_share_endpoint is None else bool(tiers_share_endpoint)
     if consecutive_errors >= 2 and can_escalate:
         if telemetry.active_trace_id:
             telemetry.log("INFO", "safety", f"Escalating step to `reasoning` tier after {consecutive_errors} consecutive tool errors")
         return "reasoning"
-    if shared and step >= 1 and prior_tier == "reasoning" and can_escalate:
-        return "reasoning"
+    if step >= 1 and prior_tier:
+        return prior_tier
     if subagent_depth == 0 and is_auto:
-        if step == 0 and (intent_mode == "DEEP_CONSULT" or suggested_tier == "reasoning"):
+        if intent_mode == "DEEP_CONSULT" or suggested_tier == "reasoning":
             return "reasoning"
         return resolve_workflow_phase_tier(active_wf_state) if active_wf_state else "fast"
     return top_tier

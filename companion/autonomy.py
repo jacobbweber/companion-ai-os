@@ -22,8 +22,8 @@ from companion.compaction import build_lossless_phase_handoff, classify_task_aut
 from companion.config import settings
 from companion.dag_runtime import execute_dag_by_name
 from companion.disciplines import (
-    FORBIDDEN_EXTERNAL_IMPORTS as FORBIDDEN_STDLIB_VIOLATION_IMPORTS, STUB_PATTERNS,
-    iter_ast_import_targets, resolve_workspace_contract, verify_repository_syntax, walk_pruned_files,
+    FORBIDDEN_EXTERNAL_IMPORTS as FORBIDDEN_STDLIB_VIOLATION_IMPORTS,
+    find_non_abstract_stubs, iter_ast_import_targets, resolve_workspace_contract, verify_repository_syntax, walk_pruned_files,
 )
 from companion.intake import PHASE_TIERS, IntentDecision, classify_turn_intent, resolve_workflow_phase_tier, run_http_smoke_probe
 from companion.llm import chat, model_gate, tier_context
@@ -80,11 +80,9 @@ def scan_placeholder_violations(paths: List[Path], root: Optional[Path] = None) 
         if top in ("tests", "skills", ".companion_backups") or rel in ("companion/autonomy.py", "companion/safety.py", "companion/disciplines.py"):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        if path.suffix.lower() in {".py", ".html", ".js"}:
-            for rx, label in STUB_PATTERNS:
-                m = rx.search(text)
-                if m:
-                    violations.append(f"{rel}:{text[: m.start()].count(chr(10)) + 1} contains {label}")
+        if contract.enforce_stdlib_only and path.suffix.lower() in {".py", ".html", ".js"}:
+            for lineno, label in find_non_abstract_stubs(text, suffix=path.suffix.lower()):
+                violations.append(f"{rel}:{lineno} contains {label}")
         if path.suffix.lower() == ".py":
             try:
                 tree = ast.parse(text, filename=rel)
@@ -394,7 +392,7 @@ def _finalize_autonomous_goal(
     if target_root == settings.root.resolve():
         sync_decisions_md(store=mem, root=target_root)
         mem.sync_memory_md()
-    git_res = eff_cp.create_git_savepoint(f"Complete Workflow #{wf_id}: {clean_goal[:72]}", init_if_needed=(target_root != settings.root.resolve())) if auto_git_commit else {}
+    git_res = eff_cp.create_git_savepoint(f"Complete Workflow #{wf_id}: {clean_goal[:72]}", init_if_needed=False) if auto_git_commit else {}
     git_line = f"\nGit Save-Point: {git_res['summary']}" if git_res.get("summary") else ""
     wf.transition("COMPLETE", f"Autonomous goal verified and completed in {elapsed_s}s", run_tests_on_verify=False)
     if wf_id is not None:

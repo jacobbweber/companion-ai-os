@@ -22,12 +22,19 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from companion.archive_and_approvals import enqueue_session_nudge
-from companion.config import settings
-from companion.llm import chat, model_gate, normalize_assistant_message, recover_empty_synthesis, tier_context
+from companion.config import execution_origin_context, settings, workspace_context
+from companion.llm import chat, model_gate, tier_context
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
-from companion.telemetry import redact_secrets, telemetry
-from companion.tool_schemas import TOOLS
-from companion.wiki_curation import pending_curation_nudge
+from companion.project_graph import get_project_graph
+from companion.streaming import (
+    CancelScope,
+    cancel_scope_context,
+    get_active_wire_doc_context,
+    get_active_wire_images,
+    wire_attachment_context,
+)
+from companion.telemetry import redact_secrets, trace_scope
+from companion.tool_schemas import TOOLS, phase_tool_context
 from companion.wiki_engine import get_wiki_engine
 
 __all__ = [
@@ -85,7 +92,7 @@ _DEFAULT_WORKER_TOOLS: Tuple[str, ...] = (
 )
 
 _RECOVERED_DBS: Set[str] = set()
-_CANCEL_EVENTS: Dict[str, threading.Event] = {}
+_CANCEL_SCOPES: Dict[str, CancelScope] = {}
 _JOBS_LOCK = threading.RLock()
 
 
@@ -193,11 +200,23 @@ class BackgroundJobManager:
 
     def is_cancel_requested(self, job_id: str) -> bool:
         with _JOBS_LOCK:
-            ev = _CANCEL_EVENTS.get(job_id)
-            if ev is not None and ev.is_set():
+            scope = _CANCEL_SCOPES.get(job_id)
+            if scope is not None and scope.is_cancelled:
                 return True
         row = self.get_job(job_id)
         return bool(row and row.get("status") == "cancelled")
+
+    def _spawn_clean_worker_thread(self, job_id: str) -> None:
+        ws = settings.get_workspace()
+        ws_root, ws_pid = ws.project_root, ws.project_id
+        doc_ctx, img_uris = get_active_wire_doc_context(), get_active_wire_images()
+        clean_ctx = contextvars.Context()
+
+        def _entry() -> None:
+            with workspace_context(ws_root, ws_pid), wire_attachment_context(doc_ctx, img_uris):
+                self._execute_job(job_id)
+
+        threading.Thread(target=lambda: clean_ctx.run(_entry), daemon=True, name=f"companion-{job_id}").start()
 
     def dispatch_job(
         self,
@@ -244,11 +263,10 @@ class BackgroundJobManager:
             self.store.conn.commit()
 
         with _JOBS_LOCK:
-            _CANCEL_EVENTS[job_id] = threading.Event()
+            _CANCEL_SCOPES[job_id] = CancelScope()
 
         if run_in_background:
-            ctx = contextvars.copy_context()
-            threading.Thread(target=lambda: ctx.run(self._execute_job, job_id), daemon=True, name=f"companion-{job_id}").start()
+            self._spawn_clean_worker_thread(job_id)
             return {
                 "ok": True, "job_id": job_id, "status": "queued", "title": eff_title, "paired_tools": paired_tools,
                 "summary": f"Dispatched background job `{job_id}` (`{eff_title}`) — foreground chat remains free.",
@@ -269,9 +287,10 @@ class BackgroundJobManager:
         }
 
     def _run_zero_identity_worker(self, job: Dict[str, Any], deadline_mono: float) -> Tuple[str, str, str]:
-        """Run a lean Zero-Identity Worker loop; return `(final_status, raw_output, approval_id_or_err)`."""
+        """Delegate Zero-Identity Worker execution to the canonical `run_worker_step_loop` (`agent.py`)."""
+        from companion.agent import run_worker_step_loop
+
         allowed_names = set(job.get("allowed_tools") or _DEFAULT_WORKER_TOOLS) - {"job_manage"}
-        tool_schemas = [t for t in TOOLS if t["function"]["name"] in allowed_names]
         ws_root = settings.get_workspace().project_root
         sys_msg = (
             "[ZERO-IDENTITY BACKGROUND WORKER BRIEF]\n"
@@ -285,51 +304,37 @@ class BackgroundJobManager:
         )
         prior_partial = str(job.get("partial_output") or "").strip()
         user_brief = str(job["goal"]) + (f"\n\n[PRIOR PARTIAL PROGRESS]\n{prior_partial[-1500:]}" if prior_partial else "")
-        msgs: List[Dict[str, Any]] = [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_brief}]
         partial_chunks: List[str] = []
         max_steps = max(1, int(job.get("max_iters") or 8))
-        job_iso, cur_nudges = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), 0
 
-        for _step in range(max_steps):
-            if self.is_cancel_requested(job["job_id"]):
-                return "cancelled", "\n".join(partial_chunks), "Cancelled by user."
-            if time.monotonic() > deadline_mono:
-                return "timed_out", "\n".join(partial_chunks), f"Timed out after {job.get('timeout_sec')}s."
-            data = self._chat_fn(msgs, tool_schemas if tool_schemas else None, "auto" if tool_schemas else "none")
-            clean_txt, think_txt, tcalls = normalize_assistant_message((data.get("choices") or [{}])[0].get("message") or {})
-            if not tcalls:
-                cur_nudge = pending_curation_nudge(self.store, job_iso, clean_txt, require_intent_phrase=False) if ("wiki_manage" in allowed_names and _step + 1 < max_steps and cur_nudges < 2) else None
-                if cur_nudge:
-                    cur_nudges += 1
-                    msgs.extend([{"role": "assistant", "content": clean_txt or "Continuing curation."}, {"role": "user", "content": cur_nudge}])
-                    continue
-                final_txt = clean_txt if clean_txt.strip() else recover_empty_synthesis(msgs, self._chat_fn, prior_thinking=think_txt)
-                return "done", final_txt, ""
-            msgs.append({"role": "assistant", "content": clean_txt, "tool_calls": tcalls})
-            for tc in tcalls:
-                fn = tc.get("function") or {}
-                tname = str(fn.get("name") or "")
-                raw_a = fn.get("arguments") or "{}"
-                try:
-                    targs = json.loads(raw_a) if isinstance(raw_a, str) else dict(raw_a)
-                except Exception:
-                    targs = {}
-                res = (
-                    "error: recursive `job_manage` is disabled inside background workers"
-                    if tname == "job_manage" or tname not in allowed_names
-                    else self._dispatch_tool(tname, targs)
-                )
-                partial_chunks.append(f"{tname}: {res[:240]}")
-                self._save_partial(job["job_id"], "\n".join(partial_chunks[-8:]))
-                apr_id = _extract_approval_pause(res)
-                if apr_id:
-                    return "waiting_approval", "\n".join(partial_chunks), apr_id
-                msgs.append({"role": "tool", "tool_call_id": tc.get("id"), "content": res})
+        def _on_tool_result(tname: str, res: str) -> Optional[str]:
+            partial_chunks.append(f"{tname}: {res[:240]}")
+            self._save_partial(job["job_id"], "\n".join(partial_chunks[-8:]))
+            return _extract_approval_pause(res)
 
-        synth_msgs = msgs + [{"role": "user", "content": "Iteration cap reached. Summarize findings concisely without calling tools."}]
-        synth_data = self._chat_fn(synth_msgs, None, "none")
-        final_s, _, _ = normalize_assistant_message((synth_data.get("choices") or [{}])[0].get("message") or {})
-        return "done", final_s or "\n".join(partial_chunks), ""
+        try:
+            st, out_txt, meta_id = run_worker_step_loop(
+                system_prompt=sys_msg,
+                user_brief=user_brief,
+                max_iters=max_steps,
+                tier=str(job.get("tier") or "fast"),
+                allowed_tool_names=allowed_names,
+                chat_fn=self._chat_fn,
+                mem=self.store,
+                dispatch_fn=self._dispatch_tool,
+                cancel_check=lambda: self.is_cancel_requested(job["job_id"]),
+                deadline_mono=deadline_mono,
+                on_tool_result=_on_tool_result,
+            )
+        except InterruptedError:
+            return "cancelled", "\n".join(partial_chunks), "Cancelled by user."
+        if st == "waiting_approval":
+            return "waiting_approval", "\n".join(partial_chunks), meta_id
+        if st == "cancelled":
+            return "cancelled", "\n".join(partial_chunks), meta_id or "Cancelled by user."
+        if st == "timed_out":
+            return "timed_out", "\n".join(partial_chunks), f"Timed out after {job.get('timeout_sec')}s."
+        return "done", out_txt or "\n".join(partial_chunks), ""
 
     def _save_partial(self, job_id: str, partial_text: str) -> None:
         with self.store._lock:
@@ -341,26 +346,52 @@ class BackgroundJobManager:
         job = self.get_job(job_id)
         if not job or job["status"] == "cancelled":
             return
+        with _JOBS_LOCK:
+            scope = _CANCEL_SCOPES.setdefault(job_id, CancelScope())
         with mem._lock:
             mem.conn.execute("UPDATE background_jobs SET status = 'running', started_at = CURRENT_TIMESTAMP, error = '' WHERE job_id = ?", (job_id,))
             mem.conn.commit()
 
         deadline = time.monotonic() + float(job.get("timeout_sec") or 600)
-        tid = telemetry.start_trace("background_job", f"{job_id}:{job['title'][:60]}") if mem.db_path.resolve() == settings.db_path.resolve() else None
+        is_live_db = mem.db_path.resolve() == settings.db_path.resolve()
+        st, raw_out, meta_err = "failed", "", ""
         try:
-            with memory_store_context(mem), tier_context(job.get("tier") or "fast"), model_gate.background_context(abort_check=lambda: self.is_cancel_requested(job_id)):
+            with (
+                trace_scope("background_job", f"{job_id}:{job['title'][:60]}", enabled=is_live_db),
+                execution_origin_context("background_job"),
+                phase_tool_context(""),
+                cancel_scope_context(scope),
+                memory_store_context(mem),
+                get_project_graph(store=mem).project_workspace_scope(job.get("project_id")),
+                tier_context(job.get("tier") or "fast"),
+                model_gate.background_context(abort_check=lambda: self.is_cancel_requested(job_id)),
+            ):
                 if job["kind"] in ("dag", "recipe") and str(job["goal"]).startswith("{"):
                     spec = json.loads(job["goal"])
                     from companion import dag_runtime
 
-                    dag_target = str(spec.get("dag") or spec.get("recipe") or "")
-                    dag_res = dag_runtime.execute_dag_by_name(
-                        dag_target,
-                        params=spec.get("params") or {},
-                        store=mem,
-                        bindings=dag_runtime.DAGRuntimeBindings(tool_fn=self._dispatch_tool),
-                    )
+                    rt_bindings = dag_runtime.DAGRuntimeBindings(tool_fn=self._dispatch_tool)
+                    if spec.get("dag_run_id"):
+                        dag_res = dag_runtime.resume_dag_run(
+                            str(spec["dag_run_id"]),
+                            approved_node_id=str(spec.get("approved_node_id") or ""),
+                            store=mem,
+                            bindings=rt_bindings,
+                        )
+                    else:
+                        dag_target = str(spec.get("dag") or spec.get("recipe") or "")
+                        dag_res = dag_runtime.execute_dag_by_name(
+                            dag_target,
+                            params=spec.get("params") or {},
+                            store=mem,
+                            bindings=rt_bindings,
+                        )
                     if dag_res.get("status") == "waiting_approval":
+                        spec["dag_run_id"] = str(dag_res.get("run_id") or spec.get("dag_run_id") or "")
+                        spec["approved_node_id"] = str(dag_res.get("paused_node_id") or "")
+                        with mem._lock:
+                            mem.conn.execute("UPDATE background_jobs SET goal = ? WHERE job_id = ?", (json.dumps(spec), job_id))
+                            mem.conn.commit()
                         st, raw_out, meta_err = "waiting_approval", str(dag_res.get("summary") or ""), str(dag_res.get("approval_id") or "")
                     else:
                         dag_ok = bool(dag_res.get("ok"))
@@ -368,14 +399,12 @@ class BackgroundJobManager:
                 else:
                     st, raw_out, meta_err = self._run_zero_identity_worker(job, deadline)
         except InterruptedError:
-            st, raw_out, meta_err = "cancelled", str(job.get("partial_output") or ""), "Cancelled during background wait."
+            st, raw_out, meta_err = "cancelled", str(job.get("partial_output") or ""), "Cancelled by user."
         except Exception as exc:
             st, raw_out, meta_err = "failed", str(job.get("partial_output") or ""), f"{type(exc).__name__}: {exc}"
         finally:
-            if tid:
-                telemetry.end_trace(tid, status="ok" if st in ("done", "waiting_approval") else "error")
             with _JOBS_LOCK:
-                _CANCEL_EVENTS.pop(job_id, None)
+                _CANCEL_SCOPES.pop(job_id, None)
 
         if st == "done":
             is_curation_job = job.get("starter") == "wiki_studio" or any(k in job["title"].lower() for k in ("wiki curation", "wiki_deep_curate", "routine deep curate"))
@@ -435,30 +464,40 @@ class BackgroundJobManager:
         if not row:
             return {"ok": False, "error": f"Background job `{job_id}` not found."}
         with _JOBS_LOCK:
-            ev = _CANCEL_EVENTS.get(row["job_id"])
-            if ev is not None:
-                ev.set()
+            scope = _CANCEL_SCOPES.get(row["job_id"])
+        if scope is not None:
+            scope.cancel()
         if row["status"] in ("queued", "running", "waiting_approval"):
             with self.store._lock:
                 self.store.conn.execute("UPDATE background_jobs SET status = 'cancelled', error = 'Cancelled by user.', finished_at = CURRENT_TIMESTAMP WHERE job_id = ?", (row["job_id"],))
                 self.store.conn.commit()
         return {"ok": True, "job_id": row["job_id"], "status": "cancelled", "summary": f"Cancelled background job `{row['job_id']}`."}
 
-    def resume_job(self, job_id: str, run_in_background: bool = True) -> Dict[str, Any]:
+    def resume_job(self, job_id: str, run_in_background: bool = True, resolution_note: str = "", approved_node_id: str = "") -> Dict[str, Any]:
         """Resume an `interrupted` or approved `waiting_approval` background job."""
         row = self.get_job(job_id)
         if not row:
             return {"ok": False, "error": f"Background job `{job_id}` not found."}
         if row["status"] not in ("waiting_approval", "interrupted", "failed", "timed_out"):
             return {"ok": False, "error": f"Job `{job_id}` has status `{row['status']}` and cannot be resumed."}
+        new_goal = str(row["goal"] or "")
+        if row["kind"] in ("dag", "recipe") and new_goal.startswith("{") and approved_node_id:
+            spec = json.loads(new_goal)
+            spec["approved_node_id"] = approved_node_id
+            new_goal = json.dumps(spec)
+        prev_partial = str(row.get("partial_output") or "").strip()
+        if resolution_note and row["kind"] not in ("dag", "recipe"):
+            prev_partial = (f"{prev_partial}\n[APPROVAL RESOLVED]: {resolution_note}" if prev_partial else f"[APPROVAL RESOLVED]: {resolution_note}")[:4000]
         with self.store._lock:
-            self.store.conn.execute("UPDATE background_jobs SET status = 'queued', approval_id = '', error = '' WHERE job_id = ?", (row["job_id"],))
+            self.store.conn.execute(
+                "UPDATE background_jobs SET status = 'queued', goal = ?, partial_output = ?, approval_id = '', error = '' WHERE job_id = ?",
+                (new_goal, redact_secrets(prev_partial), row["job_id"]),
+            )
             self.store.conn.commit()
         with _JOBS_LOCK:
-            _CANCEL_EVENTS[row["job_id"]] = threading.Event()
+            _CANCEL_SCOPES[row["job_id"]] = CancelScope()
         if run_in_background:
-            ctx = contextvars.copy_context()
-            threading.Thread(target=lambda: ctx.run(self._execute_job, row["job_id"]), daemon=True).start()
+            self._spawn_clean_worker_thread(row["job_id"])
             return {"ok": True, "job_id": row["job_id"], "status": "queued", "summary": f"Resumed background job `{row['job_id']}`."}
         self._execute_job(row["job_id"])
         after = self.get_job(row["job_id"]) or row

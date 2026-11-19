@@ -112,11 +112,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const setOperatingLevers = async (nextBg: boolean, nextSelfDev: boolean) => {
     if (nextBg !== bgAutonomy) {
-      await callAction('autonomy', { subaction: 'set_autonomy', enabled: nextBg });
+      const rBg = await callAction('autonomy', { subaction: 'set_autonomy', enabled: nextBg });
+      if (rBg.ok === false) {
+        onToast(rBg.error || 'Could not update Background Autonomy.');
+        return;
+      }
     }
     if (nextSelfDev !== selfDev) {
       const r = await callAction('autonomy', { subaction: 'set_self_dev', enabled: nextSelfDev });
-      if (!r.ok && r.error) onToast(r.error);
+      if (r.ok === false) {
+        onToast(r.error || 'Could not update Self-Dev Mode.');
+        return;
+      }
     }
     await onRefreshStatus();
     onToast('Updated operating posture.');
@@ -133,7 +140,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     });
     await apiPost('/api/settings', { tone: compTone });
     await onRefreshStatus();
-    onToast(res.summary || 'Saved Companion identity & profile.');
+    onToast(res.ok === false ? res.error || 'Could not save identity.' : res.summary || 'Saved Companion identity & profile.');
   };
 
   const sectionMeta: Record<SettingsSectionId, { title: string; sub: string }> = {

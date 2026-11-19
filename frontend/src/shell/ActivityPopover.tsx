@@ -2,13 +2,15 @@ import React, { useEffect, useState } from 'react';
 import {
   Check,
   Clock,
+  Eye,
   Layers,
   ShieldAlert,
   Sparkles,
+  Square,
   Terminal,
   X,
 } from 'lucide-react';
-import { callAction } from '../api';
+import { callAction, cancelActiveJob } from '../api';
 import type { AuxInspectorTarget, BackgroundJob, SurfaceId, WebStatus } from '../types';
 
 interface ActivityPopoverProps {
@@ -29,6 +31,7 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
   onInspect,
 }) => {
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
+  const [resolvingId, setResolvingId] = useState('');
 
   useEffect(() => {
     void callAction<{ jobs?: BackgroundJob[] }>('jobs', { subaction: 'list' }).then((res) => {
@@ -37,16 +40,34 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
   }, []);
 
   const approvals = status?.pending_approvals || [];
+  const totalApprovals = status?.pending_approvals_count ?? approvals.length;
   const nudges = (status?.session_nudges || []).filter((n) => n.category !== 'approval');
   const unseenAutonomy = status?.unseen_autonomy_count || 0;
+  const activeForeground = status?.active_job?.status === 'running' ? status.active_job : null;
 
   const resolveApproval = async (approvalId: string, decision: 'approve' | 'deny') => {
-    const res = await callAction('approvals', {
-      subaction: decision,
-      approval_id: approvalId,
-    });
+    if (resolvingId) return;
+    setResolvingId(approvalId);
+    try {
+      const res = await callAction('approvals', {
+        subaction: decision,
+        approval_id: approvalId,
+      });
+      await onRefreshStatus();
+      onToast(
+        res.ok === false
+          ? res.error || `Approval ${decision} failed.`
+          : res.summary || `Approval ${decision}d.`
+      );
+    } finally {
+      setResolvingId('');
+    }
+  };
+
+  const stopActiveTurn = async () => {
+    const r = await cancelActiveJob(activeForeground?.job_id || 'active');
     await onRefreshStatus();
-    onToast(res.summary || res.error || `Approval ${decision}d.`);
+    onToast(r.ok === false ? r.error || 'Could not stop turn.' : 'Stopped active turn.');
   };
 
   const clearNotifications = async () => {
@@ -81,11 +102,31 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
         )}
       </div>
 
+      {(status?.busy || activeForeground) && (
+        <div className="popover-approval-card" style={{ marginBottom: 6 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 12, fontWeight: 600 }}>
+              {activeForeground?.active_tool
+                ? `Running: ${activeForeground.active_tool}`
+                : status?.active_action || 'Active Turn Running'}
+            </span>
+            <button
+              type="button"
+              className="btn btn-danger btn-sm"
+              data-testid="activity-stop-turn-btn"
+              onClick={() => void stopActiveTurn()}
+            >
+              <Square size={10} fill="currentColor" /> Stop
+            </button>
+          </div>
+        </div>
+      )}
+
       {approvals.length > 0 && (
         <div>
           <div className="popover-group-label">
             <span>Approvals Needed</span>
-            <span className="count-pill">{approvals.length}</span>
+            <span className="count-pill">{totalApprovals}</span>
           </div>
           {approvals.map((apr) => (
             <div key={apr.approval_id} className="popover-approval-card">
@@ -96,10 +137,21 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
               <div style={{ fontSize: 12.5, margin: '4px 0 8px', color: 'var(--text-primary)' }}>
                 {(apr.summary || `${apr.action_name} (${apr.target})`).replace(/`/g, '')}
               </div>
-              <div style={{ display: 'flex', gap: 6 }}>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => {
+                    onInspect({ kind: 'approvals' });
+                    onClose();
+                  }}
+                >
+                  <Eye size={11} /> Preview
+                </button>
                 <button
                   type="button"
                   className="btn btn-primary btn-sm"
+                  disabled={resolvingId === apr.approval_id}
                   onClick={() => void resolveApproval(apr.approval_id, 'approve')}
                 >
                   <Check size={11} /> Approve
@@ -107,6 +159,7 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
                 <button
                   type="button"
                   className="btn btn-danger btn-sm"
+                  disabled={resolvingId === apr.approval_id}
                   onClick={() => void resolveApproval(apr.approval_id, 'deny')}
                 >
                   <X size={11} /> Deny

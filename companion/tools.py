@@ -1,5 +1,6 @@
-"""Comprehensive, Self-Guarded Tool Registry (A-Frame Application Layer, 25 tools)."""
+"""Comprehensive, Self-Guarded Tool Registry (A-Frame Application Layer, 26 tools)."""
 
+import fnmatch
 import json
 import os
 import re
@@ -20,10 +21,11 @@ from companion.harvest_tools import (
 )
 from companion.hygiene import extract_python_symbol
 from companion.llm_wire import check_url_ssrf, urlopen_safe
+from companion.mcp_hub import get_mcp_hub
 from companion.memory_store import get_memory_store
 from companion.os_tools import (
-    tool_checkpoint_manage, tool_memory_manage, tool_project_manage,
-    tool_sdd_manage, tool_system_doctor, tool_task_manage, tool_telemetry_manage, tool_workflow_manage,
+    summarize_tool_step, tool_checkpoint_manage, tool_memory_manage, tool_project_manage,
+    tool_sdd_manage, tool_system_doctor, tool_task_manage, tool_telemetry_manage, tool_web_search, tool_workflow_manage,
 )
 from companion.safety import (
     check_command_safety, check_path_safety, lint_single_file_edit,
@@ -42,7 +44,7 @@ __all__ = [
     "tool_checkpoint_manage", "tool_edit_file", "tool_education_manage", "tool_endpoint_manage",
     "tool_job_manage", "tool_list_dir", "tool_mcp_manage", "tool_memory_manage", "tool_project_manage", "tool_read_file",
     "tool_routine_manage", "tool_run_python", "tool_run_shell", "tool_sdd_manage", "tool_search", "tool_system_doctor",
-    "tool_task_manage", "tool_telemetry_manage", "tool_vault_manage", "tool_web_fetch", "tool_wiki_manage", "tool_workflow_manage", "tool_write_file",
+    "tool_task_manage", "tool_telemetry_manage", "tool_vault_manage", "tool_web_fetch", "tool_web_search", "tool_wiki_manage", "tool_workflow_manage", "tool_write_file",
 ]
 
 
@@ -77,6 +79,10 @@ def _closest_line_hint(text: str, old: str) -> str:
     return ""
 
 
+_READ_MAX_LINES = 800
+_READ_MAX_BYTES = 40_000
+
+
 def tool_read_file(args: Dict[str, Any]) -> str:
     path_str = str_arg(args, "path")
     if not path_str:
@@ -101,12 +107,22 @@ def tool_read_file(args: Dict[str, Any]) -> str:
             f"{i:5d}|{lines[i - 1]}" for i in range(s_ln, min(e_ln, len(lines)) + 1)
         )
     start = max(1, int_arg(args, "start_line", 1) or 1)
-    end = min(len(lines), int_arg(args, "end_line", 0) or len(lines))
-    return (
-        "error: start_line must be <= end_line"
-        if start > end
-        else f"# {p}  (lines {start}-{end} of {len(lines)})\n" + "\n".join(f"{i:5d}|{lines[i - 1]}" for i in range(start, end + 1))
-    )
+    req_end = int_arg(args, "end_line", 0) or len(lines)
+    if start > min(len(lines), req_end):
+        return "error: start_line must be <= end_line"
+    capped_end = min(len(lines), req_end, start + _READ_MAX_LINES - 1)
+    selected: List[str] = []
+    byte_used, actual_end = 0, start - 1
+    for i in range(start, capped_end + 1):
+        row = f"{i:5d}|{lines[i - 1]}"
+        row_bytes = len(row.encode("utf-8", errors="replace")) + 1
+        if selected and byte_used + row_bytes > _READ_MAX_BYTES:
+            break
+        selected.append(row)
+        byte_used += row_bytes
+        actual_end = i
+    trunc_note = f"\n[Showing lines {start}-{actual_end} of {len(lines)}; pass start_line={actual_end + 1} to continue]" if actual_end < min(len(lines), req_end) else ""
+    return f"# {p}  (lines {start}-{actual_end} of {len(lines)})\n" + "\n".join(selected) + trunc_note
 
 
 def tool_write_file(args: Dict[str, Any]) -> str:
@@ -193,7 +209,7 @@ _BINARY_EXTS = {".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3
 
 
 def tool_search(args: Dict[str, Any]) -> str:
-    pattern = str_arg(args, "pattern")
+    pattern, file_glob = str_arg(args, "pattern"), str_arg(args, "file_glob").lower()
     if not pattern:
         return "error: pattern is required"
     base = resolve(str_arg(args, "path", ".") or ".", for_write=False)
@@ -204,14 +220,18 @@ def tool_search(args: Dict[str, Any]) -> str:
         rx = re.compile(pattern) if bool_arg(args, "is_regex", False) else None
     except re.error as e:
         return f"error: invalid regex: {e}"
+    in_static = "static" in base.parts and "surfaces" in base.parts
     needle, matches, files = pattern.lower(), [], ([base] if base.is_file() else [])
     if base.is_dir():
         for root, dirs, fnames in os.walk(base):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            root_p = Path(root)
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and (in_static or not (d == "static" and root_p.name == "surfaces"))]
             files.extend(
-                Path(root) / fn
+                root_p / fn
                 for fn in fnames
-                if Path(fn).suffix.lower() not in _BINARY_EXTS and fn.lower() not in (".env", "secrets.env")
+                if Path(fn).suffix.lower() not in _BINARY_EXTS
+                and fn.lower() not in (".env", "secrets.env")
+                and (not file_glob or fnmatch.fnmatch(fn.lower(), file_glob))
             )
     elif not base.is_file():
         return f"error: path not found: {base}"
@@ -388,7 +408,7 @@ def tool_web_fetch(args: Dict[str, Any]) -> str:
 TOOL_IMPLS: Dict[str, Callable[[Dict[str, Any]], str]] = {
     "read_file": tool_read_file, "write_file": tool_write_file, "edit_file": tool_edit_file,
     "list_dir": tool_list_dir, "search": tool_search, "run_python": tool_run_python,
-    "run_shell": tool_run_shell, "web_fetch": tool_web_fetch, "memory_manage": tool_memory_manage,
+    "run_shell": tool_run_shell, "web_fetch": tool_web_fetch, "web_search": tool_web_search, "memory_manage": tool_memory_manage,
     "task_manage": tool_task_manage, "workflow_manage": tool_workflow_manage, "checkpoint_manage": tool_checkpoint_manage,
     "sdd_manage": tool_sdd_manage, "project_manage": tool_project_manage,
     "system_doctor": tool_system_doctor, "telemetry_manage": tool_telemetry_manage,
@@ -437,34 +457,52 @@ def _check_r3_risk_gate(name: str, args: Dict[str, Any]) -> Optional[str]:
     )
 
 
+def _resolve_mcp_tool(name: str) -> Optional[Callable[[Dict[str, Any]], str]]:
+    if not name.startswith("mcp__") or name.count("__") < 2:
+        return None
+    _, srv_id, mcp_tool = name.split("__", 2)
+
+    def _call(a: Dict[str, Any]) -> str:
+        r = get_mcp_hub().call_mcp_tool(srv_id, mcp_tool, arguments=a if isinstance(a, dict) else {}, actor="companion")
+        if r.get("awaiting_approval"):
+            return f"AWAITING_USER_APPROVAL (`{r.get('approval_id', '')}`): {r.get('error') or r.get('summary') or 'Awaiting approval.'}"
+        return str(r.get("output") or r.get("summary") or "") if r.get("ok") else f"error: {r.get('error') or 'MCP call failed.'}"
+
+    return _call
+
+
 def dispatch(name: str, args: Dict[str, Any]) -> str:
-    fn = TOOL_IMPLS.get(name)
-    if fn is None:
-        telemetry.log("WARN", "tools", f"Unknown tool requested: {name}")
-        return f"error: unknown tool: {name}"
-    gate_err = check_phase_tool_permission(name, args=args) or _check_r3_risk_gate(name, args)
-    if gate_err:
-        telemetry.record_span("tool_call", name, 0.1, status="error", detail=gate_err[:140])
-        if telemetry.active_trace_id:
-            telemetry.log("WARN", "safety", f"Tool/risk gate blocked `{name}`: {gate_err[:80]}")
-        return gate_err
-    emit_stream_event({"type": "tool_start", "tool": name})
-    t0 = time.perf_counter()
-    try:
-        with agent_tool_turn_context():
+    with agent_tool_turn_context():
+        fn = TOOL_IMPLS.get(name) or _resolve_mcp_tool(name)
+        if fn is None:
+            telemetry.log("WARN", "tools", f"Unknown tool requested: {name}")
+            return f"error: unknown tool: {name}"
+        gate_err = check_phase_tool_permission(name, args=args) or _check_r3_risk_gate(name, args)
+        if gate_err:
+            telemetry.record_span("tool_call", name, 0.1, status="error", detail=gate_err[:140])
+            if telemetry.active_trace_id:
+                telemetry.log("WARN", "safety", f"Tool/risk gate blocked `{name}`: {gate_err[:80]}")
+            return gate_err
+        step_sum = summarize_tool_step(name, args)
+        emit_stream_event({"type": "tool_start", "tool": name, "summary": step_sum})
+        t0 = time.perf_counter()
+        try:
             res = fn(args)
-        dur_ms = (time.perf_counter() - t0) * 1000.0
-        is_guard = res.startswith(_GUARD_PREFIXES)
-        is_err = is_guard or res.startswith(("error:", "exit=1"))
-        if is_guard and telemetry.active_trace_id:
-            telemetry.log("WARN", "safety", f"Safety/Write Guard blocked operation in `{name}`")
-        telemetry.record_span("tool_call", name, dur_ms, status="error" if is_err else "ok", detail=res[:140].replace("\n", " "))
-        emit_stream_event({"type": "tool_end", "tool": name, "ok": not is_err, "duration_ms": round(dur_ms, 1)})
-        return res
-    except Exception as e:
-        dur_ms = (time.perf_counter() - t0) * 1000.0
-        err_msg = f"error in {name}: {type(e).__name__}: {e}"
-        telemetry.record_span("tool_call", name, dur_ms, status="error", detail=err_msg[:140])
-        telemetry.log("ERROR", "tools", err_msg)
-        emit_stream_event({"type": "tool_end", "tool": name, "ok": False, "duration_ms": round(dur_ms, 1)})
-        return err_msg
+            dur_ms = (time.perf_counter() - t0) * 1000.0
+            is_guard = res.startswith(_GUARD_PREFIXES)
+            is_err = is_guard or res.startswith(("error:", "exit=1"))
+            if is_guard and telemetry.active_trace_id:
+                telemetry.log("WARN", "safety", f"Safety/Write Guard blocked operation in `{name}`")
+            telemetry.record_span("tool_call", name, dur_ms, status="error" if is_err else "ok", detail=res[:140].replace("\n", " "))
+            emit_stream_event({"type": "tool_end", "tool": name, "summary": step_sum, "ok": not is_err, "duration_ms": round(dur_ms, 1)})
+            return res
+        except InterruptedError:
+            emit_stream_event({"type": "tool_end", "tool": name, "summary": step_sum, "ok": False, "duration_ms": round((time.perf_counter() - t0) * 1000.0, 1)})
+            raise
+        except Exception as e:
+            dur_ms = (time.perf_counter() - t0) * 1000.0
+            err_msg = f"error in {name}: {type(e).__name__}: {e}"
+            telemetry.record_span("tool_call", name, dur_ms, status="error", detail=err_msg[:140])
+            telemetry.log("ERROR", "tools", err_msg)
+            emit_stream_event({"type": "tool_end", "tool": name, "summary": step_sum, "ok": False, "duration_ms": round(dur_ms, 1)})
+            return err_msg

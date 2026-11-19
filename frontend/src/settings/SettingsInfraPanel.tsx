@@ -24,6 +24,8 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
   const [epId, setEpId] = useState('');
   const [epProto, setEpProto] = useState<'ssh' | 'winrm' | 'http_api'>('ssh');
   const [epHost, setEpHost] = useState('');
+  const [epUser, setEpUser] = useState('');
+  const [epPort, setEpPort] = useState('');
   const [epCred, setEpCred] = useState('');
 
   // Federation & Hosted MCP
@@ -37,6 +39,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
 
   // Backups, Sandboxes, Telemetry & System Doctor
   const [backups, setBackups] = useState<SnapshotBackup[]>([]);
+  const [confirmRestoreId, setConfirmRestoreId] = useState('');
   const [sandboxes, setSandboxes] = useState<SandboxClone[]>([]);
   const [doctorReport, setDoctorReport] = useState('');
   const [runningDoctor, setRunningDoctor] = useState(false);
@@ -55,11 +58,16 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
       if (aRes.audit) setAudit(aRes.audit);
       if (eRes.endpoints) setEndpoints(eRes.endpoints);
     } else if (section === 'federation') {
-      const res = await callAction<{ partners?: FederatedPartner[]; hosted_mcp_enabled?: boolean }>('mcp', {
+      const res = await callAction<{
+        partners?: FederatedPartner[];
+        hosted_mcp_enabled?: boolean;
+        hosted_mcp_token_ref?: string;
+      }>('mcp', {
         subaction: 'list',
       });
       if (res.partners) setPartners(res.partners);
       if (typeof res.hosted_mcp_enabled === 'boolean') setHostedEnabled(res.hosted_mcp_enabled);
+      if (res.hosted_mcp_token_ref) setHostedTokenRef(res.hosted_mcp_token_ref);
     } else {
       const [bRes, sRes, tRes] = await Promise.all([
         callAction<{ snapshots?: SnapshotBackup[] }>('backup', { subaction: 'list' }),
@@ -105,12 +113,16 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
       endpoint_id: epId.trim(),
       protocol: epProto,
       host: epHost.trim(),
+      username: epUser.trim(),
+      port: epPort.trim() ? Number(epPort.trim()) : 0,
       credential_ref: epCred.trim(),
       confirmed: true,
     });
     if (res.ok) {
       setEpId('');
       setEpHost('');
+      setEpUser('');
+      setEpPort('');
       setEpCred('');
       setShowAddEndpoint(false);
       await loadSection();
@@ -205,8 +217,20 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
               </div>
               <div>
                 <label className="field-label">Host / URL</label>
-                <input className="input mono" placeholder="192.168.1.50 or http://..." value={epHost} onChange={(e) => setEpHost(e.target.value)} />
+                <input className="input mono" placeholder="192.168.1.50 or user@host:port" value={epHost} onChange={(e) => setEpHost(e.target.value)} />
               </div>
+              {epProto !== 'http_api' && (
+                <>
+                  <div>
+                    <label className="field-label">Username</label>
+                    <input className="input mono" placeholder={epProto === 'ssh' ? 'ubuntu' : 'Administrator'} value={epUser} onChange={(e) => setEpUser(e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="field-label">Port (Optional)</label>
+                    <input type="number" className="input mono" placeholder={epProto === 'ssh' ? '22' : '5985'} value={epPort} onChange={(e) => setEpPort(e.target.value)} />
+                  </div>
+                </>
+              )}
               <div>
                 <label className="field-label">Vault Credential Ref</label>
                 <input className="input mono" placeholder="Optional symbolic ref" value={epCred} onChange={(e) => setEpCred(e.target.value)} />
@@ -246,8 +270,9 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
                     type="button"
                     className="btn btn-danger btn-sm"
                     onClick={async () => {
-                      await callAction('endpoints', { subaction: 'remove', endpoint_id: ep.endpoint_id });
+                      const r = await callAction('endpoints', { subaction: 'remove', endpoint_id: ep.endpoint_id });
                       await loadSection();
+                      onToast(r.ok === false ? r.error || 'Could not remove endpoint.' : r.summary || 'Removed endpoint.');
                     }}
                   >
                     <Trash2 size={12} />
@@ -298,6 +323,8 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
                   setHostedEnabled(!hostedEnabled);
                   await onRefreshStatus();
                   onToast(res.summary || 'Updated Hosted MCP.');
+                } else {
+                  onToast(res.error || 'Could not configure Hosted MCP.');
                 }
               }}
             />
@@ -307,7 +334,24 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
               <div className="card-row-title">Inbound Token Vault Reference</div>
               <div className="card-row-desc">Symbolic Vault secret required on inbound Bearer requests.</div>
             </div>
-            <input className="input mono" style={{ width: 200 }} value={hostedTokenRef} onChange={(e) => setHostedTokenRef(e.target.value)} />
+            <div style={{ display: 'inline-flex', gap: 6 }}>
+              <input className="input mono" style={{ width: 180 }} value={hostedTokenRef} onChange={(e) => setHostedTokenRef(e.target.value)} />
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={async () => {
+                  const res = await callAction('mcp', {
+                    subaction: 'configure_hosted',
+                    enabled: hostedEnabled,
+                    token_ref: hostedTokenRef.trim() || 'hosted-mcp-token',
+                    confirmed: true,
+                  });
+                  onToast(res.ok === false ? res.error || 'Could not save token ref.' : res.summary || 'Saved Hosted MCP token reference.');
+                }}
+              >
+                Save
+              </button>
+            </div>
           </div>
         </div>
 
@@ -337,6 +381,8 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
                     setShowAddPartner(false);
                     await loadSection();
                     onToast(r.summary || 'Partner paired.');
+                  } else {
+                    onToast(r.error || 'Could not pair partner.');
                   }
                 }}
               >
@@ -471,12 +517,29 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
                 <div className="card-row-title mono">{b.snapshot_id}</div>
                 <div className="card-row-desc">{b.wiki_files} Wiki files • {b.created_at}</div>
               </div>
-              <button type="button" className="btn btn-sm" onClick={async () => {
-                const r = await callAction('backup', { subaction: 'restore', snapshot_id: b.snapshot_id });
-                onToast(r.summary || r.error || 'Restored snapshot.');
-              }}>
-                <ArchiveRestore size={12} /> Restore
-              </button>
+              {confirmRestoreId === b.snapshot_id ? (
+                <div style={{ display: 'inline-flex', gap: 6 }}>
+                  <button
+                    type="button"
+                    className="btn btn-danger btn-sm"
+                    onClick={async () => {
+                      setConfirmRestoreId('');
+                      const r = await callAction('backup', { subaction: 'restore', snapshot_id: b.snapshot_id });
+                      await onRefreshStatus();
+                      onToast(r.ok === false ? r.error || 'Restore failed.' : r.summary || 'Restored snapshot.');
+                    }}
+                  >
+                    Confirm Restore
+                  </button>
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={() => setConfirmRestoreId('')}>
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button type="button" className="btn btn-sm" onClick={() => setConfirmRestoreId(b.snapshot_id)}>
+                  <ArchiveRestore size={12} /> Restore
+                </button>
+              )}
             </div>
           ))
         )}

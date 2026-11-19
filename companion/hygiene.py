@@ -255,6 +255,19 @@ def find_semicolon_chains(tree: ast.AST, rel_path: str) -> List[str]:
     return found
 
 
+def _extract_dunder_all(tree: ast.Module) -> Set[str]:
+    """Return string symbol names explicitly exported via module-level `__all__`."""
+    exported: Set[str] = set()
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else ([node.target] if isinstance(node, ast.AnnAssign) else [])
+        val = getattr(node, "value", None)
+        if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets) and isinstance(val, (ast.List, ast.Tuple, ast.Set)):
+            for elt in val.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    exported.add(elt.value)
+    return exported
+
+
 def analyze_workspace_hygiene(
     root: Optional[Path] = None,
     max_module_lines: Optional[int] = None,
@@ -262,6 +275,7 @@ def analyze_workspace_hygiene(
 ) -> HygieneReport:
     """Perform a full deterministic AST scan with import-qualified dead-code detection and line budgets."""
     target_root = (root or settings.root).resolve()
+    has_tests_dir = (target_root / "tests").is_dir()
     mod_limit = max_module_lines or settings.max_module_lines
     fn_limit = max_function_lines or settings.max_function_lines
 
@@ -270,6 +284,7 @@ def analyze_workspace_hygiene(
     private_methods: List[Tuple[str, str, str, int]] = []
     intra_refs: Dict[str, Set[str]] = {}
     attr_refs: Dict[str, Set[str]] = {}
+    dunder_all: Dict[str, Set[str]] = {}
     imported_from_mod: Dict[str, Set[str]] = {}
     star_imported_mods: Set[str] = set()
     dynamic_getattr_names: Set[str] = set()
@@ -296,6 +311,7 @@ def analyze_workspace_hygiene(
         if len(lines) > mod_limit:
             report.oversized_modules.append(f"{rel_path} ({len(lines)} lines > budget {mod_limit})")
 
+        dunder_all[rel_path] = _extract_dunder_all(tree)
         _check_file_definitions(tree, rel_path, parts[0], fn_limit, report, defined_symbols, private_methods)
         if parts[0] not in ("tests", "skills"):
             report.semicolon_chains.extend(find_semicolon_chains(tree, rel_path))
@@ -311,6 +327,7 @@ def analyze_workspace_hygiene(
             or sym_name in imported_from_mod.get(dotted_mod, set())
             or dotted_mod in star_imported_mods
             or sym_name in dynamic_getattr_names
+            or (not has_tests_dir and sym_name in dunder_all.get(rel_path, set()))
         )
         if not alive:
             report.dead_definitions.append(

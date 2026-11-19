@@ -11,6 +11,7 @@ long-running `Goals`/`Projects`:
 - `<5ms` zero-token deterministic Python pre-checks (`PRECHECK_REGISTRY`)
 """
 
+import inspect
 import os
 import re
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ _DAY_MAP: Dict[str, int] = {
     "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
 }
 
-PrecheckFn = Callable[[MemoryStore], Tuple[bool, str]]
+PrecheckFn = Callable[..., Tuple[bool, str]]
 PRECHECK_REGISTRY: Dict[str, PrecheckFn] = {}
 
 
@@ -227,8 +228,9 @@ def compute_next_scheduled_iso(
     from_ts: Optional[datetime] = None,
     now_utc: Optional[datetime] = None,
 ) -> str:
-    """Compute next UTC ISO-8601 fire timestamp for `every ...`, `daily HH:MM`, or 5-field cron."""
+    """Compute next UTC ISO-8601 fire timestamp evaluating `daily HH:MM` and 5-field cron in local host timezone."""
     base_utc = (from_ts or now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    base_local = base_utc.astimezone()
     clean = (expr or "").strip()
     em = _EVERY_RE.match(clean)
     if em:
@@ -238,16 +240,16 @@ def compute_next_scheduled_iso(
     dm = _DAILY_RE.match(clean)
     if dm:
         hh, mm = int(dm.group(1)), int(dm.group(2))
-        cand = base_utc.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if cand <= base_utc:
-            cand += timedelta(days=1)
-        return cand.strftime("%Y-%m-%dT%H:%M:%SZ")
+        cand_local = base_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if cand_local <= base_local:
+            cand_local += timedelta(days=1)
+        return cand_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     validate_schedule_expr(clean)
-    utc_probe = (base_utc + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    local_probe = (base_local + timedelta(minutes=1)).replace(second=0, microsecond=0)
     for _ in range(60 * 24 * 366):
-        if matches_cron_5field(clean, utc_probe):
-            return utc_probe.strftime("%Y-%m-%dT%H:%M:%SZ")
-        utc_probe += timedelta(minutes=1)
+        if matches_cron_5field(clean, local_probe):
+            return local_probe.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        local_probe += timedelta(minutes=1)
     return (base_utc + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -269,8 +271,8 @@ def register_trigger_precheck(name: str, fn: PrecheckFn) -> None:
     PRECHECK_REGISTRY[name.strip()] = fn
 
 
-def evaluate_trigger_precheck(name: str, store: Optional[MemoryStore] = None) -> Tuple[bool, str]:
-    """Execute a registered `<5ms` deterministic pre-check; unknown/empty prechecks default to eligible."""
+def evaluate_trigger_precheck(name: str, store: Optional[MemoryStore] = None, last_run_at: str = "") -> Tuple[bool, str]:
+    """Execute a registered `<5ms` deterministic pre-check; passes `last_run_at` when supported."""
     clean = (name or "").strip()
     if not clean or clean == "always":
         return True, "unconditional"
@@ -279,7 +281,9 @@ def evaluate_trigger_precheck(name: str, store: Optional[MemoryStore] = None) ->
         return False, f"unknown_precheck:{clean}"
     mem = store or get_memory_store()
     try:
-        return fn(mem)
+        params = list(inspect.signature(fn).parameters.values())
+        accepts_last = len(params) >= 2 or any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+        return fn(mem, last_run_at) if accepts_last else fn(mem)
     except Exception as exc:
         return False, f"precheck_error:{type(exc).__name__}"
 
@@ -318,7 +322,7 @@ def evaluate_trigger_eligibility(
         nxt_dt = parse_iso_utc(next_run_at)
         if nxt_dt is not None and cur_utc < nxt_dt:
             return False, "not_yet_due"
-    ok_pre, reason_pre = evaluate_trigger_precheck(policy.precheck_name, store=store)
+    ok_pre, reason_pre = evaluate_trigger_precheck(policy.precheck_name, store=store, last_run_at=last_run_at)
     if not ok_pre:
         return False, f"precheck_skipped:{reason_pre}"
     return True, f"eligible_{policy.mode}"
@@ -333,7 +337,13 @@ def _iter_md_files(folder: Path):
                 yield Path(dirpath) / fname
 
 
-def _precheck_wiki_inbox_or_stale(store: MemoryStore) -> Tuple[bool, str]:
+def _sqlite_since(last_run_at: str) -> str:
+    dt = parse_iso_utc(last_run_at)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else ""
+
+
+def _precheck_wiki_inbox_or_stale(store: MemoryStore, last_run_at: str = "") -> Tuple[bool, str]:
+    _ = last_run_at
     wiki_root: Path = settings.wiki_dir
     if any(True for _ in _iter_md_files(wiki_root / "01_inbox")):
         return True, "wiki_inbox_has_notes"
@@ -343,18 +353,24 @@ def _precheck_wiki_inbox_or_stale(store: MemoryStore) -> Tuple[bool, str]:
     return (True, "pending_notes") if store.get_system_notes(limit=1) else (False, "wiki_clean")
 
 
-def _precheck_recent_chat(store: MemoryStore) -> Tuple[bool, str]:
-    cnt = int(store.conn.execute("SELECT COUNT(*) FROM conversations WHERE role = 'user'").fetchone()[0])
-    return (True, f"user_turns={cnt}") if cnt > 0 else (False, "no_chat_turns")
+def _precheck_recent_chat(store: MemoryStore, last_run_at: str = "") -> Tuple[bool, str]:
+    since_sql = _sqlite_since(last_run_at)
+    with store._lock:
+        if since_sql:
+            cnt = int(store.conn.execute("SELECT COUNT(*) FROM conversations WHERE role = 'user' AND timestamp > ?", (since_sql,)).fetchone()[0])
+        else:
+            cnt = int(store.conn.execute("SELECT COUNT(*) FROM conversations WHERE role = 'user'").fetchone()[0])
+    return (True, f"user_turns={cnt}") if cnt > 0 else (False, "no_new_chat_turns")
 
 
-def _precheck_warn_or_slow_spans(store: MemoryStore) -> Tuple[bool, str]:
+def _precheck_warn_or_slow_spans(store: MemoryStore, last_run_at: str = "") -> Tuple[bool, str]:
+    since_sql = _sqlite_since(last_run_at)
     try:
-        err_cnt = int(
-            store.conn.execute(
-                "SELECT COUNT(*) FROM telemetry_logs WHERE level IN ('WARN', 'ERROR')"
-            ).fetchone()[0]
-        )
+        with store._lock:
+            if since_sql:
+                err_cnt = int(store.conn.execute("SELECT COUNT(*) FROM telemetry_logs WHERE level IN ('WARN', 'ERROR') AND created_at > ?", (since_sql,)).fetchone()[0])
+            else:
+                err_cnt = int(store.conn.execute("SELECT COUNT(*) FROM telemetry_logs WHERE level IN ('WARN', 'ERROR')").fetchone()[0])
         if err_cnt > 0:
             return True, f"warn_or_error_logs={err_cnt}"
     except Exception:
@@ -362,12 +378,20 @@ def _precheck_warn_or_slow_spans(store: MemoryStore) -> Tuple[bool, str]:
     return False, "telemetry_clean"
 
 
-def _precheck_self_dev_work_available(store: MemoryStore) -> Tuple[bool, str]:
+def _precheck_self_dev_work_available(store: MemoryStore, last_run_at: str = "") -> Tuple[bool, str]:
     pending = store.get_pending_tasks()
     backlog = store.get_backlog(status="pending")
     if pending or backlog:
         return True, "pending_tasks_or_backlog"
-    return True, "periodic_hygiene_audit"
+    last_dt = parse_iso_utc(last_run_at)
+    if last_dt is None:
+        return True, "initial_hygiene_audit"
+    last_epoch = last_dt.timestamp()
+    for pkg in ("companion", "surfaces"):
+        pkg_dir = settings.root / pkg
+        if pkg_dir.is_dir() and any(p.stat().st_mtime > last_epoch for p in pkg_dir.glob("*.py")):
+            return True, "code_modified_since_last_run"
+    return False, "workspace_unchanged"
 
 
 register_trigger_precheck("wiki_inbox_or_stale", _precheck_wiki_inbox_or_stale)

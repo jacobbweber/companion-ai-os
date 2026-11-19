@@ -17,7 +17,7 @@ from companion.autonomy import (
     run_autonomous_goal,
 )
 from companion.compaction import build_lossless_phase_handoff
-from companion.config import SKIP_DIRS, Settings, settings, workspace_context
+from companion.config import SKIP_DIRS, Settings, self_dev_override_context, settings, workspace_context
 from companion.context import build_system_prompt
 from companion.disciplines import verify_repository_syntax, walk_pruned_files
 from companion.hygiene import analyze_workspace_hygiene, build_repo_headroom_map, extract_python_symbol
@@ -80,10 +80,12 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(db_path=Path(tmp) / "scratch.db")
             seen_sys_prompts: List[str] = []
+            seen_tail_msgs: List[str] = []
             step_n = {"n": 0}
 
             def fake_chat(messages: List[Dict[str, Any]], _tools=None, _choice="auto") -> Dict[str, Any]:
                 seen_sys_prompts.append(str(messages[0]["content"]))
+                seen_tail_msgs.append(str(messages[-1].get("content", "")))
                 step_n["n"] += 1
                 if step_n["n"] == 1:
                     return {"choices": [{"message": dict(msg_json)}]}
@@ -93,9 +95,10 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             ans = run_agent_turn(msgs, max_iters=3, chat_fn=fake_chat, store=store, verbose=False)
             self.assertEqual(ans, "Verified specs directory cleanly.")
             self.assertEqual(len(seen_sys_prompts), 2)
-            self.assertNotIn("[PRIOR STEP WORKING SCRATCHPAD]", seen_sys_prompts[0])
-            self.assertIn("[PRIOR STEP WORKING SCRATCHPAD]", seen_sys_prompts[1])
-            self.assertIn("Step-1 plan: check root files", seen_sys_prompts[1])
+            self.assertEqual(seen_sys_prompts[0], seen_sys_prompts[1])
+            self.assertNotIn("[PRIOR STEP WORKING SCRATCHPAD]", seen_sys_prompts[1])
+            self.assertIn("[PRIOR STEP WORKING SCRATCHPAD]", seen_tail_msgs[1])
+            self.assertIn("Step-1 plan: check root files", seen_tail_msgs[1])
             store.close()
 
     def test_upgrade3_ast_repo_headroom_radar_and_symbol_read_file(self) -> None:
@@ -107,8 +110,11 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(db_path=Path(tmp) / "radar.db")
             try:
-                sys_p = build_system_prompt(store=store)
-                self.assertIn("[CODEBASE AST & LINE-BUDGET RADAR", sys_p)
+                runtime_p = build_system_prompt(store=store)
+                self.assertNotIn("[CODEBASE AST & LINE-BUDGET RADAR", runtime_p)
+                with self_dev_override_context(True):
+                    sys_p = build_system_prompt(store=store)
+                    self.assertIn("[CODEBASE AST & LINE-BUDGET RADAR", sys_p)
             finally:
                 store.close()
 
@@ -153,18 +159,26 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             err_fn, _ = lint_single_file_edit(gov / "companion" / "oversized.py", big_fn, governed_root=gov)
             self.assertIn("HYGIENE GUARD REJECTED", str(err_fn))
 
+            err_u_imp, warn_u_imp = lint_single_file_edit(
+                gov / "companion" / "warn_demo.py",
+                '"""Demo."""\nimport math\n\nx = 1\n',
+                governed_root=gov,
+            )
+            self.assertIsNone(err_u_imp)
+            self.assertIn("[INLINE LINT WARNING: Unused import(s)", warn_u_imp)
+
             target_py = Path(tmp) / "warn_demo.py"
             res_w = tool_write_file({"path": str(target_py), "content": '"""Demo."""\nimport math\n\nx = 1\n'})
             self.assertIn("wrote", res_w)
-            self.assertIn("[INLINE LINT WARNING: Unused import(s)", res_w)
+            self.assertNotIn("INLINE LINT WARNING", res_w)
 
             res_e = tool_edit_file({"path": str(target_py), "old_str": "import math\n\n", "new_str": ""})
             self.assertIn("edited", res_e)
             self.assertNotIn("INLINE LINT WARNING", res_e)
 
     def test_upgrade5_rich_tool_parameter_schemas_and_phase_tool_gating(self) -> None:
-        """Verify every parameter across all 25 tools has a description and `DESIGN`/`PLAN` lock out file writes."""
-        self.assertEqual(len(TOOLS), 25)
+        """Verify every parameter across all 26 tools has a description and `DESIGN`/`PLAN` lock out file writes."""
+        self.assertEqual(len(TOOLS), 26)
         for tool_spec in TOOLS:
             fn_name = tool_spec["function"]["name"]
             props = tool_spec["function"]["parameters"]["properties"]

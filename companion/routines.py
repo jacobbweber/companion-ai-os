@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from companion.archive_and_approvals import archive_aged_conversations, enqueue_session_nudge, get_approval_queue
 from companion.autonomy import run_autonomous_goal_slice
 from companion.background_jobs import get_job_manager
-from companion.config import settings
+from companion.config import execution_origin_context, settings
 from companion.dag_runtime import execute_dag_by_name
 from companion.disciplines import walk_pruned_files
 from companion.endpoints import get_endpoint_manager
@@ -310,51 +310,51 @@ class RoutineManager:
         tkind, inputs = rt["target_kind"], rt.get("inputs") or {}
         jm = get_job_manager(store=self.store, chat_fn=chat_fn)
         job_id, status_lbl, summary_txt = "", "done", f"Executed `{rt['title']}`."
-
-        if tkind == "snapshot_backup":
-            res = create_snapshot_backup(label=f"routine_{rt['routine_id']}", store=self.store)
-            status_lbl, summary_txt = ("done" if res.get("ok") else "failed"), str(res.get("summary") or "")
-        elif tkind == "chat_archive":
-            res = archive_aged_conversations(store=self.store, older_than_days=int(inputs.get("older_than_days") or 90))
-            status_lbl, summary_txt = ("done" if res.get("ok") else "failed"), str(res.get("summary") or "")
-        elif tkind == "endpoint_pulse":
-            em = get_endpoint_manager(store=self.store)
-            targets = [inputs["endpoint_id"]] if inputs.get("endpoint_id") else [e["endpoint_id"] for e in em.list_endpoints()]
-            results = [em.test_endpoint(eid, timeout=3.0) for eid in targets]
-            offline = [eid for eid, r in zip(targets, results) if not r.get("ok")]
-            if offline:
-                enqueue_session_nudge(f"Routine `{rt['title']}` detected unreachable endpoint(s): {', '.join(offline)}.", category="routine", ref_id=rt["routine_id"], store=self.store)
-            status_lbl = "done" if not offline else f"degraded ({len(offline)} offline)"
-            summary_txt = f"Probed {len(targets)} endpoint(s): {status_lbl}."
-        elif tkind == "wiki_inbox_triage":
-            inbox = get_wiki_engine(store=self.store).list_notes(folder="01_inbox", limit=30)
-            goal = f"Run `wiki_manage(action='inspect_graduation', path=...)` across the {len(inbox)} note(s) in `01_inbox/` and write a triage digest in `01_inbox/inbox-triage-digest.md` without modifying `02_knowledge/`."
-            dispatched = jm.dispatch_job(goal=goal, title=f"Routine: {rt['title']}", kind="routine", starter=f"routine:{rt['routine_id']}", allowed_tools=["wiki_manage"], run_in_background=run_in_background)
-            job_id, status_lbl, summary_txt = str(dispatched.get("job_id") or ""), str(dispatched.get("status") or "queued"), str(dispatched.get("summary") or "")
-        elif tkind == "wiki_deep_curate":
-            wk = get_wiki_engine(store=self.store)
-            inbox = [n for n in wk.list_notes(folder="01_inbox", limit=15) if not str(n["rel_path"]).endswith("inbox-triage-digest.md")]
-            if not inbox:
-                status_lbl, summary_txt = "done (inbox clean)", "Wiki inbox already clean."
-            else:
-                target_list = ", ".join(f"`{n['rel_path']}`" for n in inbox[:5])
-                goal = f"Curate staged `01_inbox/` note(s) ({target_list}) into `02_knowledge/` using `inspect_graduation`, `validate_curation`, and `commit_curation`."
-                dispatched = jm.dispatch_job(goal=goal, title=f"Routine Deep Curate: {rt['title']}", kind="routine", starter=f"routine:{rt['routine_id']}", tier="reasoning", allowed_tools=["wiki_manage"], max_iters=14, run_in_background=run_in_background)
+        with execution_origin_context("idle_routine"):
+            if tkind == "snapshot_backup":
+                res = create_snapshot_backup(label=f"routine_{rt['routine_id']}", store=self.store)
+                status_lbl, summary_txt = ("done" if res.get("ok") else "failed"), str(res.get("summary") or "")
+            elif tkind == "chat_archive":
+                res = archive_aged_conversations(store=self.store, older_than_days=int(inputs.get("older_than_days") or 90))
+                status_lbl, summary_txt = ("done" if res.get("ok") else "failed"), str(res.get("summary") or "")
+            elif tkind == "endpoint_pulse":
+                em = get_endpoint_manager(store=self.store)
+                targets = [inputs["endpoint_id"]] if inputs.get("endpoint_id") else [e["endpoint_id"] for e in em.list_endpoints()]
+                results = [em.test_endpoint(eid, timeout=3.0) for eid in targets]
+                offline = [eid for eid, r in zip(targets, results) if not r.get("ok")]
+                if offline:
+                    enqueue_session_nudge(f"Routine `{rt['title']}` detected unreachable endpoint(s): {', '.join(offline)}.", category="routine", ref_id=rt["routine_id"], store=self.store)
+                status_lbl = "done" if not offline else f"degraded ({len(offline)} offline)"
+                summary_txt = f"Probed {len(targets)} endpoint(s): {status_lbl}."
+            elif tkind == "wiki_inbox_triage":
+                inbox = get_wiki_engine(store=self.store).list_notes(folder="01_inbox", limit=30)
+                goal = f"Run `wiki_manage(action='inspect_graduation', path=...)` across the {len(inbox)} note(s) in `01_inbox/` and write a triage digest in `01_inbox/inbox-triage-digest.md` without modifying `02_knowledge/`."
+                dispatched = jm.dispatch_job(goal=goal, title=f"Routine: {rt['title']}", kind="routine", starter=f"routine:{rt['routine_id']}", allowed_tools=["wiki_manage"], run_in_background=run_in_background)
                 job_id, status_lbl, summary_txt = str(dispatched.get("job_id") or ""), str(dispatched.get("status") or "queued"), str(dispatched.get("summary") or "")
-        elif tkind == "maintenance_agent":
-            brief, tools = _MAINTENANCE_BRIEFS.get(rt["target_name"], (f"Execute maintenance routine `{rt['title']}` concisely.", ["read_file", "wiki_manage", "memory_manage"]))
-            dispatched = jm.dispatch_job(goal=brief, title=f"Maintenance: {rt['title']}", kind="routine", starter=f"routine:{rt['routine_id']}", allowed_tools=tools, max_iters=6, run_in_background=run_in_background)
-            job_id, status_lbl, summary_txt = str(dispatched.get("job_id") or ""), str(dispatched.get("status") or "queued"), str(dispatched.get("summary") or "")
-        elif tkind == "goal_slice":
-            slice_res = run_autonomous_goal_slice(project_id=str(inputs.get("project_id") or rt.get("target_name") or "") or None, chat_fn=chat_fn, store=self.store)
-            status_lbl, summary_txt = str(slice_res.get("status") or "done"), str(slice_res.get("summary") or "")
-        elif tkind in ("dag", "recipe"):
-            if run_in_background:
-                dispatched = jm.dispatch_job(goal=f"Routine DAG {rt['target_name']}", title=f"Routine: {rt['title']}", kind="dag", starter=f"routine:{rt['routine_id']}", dag_name=rt["target_name"], dag_params=inputs, run_in_background=True)
+            elif tkind == "wiki_deep_curate":
+                wk = get_wiki_engine(store=self.store)
+                inbox = [n for n in wk.list_notes(folder="01_inbox", limit=15) if not str(n["rel_path"]).endswith("inbox-triage-digest.md")]
+                if not inbox:
+                    status_lbl, summary_txt = "done (inbox clean)", "Wiki inbox already clean."
+                else:
+                    target_list = ", ".join(f"`{n['rel_path']}`" for n in inbox[:5])
+                    goal = f"Curate staged `01_inbox/` note(s) ({target_list}) into `02_knowledge/` using `inspect_graduation`, `validate_curation`, and `commit_curation`."
+                    dispatched = jm.dispatch_job(goal=goal, title=f"Routine Deep Curate: {rt['title']}", kind="routine", starter=f"routine:{rt['routine_id']}", tier="reasoning", allowed_tools=["wiki_manage"], max_iters=14, run_in_background=run_in_background)
+                    job_id, status_lbl, summary_txt = str(dispatched.get("job_id") or ""), str(dispatched.get("status") or "queued"), str(dispatched.get("summary") or "")
+            elif tkind == "maintenance_agent":
+                brief, tools = _MAINTENANCE_BRIEFS.get(rt["target_name"], (f"Execute maintenance routine `{rt['title']}` concisely.", ["read_file", "wiki_manage", "memory_manage"]))
+                dispatched = jm.dispatch_job(goal=brief, title=f"Maintenance: {rt['title']}", kind="routine", starter=f"routine:{rt['routine_id']}", allowed_tools=tools, max_iters=6, run_in_background=run_in_background)
                 job_id, status_lbl, summary_txt = str(dispatched.get("job_id") or ""), str(dispatched.get("status") or "queued"), str(dispatched.get("summary") or "")
-            else:
-                dag_res = execute_dag_by_name(rt["target_name"], params=inputs, store=self.store)
-                status_lbl, summary_txt = str(dag_res.get("status") or ("done" if dag_res.get("ok") else "failed")), str(dag_res.get("summary") or "")
+            elif tkind == "goal_slice":
+                slice_res = run_autonomous_goal_slice(project_id=str(inputs.get("project_id") or rt.get("target_name") or "") or None, chat_fn=chat_fn, store=self.store)
+                status_lbl, summary_txt = str(slice_res.get("status") or "done"), str(slice_res.get("summary") or "")
+            elif tkind in ("dag", "recipe"):
+                if run_in_background:
+                    dispatched = jm.dispatch_job(goal=f"Routine DAG {rt['target_name']}", title=f"Routine: {rt['title']}", kind="dag", starter=f"routine:{rt['routine_id']}", dag_name=rt["target_name"], dag_params=inputs, run_in_background=True)
+                    job_id, status_lbl, summary_txt = str(dispatched.get("job_id") or ""), str(dispatched.get("status") or "queued"), str(dispatched.get("summary") or "")
+                else:
+                    dag_res = execute_dag_by_name(rt["target_name"], params=inputs, store=self.store)
+                    status_lbl, summary_txt = str(dag_res.get("status") or ("done" if dag_res.get("ok") else "failed")), str(dag_res.get("summary") or "")
 
         next_iso = _fmt_utc(compute_next_run_utc(tp.schedule_expr, after_dt=now_dt)) if tp.mode == "scheduled" and tp.schedule_expr else ""
         now_iso = _fmt_utc(now_dt)
@@ -427,15 +427,18 @@ class RoutineManager:
             enqueue_session_nudge(f"Skipped overdue routine run(s) during downtime (no thundering herd): {', '.join(skipped_routines)}.", category="routine", store=self.store)
         return {"ok": True, "skipped": skipped_routines, "caught_up": caught_up}
 
-    def tick_due_routines(self, now: Optional[datetime] = None, run_in_background: bool = True) -> Dict[str, Any]:
-        """Trigger any currently due `scheduled` routines (respecting overlap skip)."""
+    def tick_due_routines(
+        self, now: Optional[datetime] = None, run_in_background: bool = True, abort_check: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
+        """Trigger any currently due `scheduled` routines under `model_gate.background_context` preemption."""
         now_dt = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         fired, overlapped = [], []
         for rt in self.list_routines(mode="scheduled"):
             due_dt = _parse_utc(rt["next_run_at"])
             if not rt["enabled"] or due_dt is None or due_dt > now_dt:
                 continue
-            res = self._execute_routine_once(rt, now_dt, run_in_background=run_in_background)
+            with model_gate.background_context(abort_check=abort_check):
+                res = self._execute_routine_once(rt, now_dt, run_in_background=run_in_background)
             (overlapped if res.get("skipped_overlap") else fired).append(rt["routine_id"])
         return {"ok": True, "fired": fired, "skipped_overlap": overlapped}
 
@@ -479,8 +482,9 @@ class IdleAutonomyWatcher:
             return {"ok": True, "action": "busy_skip"}
 
         eff_now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        abort_fn = abort_check or (lambda: self._stop_event.is_set() or self.is_busy_fn())
         rm = get_routine_manager(store=self.store)
-        sched = rm.tick_due_routines(now=eff_now, run_in_background=False)
+        sched = rm.tick_due_routines(now=eff_now, run_in_background=False, abort_check=abort_fn)
         if sched.get("fired"):
             return {"ok": True, "action": "scheduled_routine", "fired": sched["fired"]}
 
@@ -488,7 +492,6 @@ class IdleAutonomyWatcher:
             return {"ok": True, "action": "autonomy_off"}
 
         eff_idle = float(idle_seconds) if idle_seconds is not None else max(0.0, time.monotonic() - self._last_busy_mono)
-        abort_fn = abort_check or (lambda: self._stop_event.is_set() or self.is_busy_fn())
 
         idle_rts = rm.select_eligible_idle_routines(idle_seconds=eff_idle, now_utc=eff_now, now_local=now_local)
         if idle_rts:

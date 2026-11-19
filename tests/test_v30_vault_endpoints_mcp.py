@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict
 
-from companion.archive_and_approvals import get_approval_queue, peek_session_nudges
+from companion.archive_and_approvals import get_approval_queue, peek_session_nudges, set_trust_mode
 from companion.context import build_system_prompt
 from companion.core_actions import execute_core_action
 from companion.endpoints import EndpointManager
@@ -26,7 +26,8 @@ from companion.routines import (
     RoutineManager, cleanup_sandbox_clone, compute_next_run_utc,
     create_sandbox_clone, diff_sandbox_clone, verify_sandbox_clone,
 )
-from companion.tools import dispatch
+from companion.tools import dispatch, filter_tools_for_phase, phase_tool_context
+from companion.trigger_policy import evaluate_trigger_eligibility, TriggerPolicy
 from companion.vault import VaultManager, create_snapshot_backup, restore_snapshot_backup
 from companion.wiki_engine import WikiEngine
 from surfaces.web_server import create_web_server, dispatch_raw_http
@@ -249,9 +250,10 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
             peer_srv.server_close()
 
     def test_respectful_routines_downtime_reconciliation_and_clone_sandbox(self) -> None:
-        t0 = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
-        self.assertEqual(compute_next_run_utc("every 30m", after_dt=t0), datetime(2026, 11, 10, 8, 30, tzinfo=timezone.utc))
-        self.assertEqual(compute_next_run_utc("0 9 * * *", after_dt=t0), datetime(2026, 11, 10, 9, 0, tzinfo=timezone.utc))
+        local_tz = datetime.now().astimezone().tzinfo
+        t0 = datetime(2026, 11, 10, 8, 0, tzinfo=local_tz).astimezone(timezone.utc)
+        self.assertEqual(compute_next_run_utc("every 30m", after_dt=t0), t0 + timedelta(minutes=30))
+        self.assertEqual(compute_next_run_utc("0 9 * * *", after_dt=t0), datetime(2026, 11, 10, 9, 0, tzinfo=local_tz).astimezone(timezone.utc))
 
         rm = RoutineManager(store=self.primary_store)
         bad_freeform = rm.create_or_update_routine("bad", "every 1h", target_kind="raw_prompt", actor="user")
@@ -304,6 +306,91 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
         self.assertEqual(len(p_lst["partners"]), 1)
         p_rem = execute_core_action("partners", {"subaction": "remove", "partner_id": "lab-peer"}, actor="user", store=self.primary_store)
         self.assertTrue(p_rem["ok"])
+
+    def test_dom1_dom5_ssh_allowlist_long_command_http_payload_and_user_at_host(self) -> None:
+        em = EndpointManager(store=self.primary_store)
+        reg = em.register_endpoint("gpu-ssh", "ssh", "ubuntu@192.168.1.50:2222", auth_mode="ssh_agent", actor="user")
+        self.assertTrue(reg["ok"])
+        self.assertEqual(reg["endpoint"]["username"], "ubuntu")
+        self.assertEqual(reg["endpoint"]["host"], "192.168.1.50")
+        self.assertEqual(reg["endpoint"]["port"], 2222)
+
+        long_cmd = "sudo systemctl restart gdm && " + ("echo verify_gdm_status_" * 16)
+        self.assertGreater(len(long_cmd), 340)
+        paused_ssh = em.ssh_exec("gpu-ssh", long_cmd, actor="companion")
+        self.assertTrue(paused_ssh.get("awaiting_approval"))
+        apr = get_approval_queue(self.primary_store).get_request(paused_ssh["approval_id"])
+        self.assertEqual(json.loads(apr["payload_json"])["command"], long_cmd)
+
+        em.register_endpoint("lab-api", "http_api", "http://192.168.1.55:8123", auth_mode="none", actor="user")
+        set_trust_mode("strict", actor="user", store=self.primary_store)
+        paused_http = em.api_request("lab-api", method="POST", path="/api/services/light/turn_on", json_body={"entity_id": "light.desk"}, headers={"X-Trace": "1"}, actor="companion")
+        set_trust_mode("balanced", actor="user", store=self.primary_store)
+        self.assertTrue(paused_http.get("awaiting_approval"))
+        http_payload = json.loads(get_approval_queue(self.primary_store).get_request(paused_http["approval_id"])["payload_json"])
+        self.assertEqual(http_payload["json_body"], {"entity_id": "light.desk"})
+        self.assertEqual(http_payload["headers"], {"X-Trace": "1"})
+
+        with memory_store_context(self.primary_store):
+            prop = dispatch("endpoint_manage", {"action": "register", "endpoint_id": "auto-prop", "protocol": "ssh", "host": "192.168.1.77"})
+            self.assertIn("AWAITING_USER_APPROVAL", prop)
+            v_dec = dispatch("vault_manage", {"action": "declare", "name": "ssh-lab-key", "cred_type": "ssh_key", "caller_scope": "endpoint:auto-prop"})
+            self.assertIn("ssh-lab-key", v_dec)
+            self.assertIn("endpoint:auto-prop", VaultManager(store=self.primary_store).get_metadata("ssh-lab-key")["allow_list"])
+
+    def test_dom4_dom6_precheck_last_run_at_and_native_mcp_stdio_streaming(self) -> None:
+        self.primary_store.log_message("user", "Remember our VLAN 40 trunk config")
+        self.primary_store.set_background_autonomy(True)
+        tp = TriggerPolicy(mode="on_idle", idle_min_seconds=60, cooldown_seconds=60, precheck_name="recent_unconsolidated_chat")
+        ok1, _ = evaluate_trigger_eligibility(tp, idle_seconds=120, last_run_at="2020-01-01T00:00:00Z", background_autonomy_enabled=True, store=self.primary_store)
+        self.assertTrue(ok1)
+        last_iso = (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
+        later_now = datetime.now(timezone.utc) + timedelta(minutes=10)
+        ok2, reason2 = evaluate_trigger_eligibility(tp, idle_seconds=120, last_run_at=last_iso, now_utc=later_now, background_autonomy_enabled=True, store=self.primary_store)
+        self.assertFalse(ok2)
+        self.assertIn("no_new_chat_turns", reason2)
+
+        mcp_script = self.base / "hang_mcp.py"
+        mcp_script.write_text(
+            "import json, sys, time\n"
+            "for line in sys.stdin:\n"
+            "    msg = json.loads(line)\n"
+            "    mid, meth = msg.get('id'), msg.get('method')\n"
+            "    if meth == 'initialize':\n"
+            "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'protocolVersion': '2024-11-05'}}) + '\\n'); sys.stdout.flush()\n"
+            "    elif meth == 'tools/list':\n"
+            "        tools = [\n"
+            "            {'name': 'ping_box', 'description': 'Ping host safely.', 'inputSchema': {'type': 'object', 'properties': {'host': {'type': 'string', 'description': 'Target host'}}}},\n"
+            "            {'name': 'wipe_box', 'description': 'Destructive reset.', 'annotations': {'destructiveHint': True}, 'inputSchema': {'type': 'object', 'properties': {}}},\n"
+            "        ]\n"
+            "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'tools': tools}}) + '\\n'); sys.stdout.flush()\n"
+            "        time.sleep(25)\n"
+            "    elif meth == 'tools/call':\n"
+            "        p = msg.get('params') or {}\n"
+            "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'content': [{'type': 'text', 'text': 'pong:' + str((p.get('arguments') or {}).get('host', ''))}]}}) + '\\n'); sys.stdout.flush()\n"
+            "        time.sleep(25)\n",
+            encoding="utf-8",
+        )
+        hub = MCPHub(store=self.primary_store)
+        hub.register_server("local-stdio", "stdio", command=sys.executable, args=[str(mcp_script)], actor="user", confirmed=True)
+        t_start = datetime.now(timezone.utc)
+        disc = hub.discover_server("local-stdio", actor="user")
+        elapsed = (datetime.now(timezone.utc) - t_start).total_seconds()
+        self.assertTrue(disc["ok"], disc)
+        self.assertLess(elapsed, 8.0)
+        bad_fp = hub.approve_server("local-stdio", actor="user", expected_fingerprint="deadbeef")
+        self.assertFalse(bad_fp["ok"])
+        self.assertTrue(hub.approve_server("local-stdio", actor="user", expected_fingerprint=disc["fingerprint"])["ok"])
+
+        with memory_store_context(self.primary_store):
+            names = {t["function"]["name"] for t in filter_tools_for_phase("")}
+            self.assertIn("mcp__local-stdio__ping_box", names)
+            with phase_tool_context("PLAN"):
+                self.assertIn("PHASE TOOL GATE REJECTED", dispatch("mcp__local-stdio__ping_box", {"host": "10.0.0.1"}))
+            out_ok = dispatch("mcp__local-stdio__ping_box", {"host": "10.0.0.1"})
+            self.assertIn("pong:10.0.0.1", out_ok)
+            out_destr = dispatch("mcp__local-stdio__wipe_box", {})
+            self.assertIn("AWAITING_USER_APPROVAL", out_destr)
 
 
 if __name__ == "__main__":

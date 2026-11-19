@@ -6,7 +6,12 @@ each maintain clean single-responsibility focus and generous `<465L` headroom.
 """
 
 import json
-from typing import Any, Dict
+import os
+import re
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from typing import Any, Dict, List, Optional, Tuple
 
 from companion.archive_and_approvals import format_forever_search_results, search_forever_history
 from companion.autonomy import run_autonomous_goal, run_http_smoke_probe
@@ -16,8 +21,9 @@ from companion.context import manage_active_project
 from companion.dag_runtime import resume_dag_run
 from companion.grounding import get_execution_target, get_knowledge_port
 from companion.hygiene import analyze_workspace_hygiene
+from companion.llm_wire import is_local_or_lan_endpoint, urlopen_safe
 from companion.memory_store import get_memory_store
-from companion.safety import get_active_checkpoint_manager, run_system_doctor
+from companion.safety import check_path_safety, get_active_checkpoint_manager, run_system_doctor
 from companion.sdd import CANONICAL_SPEC_FILES, sync_decisions_md, verify_sdd
 from companion.skill_forge import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
 from companion.telemetry import telemetry
@@ -328,7 +334,7 @@ def tool_workflow_manage(args: Dict[str, Any]) -> str:
 
 
 def tool_checkpoint_manage(args: Dict[str, Any]) -> str:
-    """Create, list, or rollback full workspace checkpoints or local Git save-points in the active project."""
+    """Create, list, or rollback workspace checkpoints or local Git save-points in the active project."""
     action, active_cp, target = str_arg(args, "action", "list").lower(), get_active_checkpoint_manager(), get_execution_target()
     if action == "create":
         m = target.create_checkpoint(label=str_arg(args, "label", "manual") or "manual")
@@ -337,10 +343,13 @@ def tool_checkpoint_manage(args: Dict[str, Any]) -> str:
         cps = target.list_checkpoints()
         return "\n".join(f"- {c['checkpoint_id']} (label='{c['label']}', files={c['file_count']})" for c in cps) if cps else "No checkpoints."
     if action == "rollback":
-        res = target.rollback_checkpoint(checkpoint_id=str_arg(args, "checkpoint_id") or None)
+        path_err = check_path_safety(active_cp.root / "__checkpoint_rollback__", write=True)
+        if path_err:
+            return path_err
+        res = target.rollback_checkpoint(checkpoint_id=str_arg(args, "checkpoint_id") or None, force=bool_arg(args, "force", False))
         return f"Rolled back to `{res['checkpoint_id']}` ({res['restored_count']} files)." if res.get("restored") else f"error: {res.get('error')}"
     if action == "git_save":
-        res = active_cp.create_git_savepoint(message=str_arg(args, "label", "Manual save-point") or "Manual save-point", init_if_needed=not settings.get_workspace().is_self_project)
+        res = active_cp.create_git_savepoint(message=str_arg(args, "label", "Manual save-point") or "Manual save-point", init_if_needed=bool_arg(args, "init_git", False))
         return str(res.get("summary", ""))
     if action == "git_log":
         logs = active_cp.list_git_savepoints(limit=10)
@@ -391,3 +400,104 @@ def tool_system_doctor(args: Dict[str, Any]) -> str:
 
 def tool_telemetry_manage(args: Dict[str, Any]) -> str:
     return telemetry.handle_tool(args)
+
+
+def summarize_tool_step(name: str, args: Dict[str, Any]) -> str:
+    """Format a concise human-readable 1-line label for live SSE and persisted `meta_json` tool pills."""
+    a = args or {}
+    act, pth = str_arg(a, "action") or str_arg(a, "subaction"), str_arg(a, "path")
+    if name == "read_file":
+        rng = f" ({a['symbol']})" if a.get("symbol") else (f":{a.get('start_line', 1)}-{a['end_line']}" if a.get("end_line") else "")
+        return f"Read {pth or 'file'}{rng}"
+    if name in ("write_file", "edit_file"):
+        return f"{'Wrote' if name == 'write_file' else 'Edited'} {pth or 'file'}"
+    if name in ("search", "web_search"):
+        q = str_arg(a, "pattern") or str_arg(a, "query")
+        return f"{'Web search' if name == 'web_search' else 'Searched'} \"{q[:48]}\""
+    if name in ("run_shell", "run_python"):
+        return f"Ran {str_arg(a, 'command')[:52]}" if name == "run_shell" else "Executed Python snippet"
+    if name == "wiki_manage":
+        tgt = pth or str_arg(a, "title") or str_arg(a, "query") or str_arg(a, "domain")
+        verb = "Saved Wiki" if act in ("save", "curate", "capture_inbox") else f"Wiki {act or 'list'}"
+        return f"{verb} {tgt[:52]}".strip()
+    tgt_any = pth or str_arg(a, "title") or str_arg(a, "endpoint_id") or str_arg(a, "server_id") or str_arg(a, "query")
+    return f"{name}({act}{': ' + tgt_any[:36] if tgt_any else ''})" if act else name
+
+
+class _DdgHtmlSearchParser(HTMLParser):
+    """Stdlib HTML parser extracting `{title, url, snippet}` rows from DuckDuckGo HTML Lite."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: List[Dict[str, str]] = []
+        self._mode = ""
+        self._buf: List[str] = []
+        self._cur_href = ""
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        ad = dict(attrs)
+        cls = set((ad.get("class") or "").split())
+        if tag.lower() == "a" and "result__a" in cls:
+            href = str(ad.get("href") or "").strip()
+            if "uddg=" in href:
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(href).query)
+                href = (qs.get("uddg") or [href])[0]
+            self._mode, self._cur_href, self._buf = "title", href, []
+        elif "result__snippet" in cls and self.results:
+            self._mode, self._buf = "snippet", []
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._mode == "title" and tag.lower() == "a":
+            title = re.sub(r"\s+", " ", "".join(self._buf)).strip()
+            if title and self._cur_href.startswith(("http://", "https://")):
+                self.results.append({"title": title, "url": self._cur_href, "snippet": ""})
+            self._mode, self._buf, self._cur_href = "", [], ""
+        elif self._mode == "snippet" and tag.lower() in ("a", "div", "span", "td"):
+            if self.results and not self.results[-1]["snippet"]:
+                self.results[-1]["snippet"] = re.sub(r"\s+", " ", "".join(self._buf)).strip()
+            self._mode, self._buf = "", []
+
+    def handle_data(self, data: str) -> None:
+        if self._mode and data:
+            self._buf.append(data)
+
+
+def tool_web_search(args: Dict[str, Any]) -> str:
+    """Search via configured SearXNG/JSON endpoint or DuckDuckGo HTML Lite (enforcing `local_only` privacy posture)."""
+    query = str_arg(args, "query")
+    if not query:
+        return "error: query is required"
+    max_res = max(1, min(10, int_arg(args, "max_results", 5)))
+    custom_url = os.environ.get("COMPANION_SEARCH_URL", "").strip()
+    is_lan_custom = bool(custom_url and is_local_or_lan_endpoint(custom_url))
+    if settings.effective_privacy_mode() == "local_only" and not is_lan_custom:
+        return (
+            "SAFETY GUARD REJECTED (PRIVACY LOCK): `web_search` is blocked while Privacy Posture is `local_only` "
+            "(unless `COMPANION_SEARCH_URL` points to a local/LAN SearXNG endpoint). Switch posture to `hybrid` or `cloud_allowed` in Settings -> Models & Tiers."
+        )
+    try:
+        if custom_url:
+            sep = "&" if "?" in custom_url else "?"
+            url = f"{custom_url}{sep}{urllib.parse.urlencode({'q': query, 'format': 'json'})}"
+            req = urllib.request.Request(url, headers={"User-Agent": "companion-os/3.4", "Accept": "application/json"})
+            with urlopen_safe(req, timeout=20, allow_private_lan=is_lan_custom, allow_redirects=True) as resp:
+                data = json.loads(resp.read(524_288).decode("utf-8", "replace"))
+            raw_items = data.get("results") if isinstance(data, dict) else []
+            hits = [
+                {"title": str(it.get("title") or ""), "url": str(it.get("url") or ""), "snippet": str(it.get("content") or it.get("snippet") or "")}
+                for it in (raw_items or [])[:max_res] if isinstance(it, dict) and it.get("url")
+            ]
+        else:
+            url = f"https://html.duckduckgo.com/html/?{urllib.parse.urlencode({'q': query})}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; companion-os/3.4)"})
+            with urlopen_safe(req, timeout=20, allow_private_lan=False, allow_redirects=True) as resp:
+                html_text = resp.read(524_288).decode("utf-8", "replace")
+            parser = _DdgHtmlSearchParser()
+            parser.feed(html_text)
+            hits = parser.results[:max_res]
+    except Exception as exc:
+        return str(exc) if "SAFETY GUARD REJECTED" in str(exc) else f"error: web_search failed ({type(exc).__name__}): {exc}"
+    if not hits:
+        return f"Web Search (`{query}`): no results found."
+    rows = [f"{idx}. **{h['title']}** — {h['url']}" + (f"\n   {h['snippet'][:240]}" if h.get("snippet") else "") for idx, h in enumerate(hits, 1)]
+    return f"Web Search (`{query}`): {len(hits)} result(s)\n" + "\n".join(rows)

@@ -625,6 +625,7 @@ textarea {
   top: 38px;
   right: 0;
   width: 340px;
+  max-width: calc(100vw - 24px);
   max-height: min(540px, 78dvh);
   overflow-y: auto;
   background: var(--bg-elevated);

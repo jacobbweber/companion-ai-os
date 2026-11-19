@@ -28,7 +28,7 @@ from companion.archive_and_approvals import get_approval_queue
 from companion.config import is_in_agent_tool_turn, parse_env_file, settings
 from companion.disciplines import walk_pruned_files
 from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
-from companion.telemetry import redact_secrets, secret_redactor
+from companion.telemetry import notify_db_closed, redact_secrets, secret_redactor
 
 __all__ = [
     "VALID_CREDENTIAL_TYPES", "VaultManager", "create_snapshot_backup",
@@ -545,9 +545,13 @@ def restore_snapshot_backup(
     db_src = src / "conversations.db"
     if db_src.is_file():
         with mem._lock:
+            if mem.conn.in_transaction:
+                mem.conn.rollback()
+            notify_db_closed(mem.db_path)
             src_conn = sqlite3.connect(str(db_src))
             try:
                 src_conn.backup(mem.conn)
+                mem._initialized_schemas.clear()
             finally:
                 src_conn.close()
 

@@ -222,6 +222,49 @@ class TestSDDHygieneAndIdleRoutines(unittest.TestCase):
                 with memory_store_context(st):
                     self.assertIn("http://127.0.0.1:9000", dispatch("memory_manage", {"action": "query_facts", "key": "cfg:endpoint"}))
 
+    def test_safe4_project_workspace_path_and_packaged_app_doctor_without_tests(self) -> None:
+        """Verify SAFE-4: ProjectGraph `workspace_path` scope binding and 7/7 System Doctor on packaged `app/` without `tests/`."""
+        import shutil
+
+        from companion.config import settings
+        from companion.project_graph import ProjectGraphManager
+        from companion.safety import run_system_doctor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            code_repo = base / "repo_alpha"
+            code_repo.mkdir()
+            with contextlib.closing(MemoryStore(db_path=base / "pg.db")) as st:
+                pg = ProjectGraphManager(store=st)
+                code_proj = pg.create_project("Alpha Service", kind="project", workspace_path=str(code_repo), project_id="alpha-svc")
+                life_proj = pg.create_project("Weekend Garden", kind="goal", workspace_path="", project_id="garden-goal")
+                self.assertEqual(Path(code_proj["workspace_path"]), code_repo.resolve())
+                self.assertEqual(life_proj["workspace_path"], "")
+
+                pg.set_focus_project("alpha-svc")
+                with pg.project_workspace_scope():
+                    self.assertEqual(settings.get_workspace().project_root, code_repo.resolve())
+                    self.assertEqual(settings.get_workspace().project_id, "alpha-svc")
+
+                pg.set_focus_project("garden-goal")
+                with pg.project_workspace_scope():
+                    self.assertTrue(settings.get_workspace().is_self_project)
+
+            staged_app = base / "packaged_app"
+            staged_app.mkdir()
+            shutil.copy2(settings.root / "harness.py", staged_app / "harness.py")
+            for dirname in ("companion", "surfaces", "configs", "memory", "specs", "skills", "deploy"):
+                src_d = settings.root / dirname
+                if src_d.is_dir():
+                    shutil.copytree(src_d, staged_app / dirname, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            self.assertFalse((staged_app / "tests").exists())
+            doc = run_system_doctor(root=staged_app, run_tests=True)
+            self.assertTrue(doc["healthy"], doc["summary"])
+            self.assertEqual(len(doc["checks"]), 7)
+            self.assertTrue(all(c["passed"] for c in doc["checks"]))
+            from companion.telemetry import notify_db_closed
+            notify_db_closed(staged_app / "data" / "conversations.db")
+
 
 if __name__ == "__main__":
     unittest.main()

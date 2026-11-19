@@ -54,15 +54,22 @@ if os.name == "nt" and (sys.stdout is None or Path(sys.executable).name.lower().
 
 
 def _emergency_boot_rollback(root_dir: Path, err: Exception) -> bool:
-    """If a core module import fails on startup, restore from the latest checkpoint."""
+    """If an autonomous self-dev edit breaks boot imports, restore touched files from a fresh CoW checkpoint without deleting untracked files."""
+    if "--doctor" in sys.argv or os.environ.get("COMPANION_TEST_MODE") == "1" or os.environ.get("COMPANION_SELF_DEV_MODE", "").strip().lower() not in ("1", "true", "on", "yes"):
+        return False
     raw_data = os.environ.get("COMPANION_DATA_DIR", "").strip()
     data_base = (Path(raw_data) if Path(raw_data).is_absolute() else (root_dir / raw_data)).resolve() if raw_data else (root_dir / "data")
-    candidates = [data_base / ".companion_backups" / "checkpoints", root_dir / ".companion_backups" / "checkpoints"]
+    candidates = [
+        data_base / "checkpoints" / "companion-self" / "checkpoints",
+        data_base / ".companion_backups" / "checkpoints",
+        root_dir / ".companion_backups" / "checkpoints",
+    ]
     cp_root = next((c for c in candidates if c.is_dir()), None)
     if cp_root is None:
         return False
+    now_ts = time.time()
     cps = sorted(
-        [d for d in cp_root.iterdir() if d.is_dir() and (d / "manifest.json").is_file()],
+        [d for d in cp_root.iterdir() if d.is_dir() and (d / "manifest.json").is_file() and (now_ts - d.stat().st_mtime) <= 600.0],
         key=lambda d: d.stat().st_mtime,
         reverse=True,
     )
@@ -71,37 +78,22 @@ def _emergency_boot_rollback(root_dir: Path, err: Exception) -> bool:
     latest = cps[0]
     try:
         manifest = json.loads((latest / "manifest.json").read_text(encoding="utf-8"))
-        ws_dir = (latest / "workspace").resolve()
-        root_res = root_dir.resolve()
-        manifest_paths = {entry["path"] for entry in manifest.get("files", [])}
+        ws_dir, blobs_dir, root_res = (latest / "workspace").resolve(), (latest.parent.parent / "blobs").resolve(), root_dir.resolve()
         for entry in manifest.get("files", []):
             rel = Path(entry["path"])
             if rel.is_absolute() or ".." in rel.parts:
                 continue
-            src = (ws_dir / rel).resolve()
             dst = (root_res / rel).resolve()
-            if src.is_relative_to(ws_dir) and dst.is_relative_to(root_res) and src.is_file() and not src.is_symlink():
+            if not dst.is_relative_to(root_res):
+                continue
+            sha = str(entry.get("sha256") or "")
+            blob = (blobs_dir / sha[:2] / sha).resolve() if len(sha) >= 4 else None
+            src = blob if (blob and blob.is_file()) else (ws_dir / rel).resolve()
+            if src.is_file() and not src.is_symlink():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
-        skip_dirs = {
-            ".git", ".agents", "__pycache__", ".companion_backups", "data", "frontend", "venv", ".venv", "node_modules",
-            ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "dist", "build", "coverage",
-        }
-        tracked_exts = {".py", ".md", ".json", ".toml", ".yaml", ".yml", ".ini", ".html", ".css", ".js"}
-        for cur_dir, dirs, files in os.walk(root_res):
-            dirs[:] = [d for d in sorted(dirs) if d not in skip_dirs]
-            cur_path = Path(cur_dir)
-            for fname in sorted(files):
-                item = cur_path / fname
-                if item.suffix.lower() in tracked_exts:
-                    rel_str = str(item.relative_to(root_res)).replace("\\", "/")
-                    if rel_str not in manifest_paths and not rel_str.startswith("surfaces/static/"):
-                        try:
-                            item.unlink()
-                        except Exception:
-                            pass
         print(
-            f"[SELF-RECOVERY] Boot error ({type(err).__name__}: {err}) healed by rolling back to checkpoint {latest.name}.",
+            f"[SELF-RECOVERY] Boot error ({type(err).__name__}: {err}) healed by restoring checkpoint {latest.name}.",
             file=sys.stderr,
         )
         return True
@@ -155,7 +147,7 @@ for _boot_attempt in range(2):
             tool_job_manage, tool_list_dir, tool_mcp_manage, tool_memory_manage, tool_project_manage,
             tool_read_file, tool_routine_manage, tool_run_python, tool_run_shell, tool_sdd_manage,
             tool_search, tool_system_doctor, tool_task_manage, tool_telemetry_manage,
-            tool_vault_manage, tool_web_fetch, tool_wiki_manage, tool_workflow_manage, tool_write_file,
+            tool_vault_manage, tool_web_fetch, tool_web_search, tool_wiki_manage, tool_workflow_manage, tool_write_file,
         )
         from companion.workflow_graph import workflow_engine
 

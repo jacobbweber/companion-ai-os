@@ -139,8 +139,11 @@ class TestToolsAndAgentLoop(unittest.TestCase):
             ]
             compacted = compact_messages_if_needed(msgs, max_chars=300, keep_recent=2, store=store)
             self.assertTrue(compacted)
-            # First message after system + summary note must be a 'user' message, never an orphan 'tool' message
-            self.assertEqual(msgs[2]["role"], "user")
+            # Paired checkpoint user/assistant handoff keeps strict alternation (zero mid-array system or orphan tool)
+            self.assertEqual(msgs[1]["role"], "user")
+            self.assertEqual(msgs[2]["role"], "assistant")
+            self.assertEqual(msgs[3]["role"], "user")
+            self.assertTrue(all(m["role"] != "system" for m in msgs[1:]))
             store.close()
 
     def test_first_boot_soul_and_user_identity_onboarding(self) -> None:
@@ -223,8 +226,8 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         from companion.context import format_context_budget_status, prune_stale_tool_outputs
 
         self.assertEqual(settings.context_window_tokens, 262144)
-        self.assertEqual(settings.compact_trigger_tokens, int(262144 * 0.25))
-        self.assertEqual(settings.compact_target_tokens, int(262144 * 0.10))
+        self.assertEqual(settings.compact_trigger_tokens, int(262144 * 0.75))
+        self.assertEqual(settings.compact_target_tokens, int(262144 * 0.35))
 
         msgs: List[Dict[str, Any]] = [
             {"role": "system", "content": "sys"},
@@ -241,7 +244,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
 
         status_text = format_context_budget_status(msgs)
         self.assertIn("262,144 tokens", status_text)
-        self.assertIn("65,536 tokens", status_text)
+        self.assertIn("196,608 tokens", status_text)
 
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(db_path=Path(tmp) / "compact_slash.db")
@@ -562,6 +565,128 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         self.assertIsNotNone(hint)
         self.assertIn("OODA Loop", str(hint))
         self.assertIn("ooda-troubleshooting", str(hint))
+
+    def test_frontier_core_parsers_wire_and_bounded_read(self) -> None:
+        """Verify CORE-4, CORE-5, CORE-8: prefix-orphan </think>, unclosed <think> tool rescue, parallel deltas, strict JSON args, & bounded read_file."""
+        from companion.llm import normalize_assistant_message
+        from companion.llm_wire import repair_message_protocol_invariants
+        from companion.streaming import ThinkTagStreamSplitter, _merge_tool_call_deltas, stream_event_context, strip_thinking_tags
+        from companion.tools import tool_read_file
+
+        clean_o, think_o = strip_thinking_tags("chain of thought first</think>Final crisp answer")
+        self.assertEqual(clean_o, "Final crisp answer")
+        self.assertEqual(think_o, "chain of thought first")
+        events: List[Dict[str, Any]] = []
+        with stream_event_context(events.append):
+            sp = ThinkTagStreamSplitter()
+            sp.feed("prefilled reasoning ")
+            sp.feed("still thinking</think>Visible reply")
+            sp.flush()
+        self.assertTrue(any(e.get("type") == "orphan_think_closed" for e in events))
+
+        unclosed_msg = {
+            "role": "assistant",
+            "content": '<think>Need two reads\n<tool_call>[{"name":"list_dir","arguments":{"path":"."}},{"name":"read_file","arguments":{"path":"README.md"}}]</tool_call>',
+        }
+        c_u, t_u, tcalls_u = normalize_assistant_message(unclosed_msg)
+        self.assertEqual(c_u, "")
+        self.assertIn("Need two reads", t_u)
+        self.assertEqual([tc["function"]["name"] for tc in tcalls_u], ["list_dir", "read_file"])
+        self.assertNotEqual(tcalls_u[0]["id"], tcalls_u[1]["id"])
+
+        acc: Dict[int, Dict[str, Any]] = {}
+        _merge_tool_call_deltas(acc, [{"index": 0, "id": "call_a", "function": {"name": "read_file", "arguments": '{"path":"a"}'}}])
+        _merge_tool_call_deltas(acc, [{"index": 0, "id": "call_b", "function": {"name": "write_file", "arguments": '{"path":"b"}'}}])
+        self.assertEqual([v["function"]["name"] for v in acc.values()], ["read_file", "write_file"])
+
+        repaired = repair_message_protocol_invariants([
+            {"role": "system", "content": "sys0"},
+            {"role": "system", "content": "mid-sys"},
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": "u2"},
+        ])
+        self.assertEqual([m["role"] for m in repaired], ["system", "user"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "big.txt"
+            big.write_text("\n".join(f"L{i}" for i in range(1, 1201)), encoding="utf-8")
+            rf_out = tool_read_file({"path": str(big)})
+            self.assertIn("Showing lines 1-800 of 1200; pass start_line=801 to continue", rf_out)
+            st = MemoryStore(db_path=Path(tmp) / "core.db")
+            try:
+                calls_seen = {"n": 0}
+
+                def _bad_json_chat(messages: List[Dict[str, Any]], _tools=None, _choice="auto") -> Dict[str, Any]:
+                    calls_seen["n"] += 1
+                    if calls_seen["n"] == 1:
+                        return {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{"id": "b1", "function": {"name": "list_dir", "arguments": "{truncated"}}]}}]}
+                    self.assertIn("Tool argument JSON parse error", str(messages[-1].get("content", "")))
+                    return {"choices": [{"message": {"role": "assistant", "content": "Fixed JSON."}}]}
+
+                m_list: List[Dict[str, Any]] = [{"role": "user", "content": "Run tool"}]
+                self.assertEqual(run_agent_turn(m_list, max_iters=3, chat_fn=_bad_json_chat, store=st, verbose=False), "Fixed JSON.")
+            finally:
+                st.close()
+
+    def test_frontier_cancel_scope_and_execution_origin(self) -> None:
+        """Verify CORE-6 & CORE-7: <100ms CancelScope socket/subprocess abort, WebSession Stop balance, & execution_origin."""
+        import socket
+        import subprocess
+        import sys
+        import threading
+        import time
+
+        from companion.config import execution_origin_context, get_execution_origin
+        from companion.streaming import CancelScope, check_cancelled, emit_stream_event
+        from surfaces.web_server import CompanionWebSession
+
+        self.assertEqual(get_execution_origin(), "direct")
+        with execution_origin_context("foreground_turn"):
+            self.assertEqual(get_execution_origin(), "foreground_turn")
+
+        s_srv, s_cli = socket.socketpair()
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        scope = CancelScope()
+        scope.register_socket(s_cli)
+        t0 = time.perf_counter()
+        threading.Timer(0.02, scope.cancel).start()
+        with scope.track_popen(proc):
+            try:
+                s_cli.recv(16)
+            except OSError:
+                pass
+            proc.wait(timeout=2.0)
+        self.assertLess(time.perf_counter() - t0, 0.5)
+        s_srv.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            st = MemoryStore(db_path=Path(tmp) / "stop.db")
+            try:
+                entered = threading.Event()
+
+                def _slow_chat(_m: List[Dict[str, Any]], _t=None, _c="auto") -> Dict[str, Any]:
+                    emit_stream_event({"type": "text_delta", "delta": "Partial stream"})
+                    entered.set()
+                    for _ in range(200):
+                        check_cancelled()
+                        time.sleep(0.01)
+                    return {"choices": [{"message": {"role": "assistant", "content": "done"}}]}
+
+                sess = CompanionWebSession(store=st, chat_fn=_slow_chat)
+                code, sub_p = sess.submit_async_chat("Long query")
+                self.assertEqual(code, 202)
+                entered.wait(timeout=2.0)
+                c_code, c_res = sess.cancel_active_turn(sub_p["job_id"])
+                self.assertEqual(c_code, 200)
+                self.assertTrue(c_res["cancelled"])
+                for _ in range(50):
+                    if not sess.busy:
+                        break
+                    time.sleep(0.02)
+                self.assertIn("*(Stopped by user.)*", sess.messages[-1]["content"])
+                self.assertIn("Partial stream", sess.messages[-1]["content"])
+            finally:
+                st.close()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ privacy classification, and live model discovery across three wire dialects:
 3. `gemini_native`      — Native Google Gemini API (`v1beta` `:generateContent` + `thoughtSignature` + multimodal `inlineData`)
 """
 
+import http.client
 import ipaddress
 import json
 import re
@@ -15,15 +16,13 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.streaming import (
-    ThinkTagStreamSplitter,
-    emit_stream_event,
-    get_active_wire_doc_context,
-    get_active_wire_images,
-    has_stream_sink,
-    read_completion_or_sse_stream,
+    ThinkTagStreamSplitter, emit_stream_event, get_active_cancel_scope,
+    get_active_wire_doc_context, get_active_wire_images, get_active_wire_turn_context,
+    has_stream_sink, read_completion_or_sse_stream,
 )
 
 VALID_DIALECTS = ("openai_compat", "anthropic_messages", "gemini_native")
@@ -58,11 +57,7 @@ def is_local_or_lan_endpoint(url: str) -> bool:
         return False
 
 
-def check_url_ssrf(
-    url_or_host: str,
-    allow_private_lan: bool = False,
-    blocked_ports: Tuple[int, ...] = (),
-) -> Optional[str]:
+def check_url_ssrf(url_or_host: str, allow_private_lan: bool = False, blocked_ports: Tuple[int, ...] = ()) -> Optional[str]:
     """Validate `url_or_host` against metadata/link-local/private SSRF ranges and blocked non-HTTP ports."""
     raw = (url_or_host or "").strip()
     if not raw:
@@ -91,22 +86,19 @@ def check_url_ssrf(
         ip_obj = getattr(raw_ip, "ipv4_mapped", None) or raw_ip
         if ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast:
             return f"SAFETY GUARD REJECTED: link-local/metadata IP `{ip_obj}` is blocked"
-        if not allow_private_lan and (
-            ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_reserved or (ip_obj.version == 4 and ip_obj in _CGNAT_NET)
-        ):
+        if not allow_private_lan and (ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_reserved or (ip_obj.version == 4 and ip_obj in _CGNAT_NET)):
             return f"SAFETY GUARD REJECTED: private/loopback IP `{ip_obj}` is blocked"
     return None
 
 
 def urlopen_safe(
-    req_or_url: Any,
-    timeout: float = 20.0,
-    context: Any = None,
-    allow_private_lan: bool = True,
-    allow_redirects: bool = False,
-    blocked_ports: Tuple[int, ...] = (),
+    req_or_url: Any, timeout: float = 20.0, context: Any = None,
+    allow_private_lan: bool = True, allow_redirects: bool = False, blocked_ports: Tuple[int, ...] = (),
 ) -> Any:
     """Open `req_or_url` bypassing system HTTP proxies for local/LAN hosts and enforcing redirect SSRF checks."""
+    scope = get_active_cancel_scope()
+    if scope is not None:
+        scope.check()
     if urllib.request.urlopen is not _ORIG_URLOPEN:
         kw = {"context": context} if context is not None else {}
         return urllib.request.urlopen(req_or_url, timeout=timeout, **kw)
@@ -128,10 +120,28 @@ def urlopen_safe(
             return new_req
 
     handlers: List[Any] = [_SafeRedirectHandler()]
+    if scope is not None:
+        class _CancelHTTPHandler(urllib.request.HTTPHandler):
+            def http_open(self, req: Any) -> Any:
+                class _Conn(http.client.HTTPConnection):
+                    def connect(self_c) -> None:
+                        super().connect()
+                        scope.register_socket(self_c.sock)
+                return self.do_open(_Conn, req)
+
+        class _CancelHTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req: Any) -> Any:
+                class _SConn(http.client.HTTPSConnection):
+                    def connect(self_c) -> None:
+                        super().connect()
+                        scope.register_socket(self_c.sock)
+                return self.do_open(_SConn, req, context=self._context)
+
+        handlers.extend([_CancelHTTPHandler(), _CancelHTTPSHandler(context=context)])
+    elif context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
     if is_local_or_lan_endpoint(url):
         handlers.append(urllib.request.ProxyHandler({}))
-    if context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=context))
     return urllib.request.build_opener(*handlers).open(req_or_url, timeout=timeout)
 
 
@@ -166,27 +176,79 @@ def _extract_msg_text(raw_c: Any) -> str:
     return "\n".join(str(p.get("text", "")) for p in raw_c if isinstance(p, dict) and p.get("type") == "text")
 
 
-def inject_openai_turn_attachments(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Normalize leading `system` message and inject active turn document/media attachments onto the last `user` message."""
-    wire: List[Dict[str, Any]] = []
+def repair_message_protocol_invariants(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Enforce single index-0 `system`, unique `tool_call_id` pairing, and zero consecutive `user` HTTP 400s."""
+    repaired: List[Dict[str, Any]] = []
+    seen_tc_ids: set[str] = set()
+    open_tc_ids: List[str] = []
+
+    def _flush_missing_tools() -> None:
+        while open_tc_ids:
+            repaired.append({"role": "tool", "tool_call_id": open_tc_ids.pop(0), "content": "(tool step interrupted)"})
+
     for m in messages:
-        if m.get("role") == "system" and wire:
-            if len(wire) == 1 and wire[0].get("role") == "system":
-                wire[0] = {**wire[0], "content": f"{wire[0].get('content', '')}\n\n{m.get('content', '')}"}
+        role = str(m.get("role") or "user")
+        if role == "system":
+            if not repaired:
+                repaired.append(dict(m))
+            elif len(repaired) == 1 and repaired[0].get("role") == "system":
+                repaired[0] = {**repaired[0], "content": f"{repaired[0].get('content', '')}\n\n{m.get('content', '')}".strip()}
             else:
-                wire.append({**m, "role": "user"})
-        elif m.get("role") == "assistant":
+                _flush_missing_tools()
+                txt = _extract_msg_text(m.get("content")).strip()
+                if txt:
+                    if repaired[-1].get("role") == "user":
+                        repaired[-1] = {**repaired[-1], "content": f"{_extract_msg_text(repaired[-1].get('content'))}\n\n{txt}".strip()}
+                    else:
+                        repaired.append({"role": "user", "content": txt})
+            continue
+        if role == "tool":
+            tcid = str(m.get("tool_call_id") or "").strip()
+            if tcid and tcid in open_tc_ids:
+                open_tc_ids.remove(tcid)
+                repaired.append({**m, "tool_call_id": tcid})
+            elif open_tc_ids:
+                repaired.append({**m, "tool_call_id": open_tc_ids.pop(0)})
+            continue
+        _flush_missing_tools()
+        if role == "assistant":
+            clean_m = dict(m)
+            if isinstance(clean_m.get("tool_calls"), list) and clean_m["tool_calls"]:
+                norm_tcs: List[Dict[str, Any]] = []
+                for tc in clean_m["tool_calls"]:
+                    raw_id = str(tc.get("id") or "").strip()
+                    eff_id = raw_id if (raw_id and raw_id.lower() != "null" and raw_id not in seen_tc_ids) else f"call_{uuid.uuid4().hex[:8]}"
+                    seen_tc_ids.add(eff_id)
+                    open_tc_ids.append(eff_id)
+                    norm_tcs.append({**tc, "id": eff_id, "type": "function"})
+                clean_m["tool_calls"] = norm_tcs
+            repaired.append(clean_m)
+        else:
+            if repaired and repaired[-1].get("role") == "user" and not isinstance(repaired[-1].get("content"), list) and not isinstance(m.get("content"), list):
+                repaired[-1] = {**repaired[-1], "content": f"{repaired[-1].get('content', '')}\n\n{m.get('content', '')}".strip()}
+            else:
+                repaired.append(dict(m))
+    _flush_missing_tools()
+    return repaired
+
+
+def inject_openai_turn_attachments(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Repair protocol invariants and inject `<turn_context>` + document/media attachments onto the active `user` turn."""
+    wire: List[Dict[str, Any]] = []
+    for m in repair_message_protocol_invariants(messages):
+        if m.get("role") == "assistant":
             clean_m = {k: v for k, v in m.items() if not str(k).startswith("_")}
             if isinstance(clean_m.get("tool_calls"), list):
                 clean_m["tool_calls"] = [{k: v for k, v in tc.items() if not str(k).startswith("_")} for tc in clean_m["tool_calls"]]
             wire.append(clean_m)
         else:
             wire.append(m)
-    doc_ctx, media_uris = get_active_wire_doc_context(), get_active_wire_images()
-    if (doc_ctx or media_uris) and any(w.get("role") == "user" for w in wire):
+    turn_ctx, doc_ctx, media_uris = get_active_wire_turn_context(), get_active_wire_doc_context(), get_active_wire_images()
+    extra_txt = "\n\n".join(x for x in (turn_ctx, doc_ctx) if x)
+    if (extra_txt or media_uris) and any(w.get("role") == "user" for w in wire):
         u_idx = max(i for i, w in enumerate(wire) if w.get("role") == "user")
         base_txt = str(wire[u_idx].get("content") or "")
-        merged_txt = f"{base_txt}\n\n{doc_ctx}".strip() if doc_ctx else base_txt
+        merged_txt = f"{base_txt}\n\n{extra_txt}".strip() if (extra_txt and turn_ctx not in base_txt) else base_txt
         if media_uris:
             parts: List[Dict[str, Any]] = [{"type": "text", "text": merged_txt or "Inspect the attached media file(s)."}]
             for uri in media_uris:
@@ -251,7 +313,8 @@ def _build_anthropic_request(
     base = base_url.rstrip("/")
     url = f"{base}/messages" if base.lower().endswith("/v1") else f"{base}/v1/messages"
     sys_parts, turns = [], []
-    doc_ctx, media_uris = get_active_wire_doc_context(), get_active_wire_images()
+    turn_ctx, doc_ctx, media_uris = get_active_wire_turn_context(), get_active_wire_doc_context(), get_active_wire_images()
+    extra_ctx = "\n\n".join(x for x in (turn_ctx, doc_ctx) if x)
     last_u = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
     for idx, m in enumerate(messages):
         role, txt = str(m.get("role") or "user"), _extract_msg_text(m.get("content"))
@@ -272,7 +335,7 @@ def _build_anthropic_request(
             _append_merged_turn(turns, "user", [{"type": "tool_result", "tool_use_id": str(m.get("tool_call_id") or "toolu_1"), "content": txt or "(ok)"}], "content")
         else:
             u_blocks: List[Dict[str, Any]] = []
-            eff_txt = f"{txt}\n\n{doc_ctx}".strip() if (idx == last_u and doc_ctx) else txt
+            eff_txt = f"{txt}\n\n{extra_ctx}".strip() if (idx == last_u and extra_ctx and turn_ctx not in txt) else txt
             if idx == last_u and media_uris:
                 for uri in media_uris:
                     mime, b64 = _split_data_uri(uri)
@@ -330,7 +393,8 @@ def _build_gemini_request(
     op = "streamGenerateContent?alt=sse" if stream else "generateContent"
     url = f"{base}/models/{model.strip().removeprefix('models/')}:{op}"
     sys_parts, contents, tc_names = [], [], {}
-    doc_ctx, media_uris = get_active_wire_doc_context(), get_active_wire_images()
+    turn_ctx, doc_ctx, media_uris = get_active_wire_turn_context(), get_active_wire_doc_context(), get_active_wire_images()
+    extra_ctx = "\n\n".join(x for x in (turn_ctx, doc_ctx) if x)
     last_u = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
     for idx, m in enumerate(messages):
         role, txt = str(m.get("role") or "user"), _extract_msg_text(m.get("content"))
@@ -359,7 +423,7 @@ def _build_gemini_request(
             _append_merged_turn(contents, "user", [{"functionResponse": {"name": fname, "response": {"result": txt or "(ok)"}}}], "parts")
         else:
             u_parts: List[Dict[str, Any]] = []
-            eff_txt = f"{txt}\n\n{doc_ctx}".strip() if (idx == last_u and doc_ctx) else txt
+            eff_txt = f"{txt}\n\n{extra_ctx}".strip() if (idx == last_u and extra_ctx and turn_ctx not in txt) else txt
             if idx == last_u and media_uris:
                 for uri in media_uris:
                     mime, b64 = _split_data_uri(uri)
@@ -400,11 +464,12 @@ def prepare_wire_request(
 ) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
     """Build `(url, headers, body)` for `openai_compat`, `anthropic_messages`, or `gemini_native`."""
     d = (dialect or "openai_compat").strip().lower()
+    norm_msgs = repair_message_protocol_invariants(messages)
     if d == "anthropic_messages":
-        return _build_anthropic_request(messages, tools, tool_choice, base_url, model, api_key, temperature, max_tokens, reasoning_effort, stream)
+        return _build_anthropic_request(norm_msgs, tools, tool_choice, base_url, model, api_key, temperature, max_tokens, reasoning_effort, stream)
     if d == "gemini_native":
-        return _build_gemini_request(messages, tools, tool_choice, base_url, model, api_key, temperature, max_tokens, reasoning_effort, stream)
-    return _build_openai_compat_request(messages, tools, tool_choice, base_url, model, api_key, temperature, max_tokens, reasoning_effort, stream)
+        return _build_gemini_request(norm_msgs, tools, tool_choice, base_url, model, api_key, temperature, max_tokens, reasoning_effort, stream)
+    return _build_openai_compat_request(norm_msgs, tools, tool_choice, base_url, model, api_key, temperature, max_tokens, reasoning_effort, stream)
 
 
 def _finalize_normalized_choice(
@@ -586,6 +651,10 @@ def read_wire_response(dialect: str, resp: Any) -> Dict[str, Any]:
     return read_completion_or_sse_stream(resp)
 
 
+def _is_stream_error(low_err: str) -> bool:
+    return any(k in low_err for k in ("stream", "sse", "event-stream"))
+
+
 def heal_http_400_request(dialect: str, url: str, body: Dict[str, Any], err_body: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     """Attempt 1-shot parameter self-healing when an endpoint rejects `stream`, `temperature`, `max_tokens`, or `thinking`."""
     d, low_err, mutated = (dialect or "openai_compat").strip().lower(), (err_body or "").lower(), dict(body)
@@ -595,14 +664,14 @@ def heal_http_400_request(dialect: str, url: str, body: Dict[str, Any], err_body
             gcfg.pop("thinkingConfig", None)
             mutated["generationConfig"] = gcfg
             return url, mutated
-        if ":streamGenerateContent" in url:
+        if ":streamGenerateContent" in url and _is_stream_error(low_err):
             return url.replace(":streamGenerateContent?alt=sse", ":generateContent").replace(":streamGenerateContent", ":generateContent"), mutated
         return None
     if d == "anthropic_messages":
         if "thinking" in low_err and "thinking" in mutated:
             mutated.pop("thinking", None)
             return url, mutated
-        return (url, mutated) if mutated.pop("stream", None) is not None else None
+        return (url, mutated) if (_is_stream_error(low_err) and mutated.pop("stream", None) is not None) else None
     changed = False
     if "max_completion_tokens" in low_err and "max_tokens" in mutated:
         mutated["max_completion_tokens"] = mutated.pop("max_tokens")
@@ -614,7 +683,7 @@ def heal_http_400_request(dialect: str, url: str, body: Dict[str, Any], err_body
         mutated.pop("reasoning_effort", None)
         mutated.pop("reasoning", None)
         changed = True
-    if not changed and mutated.get("stream"):
+    if not changed and mutated.get("stream") and _is_stream_error(low_err):
         mutated.pop("stream", None)
         changed = True
     return (url, mutated) if changed else None

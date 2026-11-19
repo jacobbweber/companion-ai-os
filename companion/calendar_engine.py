@@ -133,7 +133,9 @@ class CalendarManager:
     def _project_routines(self, start_dt: datetime, end_dt: datetime) -> List[Dict[str, Any]]:
         rm = get_routine_manager(store=self.store)
         projected: List[Dict[str, Any]] = []
-        end_bound = end_dt + timedelta(days=1) - timedelta(seconds=1)
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        start_utc = datetime(start_dt.year, start_dt.month, start_dt.day, 0, 0, 0, tzinfo=local_tz).astimezone(timezone.utc)
+        end_bound = datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59, tzinfo=local_tz).astimezone(timezone.utc)
         for rt in rm.list_routines():
             if not rt.get("enabled"):
                 continue
@@ -144,7 +146,7 @@ class CalendarManager:
             if not expr:
                 continue
             seen_days: Dict[str, Tuple[str, int]] = {}
-            cursor = start_dt - timedelta(minutes=1)
+            cursor = start_utc - timedelta(minutes=1)
             for _ in range(400):
                 try:
                     nxt = compute_next_run_utc(expr, after_dt=cursor)
@@ -152,8 +154,9 @@ class CalendarManager:
                     break
                 if nxt > end_bound:
                     break
-                d_key = nxt.strftime("%Y-%m-%d")
-                t_str = nxt.strftime("%H:%M")
+                nxt_loc = nxt.astimezone(local_tz)
+                d_key = nxt_loc.strftime("%Y-%m-%d")
+                t_str = nxt_loc.strftime("%H:%M")
                 if d_key not in seen_days:
                     seen_days[d_key] = (t_str, 1)
                 else:
@@ -177,9 +180,10 @@ class CalendarManager:
     def get_calendar_window(self, start_date: str = "", end_date: str = "", days: int = 35, board_id: str = "") -> Dict[str, Any]:
         """Return a unified timeline of Events, Sprint Windows, Planned Tasks, Deadlines, Routines & SRS Reviews."""
         _ = self.store
-        now_dt = _now_utc()
-        today_s = now_dt.strftime("%Y-%m-%d")
-        s_dt = _parse_ymd(start_date) if start_date else (now_dt.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_dt.weekday()))
+        now_local = datetime.now().astimezone()
+        today_s = now_local.strftime("%Y-%m-%d")
+        now_dt = _parse_ymd(today_s) or _now_utc()
+        s_dt = _parse_ymd(start_date) if start_date else (now_dt - timedelta(days=now_dt.weekday()))
         if s_dt is None:
             return {"ok": False, "error": f"Invalid `start_date` '{start_date}'; expected YYYY-MM-DD."}
         span = max(1, min(180, int(days or 35)))
@@ -236,8 +240,14 @@ class CalendarManager:
             edu = get_education_engine(store=self.store)
             _ = edu.store
             srs_by_day: Dict[str, int] = {}
+            local_tz = now_local.tzinfo or timezone.utc
             for (due_iso,) in self.store._fetch_rows("SELECT due_at FROM education_mastery"):
-                d_s = max(today_s, str(due_iso)[:10])
+                raw_due = str(due_iso or "").strip()
+                try:
+                    due_loc_s = datetime.fromisoformat(raw_due.replace("Z", "+00:00")).astimezone(local_tz).strftime("%Y-%m-%d")
+                except Exception:
+                    due_loc_s = raw_due[:10]
+                d_s = max(today_s, due_loc_s)
                 if s_ymd <= d_s <= e_ymd:
                     srs_by_day[d_s] = srs_by_day.get(d_s, 0) + 1
             for d_s, cnt in sorted(srs_by_day.items()):
@@ -284,7 +294,7 @@ def execute_calendar_action(p: Dict[str, Any], store: Optional[MemoryStore] = No
         evs = mgr.list_events(str(p.get("start_date") or ""), str(p.get("end_date") or ""))
         return {"ok": True, "events": evs, "summary": f"{len(evs)} explicit calendar event(s)."}
     days = 7 if sub == "week" else (1 if sub == "today" else int(p.get("days") or 35))
-    start_d = _now_utc().strftime("%Y-%m-%d") if sub == "today" else str(p.get("start_date") or "")
+    start_d = datetime.now().astimezone().strftime("%Y-%m-%d") if sub == "today" else str(p.get("start_date") or "")
     win = mgr.get_calendar_window(start_date=start_d, end_date=str(p.get("end_date") or ""), days=days, board_id=str(p.get("board_id") or ""))
     if win.get("ok"):
         win["output"] = "\n".join(

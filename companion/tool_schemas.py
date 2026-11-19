@@ -2,15 +2,19 @@
 Rich OpenAI Tool Schemas & Phase-Scoped `AllowedTools` Gating (A-Frame Application Layer).
 
 Provides:
-1. All 25 deterministic tool schemas with explicit 1-line parameter descriptions so local
+1. All 26 deterministic tool schemas with explicit 1-line parameter descriptions so local
    open-weight models (`Qwen`, `DeepSeek`, `Llama`, `Mistral`) never guess argument semantics.
 2. Mechanical `PHASE_ALLOWED_TOOLS` & fine-grained `(tool, action)` gating (`phase_tool_context`,
    `filter_tools_for_phase`, `check_phase_tool_permission`) locking out file/state mutations in read-only phases.
 """
 
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
+
+from companion.config import SKIP_DIRS, settings
 
 
 _ACTIVE_PHASE: ContextVar[str] = ContextVar("companion_active_phase", default="")
@@ -54,19 +58,22 @@ TOOLS: List[Dict[str, Any]] = [
         "pattern": _p("string", "Substring or regex pattern to search for."),
         "path": _p("string", "Directory or file path to scope the search (defaults to `.`)."),
         "is_regex": _p("boolean", "Set true to treat `pattern` as a Python regular expression."),
+        "file_glob": _p("string", "Optional filename glob filter such as `*.py`, `*.ts`, or `*.md`."),
     }, ["pattern"]),
     _tool("run_python", "Execute Python 3 code directly in the active project root with UTF-8 output (preferred on Windows).", {
         "code": _p("string", "Valid Python 3 snippet to execute via `sys.executable -c`."),
-        "confirmed": _p("boolean", "Set true only after explicit user confirmation for R3 external/system operations."),
     }, ["code"]),
     _tool("run_shell", "Execute a safe non-destructive shell command in the active project root.", {
         "command": _p("string", "Shell command line to run (destructive commands are blocked by Safety Guard)."),
-        "confirmed": _p("boolean", "Set true only after explicit user confirmation for R3 external/system commands."),
     }, ["command"]),
     _tool("web_fetch", "Fetch an HTTP/HTTPS URL with SSRF protection, 512 KB stream cap, and automatic HTML-to-Markdown conversion.", {
         "url": _p("string", "Full `http://` or `https://` URL to fetch."),
         "raw": _p("boolean", "Set true to return raw HTML instead of readable Markdown."),
     }, ["url"]),
+    _tool("web_search", "Search the public web or configured local SearXNG endpoint (gated by LAN `local_only` privacy posture).", {
+        "query": _p("string", "Search query keywords or natural-language question to look up."),
+        "max_results": _p("integer", "Maximum number of search results to return (1-10, default 5)."),
+    }, ["query"]),
     _tool("memory_manage", "Manage persistent SQLite memory, KnowledgePort facts, ADRs, user profile, notes, history, and `MEMORY.md` sync.", {
         "action": _p("string", "Memory or KnowledgePort operation to execute.", enum=["add_note", "get_notes", "add_adr", "get_adrs", "set_profile", "get_profile", "upsert_fact", "query_facts", "search", "search_history", "recent_history", "sync"]),
         "content": _p("string", "System note or lesson text (for `add_note`)."),
@@ -158,18 +165,19 @@ TOOLS: List[Dict[str, Any]] = [
         "allowed_tools": _p("string", "Optional comma-separated tool names to grant the worker."),
     }, ["action"]),
     _tool("wiki_manage", "Operate the Co-Owned 4-Folder Knowledge Wiki Warehouse (`01_inbox`..`04_archive`), 11 governed templates, Multi-Turn Deliberate Curation (`inspect_graduation` -> `read` -> `validate_curation` -> `commit_curation`), `ontology` cross-domain bridges, Never-Delete lineage (`curation_history`/`revert_curation`), and 2D Mind Map.", {
-        "action": _p("string", "Wiki Warehouse, Template, Maintenance, or Deliberate Curation operation (`capture_inbox` stages in `01_inbox/`; `inspect_graduation` -> `validate_curation` -> `commit_curation` graduates into `02_knowledge/`; `tree`, `diff`, `list_stale`, `verify_note`, and `consolidate_ontology` maintain quality).", enum=[
-            "list", "tree", "read", "search", "capture_inbox", "save", "graduate",
+        "action": _p("string", "Wiki Warehouse, Template, Maintenance, or Deliberate Curation operation (`capture_inbox` stages in `01_inbox/`; `curate`/`save` writes governed notes; `inspect_graduation` -> `validate_curation` -> `commit_curation` graduates into `02_knowledge/`).", enum=[
+            "list", "tree", "read", "search", "capture_inbox", "save", "curate", "graduate",
             "inspect_graduation", "validate_curation", "commit_curation", "curation_history", "revert_curation",
             "list_templates", "read_template", "save_template", "tag_authority", "create_proxy_note", "deep_curate_job",
             "diff", "consolidate_ontology", "verify_note", "list_stale", "stage_turn",
-            "trash", "restore", "graph", "reindex", "export_chat",
+            "trash", "list_trash", "restore", "graph", "reindex", "export_chat",
         ]),
         "path": _p("string", "Relative Wiki note path or stem (e.g. `01_inbox/my-note.md` or `02_knowledge/homelab/esxi-host.md`)."),
         "title": _p("string", "Human-readable note or template title."),
         "summary": _p("string", "1-2 sentence executive summary required in `02_knowledge/` frontmatter (or asset summary for `create_proxy_note`)."),
         "template": _p("string", "Governed template slug (`zettelkasten-atomic`, `adr-decision`, `sop-runbook`, `concept-map-system-hub`, `concept-comparison`, `dikw-pyramid-of-insight`, `weekly-worklog`, `standard-note`, `homelab-host-spec`, `homelab-network-matrix`, `proxy-asset-note`)."),
         "content": _p("string", "Markdown note body matching the selected template's `required_sections` (supports `[[wikilinks]]`, zero unfilled placeholders)."),
+        "body": _p("string", "Alias for `content` Markdown note body when saving or curating a note."),
         "query": _p("string", "Search query string when `action='search'` — supports YAML frontmatter `key:value` filters (`tag:...`, `domain:...`, `template:...`, `ontology:...`, `author:...`, `type:...`, `has:...`, or any custom YAML key) combined with free-text and 2-hop `ontology` bridges."),
         "domain": _p("string", "Top-level domain folder under `02_knowledge/` (e.g. `homelab`, `equipment-ops`, `software-engineering`, `health-fitness`)."),
         "topic": _p("string", "Optional second-level topic folder under `02_knowledge/<domain>/`."),
@@ -209,10 +217,14 @@ TOOLS: List[Dict[str, Any]] = [
         "username": _p("string", "Optional remote login username for SSH, WinRM, or Basic Auth."),
         "auth_mode": _p("string", "Authentication mechanism bound to `credential_ref`.", enum=["none", "ssh_key", "ssh_agent", "basic_auth", "bearer_token", "api_key_header"]),
         "credential_ref": _p("string", "Symbolic Blind Vault secret name (NEVER pass a raw password, key, or token)."),
+        "label": _p("string", "Optional human-friendly display label for the endpoint."),
+        "auth_header": _p("string", "Custom HTTP authentication header name (default `X-API-Key`) for `api_key_header`."),
+        "verify_tls": _p("boolean", "Whether to enforce HTTPS certificate verification (default true)."),
         "command": _p("string", "Bounded shell or PowerShell command for `ssh_exec` or `winrm_exec`."),
         "remote_path": _p("string", "Remote file path to inspect safely via `ssh_read_file`."),
         "method": _p("string", "HTTP verb (`GET`, `POST`, `PUT`, `DELETE`) when `action='api_request'`."),
         "path": _p("string", "URL path suffix (e.g. `/v1/models`) when `action='api_request'`."),
+        "json_body": _p("object", "Optional JSON request payload dictionary when `action='api_request'`."),
     }, ["action"]),
     _tool("mcp_manage", "Propose/discover/call outbound MCP servers, harvest MCP tool schemas into Capability Packs (`harvest_skill`), and handshake/delegate jobs to Federated Partners.", {
         "action": _p("string", "Federated MCP Hub, Harvester, or Partner action (`propose_server` stages approval; `harvest_skill` builds `data/skills/<pack_name>/`).", enum=["list", "propose_server", "register_server", "discover", "call_tool", "harvest_skill", "list_partners", "register_partner", "handshake_partner", "delegate_partner", "check_partner_job"]),
@@ -223,14 +235,15 @@ TOOLS: List[Dict[str, Any]] = [
         "url": _p("string", "Remote HTTP MCP endpoint URL (`http://.../api/mcp`) for servers or partners."),
         "credential_ref": _p("string", "Symbolic Vault token reference for authenticating to the server or partner."),
         "tool_name": _p("string", "Discovered MCP tool name to invoke when `action='call_tool'`."),
-        "arguments": _p("string", "JSON object string of arguments for `call_tool`."),
+        "arguments": _p("object", "Key-value JSON arguments dictionary passed to `call_tool`."),
         "partner_id": _p("string", "Paired Federated Companion ID (e.g. `lab-peer` or `workstation`)."),
         "goal": _p("string", "Task goal to delegate to a remote Federated Partner when `action='delegate_partner'`."),
         "job_id": _p("string", "Remote background job ID when `action='check_partner_job'`."),
     }, ["action"]),
     _tool("routine_manage", "Manage Unified `TriggerPolicy` Routines (`manual`, `scheduled`, `on_idle` with time-slot windows), Background Autonomy (`autonomy_status`, `autonomy_on`, `autonomy_off`, `morning`), isolated self-dev sandbox clones, saved prompts, and pending approvals.", {
-        "action": _p("string", "Routine, Background Autonomy, sandbox clone, saved prompt, or approval inspection action.", enum=["list", "create", "delete", "tick", "run_now", "autonomy_status", "autonomy_on", "autonomy_off", "morning", "list_approvals", "sandbox_list", "sandbox_create", "sandbox_verify", "sandbox_diff", "sandbox_cleanup", "prompt_list", "prompt_save", "prompt_render"]),
-        "routine_id": _p("string", "Kebab-case identifier for `create`, `delete`, or `run_now`."),
+        "action": _p("string", "Routine, Background Autonomy, sandbox clone, saved prompt, or approval inspection action.", enum=["list", "create", "enable", "disable", "delete", "tick", "run_now", "autonomy_status", "autonomy_on", "autonomy_off", "morning", "list_approvals", "sandbox_list", "sandbox_create", "sandbox_verify", "sandbox_diff", "sandbox_cleanup", "prompt_list", "prompt_save", "prompt_render"]),
+        "routine_id": _p("string", "Kebab-case identifier for `create`, `enable`, `disable`, `delete`, or `run_now`."),
+        "title": _p("string", "Optional human-readable title when creating or updating a routine."),
         "mode": _p("string", "TriggerPolicy mode (`manual`, `scheduled`, or `on_idle`).", enum=["manual", "scheduled", "on_idle"]),
         "schedule_expr": _p("string", "Schedule expression when `mode='scheduled'` (`every 30m`, `every 6h`, `daily 08:00`, or 5-field cron)."),
         "allowed_window": _p("string", "Optional local time window when `mode='on_idle'` (e.g. `22:00-06:00` or `Mon-Fri 22:00-06:00`)."),
@@ -240,6 +253,8 @@ TOOLS: List[Dict[str, Any]] = [
         "requires_self_dev": _p("boolean", "Set true if the routine mutates Companion core and requires `Self-Dev Mode = ON`."),
         "target_kind": _p("string", "Verified routine target category (free-form prompts are forbidden).", enum=["dag", "maintenance_agent", "goal_slice", "wiki_inbox_triage", "wiki_deep_curate", "snapshot_backup", "endpoint_pulse", "chat_archive"]),
         "target_name": _p("string", "Code-controlled DAG name or maintenance target name."),
+        "inputs": _p("object", "Optional key-value input dictionary passed to the routine target."),
+        "variables": _p("object", "Optional template variable dictionary for `prompt_render` or `create`."),
         "sandbox_id": _p("string", "Sandbox clone ID (`sbx_...`) for `sandbox_verify`, `sandbox_diff`, or `sandbox_cleanup`."),
         "name": _p("string", "Template slug for `prompt_save` or `prompt_render`."),
         "template": _p("string", "Reusable prompt text (with optional `{{var}}` placeholders) for `prompt_save`."),
@@ -310,11 +325,14 @@ TOOLS: List[Dict[str, Any]] = [
 
 ALL_TOOL_NAMES: FrozenSet[str] = frozenset(t["function"]["name"] for t in TOOLS)
 _READ_ORIENT_TOOLS: Tuple[str, ...] = (
-    "read_file", "list_dir", "search", "web_fetch", "memory_manage", "task_manage",
+    "read_file", "list_dir", "search", "web_fetch", "web_search", "memory_manage", "task_manage",
     "workflow_manage", "checkpoint_manage", "sdd_manage", "telemetry_manage", "project_manage",
     "system_doctor", "job_manage", "wiki_manage", "vault_manage", "endpoint_manage", "mcp_manage",
     "routine_manage", "agile_manage", "calendar_manage", "education_manage",
 )
+_REPO_INTERNAL_TOOLS: FrozenSet[str] = frozenset({"sdd_manage", "checkpoint_manage", "task_manage", "system_doctor"})
+_CODE_MARKERS: FrozenSet[str] = frozenset({".git", "pyproject.toml", "package.json", "cargo.toml", "go.mod", "makefile", "requirements.txt"})
+_CODE_EXTS: FrozenSet[str] = frozenset({".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".cs", ".csproj", ".sln", ".java", ".c", ".cpp", ".sh", ".ps1"})
 
 PHASE_ALLOWED_TOOLS: Dict[str, FrozenSet[str]] = {
     "INTAKE": frozenset(_READ_ORIENT_TOOLS),
@@ -359,11 +377,40 @@ def r3_approval_context(approved: bool = True) -> Iterator[bool]:
         _R3_STEP_APPROVED.reset(token)
 
 
+def _workspace_hidden_tools(eff_phase: str) -> FrozenSet[str]:
+    ws = settings.get_workspace()
+    if ws.is_self_project:
+        return frozenset() if (eff_phase or settings.is_self_dev_enabled()) else _REPO_INTERNAL_TOOLS
+    root = ws.project_root
+    if (root / "companion").is_dir() and (root / "specs" / "ARCHITECTURE.md").is_file():
+        return frozenset()
+    if eff_phase or any((root / m).exists() for m in _CODE_MARKERS):
+        return frozenset({"sdd_manage", "system_doctor"})
+    try:
+        for cur, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            if any(Path(fn).suffix.lower() in _CODE_EXTS or fn.lower() in _CODE_MARKERS for fn in files):
+                return frozenset({"sdd_manage", "system_doctor"})
+            if Path(cur) != root:
+                dirs[:] = []
+    except OSError:
+        pass
+    return _REPO_INTERNAL_TOOLS
+
+
 def filter_tools_for_phase(phase: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return only the tool schemas permitted in `phase` (all tools when ungated or in `IMPLEMENT`/`RECOVER`)."""
+    """Return tool schemas permitted in `phase`, scoping repo-internal tools and appending approved MCP schemas."""
     eff = (phase if phase is not None else current_workflow_phase()).strip().upper()
-    allowed = PHASE_ALLOWED_TOOLS.get(eff)
-    return TOOLS if not allowed else [t for t in TOOLS if t["function"]["name"] in allowed]
+    allowed, hidden = PHASE_ALLOWED_TOOLS.get(eff), _workspace_hidden_tools(eff)
+    base = [t for t in TOOLS if t["function"]["name"] not in hidden and (not allowed or t["function"]["name"] in allowed)]
+    if not allowed or eff in ("IMPLEMENT", "RECOVER"):
+        try:
+            from companion.mcp_hub import get_mcp_hub
+
+            base.extend(get_mcp_hub().list_approved_openai_tools())
+        except Exception:
+            pass
+    return base
 
 
 _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
@@ -373,14 +420,14 @@ _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "workflow_manage": frozenset({"start", "transition", "abort", "complete", "recover", "autonomy", "blueprint", "approve", "run_dag", "resume_dag", "run_recipe", "bootstrap_skill", "run_script"}),
     "job_manage": frozenset({"dispatch", "cancel", "resume"}),
     "wiki_manage": frozenset({
-        "capture_inbox", "save", "graduate", "commit_curation", "revert_curation",
+        "capture_inbox", "save", "curate", "graduate", "commit_curation", "revert_curation",
         "save_template", "create_proxy_note", "deep_curate_job", "consolidate_ontology",
         "verify_note", "stage_turn", "trash", "restore", "export_chat",
     }),
     "vault_manage": frozenset({"declare", "request_scope"}),
     "endpoint_manage": frozenset({"propose", "register", "remove", "ssh_exec", "winrm_exec", "api_request"}),
     "mcp_manage": frozenset({"propose_server", "register_server", "call_tool", "harvest_skill", "register_partner", "delegate_partner"}),
-    "routine_manage": frozenset({"create", "delete", "tick", "run_now", "autonomy_on", "autonomy_off", "sandbox_create", "sandbox_cleanup", "prompt_save"}),
+    "routine_manage": frozenset({"create", "enable", "disable", "delete", "tick", "run_now", "autonomy_on", "autonomy_off", "sandbox_create", "sandbox_cleanup", "prompt_save"}),
     "agile_manage": frozenset({"create_project", "update_project", "save_board", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "create_timebox", "start_sprint", "rollover_sprint", "create_item", "create_card", "update_item", "update_card", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker"}),
     "calendar_manage": frozenset({"add_event", "delete_event"}),
     "education_manage": frozenset({"save_course", "set_active", "advance_stage", "upsert_items", "grade_item", "curate_note"}),

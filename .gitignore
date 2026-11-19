@@ -17,6 +17,7 @@ venv/
 .env
 secrets.env
 **/secrets.env
+**/.web_csrf_secret
 
 # Isolated User Runtime Data (Generated automatically on first boot — NEVER commit)
 data/

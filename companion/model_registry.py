@@ -460,7 +460,7 @@ def execute_model_registry_action(params: Optional[Dict[str, Any]] = None, actor
     p = dict(params or {})
     mem = store or get_memory_store()
     sub = str(p.get("subaction") or p.get("action") or "status").strip().lower()
-    mutating_subs = ("save_provider", "delete_provider", "set_privacy", "save_tier", "reset_tier", "set_mode", "set_compaction", "save_compaction")
+    mutating_subs = ("save_provider", "delete_provider", "set_privacy", "save_tier", "set_tier", "reset_tier", "set_mode", "set_compaction", "save_compaction")
     if sub in mutating_subs and (actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn()):
         return {"ok": False, "error": f"SECURITY GUARD: `{sub}` requires direct user/CLI/Web authorization."}
     if sub in ("status", "list", "matrix"):
@@ -483,9 +483,9 @@ def execute_model_registry_action(params: Optional[Dict[str, Any]] = None, actor
             mem.conn.commit()
         bump_model_registry_cache()
         return {**get_model_matrix_snapshot(mem), "summary": f"Removed provider `{pid}`."}
-    if sub in ("test_provider", "discover_models"):
+    if sub in ("test_provider", "discover_models", "discover"):
         return _discover_or_test_provider(p, mem)
-    if sub == "save_tier":
+    if sub in ("save_tier", "set_tier"):
         return _save_tier_route(p, mem)
     if sub == "reset_tier":
         tier = str(p.get("tier") or "").strip().lower()
@@ -513,10 +513,14 @@ def execute_model_registry_action(params: Optional[Dict[str, Any]] = None, actor
         trig = float(p.get("trigger_pct") or p.get("compact_trigger_pct") or settings.compact_trigger_pct)
         targ = float(p.get("target_pct") or p.get("compact_target_pct") or settings.compact_target_pct)
         settings.update_compaction_watermarks(trig, targ)
+        if p.get("keep_recent_messages") is not None:
+            kr = max(4, min(64, int(p["keep_recent_messages"])))
+            settings.keep_recent_messages = kr
+            mem.set_user_profile("keep_recent_messages", str(kr))
         mem.set_user_profile("compact_trigger_pct", f"{settings.compact_trigger_pct:.1f}")
         mem.set_user_profile("compact_target_pct", f"{settings.compact_target_pct:.1f}")
         bump_model_registry_cache()
-        return {**get_model_matrix_snapshot(mem), "summary": f"Updated context compaction watermarks: trigger={settings.compact_trigger_pct:.1f}% -> target={settings.compact_target_pct:.1f}%."}
+        return {**get_model_matrix_snapshot(mem), "summary": f"Updated context compaction watermarks: trigger={settings.compact_trigger_pct:.1f}% -> target={settings.compact_target_pct:.1f}% (keep_recent={settings.keep_recent_messages})."}
     return {"ok": False, "error": f"Unknown `models` subaction `{sub}`."}
 
 

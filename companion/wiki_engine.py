@@ -1,16 +1,7 @@
-"""
-Co-Owned Interactive Knowledge Wiki Engine 3.0 (`companion/wiki_engine.py` — A-Frame Domain Layer).
-
-Implements the plain-Markdown 4-Folder Knowledge Warehouse (`01_inbox/`, `02_knowledge/`,
-`03_resources/`, `04_archive/` + undoable `trash/`) strictly separated from personal profile memory:
-1. Code-Enforced One-Door Inbox (`Option A`): Fast `inbox-raw` human/export staging in `01_inbox/`,
-   paired with governed 11-template + rich YAML frontmatter enforcement in `02_knowledge/`.
-2. Max-2-Level Taxonomy: `02_knowledge/<domain>[/<topic>]/<note>.md` prevents deep folder mazes.
-3. Dual-Author Respect (`user` vs `companion`) + Never-Delete `04_archive/` lineage (`supersedes`/`superseded_by`).
-4. Read Purity, Optimistic `content_hash` Locks, `[[wikilinks]]` + 2-hop `ontology` Cross-Domain Graph.
-"""
+"""Co-Owned Interactive Knowledge Wiki Engine 3.0 (`companion/wiki_engine.py` — A-Frame Domain Layer)."""
 
 import json
+import os
 import re
 import shutil
 import threading
@@ -18,8 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue
-from companion.config import settings
+from companion.archive_and_approvals import get_approval_queue, get_trust_mode
+from companion.config import get_execution_origin, settings
 from companion.disciplines import walk_pruned_files
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.semantic_memory import hybrid_rrf_rank
@@ -386,10 +377,19 @@ class WikiEngine:
             row = mem.conn.execute("SELECT COUNT(*) FROM wiki_notes_index WHERE folder = '02_knowledge' AND domain = ? AND rel_path != ?", (domain, exclude_rel)).fetchone()
         return int(row[0]) if row else 0
 
-    def save_or_update_note(self, rel_path: str, content: str, title: str = "", tags: Optional[List[str]] = None, actor: str = "companion", expected_hash: str = "", confirmed: bool = False, summary: str = "", template: str = "", ontology: Optional[List[str]] = None, status: str = "") -> Dict[str, Any]:
+    def _find_domain_peer_link(self, domain: str, exclude_rel: str) -> str:
+        rows = self.store._fetch_rows(
+            "SELECT stem FROM wiki_notes_index WHERE folder = '02_knowledge' AND domain = ? AND rel_path != ? "
+            "ORDER BY CASE WHEN document_type = 'hub' OR stem LIKE '%hub%' OR stem LIKE '%index%' THEN 0 ELSE 1 END, rel_path ASC LIMIT 1",
+            (domain, exclude_rel),
+        )
+        return f"[[{rows[0][0]}]]" if rows else ""
+
+    def save_or_update_note(self, rel_path: str, content: Optional[str] = None, title: str = "", tags: Optional[List[str]] = None, actor: str = "companion", expected_hash: str = "", confirmed: bool = False, summary: str = "", template: str = "", ontology: Optional[List[str]] = None, status: str = "") -> Dict[str, Any]:
         is_user = actor.strip().lower() in ("user", "cli", "web")
+        is_fg = (not is_user) and get_execution_origin() == "foreground_turn" and get_trust_mode(store=self.store) != "strict"
         norm_in = (rel_path or "").strip().replace("\\", "/").lstrip("/")
-        if not is_user and norm_in.startswith("02_knowledge/"):
+        if not is_user and not is_fg and norm_in.startswith("02_knowledge/"):
             cand_check, _ = self._validate_rel_note_path(norm_in)
             if cand_check is not None and not cand_check.is_file():
                 return {"ok": False, "error": "WIKI ONE-DOOR INBOX GUARD: New Companion notes must be captured in `01_inbox/` first (then curated via `inspect_graduation` -> `commit_curation` or `graduate_note`)."}
@@ -397,8 +397,6 @@ class WikiEngine:
         if path_err or full is None:
             return {"ok": False, "error": path_err or "Invalid path."}
         rel = str(full.relative_to(self.root)).replace("\\", "/")
-        clean_body_raw = redact_secrets(content or "")
-        in_meta, in_body = parse_frontmatter(clean_body_raw)
         existed, old_meta, old_body = full.is_file(), {}, ""
         if existed:
             disk_bytes = full.read_bytes()
@@ -406,31 +404,68 @@ class WikiEngine:
             if expected_hash and expected_hash.strip() != disk_hash:
                 return {"ok": False, "conflict": True, "current_hash": disk_hash, "error": f"CONCURRENCY CONFLICT on `{rel}`: expected hash `{expected_hash}`, found `{disk_hash}`. Re-read the note before saving."}
             old_meta, old_body = parse_frontmatter(disk_bytes.decode("utf-8", errors="replace"))
-            if not is_user and str(old_meta.get("author") or "companion").strip().lower() in ("user", "human", "partner"):
-                allowed, apr = get_approval_queue(self.store).check_or_enqueue("wiki_edit", "edit_user_note", rel, f"Companion requests permission to update your user-authored Wiki note `{rel}`.", payload={"path": rel, "content": clean_body_raw, "title": title, "tags": tags, "summary": summary, "template": template, "ontology": ontology, "content_sha": sha16_bytes(clean_body_raw.encode("utf-8"))}, requester=actor, confirmed=confirmed, always_require_in_autonomous=True)
-                if not allowed:
-                    return {"ok": False, "awaiting_approval": True, "approval_id": apr["approval_id"], "error": f"WIKI AUTHOR GUARD REJECTED (`{apr['approval_id']}`): `{rel}` has `author: user` and awaits your approval before Companion can edit it."}
+        if content is None:
+            clean_body_raw, in_meta, in_body = old_body, {}, old_body
+        else:
+            clean_body_raw = redact_secrets(content)
+            in_meta, parsed_b = parse_frontmatter(clean_body_raw)
+            in_body = parsed_b if (parsed_b.strip() or not existed) else old_body
+        if existed and not is_user and str(old_meta.get("author") or "companion").strip().lower() in ("user", "human", "partner"):
+            allowed, apr = get_approval_queue(self.store).check_or_enqueue("wiki_edit", "edit_user_note", rel, f"Companion requests permission to update your user-authored Wiki note `{rel}`.", payload={"path": rel, "content": in_body, "title": title, "tags": tags, "summary": summary, "template": template, "ontology": ontology, "content_sha": sha16_bytes(in_body.encode("utf-8"))}, requester=actor, confirmed=confirmed, always_require_in_autonomous=True)
+            if not allowed:
+                return {"ok": False, "awaiting_approval": True, "approval_id": apr["approval_id"], "error": f"WIKI AUTHOR GUARD REJECTED (`{apr['approval_id']}`): `{rel}` has `author: user` and awaits your approval before Companion can edit it."}
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         eff_author = "user" if is_user else str(old_meta.get("author") or "companion")
-        eff_title = title.strip() or str(in_meta.get("title") or old_meta.get("title") or full.stem)
+        eff_title = title.strip() or str(in_meta.get("title") or old_meta.get("title") or full.stem.replace("-", " ").title())
         parts = rel.split("/")
         eff_domain = parts[1] if parts[0] == "02_knowledge" and len(parts) >= 3 else parts[0]
         eff_topic = parts[2] if parts[0] == "02_knowledge" and len(parts) == 4 else str(in_meta.get("topic") or old_meta.get("topic") or "")
         eff_tpl = slugify_wiki(template or str(in_meta.get("template") or old_meta.get("template") or ("standard-note" if parts[0] == "02_knowledge" else "inbox-raw")), "standard-note")
         eff_status = status.strip() or str(in_meta.get("status") or old_meta.get("status") or ("inbox" if parts[0] == "01_inbox" else "active"))
-        raw_tags = tags if tags is not None else (in_meta["tags"] if "tags" in in_meta else old_meta.get("tags") or [])
-        raw_ont = ontology if ontology is not None else (in_meta["ontology"] if "ontology" in in_meta else old_meta.get("ontology") or [])
-        merged_meta = hydrate_note_meta({**old_meta, **in_meta}, eff_title, in_body, eff_author, eff_status, eff_tpl, eff_domain, eff_topic, as_slug_list(raw_tags), canonicalize_ontology(self.root, raw_ont), now_iso, summary=summary or str(in_meta.get("summary") or ""))
+        eff_sum = (summary or str(in_meta.get("summary") or old_meta.get("summary") or "")).strip()
+        if is_fg and parts[0] == "02_knowledge":
+            if len(eff_sum) < 20:
+                first_ln = next((ln.strip(" #-*>") for ln in in_body.splitlines() if ln.strip() and not ln.lstrip().startswith("#")), eff_title)
+                eff_sum = f"{eff_title} — {first_ln}"[:220]
+                if len(eff_sum) < 24:
+                    eff_sum = f"Curated reference note for {eff_title} in {eff_domain}."
+            if eff_tpl == "standard-note" and not template.strip() and not in_meta.get("template"):
+                low_b = in_body.lower()
+                if "## overview" not in low_b or "## key details" not in low_b:
+                    core_b = re.sub(r"^\s*#\s+[^\n]+\n*", "", in_body.strip()) or eff_sum
+                    if len(core_b) < 40:
+                        core_b = f"{core_b}\n\nRecorded in `{rel}`."
+                    in_body = f"# {eff_title}\n\n## Overview\n{eff_sum}\n\n## Key Details\n{core_b}\n"
+        raw_tags = tags if tags is not None else (in_meta["tags"] if "tags" in in_meta else old_meta.get("tags") or ([eff_domain] if is_fg else []))
+        raw_ont = ontology if ontology is not None else (in_meta["ontology"] if "ontology" in in_meta else old_meta.get("ontology") or (["reference-knowledge"] if is_fg else []))
+        merged_meta = hydrate_note_meta({**old_meta, **in_meta}, eff_title, in_body, eff_author, eff_status, eff_tpl, eff_domain, eff_topic, as_slug_list(raw_tags) or ([eff_domain] if is_fg else []), canonicalize_ontology(self.root, raw_ont) or (["reference-knowledge"] if is_fg else []), now_iso, summary=eff_sum)
+        dom_others = self._count_other_domain_notes(eff_domain, rel) if parts[0] == "02_knowledge" else 0
+        if is_fg and dom_others > 0 and not extract_wikilinks(in_body + " " + " ".join(str(x) for x in (merged_meta.get("related") or []))):
+            if peer_lk := self._find_domain_peer_link(eff_domain, rel):
+                merged_meta["related"] = [*(merged_meta.get("related") or []), peer_lk]
         prior_governed = existed and not is_user and not validate_curated_note(self.root, old_meta, old_body, existing_domain_notes=0)
-        if parts[0] == "02_knowledge" and (prior_governed or bool(template.strip()) or bool(in_meta.get("template"))):
-            errs = validate_curated_note(self.root, merged_meta, in_body, existing_domain_notes=self._count_other_domain_notes(eff_domain, rel))
+        if parts[0] == "02_knowledge" and (is_fg or prior_governed or bool(template.strip()) or bool(in_meta.get("template"))):
+            errs = validate_curated_note(self.root, merged_meta, in_body, existing_domain_notes=dom_others)
             if errs:
                 return {"ok": False, "validation_errors": errs, "error": "WIKI SCHEMA GUARD REJECTED:\n- " + "\n- ".join(errs)}
-        archived_to = self._archive_prior_version(full, "edit", superseded_by=rel) if existed else None
+        tx_id = f"ctx_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{os.urandom(2).hex()}" if (is_fg and parts[0] == "02_knowledge") else ""
+        archived_to = self._archive_prior_version(full, "fg_edit" if tx_id else "edit", superseded_by=rel, tx_id=tx_id, subdir="revisions" if tx_id else "") if existed else None
+        if tx_id:
+            merged_meta["curation_tx_id"] = tx_id
+            if archived_to:
+                merged_meta["supersedes"] = [archived_to]
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(render_frontmatter(merged_meta, in_body), encoding="utf-8", newline="\n")
         self._index_single_file(full)
-        return {"ok": True, "path": rel, "author": eff_author, "archived_prior": archived_to, "content_hash": sha16_bytes(full.read_bytes()), "summary": f"Saved `{rel}` (`author: {eff_author}`" + (f", archived prior -> `{archived_to}`" if archived_to else "") + ")."}
+        if tx_id:
+            kb_arch = [{"original_path": rel, "archive_path": archived_to}] if archived_to else []
+            with self.store._lock:
+                self.store.conn.execute(
+                    "INSERT INTO wiki_curation_history (tx_id, curation_id, strategy, actor, summary, inbox_archives_json, knowledge_archives_json, output_paths_json, repointed_links_json, reverted, created_at) VALUES (?, 'foreground', 'FOREGROUND_SAVE', ?, ?, '[]', ?, ?, '[]', 0, ?)",
+                    (tx_id, actor, f"Foreground curated save `{rel}`", json.dumps(kb_arch), json.dumps([rel]), now_iso),
+                )
+                self.store.conn.commit()
+        return {"ok": True, "path": rel, "author": eff_author, "tx_id": tx_id, "archived_prior": archived_to, "content_hash": sha16_bytes(full.read_bytes()), "summary": f"Saved `{rel}` (`author: {eff_author}`" + (f", archived prior -> `{archived_to}`" if archived_to else "") + ")."}
 
     def graduate_note(self, inbox_path: str, domain: str, topic: str = "", new_slug: str = "", actor: str = "companion", confirmed: bool = False, template: str = "", summary: str = "", ontology: Optional[List[str]] = None) -> Dict[str, Any]:
         src_rel = (inbox_path or "").strip().replace("\\", "/").lstrip("/")
@@ -446,18 +481,28 @@ class WikiEngine:
         dst_full, dst_err = self._validate_rel_note_path(dst_rel)
         if dst_err or dst_full is None:
             return {"ok": False, "error": dst_err or "Invalid destination path."}
+        is_user = actor.strip().lower() in ("user", "cli", "web")
+        is_fg = (not is_user) and get_execution_origin() == "foreground_turn" and get_trust_mode(store=self.store) != "strict"
+        dst_user_owned = False
+        if dst_full.is_file():
+            dst_old_m, _ = parse_frontmatter(dst_full.read_text(encoding="utf-8", errors="replace"))
+            dst_user_owned = str(dst_old_m.get("author") or "").strip().lower() in ("user", "human", "partner")
         meta, body = parse_frontmatter(src_full.read_text(encoding="utf-8", errors="replace"))
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         raw_tpl = slugify_wiki(template or str(meta.get("template") or ""), "")
         must_validate = bool(template.strip()) or raw_tpl in ("", "inbox-raw")
-        cur_tpl = (raw_tpl or "inbox-raw") if must_validate else raw_tpl
-        out_meta = hydrate_note_meta({**meta, "supersedes": [src_rel]}, str(meta.get("title") or note_slug), body, str(meta.get("author") or "companion"), "active", cur_tpl, dom_slug, top_slug, as_slug_list(meta.get("tags")) or [dom_slug], canonicalize_ontology(self.root, ontology if ontology is not None else meta.get("ontology")), now_iso, summary=summary)
+        cur_tpl = ("standard-note" if (is_fg and raw_tpl in ("", "inbox-raw")) else (raw_tpl or "inbox-raw")) if must_validate else raw_tpl
+        out_meta = hydrate_note_meta({**meta, "supersedes": [src_rel]}, str(meta.get("title") or note_slug), body, str(meta.get("author") or "companion"), "active", cur_tpl, dom_slug, top_slug, as_slug_list(meta.get("tags")) or [dom_slug], canonicalize_ontology(self.root, ontology if ontology is not None else meta.get("ontology")) or (["reference-knowledge"] if is_fg else []), now_iso, summary=summary)
+        dom_others = self._count_other_domain_notes(dom_slug, dst_rel)
+        if is_fg and dom_others > 0 and not extract_wikilinks(body + " " + " ".join(str(x) for x in (out_meta.get("related") or []))):
+            if peer_lk := self._find_domain_peer_link(dom_slug, dst_rel):
+                out_meta["related"] = [*(out_meta.get("related") or []), peer_lk]
         if must_validate:
-            errs = validate_curated_note(self.root, out_meta, body, existing_domain_notes=self._count_other_domain_notes(dom_slug, dst_rel))
+            errs = validate_curated_note(self.root, out_meta, body, existing_domain_notes=dom_others)
             if errs:
                 return {"ok": False, "validation_errors": errs, "error": "WIKI SCHEMA GUARD REJECTED:\n- " + "\n- ".join(errs)}
-        if actor.strip().lower() not in ("user", "cli", "web"):
-            allowed, apr = get_approval_queue(self.store).check_or_enqueue("wiki_edit", "graduate_note", f"{src_rel} -> {dst_rel}", f"Graduate inbox note `{src_rel}` into curated knowledge `{dst_rel}`.", payload={"from": src_rel, "to": dst_rel, "template": template, "summary": summary, "ontology": ontology}, requester=actor, confirmed=confirmed)
+        if not is_user and (not is_fg or dst_user_owned):
+            allowed, apr = get_approval_queue(self.store).check_or_enqueue("wiki_edit", "graduate_note", f"{src_rel} -> {dst_rel}", f"Graduate inbox note `{src_rel}` into curated knowledge `{dst_rel}`.", payload={"from": src_rel, "to": dst_rel, "template": template, "summary": summary, "ontology": ontology}, requester=actor, confirmed=confirmed, always_require_in_autonomous=dst_user_owned)
             if not allowed:
                 return {"ok": False, "awaiting_approval": True, "approval_id": apr["approval_id"], "error": f"Approval `{apr['approval_id']}` required to graduate `{src_rel}` -> `{dst_rel}`."}
         arch_src = self._archive_prior_version(src_full, "graduate", superseded_by=dst_rel)

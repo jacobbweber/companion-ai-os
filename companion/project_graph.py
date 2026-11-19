@@ -10,13 +10,15 @@ domain-blind execution graph (`Projects/Goals -> Milestones -> Work Items`):
 - Attaches `TriggerPolicy` to Goals/Projects for multi-session `on_idle` windowed execution
 """
 
+import contextlib
 import json
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
-from companion.config import SELF_PROJECT_ID, settings
+from companion.config import SELF_PROJECT_ID, _WORKSPACE_OVERRIDE, settings, workspace_context
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.trigger_policy import (
     TriggerPolicy,
@@ -28,7 +30,7 @@ VALID_ITEM_OWNERS = ("companion", "human", "collaborative")
 VALID_STAGE_KINDS = ("OBSERVE_DATA", "CURATE_DIKW", "FORGE_CAPABILITY", "DELIVER_AND_VERIFY")
 STAGE_ORDER: Dict[str, int] = {name: idx for idx, name in enumerate(VALID_STAGE_KINDS)}
 DONE_STATUSES = ("done", "completed")
-READY_STATUSES = ("ready", "pending")
+READY_STATUSES = ("ready", "pending", "sprint_todo")
 BOARD_COLUMNS = (
     ("backlog", "Backlog"),
     ("ready", "Ready"),
@@ -133,11 +135,35 @@ class ProjectGraphManager:
         return str(row[0][0]) if row else raw
 
     def set_focus_project(self, project_id: str) -> Dict[str, Any]:
-        """Set the user's active Goal/Project focus across UI and Chat tool turns."""
+        """Set the user's active Goal/Project focus across UI and Chat tool turns (syncing repo `workspace_path` if bound)."""
         pid = self.resolve_project_id(project_id)
         proj = self.get_project(pid)
         self.store.set_user_profile("active_goal_project_id", proj["project_id"])
+        ws_path = str(proj.get("workspace_path") or "").strip()
+        if self.store.db_path.resolve() == settings.db_path.resolve():
+            if proj["project_id"] == SELF_PROJECT_ID:
+                settings.reset_workspace()
+            elif ws_path and Path(ws_path).is_dir():
+                settings.set_workspace(Path(ws_path).resolve(), proj["project_id"])
         return proj
+
+    @contextlib.contextmanager
+    def project_workspace_scope(self, project_id: Optional[str] = None) -> Iterator[None]:
+        """Bind `workspace_context(Path(workspace_path), project_id)` when a focused/target project has a bound repo directory."""
+        if _WORKSPACE_OVERRIDE.get() is not None:
+            yield
+            return
+        raw_pid = (project_id or self.store.get_user_profile().get("active_goal_project_id") or "").strip()
+        if not raw_pid:
+            yield
+            return
+        proj = self.get_project(raw_pid)
+        ws_path = str(proj.get("workspace_path") or "").strip()
+        if ws_path and Path(ws_path).is_dir():
+            with workspace_context(Path(ws_path).resolve(), proj["project_id"]):
+                yield
+        else:
+            yield
 
     def create_project(
         self,
@@ -146,6 +172,7 @@ class ProjectGraphManager:
         slug: Optional[str] = None,
         kind: str = "goal",
         workspace_id: Optional[str] = None,
+        workspace_path: str = "",
         wiki_hub_path: str = "",
         risk_ceiling: str = "R2",
         trigger_policy: Optional[Union[TriggerPolicy, Dict[str, Any]]] = None,
@@ -159,23 +186,25 @@ class ProjectGraphManager:
         pid = (project_id or f"proj_{base_slug}_{uuid.uuid4().hex[:6]}").strip()
         tp = trigger_policy if isinstance(trigger_policy, TriggerPolicy) else TriggerPolicy.from_dict(trigger_policy)
         ws_id = (workspace_id or settings.get_workspace().project_id or SELF_PROJECT_ID).strip()
+        ws_p = str(Path(workspace_path).resolve()) if (workspace_path or "").strip() else ""
         with self.store._lock:
             final_slug = base_slug
             if self.store.conn.execute("SELECT 1 FROM projects WHERE slug = ? AND project_id != ?", (final_slug, pid)).fetchone():
                 final_slug = f"{base_slug}-{uuid.uuid4().hex[:4]}"
             self.store.conn.execute(
-                "INSERT INTO projects (project_id, slug, title, goal_summary, kind, status, workspace_id, wiki_hub_path, risk_ceiling, trigger_policy_json, metadata_json) "
-                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) "
+                "INSERT INTO projects (project_id, slug, title, goal_summary, kind, status, workspace_id, workspace_path, wiki_hub_path, risk_ceiling, trigger_policy_json, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET title = excluded.title, goal_summary = excluded.goal_summary, kind = excluded.kind, "
+                "workspace_path = CASE WHEN excluded.workspace_path != '' THEN excluded.workspace_path ELSE projects.workspace_path END, "
                 "wiki_hub_path = excluded.wiki_hub_path, risk_ceiling = excluded.risk_ceiling, trigger_policy_json = excluded.trigger_policy_json, metadata_json = excluded.metadata_json, updated_at = CURRENT_TIMESTAMP",
-                (pid, final_slug, clean_title, goal_summary.strip(), kind, ws_id, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(metadata or {})),
+                (pid, final_slug, clean_title, goal_summary.strip(), kind, ws_id, ws_p, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(metadata or {})),
             )
             self.store.conn.commit()
         return self.get_project(pid)
 
     def get_project(self, project_id: Optional[str] = None) -> Dict[str, Any]:
         pid = self.resolve_project_id(project_id)
-        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
+        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
         rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM projects WHERE project_id = ?", (pid,))
         if not rows:
             with self.store._lock:
@@ -185,7 +214,7 @@ class ProjectGraphManager:
         return _hydrate_project(rows[0])
 
     def list_projects(self, status: Optional[str] = None, kind: Optional[str] = None) -> List[Dict[str, Any]]:
-        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
+        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
         clauses: List[Tuple[str, Any]] = []
         if status:
             clauses.append(("status = ?", status))
@@ -207,27 +236,60 @@ class ProjectGraphManager:
         goal_s = str(updates.get("goal_summary") if updates.get("goal_summary") is not None else proj["goal_summary"]).strip()
         status = str(updates.get("status") or proj["status"]).strip()
         wiki_p = str(updates.get("wiki_hub_path") if updates.get("wiki_hub_path") is not None else proj["wiki_hub_path"]).strip()
+        raw_ws_p = updates.get("workspace_path")
+        ws_p = (str(Path(str(raw_ws_p).strip()).resolve()) if str(raw_ws_p).strip() else "") if raw_ws_p is not None else str(proj.get("workspace_path") or "")
         with self.store._lock:
             self.store.conn.execute(
-                "UPDATE projects SET title = ?, goal_summary = ?, status = ?, wiki_hub_path = ?, trigger_policy_json = ?, metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
-                (title, goal_s, status, wiki_p, json.dumps(tp_dict), json.dumps(meta), pid),
+                "UPDATE projects SET title = ?, goal_summary = ?, status = ?, workspace_path = ?, wiki_hub_path = ?, trigger_policy_json = ?, metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
+                (title, goal_s, status, ws_p, wiki_p, json.dumps(tp_dict), json.dumps(meta), pid),
             )
             self.store.conn.commit()
         return self.get_project(pid)
 
-    def create_milestone(self, project_id: str, title: str, description: str = "", stage_kind: str = "DELIVER_AND_VERIFY", target_date: str = "", sort_order: Optional[int] = None) -> Dict[str, Any]:
+    def create_milestone(self, project_id: str, title: str, description: str = "", stage_kind: str = "DELIVER_AND_VERIFY", target_date: str = "", sort_order: Optional[int] = None, milestone_id: str = "") -> Dict[str, Any]:
         pid = self.resolve_project_id(project_id)
         sk = stage_kind if stage_kind in VALID_STAGE_KINDS else "DELIVER_AND_VERIFY"
-        mid = f"ms_{uuid.uuid4().hex[:8]}"
+        mid = (milestone_id or "").strip() or f"ms_{uuid.uuid4().hex[:8]}"
         order_val = int(sort_order) if sort_order is not None else STAGE_ORDER.get(sk, 3) * 10
         with self.store._lock:
             self.store._ensure_project_record(pid)
             self.store.conn.execute(
-                "INSERT INTO milestones (milestone_id, project_id, title, description, stage_kind, status, sort_order, target_date) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+                "INSERT INTO milestones (milestone_id, project_id, title, description, stage_kind, status, sort_order, target_date) VALUES (?, ?, ?, ?, ?, 'active', ?, ?) "
+                "ON CONFLICT(milestone_id) DO UPDATE SET title = CASE WHEN excluded.title != '' THEN excluded.title ELSE milestones.title END, "
+                "description = CASE WHEN excluded.description != '' THEN excluded.description ELSE milestones.description END, "
+                "stage_kind = excluded.stage_kind, target_date = CASE WHEN excluded.target_date != '' THEN excluded.target_date ELSE milestones.target_date END",
                 (mid, pid, title.strip(), description.strip(), sk, order_val, target_date.strip()),
             )
             self.store.conn.commit()
-        return {"milestone_id": mid, "epic_id": mid, "project_id": pid, "title": title.strip(), "description": description.strip(), "stage_kind": sk, "status": "active", "sort_order": order_val, "target_date": target_date.strip()}
+        rows = self.store._fetch_dicts(["milestone_id", "project_id", "title", "description", "stage_kind", "status", "sort_order", "target_date"], "SELECT milestone_id, project_id, title, description, stage_kind, status, sort_order, target_date FROM milestones WHERE milestone_id = ?", (mid,))
+        out = rows[0] if rows else {"milestone_id": mid, "project_id": pid, "title": title.strip(), "description": description.strip(), "stage_kind": sk, "status": "active", "sort_order": order_val, "target_date": target_date.strip()}
+        out["epic_id"] = out["milestone_id"]
+        return out
+
+    def delete_milestone(self, milestone_id: str) -> bool:
+        clean_id = (milestone_id or "").strip()
+        if not clean_id:
+            return False
+        with self.store._lock:
+            self.store.conn.execute("UPDATE work_items SET milestone_id = '' WHERE milestone_id = ?", (clean_id,))
+            cur = self.store.conn.execute("DELETE FROM milestones WHERE milestone_id = ?", (clean_id,))
+            self.store.conn.commit()
+        return bool(cur.rowcount)
+
+    def slice_unblocker(self, item_ref: Union[str, int], title: str = "", description: str = "", owner: str = "companion") -> Dict[str, Any]:
+        """Create a 15-minute `ready` unblocker step linked to `item_ref`."""
+        parent = self.get_item(item_ref)
+        step_title = (title or "").strip() or f"15m Unblocker: {parent['title'][:72]}"
+        unblocker = self.create_item(
+            project_id=parent["project_id"], title=step_title,
+            description=(description or f"First 15-minute unblocking slice for `{parent['item_id']}` ({parent['title']}).").strip(),
+            owner=owner or parent["owner"], stage_kind=parent["stage_kind"], status="ready",
+            priority=max(1, int(parent["priority"]) - 1), milestone_id=parent["milestone_id"],
+            timebox_id=parent["timebox_id"], estimate_minutes=15, tags=["unblocker", parent["item_id"]],
+        )
+        new_deps = list(dict.fromkeys([unblocker["item_id"], *parent["depends_on"]]))
+        self.update_item(parent["item_id"], depends_on=new_deps)
+        return unblocker
 
     def seed_dikw_goal_milestones(self, project_id: str) -> Dict[str, str]:
         """Ensure the 4 DIKW/Capability prerequisite milestones exist for a broad Goal project."""

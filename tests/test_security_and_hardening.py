@@ -141,7 +141,8 @@ class TestSecurityAndHardening(unittest.TestCase):
         ok_pair, set_cookie = verify_lan_client_auth({}, "100.75.10.9", qs={"token": ["lan_pair_tok_777"]})
         self.assertTrue(ok_pair)
         self.assertIn("HttpOnly", set_cookie)
-        self.assertIn("SameSite=Strict", set_cookie)
+        self.assertIn("SameSite=Lax", set_cookie)
+        self.assertIn("Max-Age=2592000", set_cookie)
 
         srv, sess = create_web_server(host="127.0.0.1", port=0, store=self.store)
         port = srv.server_address[1]

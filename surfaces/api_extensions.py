@@ -7,9 +7,11 @@ Forever Chat Multimodal File Attachments (`/api/attachments`, `/api/attachments/
 and Token-Authenticated Inbound Hosted MCP Order Counter (`/api/mcp`) into `CompanionWebRequestHandler`.
 """
 
+import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -25,27 +27,37 @@ from companion.attachments import (
     read_attachment_raw,
 )
 from companion.background_jobs import get_job_manager
+from companion.checkpoints import get_active_checkpoint_manager
 from companion.config import settings
 from companion.core_actions import execute_core_action, list_core_actions
 from companion.education_engine import get_education_engine
+from companion.llm import active_swap_status
 from companion.mcp_hub import get_mcp_hub
 from companion.memory_store import MemoryStore
 from companion.model_registry import get_model_matrix_snapshot
 from companion.project_graph import get_project_graph
 from companion.routines import IdleAutonomyWatcher, describe_operating_quadrant
 from companion.streaming import wire_attachment_context
-from companion.telemetry import telemetry
+from companion.telemetry import TelemetryEngine, read_ro_rows, telemetry
 from companion.wiki_engine import get_wiki_engine
 from companion.wiki_maintenance import read_wiki_asset_raw
+from companion.workflow_graph import WorkflowEngine
 
 __all__ = [
+    "build_history_payload",
     "build_reload_command",
+    "build_telemetry_payload",
+    "build_web_status_payload",
+    "cancel_web_or_bg_job",
+    "commit_cancelled_turn",
     "create_session_idle_watcher",
     "dispatch_chat_or_job_with_attachments",
     "enrich_web_status",
     "handle_extended_get",
     "handle_extended_post",
     "handle_extended_raw_get",
+    "load_or_create_csrf_token",
+    "record_coalesced_job_event",
     "register_service_reload_handler",
     "request_service_reload",
     "spawn_companion_reload",
@@ -293,6 +305,169 @@ def handle_extended_post(
     return None
 
 
+def build_web_status_payload(sess: Any) -> Dict[str, Any]:
+    """Build non-blocking live status JSON for `GET /api/status`."""
+    prof = {str(k): str(v) for k, v in read_ro_rows(sess.db_path, "SELECT key, value FROM user_profile")}
+    wf_engine = WorkflowEngine(store=sess.store)
+    active_wf = sess.store.get_active_workflow()
+    tasks = [{"id": tid, "description": desc, "status": st, "priority": prio} for tid, desc, st, prio in sess.store.get_pending_tasks()[:10]]
+    backlog = [{"id": bid, "description": desc, "category": cat, "status": st} for bid, desc, cat, st in sess.store.get_backlog(status="pending")[:10]]
+    ws = settings.get_workspace()
+    f_cfg, r_cfg = settings.resolve_tier("fast"), settings.resolve_tier("reasoning")
+    busy_sec = int(max(0.0, time.monotonic() - sess._busy_started)) if sess.busy else 0
+    try:
+        savepoints = get_active_checkpoint_manager().list_git_savepoints(limit=5)
+    except Exception:
+        savepoints = []
+    with sess._jobs_lock:
+        active_job = sess._serialize_job(sess._jobs[sess.active_job_id], include_live_spans=True) if sess.active_job_id in sess._jobs else None
+    return {
+        "ok": True, "csrf_token": sess.csrf_token,
+        "companion_name": prof.get("companion_name") or settings.companion_name or "Companion",
+        "user_name": prof.get("user_name") or settings.user_name or "Partner",
+        "tone": prof.get("companion_tone", "balanced"), "active_model_tier": prof.get("active_model_tier", "auto"),
+        "fast_model": f_cfg.model, "reasoning_model": r_cfg.model,
+        "workspace": {"project_id": ws.project_id, "project_root": str(ws.project_root), "is_self_project": ws.is_self_project},
+        "busy": sess.busy, "active_action": sess.active_action, "busy_seconds": busy_sec,
+        "model_swap": active_swap_status(), "active_job": active_job, "lan_url": sess.lan_url, "workflow": active_wf,
+        "awaiting_approval": bool((active_wf or {}).get("metadata", {}).get("awaiting_plan_approval") and (active_wf or {}).get("current_state") == "PLAN"),
+        "workflow_hud": wf_engine.render_hud(), "pending_tasks": tasks, "pending_backlog": backlog, "recent_savepoints": savepoints,
+        **enrich_web_status(sess.store),
+    }
+
+
+def build_telemetry_payload(db_path: Path, limit: int = 12, trace_id: str = "") -> Dict[str, Any]:
+    """Build waterfall trace, span, log, and KPI JSON payload for `GET /api/telemetry`."""
+    tel = telemetry if db_path == settings.db_path.resolve() else TelemetryEngine(db_path=db_path)
+    try:
+        kpis = tel.get_kpis()
+    finally:
+        if tel is not telemetry:
+            tel.close()
+    cap = max(1, min(int(limit), 50))
+    tr_rows = read_ro_rows(db_path, "SELECT trace_id, trace_type, name, status, duration_ms, span_count, error_count, created_at FROM telemetry_traces ORDER BY rowid DESC LIMIT ?", (cap,))
+    traces = [{"trace_id": str(tid), "trace_type": str(tt), "name": str(nm), "status": str(st), "duration_ms": round(float(dur or 0.0), 1), "span_count": int(sc or 0), "error_count": int(ec or 0), "created_at": str(ts)} for tid, tt, nm, st, dur, sc, ec, ts in tr_rows]
+    chosen_tid = trace_id.strip() or (traces[0]["trace_id"] if traces else "")
+    sp_rows = read_ro_rows(db_path, "SELECT id, span_type, name, status, offset_ms, duration_ms, detail FROM telemetry_spans WHERE trace_id = ? ORDER BY id ASC", (chosen_tid,)) if chosen_tid else []
+    spans = [{"id": int(sid), "span_type": str(st), "name": str(nm), "status": str(stat), "offset_ms": round(float(off or 0.0), 1), "duration_ms": round(float(dur or 0.0), 1), "detail": str(det)} for sid, st, nm, stat, off, dur, det in sp_rows]
+    log_rows = read_ro_rows(db_path, "SELECT id, level, component, trace_id, message, created_at FROM telemetry_logs ORDER BY id DESC LIMIT 30")
+    logs = [{"id": int(lid), "level": str(lv), "component": str(cp), "trace_id": str(tid), "message": str(msg), "created_at": str(ts)} for lid, lv, cp, tid, msg, ts in log_rows]
+    return {"ok": True, "kpis": kpis, "selected_trace_id": chosen_tid, "traces": traces, "spans": spans, "logs": logs}
+
+
+def commit_cancelled_turn(
+    sess: Any, pre_msgs: List[Dict[str, Any]], clean_msg: str, mode: str, awaiting_approval: bool,
+) -> Tuple[int, Dict[str, Any]]:
+    """Commit partial streamed text + `*(Stopped by user.)*` cleanly so SQLite and `sess.messages` stay balanced."""
+    partial_txt = ""
+    with sess._jobs_lock:
+        if sess.active_job_id and sess.active_job_id in sess._jobs:
+            partial_txt = str(sess._jobs[sess.active_job_id].get("stream_text") or "").rstrip()
+    stopped_reply = f"{partial_txt}\n\n*(Stopped by user.)*" if partial_txt else "*(Stopped by user.)*"
+    sess.messages[:] = pre_msgs
+    sess.messages.extend([{"role": "user", "content": clean_msg}, {"role": "assistant", "content": stopped_reply}])
+    tag = "web_plan" if mode == "plan" else ("web_goal" if mode == "goal" else "web_ui")
+    last_ua = read_ro_rows(
+        sess.db_path,
+        "SELECT role FROM conversations WHERE role IN ('user', 'assistant') AND COALESCE(session_tag, '') NOT LIKE 'subagent:%' AND COALESCE(session_tag, '') NOT LIKE 'autonomy:%' ORDER BY id DESC LIMIT 1",
+    )
+    if not last_ua or str(last_ua[0][0]) != "user":
+        sess.store.log_message("user", clean_msg, session_tag=tag)
+    sess.store.log_message("assistant", stopped_reply, session_tag=tag)
+    return 200, {"ok": True, "cancelled": True, "role": "assistant", "mode": mode, "awaiting_approval": awaiting_approval, "response": stopped_reply}
+
+
+def cancel_web_or_bg_job(sess: Any, raw_job_id: str = "") -> Tuple[int, Dict[str, Any]]:
+    """Abort an active foreground turn (`job_...` / `active`) or background worker (`bgj_...`) in `<100ms`."""
+    target_id = (raw_job_id or "").strip()
+    if target_id.startswith("bgj_"):
+        res = get_job_manager(store=sess.store).cancel_job(target_id)
+        return (200 if res.get("ok") else 404), res
+    return sess.cancel_active_turn(target_id)
+
+
+def load_or_create_csrf_token(db_path: Path) -> str:
+    """Persist CSRF token in `data/.web_csrf_secret` (`0o600`) so restarts never break open tabs."""
+    secret_file = db_path.parent / ".web_csrf_secret"
+    try:
+        if secret_file.is_file():
+            tok = secret_file.read_text(encoding="utf-8").strip()
+            if len(tok) >= 20:
+                return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(24)
+    try:
+        secret_file.parent.mkdir(parents=True, exist_ok=True)
+        secret_file.write_text(tok, encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(secret_file, 0o600)
+    except OSError:
+        pass
+    return tok
+
+
+def build_history_payload(db_path: Path, limit: int = 60, include_tools: bool = False, before_id: int = 0) -> Dict[str, Any]:
+    """Return Forever Chat history hydrated with persisted `meta_json` (`thinking`, `tool_steps`, `duration_ms`, `model`)."""
+    cap = max(1, min(int(limit), 200))
+    clauses = ["COALESCE(session_tag, '') NOT LIKE 'subagent:%'", "COALESCE(session_tag, '') NOT LIKE 'autonomy:%'"]
+    if not include_tools:
+        clauses.append("role IN ('user', 'assistant')")
+    if before_id > 0:
+        clauses.append("id < ?")
+    where_sql = f"WHERE {' AND '.join(clauses)} "
+    rows = read_ro_rows(
+        db_path,
+        f"SELECT id, role, content, timestamp, COALESCE(session_tag, ''), COALESCE(meta_json, '{{}}') FROM conversations {where_sql}ORDER BY id DESC LIMIT ?",
+        (*((int(before_id),) if before_id > 0 else ()), cap + 1),
+    )
+    items: List[Dict[str, Any]] = []
+    for cid, role, content, ts, tag, raw_meta in reversed(rows[:cap]):
+        try:
+            meta = json.loads(str(raw_meta or "{}"))
+        except Exception:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        entry: Dict[str, Any] = {"id": int(cid), "role": str(role), "content": str(content), "timestamp": str(ts), "session_tag": str(tag)}
+        if meta.get("thinking"):
+            entry["thinking"] = str(meta["thinking"])
+        if isinstance(meta.get("tool_steps"), list) and meta["tool_steps"]:
+            entry["tool_steps"] = meta["tool_steps"]
+        if meta.get("duration_ms"):
+            entry["duration_ms"] = meta["duration_ms"]
+        if meta.get("model"):
+            entry["model"] = str(meta["model"])
+        items.append(entry)
+    return {"ok": True, "count": len(items), "has_more": len(rows) > cap, "messages": items}
+
+
+def record_coalesced_job_event(job: Dict[str, Any], ev: Dict[str, Any]) -> None:
+    """Update live job stream snapshot and coalesce consecutive delta events so long turns never drop tail events."""
+    etype = str(ev.get("type") or "")
+    if etype == "text_delta":
+        job["stream_text"] = job.get("stream_text", "") + str(ev.get("delta") or "")
+    elif etype == "thinking_delta":
+        job["stream_thinking"] = job.get("stream_thinking", "") + str(ev.get("delta") or "")
+    elif etype == "orphan_think_closed":
+        moved = str(ev.get("thinking") or job.get("stream_text") or "")
+        job["stream_thinking"] = (job.get("stream_thinking", "") + moved).strip()
+        job["stream_text"] = ""
+    elif etype == "phase":
+        job["active_phase"] = str(ev.get("phase") or "")
+    elif etype == "tool_start":
+        job["active_tool"] = str(ev.get("summary") or ev.get("tool") or "")
+    elif etype == "tool_end":
+        job["active_tool"] = ""
+        steps = job.setdefault("tool_steps", [])
+        steps.append({"tool": str(ev.get("tool") or ""), "summary": str(ev.get("summary") or ev.get("tool") or ""), "ok": bool(ev.get("ok", True)), "duration_ms": ev.get("duration_ms", 0)})
+    events: List[Dict[str, Any]] = job["events"]
+    if etype in ("text_delta", "thinking_delta") and events and events[-1].get("type") == etype and (len(events) >= 256 or len(str(events[-1].get("delta") or "")) < 64):
+        events[-1]["delta"] = str(events[-1].get("delta") or "") + str(ev.get("delta") or "")
+    elif len(events) < 8000:
+        events.append(dict(ev))
+
+
 def dispatch_chat_or_job_with_attachments(
     sess: Any, body: Dict[str, Any], is_async: bool,
 ) -> Tuple[int, Dict[str, Any]]:
@@ -300,12 +475,14 @@ def dispatch_chat_or_job_with_attachments(
     msg = str(body.get("message") or "")
     mode = str(body.get("mode") or "chat")
     focus_pid = str(body.get("project_id") or "").strip()
-    if focus_pid:
-        get_project_graph(store=sess.store).set_focus_project(focus_pid)
     raw_ids = body.get("attachment_ids")
     att_ids = [str(x) for x in raw_ids] if isinstance(raw_ids, list) else None
     prep = prepare_turn_attachments(msg, att_ids, store=sess.store)
     with wire_attachment_context(prep.wire_doc_context, prep.wire_image_uris):
         if is_async:
-            return sess.submit_async_chat(prep.display_message, mode=mode)
-        return sess.execute_chat(prep.display_message, mode=mode)
+            code, res = sess.submit_async_chat(prep.display_message, mode=mode, focus_project_id=focus_pid, followup_doc_note=prep.followup_doc_note)
+        else:
+            code, res = sess.execute_chat(prep.display_message, mode=mode, focus_project_id=focus_pid, followup_doc_note=prep.followup_doc_note)
+    if code < 400 and isinstance(res, dict):
+        res.setdefault("display_message", prep.display_message)
+    return code, res

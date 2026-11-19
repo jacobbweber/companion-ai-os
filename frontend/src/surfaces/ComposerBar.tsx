@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowUp,
   ChevronDown,
@@ -8,6 +8,7 @@ import {
   Rocket,
   Shield,
   Sparkles,
+  Square,
   X,
 } from 'lucide-react';
 import { apiPost, callAction, uploadAttachment } from '../api';
@@ -21,14 +22,19 @@ interface ComposerBarProps {
   selectedProjectId: string;
   busy: boolean;
   onSelectProject: (projectId: string) => void;
-  onSendMessage: (message: string, attachmentIds: string[], execMode: ComposerExecMode) => Promise<void>;
+  onSendMessage: (
+    message: string,
+    attachmentIds: string[],
+    execMode: ComposerExecMode
+  ) => Promise<boolean>;
+  onStopActiveTurn?: () => Promise<void>;
   onRefreshStatus: () => Promise<void>;
   onToast: (msg: string) => void;
 }
 
 const SLASH_COMMANDS = [
-  { cmd: '/plan ', desc: 'Draft an aligned Blueprint before changing code' },
-  { cmd: '/goal ', desc: 'Run multi-step autonomous execution with Doctor gates' },
+  { cmd: '/plan ', desc: 'Draft an aligned Blueprint before changing code', mode: 'plan' as const },
+  { cmd: '/goal ', desc: 'Run multi-step autonomous execution with Doctor gates', mode: 'goal' as const },
   { cmd: '/morning', desc: 'Read overnight & idle Autonomy Briefing' },
   { cmd: '/checkin', desc: 'Executive check-in on goals, priorities & health' },
   { cmd: '/doctor', desc: 'Run 7-stage System Doctor diagnostics' },
@@ -43,15 +49,18 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
   busy,
   onSelectProject,
   onSendMessage,
+  onStopActiveTurn,
   onRefreshStatus,
   onToast,
 }) => {
   const [draft, setDraft] = useState('');
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
   const [openMenu, setOpenMenu] = useState<'none' | 'context' | 'model' | 'posture' | 'project'>('none');
   const [prompts, setPrompts] = useState<PromptTemplate[]>([]);
   const [execMode, setExecMode] = useState<ComposerExecMode>('chat');
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -69,11 +78,38 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
     ? SLASH_COMMANDS.filter((s) => s.cmd.startsWith(draft.toLowerCase()))
     : [];
 
-  const handleUploadFiles = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    const nextH = Math.min(180, Math.max(36, el.scrollHeight || 36));
+    el.style.height = `${nextH}px`;
+  }, [draft]);
+
+  useEffect(() => {
+    if (openMenu === 'none') return;
+    const onPointerDown = (ev: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(ev.target as Node)) {
+        setOpenMenu('none');
+      }
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') setOpenMenu('none');
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [openMenu]);
+
+  const handleUploadFiles = async (files: FileList | File[] | null) => {
+    const arr = files ? Array.from(files) : [];
+    if (arr.length === 0) return;
     setUploading(true);
     try {
-      for (const f of Array.from(files)) {
+      for (const f of arr) {
         const res = await uploadAttachment(f);
         if (res.ok && res.attachment) {
           setAttachments((prev) => [...prev, res.attachment!]);
@@ -101,21 +137,21 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
 
   const selectTier = async (tier: string) => {
     setOpenMenu('none');
-    await apiPost('/api/settings', { tier });
+    const r = await apiPost<{ ok?: boolean; error?: string }>('/api/settings', { tier });
     await onRefreshStatus();
-    onToast(`Model routing set to ${tier}.`);
+    onToast(r.ok === false ? r.error || 'Could not set model tier.' : `Model routing set to ${tier}.`);
   };
 
   const selectTrust = async (mode: string) => {
-    await callAction('trust', { subaction: 'set', mode });
+    const r = await callAction('trust', { subaction: 'set', mode });
     await onRefreshStatus();
-    onToast(`Trust mode set to ${mode}.`);
+    onToast(r.ok === false ? r.error || 'Could not update trust mode.' : `Trust mode set to ${mode}.`);
   };
 
   const toggleBgAutonomy = async () => {
     const res = await callAction('autonomy', { subaction: 'set_autonomy', enabled: !bgAutonomy });
     await onRefreshStatus();
-    onToast(res.summary || `Background Autonomy ${!bgAutonomy ? 'ON' : 'OFF'}.`);
+    onToast(res.summary || res.error || `Background Autonomy ${!bgAutonomy ? 'ON' : 'OFF'}.`);
   };
 
   const toggleSelfDev = async () => {
@@ -125,20 +161,44 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
   };
 
   const submit = async () => {
-    const text = draft.trim();
+    let text = draft.trim();
     if ((!text && attachments.length === 0) || busy || uploading) return;
+    let chosenMode = execMode;
+    if (text.toLowerCase().startsWith('/plan ') && chosenMode === 'chat') {
+      chosenMode = 'plan';
+      text = text.slice(6).trim();
+    } else if (text.toLowerCase().startsWith('/goal ') && chosenMode === 'chat') {
+      chosenMode = 'goal';
+      text = text.slice(6).trim();
+    }
     const ids = attachments.map((a) => a.id);
-    const chosenMode = execMode;
-    setDraft('');
-    setAttachments([]);
-    setExecMode('chat');
     setOpenMenu('none');
-    await onSendMessage(text || 'Inspect attached file(s).', ids, chosenMode);
+    const accepted = await onSendMessage(text || 'Inspect attached file(s).', ids, chosenMode);
+    if (accepted) {
+      setDraft('');
+      setAttachments([]);
+      setExecMode('chat');
+    }
   };
 
   return (
-    <div className="composer-outer">
-      <div className="composer-shell" data-testid="floating-composer">
+    <div className="composer-outer" ref={rootRef}>
+      <div
+        className={`composer-shell ${dragActive ? 'drag-active' : ''}`}
+        data-testid="floating-composer"
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragActive(true);
+        }}
+        onDragLeave={() => setDragActive(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragActive(false);
+          if (e.dataTransfer?.files?.length) {
+            void handleUploadFiles(e.dataTransfer.files);
+          }
+        }}
+      >
         {/* Top Context Strip: Project Selector + Staged Attachments */}
         <div className="composer-context-bar">
           <div style={{ position: 'relative' }}>
@@ -175,9 +235,9 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
             )}
           </div>
 
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
             {execMode !== 'chat' && (
-              <span className="badge accent">
+              <span className="badge accent" data-testid={`composer-mode-pill-${execMode}`}>
                 <Rocket size={11} />{' '}
                 {execMode === 'plan'
                   ? 'Plan First'
@@ -195,7 +255,7 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
               </span>
             )}
             {attachments.map((att) => (
-              <span key={att.id} className="badge">
+              <span key={att.id} className="badge" data-testid={`composer-att-${att.id}`}>
                 {att.filename}
                 <button
                   type="button"
@@ -219,12 +279,17 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
                 type="button"
                 className="popover-row"
                 onClick={() => {
-                  if (item.cmd.endsWith(' ')) {
+                  if (item.mode) {
+                    setExecMode(item.mode);
+                    setDraft('');
+                    textareaRef.current?.focus();
+                  } else if (item.cmd.endsWith(' ')) {
                     setDraft(item.cmd);
                     textareaRef.current?.focus();
                   } else {
-                    setDraft('');
-                    void onSendMessage(item.cmd, [], 'chat');
+                    void onSendMessage(item.cmd, [], 'chat').then((ok) => {
+                      if (ok) setDraft('');
+                    });
                   }
                 }}
               >
@@ -241,10 +306,27 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
           className="composer-textarea"
           data-testid="chat-composer-input"
           rows={1}
-          placeholder="Ask anything, / for actions"
+          style={{ maxHeight: 180, overflowY: 'auto' }}
+          placeholder="Ask anything, / for actions (paste or drop files)"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          onPaste={(e) => {
+            const items = Array.from(e.clipboardData?.items || []);
+            const pastedFiles = items
+              .filter((it) => it.kind === 'file')
+              .map((it) => it.getAsFile())
+              .filter((f): f is File => Boolean(f));
+            if (pastedFiles.length > 0) {
+              e.preventDefault();
+              void handleUploadFiles(pastedFiles);
+            }
+          }}
           onKeyDown={(e) => {
+            if (e.key === 'Escape' && openMenu !== 'none') {
+              e.preventDefault();
+              setOpenMenu('none');
+              return;
+            }
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
               void submit();
@@ -252,7 +334,7 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
           }}
         />
 
-        {/* Bottom Inline Bar: `+` Context, Model Tier ⌄, Posture ⌄, Send */}
+        {/* Bottom Inline Bar: `+` Context, Model Tier ⌄, Posture ⌄, Send / Stop */}
         <div className="composer-footer-bar">
           <div className="composer-footer-left">
             <input
@@ -260,7 +342,10 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
               type="file"
               multiple
               hidden
-              onChange={(e) => void handleUploadFiles(e.target.files)}
+              onChange={(e) => {
+                void handleUploadFiles(e.target.files);
+                e.currentTarget.value = '';
+              }}
             />
             <button
               type="button"
@@ -436,16 +521,30 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
               </div>
             )}
 
-            <button
-              type="button"
-              className="composer-send-circle"
-              data-testid="composer-send-btn"
-              disabled={(!draft.trim() && attachments.length === 0) || busy || uploading}
-              onClick={() => void submit()}
-              aria-label="Send message"
-            >
-              <ArrowUp size={15} />
-            </button>
+            {busy ? (
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                data-testid="composer-stop-btn"
+                onClick={() => void onStopActiveTurn?.()}
+                aria-label="Stop active turn"
+                title="Stop active generation (<100ms)"
+                style={{ borderRadius: 999, padding: '5px 11px', fontWeight: 600 }}
+              >
+                <Square size={11} fill="currentColor" /> Stop
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="composer-send-circle"
+                data-testid="composer-send-btn"
+                disabled={(!draft.trim() && attachments.length === 0) || uploading}
+                onClick={() => void submit()}
+                aria-label="Send message"
+              >
+                <ArrowUp size={15} />
+              </button>
+            )}
           </div>
         </div>
       </div>

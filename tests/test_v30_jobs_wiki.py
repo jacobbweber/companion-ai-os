@@ -19,6 +19,7 @@ from companion.archive_and_approvals import (
     save_prompt_template, search_forever_history, session_id_context, set_trust_mode,
 )
 from companion.background_jobs import MAX_ENVELOPE_CHARS, BackgroundJobManager, resolve_paired_worker_tools
+from companion.config import execution_origin_context
 from companion.core_actions import execute_core_action, list_core_actions
 from companion.grounding import build_epistemic_grounding
 from companion.memory_store import MemoryStore, memory_store_context
@@ -109,16 +110,18 @@ class TestStage1CoreActionsArchiveAndApprovals(unittest.TestCase):
         enqueue_session_nudge("Other session event", category="job", session_id="other_sess", store=self.store)
         self.assertEqual(len(peek_session_nudges(session_id="main", store=self.store)), 1)
 
-        captured_sys: list[str] = []
+        captured_wire_user: list[str] = []
 
         def fake_chat(msgs, tools=None, tool_choice="auto"):
-            captured_sys.append(msgs[0]["content"])
+            from companion.llm_wire import inject_openai_turn_attachments
+            wire_msgs = inject_openai_turn_attachments(msgs)
+            captured_wire_user.append(str(wire_msgs[-1]["content"]))
             return {"choices": [{"message": {"role": "assistant", "content": "All caught up!"}}]}
 
         msgs = [{"role": "user", "content": "Hello!"}]
         reply = run_agent_turn(msgs, max_iters=2, chat_fn=fake_chat, store=self.store, verbose=False, auto_promote=False)
         self.assertEqual(reply, "All caught up!")
-        self.assertIn("Job bgj_1 finished cleanly.", captured_sys[0])
+        self.assertIn("Job bgj_1 finished cleanly.", captured_wire_user[0])
         self.assertEqual(consume_session_nudges(session_id="main", store=self.store), "")
         self.assertEqual(len(peek_session_nudges(session_id="other_sess", store=self.store)), 1)
 
@@ -311,6 +314,63 @@ class TestStage2BackgroundJobsAndStage3WikiEngine(unittest.TestCase):
         self.assertEqual(wk.list_notes(folder="01_inbox"), [])
         self.assertTrue((reg_wiki_dir / "02_knowledge/ops/pending-grad.md").exists())
         self.assertIn("Runbook v2", wk.read_note("02_knowledge/ops/runbook.md")["body"])
+
+    def test_dom1_r3_tool_approval_exec_error_surfacing_and_atomic_dedup(self) -> None:
+        aq = get_approval_queue(self.store)
+        with memory_store_context(self.store):
+            r1 = dispatch("run_shell", {"command": "systemctl restart gdm"})
+            r2 = dispatch("run_shell", {"command": "systemctl restart gdm"})
+            self.assertIn("RISK GATE REJECTED (R3)", r1)
+            waiting = aq.list_requests(status="waiting")
+            self.assertEqual(len(waiting), 1)
+            self.assertIn(waiting[0]["approval_id"], r2)
+            with unittest.mock.patch.dict("companion.tools.TOOL_IMPLS", {"run_shell": lambda a: f"exit=0\nrestarted:{a['command']}"}):
+                res_ok = execute_core_action("approvals", {"subaction": "approve", "approval_id": waiting[0]["approval_id"]}, actor="user", store=self.store)
+            self.assertTrue(res_ok["ok"])
+            self.assertIn("restarted:systemctl restart gdm", res_ok["applied_summary"])
+
+            _, bad_apr = aq.check_or_enqueue(
+                category="r3_tool", action_name="run_shell", target="bad-cmd",
+                summary="Failing R3 command", payload={"tool": "missing_tool_xyz", "command": "bad"},
+                requester="companion", confirmed=False, always_require_in_autonomous=True,
+            )
+            res_err = execute_core_action("approvals", {"subaction": "approve", "approval_id": bad_apr["approval_id"]}, actor="user", store=self.store)
+            self.assertFalse(res_err["ok"])
+            self.assertIn("Unknown R3 tool", res_err["execution_error"])
+
+    def test_dom3_foreground_one_step_wiki_save_body_preservation_and_user_guard(self) -> None:
+        fg_wiki_dir = self.base / "wiki_fg"
+        wk = WikiEngine(wiki_dir=fg_wiki_dir, store=self.store)
+        wk.save_or_update_note("02_knowledge/homelab/user-sacred.md", "# Sacred User Note", title="User Sacred", actor="user")
+        with memory_store_context(self.store), unittest.mock.patch("companion.core_actions.get_wiki_engine", return_value=wk):
+            with execution_origin_context("background_job"):
+                bg_blk = dispatch("wiki_manage", {"action": "curate", "domain": "homelab", "title": "BG Blocked", "body": "Blocked in background."})
+                self.assertIn("ONE-DOOR INBOX GUARD", bg_blk)
+
+            with execution_origin_context("foreground_turn"):
+                fg_save = dispatch("wiki_manage", {
+                    "action": "curate", "domain": "homelab", "title": "Ubuntu RDP Black Screen",
+                    "summary": "Restart GDM over SSH when Ubuntu RDP shows a black screen.",
+                    "body": "Run `sudo systemctl restart gdm` over SSH to reset the GNOME display manager.",
+                })
+                self.assertIn("02_knowledge/homelab/ubuntu-rdp-black-screen.md", fg_save)
+                first_read = wk.read_note("02_knowledge/homelab/ubuntu-rdp-black-screen.md")
+                self.assertTrue(first_read["ok"])
+                self.assertIn("sudo systemctl restart gdm", first_read["body"])
+
+                meta_only = dispatch("wiki_manage", {
+                    "action": "save", "path": "02_knowledge/homelab/ubuntu-rdp-black-screen.md",
+                    "tags": "rdp,gdm,ubuntu",
+                })
+                self.assertIn("02_knowledge/homelab/ubuntu-rdp-black-screen.md", meta_only)
+                second_read = wk.read_note("02_knowledge/homelab/ubuntu-rdp-black-screen.md")
+                self.assertIn("sudo systemctl restart gdm", second_read["body"])
+                self.assertIn("gdm", second_read["tags"])
+                revs = list((fg_wiki_dir / "04_archive/revisions").glob("*.md"))
+                self.assertGreaterEqual(len(revs), 1)
+
+                sacred_pause = dispatch("wiki_manage", {"action": "save", "path": "02_knowledge/homelab/user-sacred.md", "body": "# Overwrite attempt"})
+                self.assertTrue(sacred_pause.startswith("AWAITING_USER_APPROVAL"))
 
 
 if __name__ == "__main__":

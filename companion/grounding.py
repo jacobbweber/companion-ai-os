@@ -26,6 +26,8 @@ from companion.disciplines import GENERAL_TRACKED_EXTENSIONS, analyze_python_sou
 from companion.hygiene import build_repo_headroom_map
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.semantic_memory import expand_semantic_terms, semantic_similarity
+from companion.streaming import check_cancelled, get_active_cancel_scope
+from companion.vault import get_vault_manager
 from companion.wiki_engine import get_wiki_engine
 
 __all__ = [
@@ -441,7 +443,10 @@ class ExecutionTarget(Protocol):
     def run_python_code(self, code: str, timeout: Optional[int] = None) -> str: ...
     def create_checkpoint(self, label: str = "auto") -> Dict[str, Any]: ...
     def list_checkpoints(self) -> List[Dict[str, Any]]: ...
-    def rollback_checkpoint(self, checkpoint_id: Optional[str] = None, reason: str = "") -> Dict[str, Any]: ...
+    def rollback_checkpoint(self, checkpoint_id: Optional[str] = None, reason: str = "", force: bool = False) -> Dict[str, Any]: ...
+
+
+_STRIP_ENV_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASSWD", "_CREDENTIAL")
 
 
 class LocalWorkspaceTarget:
@@ -460,16 +465,26 @@ class LocalWorkspaceTarget:
 
     def exec_env_and_cwd(self) -> Tuple[Dict[str, str], str]:
         ws = settings.get_workspace()
-        return {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PYTHONPATH": str(ws.project_root)}, str(ws.project_root)
+        clean_env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() != "COMPANION_WEB_TOKEN"
+            and not k.upper().endswith(_STRIP_ENV_SUFFIXES)
+            and not k.upper().startswith("COMPANION_SECRET")
+        }
+        return {**clean_env, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PYTHONPATH": str(ws.project_root)}, str(ws.project_root)
 
     def read_text(self, path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
 
     def write_text(self, path: Path, content: str, backup: bool = True) -> None:
-        if backup and path.is_file():
-            self._cp_mgr().backup_file(path)
+        cp_mgr = self._cp_mgr()
+        existed_before = path.is_file()
+        before_bytes = path.read_bytes() if existed_before else None
+        if backup and existed_before:
+            cp_mgr.backup_file(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8", newline="\n")
+        cp_mgr.record_file_touch(path, existed_before, before_bytes, path.read_bytes())
 
     def list_dir(self, path: Path) -> List[str]:
         return [e.name + "/" if e.is_dir() else e.name for e in sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))]
@@ -513,29 +528,52 @@ class LocalWorkspaceTarget:
         self, cmd_or_args: Any, shell: bool = False, timeout: Optional[int] = None,
         extra_env: Optional[Dict[str, str]] = None, cwd_override: Optional[str] = None,
     ) -> Tuple[int, str, str, Optional[str]]:
+        check_cancelled()
         active_cp, self_cp, store = self._cp_mgr(), get_self_checkpoint_manager(), get_memory_store()
-        pre_snap = active_cp.snapshot_py_files()
+        guard_self_py = self.is_self_project and settings.is_self_dev_enabled()
+        pre_py_stats = active_cp.snapshot_py_stats() if guard_self_py else None
         pre_priv = self._snapshot_priv_db(store)
         ro_snap = self_cp.snapshot_readonly_tree() if ((not self.is_self_project) or (not settings.is_self_dev_enabled())) else None
         env, cwd = self.exec_env_and_cwd()
         if extra_env:
             env = {**env, **extra_env}
         eff_timeout = timeout or settings.shell_timeout
+        scope = get_active_cancel_scope()
+        proc = subprocess.Popen(
+            cmd_or_args, shell=shell, cwd=cwd_override or cwd, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         try:
-            r = subprocess.run(
-                cmd_or_args, shell=shell, cwd=cwd_override or cwd, env=env, stdin=subprocess.DEVNULL,
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=eff_timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            if scope is not None:
+                with scope.track_popen(proc):
+                    out_raw, err_raw = proc.communicate(timeout=eff_timeout)
+            else:
+                out_raw, err_raw = proc.communicate(timeout=eff_timeout)
         except subprocess.TimeoutExpired:
-            active_cp.guard_py_files_after_exec(pre_snap)
+            proc.kill()
+            proc.communicate()
+            if pre_py_stats is not None:
+                active_cp.guard_py_stats_after_exec(pre_py_stats)
             self._guard_self_dev_db(store, pre_priv)
             if ro_snap is not None:
                 self_cp.enforce_readonly_tree(ro_snap)
             return -1, "", "", f"timed out after {eff_timeout}s"
-        guard_err = self._guard_self_dev_db(store, pre_priv) or active_cp.guard_py_files_after_exec(pre_snap) or (
+        finally:
+            if scope is not None and scope.is_cancelled:
+                if pre_py_stats is not None:
+                    active_cp.guard_py_stats_after_exec(pre_py_stats)
+                self._guard_self_dev_db(store, pre_priv)
+                if ro_snap is not None:
+                    self_cp.enforce_readonly_tree(ro_snap)
+        check_cancelled()
+        guard_err = self._guard_self_dev_db(store, pre_priv) or (
+            active_cp.guard_py_stats_after_exec(pre_py_stats) if pre_py_stats is not None else None
+        ) or (
             self_cp.enforce_readonly_tree(ro_snap) if ro_snap is not None else None
         )
-        return r.returncode, r.stdout or "", r.stderr or "", guard_err
+        vault = get_vault_manager(store=store)
+        return proc.returncode, vault.scrub_output(out_raw or ""), vault.scrub_output(err_raw or ""), guard_err
 
     def run_python_code(self, code: str, timeout: Optional[int] = None) -> str:
         if not (code or "").strip():
@@ -557,8 +595,8 @@ class LocalWorkspaceTarget:
     def list_checkpoints(self) -> List[Dict[str, Any]]:
         return self._cp_mgr().list_checkpoints()
 
-    def rollback_checkpoint(self, checkpoint_id: Optional[str] = None, reason: str = "") -> Dict[str, Any]:
-        return self._cp_mgr().rollback_checkpoint(checkpoint_id=checkpoint_id, reason=reason)
+    def rollback_checkpoint(self, checkpoint_id: Optional[str] = None, reason: str = "", force: bool = False) -> Dict[str, Any]:
+        return self._cp_mgr().rollback_checkpoint(checkpoint_id=checkpoint_id, reason=reason, force=force)
 
 
 _CUSTOM_EXECUTION_TARGET: Optional[ExecutionTarget] = None

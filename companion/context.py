@@ -1,17 +1,19 @@
 """Dynamic System Prompt Builder, Multi-Project Workspace Manager & Context Facade (A-Frame Application Layer)."""
 
 import json
+import os
 import platform
+import re
 import socket
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from companion.archive_and_approvals import get_trust_mode
+from companion.archive_and_approvals import get_approval_queue, get_trust_mode
 from companion.compaction import (
     KeyTokens, build_lossless_phase_handoff, compact_messages_if_needed as _compact_messages_impl,
     estimate_messages_chars, estimate_messages_tokens, extract_key_tokens, format_context_budget_status,
-    normalize_compaction_text, prune_stale_tool_outputs, verify_compaction_summary,
+    normalize_compaction_text, prune_stale_tool_outputs, should_compact, verify_compaction_summary,
 )
 from companion.config import MODEL_TIERS, SELF_PROJECT_ID, settings, slugify_project_id
 from companion.education_engine import format_education_hud
@@ -19,16 +21,17 @@ from companion.grounding import build_epistemic_grounding, build_workspace_radar
 from companion.llm import format_model_tiers_status
 from companion.mcp_hub import format_connected_partners_hud
 from companion.memory_store import MemoryStore, get_memory_store
-from companion.project_graph import format_project_graph_hud
+from companion.project_graph import format_project_graph_hud, get_project_graph
 from companion.workflow_graph import WorkflowEngine, workflow_engine
 
 __all__ = [
     "DEFAULT_SOUL_AND_USER", "KeyTokens", "VALID_TONES", "bootstrap_identity", "build_lossless_phase_handoff",
-    "build_system_prompt", "compact_messages_if_needed", "discover_skills", "estimate_messages_chars",
-    "estimate_messages_tokens", "execute_identity_action", "extract_key_tokens", "format_context_budget_status",
-    "format_identity_summary", "format_skills_catalog", "is_identity_bootstrapped", "manage_active_project",
-    "manage_companion_tone", "manage_model_tier", "normalize_compaction_text", "prune_stale_tool_outputs",
-    "run_first_boot_onboarding", "sync_identity_md", "verify_compaction_summary",
+    "build_system_prompt", "build_turn_context", "compact_messages_if_needed", "consolidate_turn_memory",
+    "discover_skills", "estimate_messages_chars", "estimate_messages_tokens", "execute_identity_action",
+    "extract_key_tokens", "format_context_budget_status", "format_identity_summary", "format_skills_catalog",
+    "is_identity_bootstrapped", "manage_active_project", "manage_companion_tone", "manage_model_tier",
+    "normalize_compaction_text", "prune_stale_tool_outputs", "run_first_boot_onboarding", "should_compact",
+    "sync_identity_md", "verify_compaction_summary",
 ]
 
 DEFAULT_SOUL_AND_USER: Dict[str, str] = {
@@ -86,8 +89,11 @@ def _load_known_projects(mem: MemoryStore) -> Dict[str, str]:
 
 
 def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known: Dict[str, str]) -> None:
+    pg = get_project_graph(store=mem)
     if pid != SELF_PROJECT_ID:
         known[pid] = str(proot)
+        pg.create_project(title=pid.replace("-", " ").title(), kind="project", workspace_id=pid, workspace_path=str(proot), project_id=pid)
+    pg.set_focus_project(pid)
     mem.set_user_profile("active_project_id", pid)
     mem.set_user_profile("active_project_path", str(proot))
     mem.set_user_profile("known_projects_json", json.dumps(known, sort_keys=True))
@@ -341,95 +347,124 @@ def _format_identity_hud_block(prof: Dict[str, str]) -> str:
 
 
 def _format_host_runtime_hud() -> str:
-    """Return dynamic stdlib host/OS/arch/Python runtime line for `LIVE SYSTEM HUD`."""
-    return f"host=`{socket.gethostname()}` | os=`{platform.system()} {platform.release()} ({platform.machine()})` | python=`{platform.python_version()}`"
+    """Return OS-accurate stdlib host/shell/Python runtime line."""
+    shell_lbl = "Windows PowerShell (`run_python` for multiline Python)" if os.name == "nt" else "POSIX bash"
+    return f"host=`{socket.gethostname()}` | os=`{platform.system()} {platform.release()}` | shell=`{shell_lbl}` | python=`{platform.python_version()}`"
 
 
 def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional[WorkflowEngine] = None, user_query: str = "") -> str:
-    """Construct the live, state-aware System Prompt with WorkspaceContext, Epistemic Grounding, and Workspace Radar."""
-    mem, wf = (store or get_memory_store()), (wf_engine or workflow_engine)
+    """Construct a calm, ~700-token session-stable static System Prompt preserving KV-cache across steps/turns."""
+    _ = wf_engine
+    mem = store or get_memory_store()
     is_identity_bootstrapped(store=mem)
     default_md = settings.memory_md_path if mem.db_path.resolve() == settings.db_path.resolve() else (mem.db_path.parent / "MEMORY.md")
     if not default_md.is_file():
         mem.sync_memory_md(target_path=default_md)
-    prof, ws, self_dev_on = mem.get_user_profile(), settings.get_workspace(), mem.is_self_dev_mode_enabled()
+    prof, ws = mem.get_user_profile(), settings.get_workspace()
+    self_dev_on = settings.is_self_dev_enabled() if mem.db_path.resolve() == settings.db_path.resolve() else (settings.get_self_dev_override() if settings.get_self_dev_override() is not None else mem.is_self_dev_mode_enabled())
     identity_text, host_hud = _format_identity_hud_block(prof), _format_host_runtime_hud()
     ws_lock = (
-        ("Self-Evolution Mode (`companion-self` | `Self-Dev Mode = ON` — edit with SDD & `system_doctor` discipline)" if self_dev_on else "DAILY-DRIVER STABLE MODE (`companion-self` | `Self-Dev Mode = OFF` per ADR-019 — core repo is MECHANICALLY READ-ONLY; `data/` & external `/project` workspaces are 100% writable; only human `/selfdev on` or Web System Studio can unlock)")
+        ("Self-Evolution (`companion-self` | `Self-Dev=ON`)" if self_dev_on else "Daily-Driver Runtime (`companion-self` | `Self-Dev=OFF`, core read-only; `data/`, Wiki & external projects writable)")
         if ws.is_self_project
-        else f"EXTERNAL PROJECT MODE (`{ws.self_root}` is MECHANICALLY LOCKED READ-ONLY per ADR-007)"
+        else f"External Workspace (`{ws.project_id}` -> `{ws.project_root}`; Companion core read-only)"
     )
-    repo_radar, hud, bg_on = build_workspace_radar(ws.project_root), wf.render_hud(), mem.is_background_autonomy_enabled()
-    self_dev_lock = f" [{settings.self_dev_lock_reason()}]" if settings.is_self_dev_locked_by_env() else ""
     trust_mode, partners_hud = get_trust_mode(store=mem), format_connected_partners_hud(store=mem)
     partners_section = f"\n{partners_hud}\n" if partners_hud else ""
-    agile_hud, edu_hud = format_project_graph_hud(store=mem), format_education_hud(store=mem)
-    active_mode = prof.get("active_model_tier", "auto").strip().lower() or "auto"
-    fast_cfg, code_cfg, reas_cfg = settings.resolve_tier("fast"), settings.resolve_tier("coding"), settings.resolve_tier("reasoning")
-    code_hud = f" | coding=`{code_cfg.model}` (temp={code_cfg.temperature})" if code_cfg.is_dedicated else ""
-    pending_tasks, backlog_items = mem.get_pending_tasks()[:6], mem.get_backlog(status="pending")[:6]
-    notes, skills = mem.get_system_notes(limit=5), discover_skills(settings.root)
-    grounding = build_epistemic_grounding(user_query, store=mem, root=ws.project_root, skills=skills, top_k=6)
-    shown_skills = grounding.top_skills if grounding.top_skills else skills[:6]
-    extra_skills = [s["name"] for s in skills if s["name"] not in {sk["name"] for sk in shown_skills}]
+    agile_hud = "\n".join(format_project_graph_hud(store=mem).splitlines()[:4])
+    edu_hud = "\n".join(format_education_hud(store=mem).splitlines()[:3])
+    skills = discover_skills(settings.root)
+    skill_names = ", ".join(f"`{s['name']}`" for s in skills)
 
-    tasks_str = "\n".join(f"  - Task #{tid} [P{pr} | {st}]: {desc}" for tid, desc, st, pr in pending_tasks) if pending_tasks else "  - (No pending immediate tasks)"
-    backlog_str = "\n".join(f"  - Backlog #{bid} [{cat}]: {desc}" for bid, desc, cat, _ in backlog_items) if backlog_items else "  - (No pending backlog items)"
-    notes_str = "\n".join(f"  - [{cat}] {n}" for n, cat, _ in notes) if notes else "  - Always use `run_python` for executing Python snippets on Windows."
-    skills_str = "\n".join(f"  - `{s['name']}` (`{s['path']}`): {s['description']}" for s in shown_skills) if shown_skills else "  - (No skills found in `skills/`)"
-    if extra_skills:
-        skills_str += f"\n  - Additional available skills ({len(extra_skills)}): {', '.join(f'`{n}`' for n in extra_skills[:18])}"
+    known_block = ""
+    if user_query.strip():
+        grounding = build_epistemic_grounding(user_query, store=mem, root=ws.project_root, skills=skills, top_k=4)
+        if grounding.known_facts:
+            known_block = "\n[KNOWN FACTS]\n" + "\n".join(f"  - [{e.source}] `{e.key}`: {e.content}" for e in grounding.known_facts[:5]) + "\n"
 
-    return f"""{identity_text}
+    self_dev_block = ""
+    if ws.is_self_project and self_dev_on:
+        repo_radar = build_workspace_radar(ws.project_root)
+        self_dev_block = (
+            f"\n[CODEBASE AST & LINE-BUDGET RADAR (`{ws.project_id}`)]\n{repo_radar}\n"
+            "- SDD & Ring-0 Rules: Keep Ring-0 100% Python stdlib, modules <=700L, functions <=100L, and sync `specs/` (`sdd_manage` / `system_doctor`).\n"
+        )
 
-===========================================================================
-LIVE SYSTEM HUD (Auto-Refreshed from SQLite State Store)
-===========================================================================
-Host Runtime   : {host_hud}
-Active Project : `{ws.project_id}` -> {ws.project_root}
-Workspace Guard: {ws_lock}
-Companion Core : {settings.root} (Entry: `harness.py` | Specs: `specs/` | Skills: `skills/` | Data: `{settings.effective_data_dir}` | Wiki: `{settings.wiki_dir}`)
-Memory & DB    : {settings.memory_md_path} | {mem.db_path}
-Trust Mode     : `{trust_mode}` (Blind Vault Zero-Reveal Active | Approvals Queue: `/approvals`)
-Model Routing  : mode=`{active_mode}` | privacy=`{settings.effective_privacy_mode()}` | fast=`{fast_cfg.model}` (temp={fast_cfg.temperature}){code_hud} | reasoning=`{reas_cfg.model}` (temp={reas_cfg.temperature})
-Operating Modes: Self-Dev=`{'ON (Core Editable)' if self_dev_on else 'OFF (Core Read-Only)'}`{self_dev_lock} | Background Autonomy=`{'ON (Personal+Self-Dev Idle)' if (bg_on and self_dev_on) else ('ON (Personal & Goal Slices Idle)' if bg_on else 'OFF')}`
-{partners_section}
-[MULTI-TIER MODEL ROUTING & OODA LOOP (ALWAYS-ON RULES)]
-1. Organic Deep Thinking (`tier="reasoning"`): When the User asks a strategic, architectural, or multi-option tradeoff question, call `workflow_manage(action="subagent", tier="reasoning", skill="deep-thinking", goal="...")` in 1 hop.
-2. OODA Troubleshooting (`Observe -> Orient -> Decide -> Act`): When diagnosing bugs, test failures, or system issues, follow `skills/ooda-troubleshooting/SKILL.md` or run `workflow_manage(action="run_dag", dag="ooda-diagnose")`.
-3. Second Opinion When Stuck: Any time 2 consecutive tool calls or verification checks fail, consult `tier="reasoning"` before making another edit.
+    os_rule = (
+        "- Windows Host: Use PowerShell-compatible commands in `run_shell`, and prefer `run_python` for Python scripts (never bash heredocs)."
+        if os.name == "nt"
+        else "- Linux/POSIX Host: Use standard POSIX shell commands in `run_shell` or `run_python` for structured scripts."
+    )
+    return (
+        f"{identity_text}\n\n"
+        f"[RUNTIME & GOVERNANCE]\n"
+        f"- Runtime  : {host_hud}\n"
+        f"- Workspace: {ws_lock}\n"
+        f"- Paths    : data=`{settings.effective_data_dir}` | wiki=`{settings.wiki_dir}` | trust=`{trust_mode}` | privacy=`{settings.effective_privacy_mode()}`\n"
+        f"{partners_section}\n"
+        f"{agile_hud}\n\n"
+        f"{edu_hud}\n"
+        f"{known_block}{self_dev_block}\n"
+        f"[AVAILABLE SKILLS — PROGRESSIVE DISCLOSURE RUNBOOKS (L2)]\n"
+        f"Read `skills/<name>/SKILL.md` via `read_file` when a domain runbook applies: {skill_names}\n\n"
+        f"[EXECUTION REMINDERS]\n"
+        f"- Execute tools autonomously and answer in clear, grounded plain English without asking the user to run internal commands.\n"
+        f"- Use `wiki_manage` for Knowledge Wiki notes (`01_inbox/`..`04_archive/`), `agile_manage` for Goals/Boards, and `calendar_manage` for schedule items.\n"
+        f"{os_rule}\n"
+    )
 
-[STATE MACHINE WORKFLOW STATUS]
-{hud}
 
-[ACTIVE TASKS]
-{tasks_str}
+def build_turn_context(
+    store: Optional[MemoryStore] = None, wf_engine: Optional[WorkflowEngine] = None,
+    user_query: str = "", nudge_banner: str = "",
+) -> str:
+    """Build a compact dynamic `<turn_context>` block injected on the active user turn (never mutating `messages[0]`)."""
+    mem, wf = (store or get_memory_store()), (wf_engine or workflow_engine)
+    ws = settings.get_workspace()
+    lines: List[str] = []
+    active_wf = mem.get_active_workflow()
+    if active_wf:
+        lines.append(f"active_workflow: #{active_wf['id']} state={active_wf['current_state']} ({wf.render_hud().splitlines()[0][:120]})")
+    waiting_apr = len(get_approval_queue(mem).list_requests(status="waiting"))
+    if waiting_apr:
+        lines.append(f"pending_approvals: {waiting_apr}")
+    pending_tasks = mem.get_pending_tasks()[:3]
+    if pending_tasks:
+        lines.append("focus_tasks: " + "; ".join(f"#{tid}({st}) {desc[:60]}" for tid, desc, st, _ in pending_tasks))
+    if user_query.strip():
+        skills = discover_skills(settings.root)
+        grounding = build_epistemic_grounding(user_query, store=mem, root=ws.project_root, skills=skills, top_k=3)
+        if grounding.known_facts:
+            lines.append("relevant_facts: " + "; ".join(f"{e.key}={e.content[:90]}" for e in grounding.known_facts[:4]))
+        if grounding.top_skills:
+            lines.append("matched_skills: " + ", ".join(f"{s['name']} ({s['path']})" for s in grounding.top_skills[:3]))
+    if nudge_banner.strip():
+        lines.append(nudge_banner.strip())
+    return ("<turn_context>\n" + "\n".join(lines) + "\n</turn_context>") if lines else ""
 
-[TOP PENDING BACKLOG]
-{backlog_str}
 
-{agile_hud}
+_DURABLE_FACT_RE = re.compile(
+    r"(?:^|\.\s+)(?:please\s+)?(?:remember\s+that|note\s+that|for\s+future\s+reference[,:]?)\s+([^.\n]{8,180})",
+    re.I,
+)
 
-{edu_hud}
 
-[RECENT SYSTEM NOTES & LESSONS]
-{notes_str}
-{grounding.prompt_block}
-[CODEBASE AST & LINE-BUDGET RADAR (`{ws.project_id}`)]
-{repo_radar}
-
-[AVAILABLE SKILLS — PROGRESSIVE DISCLOSURE RUNBOOKS (L2)]
-Tools (`companion/tools.py`) are L1 atomic execution primitives; Skills (`skills/<name>/SKILL.md`) are L2 declarative runbooks:
-{skills_str}
-
-[EXECUTION REMINDERS]
-- Partnership Rule: Never ask the User to run internal tools or write code — execute tools autonomously and communicate in warm, plain executive English.
-- Surgical Reads & Inline Guard: Use `read_file(path="...", symbol="ClassName.method")` to inspect exact AST definitions without wasting context. `write_file`/`edit_file` run an instant micro-linter (blocking `>700L` modules, `>100L` functions, upward A-Frame imports, and external packages).
-- Practice SDD: keep `specs/PRODUCT.md`, `specs/ARCHITECTURE.md`, `specs/CONTRACTS.md`, and `specs/DECISIONS.md` aligned with Companion core changes (`sdd_manage` / `system_doctor`).
-- Switch or initialize isolated external projects via `project_manage(action="init"|"switch"|"self"|"list")` or `/project`.
-- Wiki Warehouse notes (`01_inbox/`, `02_knowledge/`, `03_resources/`, `04_archive/`) live in the Wiki Warehouse, not the repo root — always use `wiki_manage` directly (never `list_dir`/`read_file` on `01_inbox` or `02_knowledge`). Stage rough captures into `01_inbox/` first; when curating/graduating to `02_knowledge/`, prioritize deliberate multi-turn quality (`inspect_graduation` -> `read` every `must_read` overlap -> pick one of the 11 governed templates & absorb into sections -> `validate_curation` -> `commit_curation`).
-- On Windows, ALWAYS use `run_python` to run Python code (never use bash `<< EOF` in `run_shell`).
-"""
+def consolidate_turn_memory(user_text: str, assistant_text: str = "", store: Optional[MemoryStore] = None) -> int:
+    """Distill explicit durable user facts into `knowledge_facts` post-turn without foreground tool interruptions."""
+    _ = assistant_text
+    clean = (user_text or "").strip()
+    if not clean or clean.startswith(("/", "[")):
+        return 0
+    mem = store or get_memory_store()
+    saved = 0
+    for m in _DURABLE_FACT_RE.finditer(clean):
+        fact_val = m.group(1).strip(" .,;:")
+        slug = re.sub(r"[^a-z0-9]+", "_", fact_val.lower()).strip("_")[:36]
+        if slug:
+            mem.upsert_knowledge_fact(f"user_note:{slug}", fact_val, source="post_turn", confidence=0.95)
+            saved += 1
+    if saved and mem.db_path.resolve() == settings.db_path.resolve():
+        mem.sync_memory_md()
+    return saved
 
 
 def compact_messages_if_needed(
@@ -441,6 +476,8 @@ def compact_messages_if_needed(
     last_usage_tokens: int = 0,
     summarizer_fn: Optional[Any] = None,
     tier: Optional[str] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    active_turn_start_idx: int = 0,
 ) -> List[Dict[str, Any]]:
     """Adaptive 2-stage compaction with live `build_system_prompt` fallback."""
     mem = store or get_memory_store()
@@ -454,4 +491,6 @@ def compact_messages_if_needed(
         summarizer_fn=summarizer_fn,
         tier=tier,
         system_prompt_fn=lambda: build_system_prompt(store=mem),
+        tools=tools,
+        active_turn_start_idx=active_turn_start_idx,
     )

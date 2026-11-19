@@ -134,7 +134,11 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
 
                     # Mutate files + SQLite tasks & facts in proj-alpha
                     (ext_a / "settings.toml").write_text('mode = "broken"\n', encoding="utf-8")
-                    (ext_a / "orphan.json").write_text('{"temp": true}\n', encoding="utf-8")
+                    orphan_p = ext_a / "orphan.json"
+                    orphan_p.write_text('{"temp": true}\n', encoding="utf-8")
+                    cp_a.record_file_touch(orphan_p, False, None, orphan_p.read_bytes())
+                    human_cs = ext_a / "Program.cs"
+                    human_cs.write_text("Console.WriteLine(1);\n", encoding="utf-8")
                     alpha_tid = store.add_task("Alpha experimental task")
                     store.upsert_knowledge_fact("env:mode", "broken")
                     self.assertEqual([t[0] for t in store.get_pending_tasks()], [alpha_tid])
@@ -143,11 +147,12 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
                     with workspace_context(ext_b, "proj-beta"):
                         self.assertEqual(store.get_pending_tasks(), [])
 
-                    # Rollback proj-alpha checkpoint: rewinds TOML, deletes orphan.json, rewinds alpha tasks/facts, preserves self_tid!
+                    # Rollback proj-alpha checkpoint: rewinds TOML, deletes Companion orphan.json, preserves human Program.cs & self_tid!
                     rb = cp_a.rollback_checkpoint(snap["checkpoint_id"])
                     self.assertTrue(rb["restored"])
                     self.assertEqual((ext_a / "settings.toml").read_text(encoding="utf-8"), 'mode = "stable"\n')
                     self.assertFalse((ext_a / "orphan.json").exists())
+                    self.assertTrue(human_cs.exists())
                     self.assertEqual(store.get_pending_tasks(), [])
                     self.assertEqual(store.query_knowledge_facts("env:mode")[0]["value"], "stable")
 
@@ -172,7 +177,7 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
 
         with patch.object(settings, "tiers_share_endpoint", return_value=False):
             self.assertEqual(select_turn_step_tier("auto", None, 0, step=0, intent_mode="DEEP_CONSULT"), "reasoning")
-            self.assertEqual(select_turn_step_tier("auto", None, 0, step=1, intent_mode="DEEP_CONSULT", prior_tier="reasoning"), "fast")
+            self.assertEqual(select_turn_step_tier("auto", None, 0, step=1, intent_mode="DEEP_CONSULT", prior_tier="reasoning"), "reasoning")
 
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp) / "ready_ws"
@@ -186,8 +191,8 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
                 self.assertEqual(r_gap.status, "NEEDS_ALIGNMENT")
                 self.assertIn("ExternalBillingCluster", r_gap.unknown_terms)
                 r_r3 = assess_turn_readiness("Run git push origin main to publish release", store=st, root=ws)
-                self.assertEqual(r_r3.status, "NEEDS_ALIGNMENT")
-                self.assertEqual(r_r3.risk_tier, ActionRiskTier.R3_HIGH_IMPACT_MUTATION)
+                self.assertEqual(r_r3.status, "READY")
+                self.assertIn("RISK GATE REJECTED (R3)", dispatch("run_shell", {"command": "git push origin main"}))
             finally:
                 st.close()
 
@@ -454,18 +459,27 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
                     def _probe_chat(messages: List[Dict[str, Any]], _tools=None, _choice="auto") -> Dict[str, Any]:
                         seen_tiers.append(current_tier_name() or "")
                         u = str(messages[-1].get("content", ""))
-                        if "Compare tradeoffs" in u:
-                            tc = {"id": "mut1", "function": {"name": "write_file", "arguments": '{"path":"illegal.txt","content":"x"}'}}
+                        if "Compare tradeoffs" in u and messages[-1].get("role") == "user":
+                            fname = "allowed_q.txt" if "?" in u else "illegal.txt"
+                            tc = {"id": "mut1", "function": {"name": "write_file", "arguments": json.dumps({"path": fname, "content": "x"})}}
                             return {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [tc]}}]}
                         return {"choices": [{"message": {"role": "assistant", "content": "Inspected cleanly."}}]}
 
                     run_agent_turn([{"role": "user", "content": "Patch ExternalBillingCluster and SyncBrokerV2 routing"}], max_iters=2, chat_fn=_probe_chat, store=st, verbose=False)
                     self.assertEqual(seen_tiers[0], "reasoning")
+                    # Normal Chat `?` prompts retain write tools (CORE-1), whereas explicit PLAN phase locks write tools
+                    q_msgs: List[Dict[str, Any]] = [{"role": "user", "content": "Compare tradeoffs between architecture options and save summary for local queues?"}]
+                    run_agent_turn(q_msgs, max_iters=2, chat_fn=_probe_chat, store=st, verbose=False)
+                    self.assertTrue((ws / "allowed_q.txt").exists())
                     consult_msgs: List[Dict[str, Any]] = [{"role": "user", "content": "Compare tradeoffs between architecture options for local queues"}]
-                    run_agent_turn(consult_msgs, max_iters=2, chat_fn=_probe_chat, store=st, verbose=False)
+                    with phase_tool_context("PLAN"):
+                        run_agent_turn(consult_msgs, max_iters=2, chat_fn=_probe_chat, store=st, verbose=False)
                     self.assertFalse((ws / "illegal.txt").exists())
                     self.assertTrue(any("PHASE TOOL GATE REJECTED" in str(m.get("content", "")) for m in consult_msgs if m.get("role") == "tool"))
-                    bp_auto = run_agent_turn([{"role": "user", "content": "Build a service listener — I am not sure how to structure it, align with me first"}], chat_fn=_probe_chat, store=st, verbose=False)
+                    bp_auto = run_agent_turn(
+                        [{"role": "user", "content": "Build a service listener — I am not sure how to structure it, align with me first"}],
+                        chat_fn=_probe_chat, store=st, verbose=False, auto_promote=True,
+                    )
                     self.assertIn("Blueprint Ready for Your Review", bp_auto)
                     self.assertTrue(is_awaiting_blueprint_approval(st))
             finally:

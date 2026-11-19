@@ -16,6 +16,7 @@ import sqlite3
 import sys
 import threading
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -23,7 +24,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from companion import __version__
 from companion.config import SELF_PROJECT_ID, is_in_agent_tool_turn, settings
 from companion.semantic_memory import hybrid_rrf_rank
-from companion.telemetry import redact_secrets, telemetry_db_context
+from companion.telemetry import get_db_writer_lock, notify_db_closed, redact_secrets, sqlite_write_tx, telemetry_db_context
 
 
 def parse_time_window(window: str, now: Optional[datetime] = None) -> Optional[Tuple[str, str]]:
@@ -101,7 +102,7 @@ FOUNDATIONAL_ADRS: List[Tuple[str, str, str, str]] = [
 ]
 
 SCHEMA_SQL = (
-    "CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, content TEXT NOT NULL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, tool_call_id TEXT, session_tag TEXT)",
+    "CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, content TEXT NOT NULL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, tool_call_id TEXT, session_tag TEXT, meta_json TEXT DEFAULT '{}')",
     "CREATE TABLE IF NOT EXISTS system_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL, category TEXT DEFAULT 'general', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS user_profile (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS architecture_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL UNIQUE, context TEXT NOT NULL, decision TEXT NOT NULL, consequences TEXT NOT NULL, status TEXT DEFAULT 'accepted', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
@@ -109,7 +110,7 @@ SCHEMA_SQL = (
     "CREATE TABLE IF NOT EXISTS workflow_transitions (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id INTEGER NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, summary TEXT NOT NULL, verification_passed INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS autonomy_journal (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_name TEXT NOT NULL, entry_kind TEXT DEFAULT 'routine', status TEXT NOT NULL, checkpoint_id TEXT DEFAULT '', doctor_passed INTEGER DEFAULT 1, summary TEXT NOT NULL, seen_by_user INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS knowledge_facts (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT DEFAULT 'companion-self', key TEXT NOT NULL, value TEXT NOT NULL, source TEXT DEFAULT 'agent', confidence REAL DEFAULT 1.0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE(project_id, key))",
-    "CREATE TABLE IF NOT EXISTS projects (project_id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title TEXT NOT NULL, goal_summary TEXT DEFAULT '', kind TEXT DEFAULT 'project', status TEXT DEFAULT 'active', workspace_id TEXT DEFAULT 'companion-self', wiki_hub_path TEXT DEFAULT '', risk_ceiling TEXT DEFAULT 'R2', trigger_policy_json TEXT DEFAULT '{}', metadata_json TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS projects (project_id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title TEXT NOT NULL, goal_summary TEXT DEFAULT '', kind TEXT DEFAULT 'project', status TEXT DEFAULT 'active', workspace_id TEXT DEFAULT 'companion-self', workspace_path TEXT DEFAULT '', wiki_hub_path TEXT DEFAULT '', risk_ceiling TEXT DEFAULT 'R2', trigger_policy_json TEXT DEFAULT '{}', metadata_json TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS milestones (milestone_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT DEFAULT '', stage_kind TEXT DEFAULT 'DELIVER_AND_VERIFY', status TEXT DEFAULT 'active', sort_order INTEGER DEFAULT 0, target_date TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS project_timeboxes (timebox_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, goal TEXT DEFAULT '', start_date TEXT NOT NULL, end_date TEXT NOT NULL, status TEXT DEFAULT 'planning', metadata_json TEXT DEFAULT '{}', retro_notes TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS work_items (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL UNIQUE, project_id TEXT NOT NULL DEFAULT 'companion-self', milestone_id TEXT DEFAULT '', timebox_id TEXT DEFAULT '', workflow_id INTEGER, item_kind TEXT NOT NULL DEFAULT 'task', title TEXT NOT NULL, description TEXT DEFAULT '', category TEXT DEFAULT 'general', status TEXT NOT NULL DEFAULT 'pending', owner TEXT NOT NULL DEFAULT 'companion', stage_kind TEXT NOT NULL DEFAULT 'DELIVER_AND_VERIFY', priority INTEGER DEFAULT 3, depends_on_json TEXT DEFAULT '[]', verification_json TEXT DEFAULT '{}', dag_name TEXT DEFAULT '', checkpoint_id TEXT DEFAULT '', acceptance_criteria TEXT DEFAULT '', verification_result TEXT DEFAULT '', estimated_effort TEXT DEFAULT '', actual_effort TEXT DEFAULT '', estimate_minutes INTEGER DEFAULT 30, planned_date TEXT DEFAULT '', due_date TEXT DEFAULT '', checklist_json TEXT DEFAULT '[]', tags_json TEXT DEFAULT '[]', position INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, completed_at DATETIME)",
@@ -129,25 +130,33 @@ class MemoryStore:
     """Thread-safe SQLite-backed memory and state store for Companion AI OS."""
 
     def __init__(self, db_path: Optional[Path] = None):
-        self._lock = threading.RLock()
         self._initialized_schemas: set[str] = set()
+        self._closed = False
         self.db_path = Path(db_path or settings.db_path)
+        self._lock = get_db_writer_lock(self.db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
         with self._lock:
             self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA busy_timeout=15000")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self._init_and_migrate_db()
+        _LIVE_STORES[_db_cache_key(self.db_path)] = self
+
+    @contextlib.contextmanager
+    def write_tx(self) -> Iterator[sqlite3.Cursor]:
+        """Run a multi-statement SQLite write transaction under the shared DB writer lock with automatic rollback."""
+        with sqlite_write_tx(self.conn, self._lock) as cur:
+            yield cur
 
     def ensure_schema(self, key: str, init_fn: Callable[["MemoryStore"], None]) -> None:
-        """Run a subsystem DDL initializer at most once per `MemoryStore` instance under `self._lock`."""
+        """Run a subsystem DDL initializer at most once per `MemoryStore` instance under `self.write_tx()`."""
         if key in self._initialized_schemas:
             return
-        with self._lock:
+        with self.write_tx():
             if key not in self._initialized_schemas:
                 init_fn(self)
-                self.conn.commit()
                 self._initialized_schemas.add(key)
 
     def _fetch_rows(self, sql: str, params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
@@ -165,14 +174,19 @@ class MemoryStore:
         )
 
     def _init_and_migrate_db(self) -> None:
-        cursor = self.conn.cursor()
-        for ddl in SCHEMA_SQL:
-            cursor.execute(ddl)
-        cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(content)")
-        if cursor.execute("SELECT 1 FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts) LIMIT 1").fetchone():
-            cursor.execute("INSERT INTO conversations_fts(rowid, content) SELECT id, content FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts)")
-        self._ensure_project_record(SELF_PROJECT_ID)
-        self.conn.commit()
+        with self.write_tx() as cursor:
+            for ddl in SCHEMA_SQL:
+                cursor.execute(ddl)
+            proj_cols = {str(r[1]) for r in cursor.execute("PRAGMA table_info(projects)").fetchall()}
+            if "workspace_path" not in proj_cols:
+                cursor.execute("ALTER TABLE projects ADD COLUMN workspace_path TEXT DEFAULT ''")
+            conv_cols = {str(r[1]) for r in cursor.execute("PRAGMA table_info(conversations)").fetchall()}
+            if "meta_json" not in conv_cols:
+                cursor.execute("ALTER TABLE conversations ADD COLUMN meta_json TEXT DEFAULT '{}'")
+            cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(content)")
+            if cursor.execute("SELECT 1 FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts) LIMIT 1").fetchone():
+                cursor.execute("INSERT INTO conversations_fts(rowid, content) SELECT id, content FROM conversations WHERE id NOT IN (SELECT rowid FROM conversations_fts)")
+            self._ensure_project_record(SELF_PROJECT_ID)
         self._seed_defaults()
         if self.db_path.resolve() == settings.db_path.resolve():
             prof = self.get_user_profile()
@@ -183,47 +197,42 @@ class MemoryStore:
                 self.sync_memory_md(target_path=settings.memory_md_path)
 
     def _seed_defaults(self) -> None:
-        cursor = self.conn.cursor()
-        existing_map = dict(cursor.execute("SELECT key, value FROM user_profile").fetchall())
-        prev_ver = existing_map.get("app_version", "")
-        dirty = False
-        if existing_map and prev_ver != __version__:
-            bdir = self.db_path.parent / ".companion_backups"
-            bdir.mkdir(parents=True, exist_ok=True)
-            with contextlib.closing(sqlite3.connect(str(bdir / f"pre_upgrade_{prev_ver or 'v0'}_to_{__version__}.db"))) as bconn:
-                self.conn.backup(bconn)
-        for key, val in DEFAULT_USER_PROFILE.items():
-            if key not in existing_map:
-                seed_val = ("on" if settings.self_dev_default else "off") if key == "self_dev_mode" else val
-                cursor.execute("INSERT INTO user_profile (key, value) VALUES (?, ?)", (key, seed_val))
-                dirty = True
-        if prev_ver != __version__:
-            cursor.execute("INSERT OR REPLACE INTO user_profile (key, value) VALUES ('app_version', ?)", (__version__,))
-            dirty = True
-        existing_by_code = {
-            r[0].split(":", 1)[0].strip(): r
-            for r in cursor.execute("SELECT title, context, decision, consequences, status FROM architecture_decisions").fetchall()
-        }
-        for title, context, decision, consequences in FOUNDATIONAL_ADRS:
-            code = title.split(":", 1)[0].strip()
-            prev_row = existing_by_code.get(code)
-            if prev_row is None:
-                cursor.execute("INSERT INTO architecture_decisions (title, context, decision, consequences, status) VALUES (?, ?, ?, ?, 'accepted')", (title, context, decision, consequences))
-                dirty = True
-            elif prev_row[4] == "accepted" and prev_row[:4] != (title, context, decision, consequences):
-                cursor.execute("UPDATE architecture_decisions SET title = ?, context = ?, decision = ?, consequences = ? WHERE title = ?", (title, context, decision, consequences, prev_row[0]))
-                dirty = True
-        if dirty:
-            self.conn.commit()
+        with self.write_tx() as cursor:
+            existing_map = dict(cursor.execute("SELECT key, value FROM user_profile").fetchall())
+            prev_ver = existing_map.get("app_version", "")
+            if existing_map and prev_ver != __version__:
+                bdir = self.db_path.parent / ".companion_backups"
+                bdir.mkdir(parents=True, exist_ok=True)
+                with contextlib.closing(sqlite3.connect(str(bdir / f"pre_upgrade_{prev_ver or 'v0'}_to_{__version__}.db"))) as bconn:
+                    self.conn.backup(bconn)
+            for key, val in DEFAULT_USER_PROFILE.items():
+                if key not in existing_map:
+                    seed_val = ("on" if settings.self_dev_default else "off") if key == "self_dev_mode" else val
+                    cursor.execute("INSERT INTO user_profile (key, value) VALUES (?, ?)", (key, seed_val))
+            if prev_ver != __version__:
+                cursor.execute("INSERT OR REPLACE INTO user_profile (key, value) VALUES ('app_version', ?)", (__version__,))
+            existing_by_code = {
+                r[0].split(":", 1)[0].strip(): r
+                for r in cursor.execute("SELECT title, context, decision, consequences, status FROM architecture_decisions").fetchall()
+            }
+            for title, context, decision, consequences in FOUNDATIONAL_ADRS:
+                code = title.split(":", 1)[0].strip()
+                prev_row = existing_by_code.get(code)
+                if prev_row is None:
+                    cursor.execute("INSERT INTO architecture_decisions (title, context, decision, consequences, status) VALUES (?, ?, ?, ?, 'accepted')", (title, context, decision, consequences))
+                elif prev_row[4] == "accepted" and prev_row[:4] != (title, context, decision, consequences):
+                    cursor.execute("UPDATE architecture_decisions SET title = ?, context = ?, decision = ?, consequences = ? WHERE title = ?", (title, context, decision, consequences, prev_row[0]))
 
-    def log_message(self, role: str, content: str, tool_call_id: Optional[str] = None, session_tag: Optional[str] = None) -> int:
+    def log_message(
+        self, role: str, content: str, tool_call_id: Optional[str] = None,
+        session_tag: Optional[str] = None, meta: Optional[Dict[str, Any]] = None,
+    ) -> int:
         safe_text = redact_secrets(str(content))
-        with self._lock:
-            cursor = self.conn.cursor()
-            cursor.execute("INSERT INTO conversations (role, content, tool_call_id, session_tag) VALUES (?, ?, ?, ?)", (role, safe_text, tool_call_id, session_tag))
+        safe_meta = redact_secrets(json.dumps(meta, ensure_ascii=False)) if meta else "{}"
+        with self.write_tx() as cursor:
+            cursor.execute("INSERT INTO conversations (role, content, tool_call_id, session_tag, meta_json) VALUES (?, ?, ?, ?, ?)", (role, safe_text, tool_call_id, session_tag, safe_meta))
             row_id = int(cursor.lastrowid)
             cursor.execute("INSERT OR REPLACE INTO conversations_fts(rowid, content) VALUES (?, ?)", (row_id, safe_text))
-            self.conn.commit()
             return row_id
 
     def get_recent_messages(self, limit: int = 50, role_filter: Optional[str] = None) -> List[Tuple[str, str, str]]:
@@ -452,13 +461,11 @@ class MemoryStore:
 
     def create_workflow_run(self, workflow_type: str, goal: str, initial_state: str, acceptance_criteria: str = "", checkpoint_id: str = "", metadata: Optional[Dict[str, Any]] = None, project_id: Optional[str] = None) -> int:
         pid = _eff_pid(project_id)
-        with self._lock:
-            self.conn.execute("UPDATE workflow_runs SET status = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE status = 'active' AND project_id = ?", (pid,))
-            cursor = self.conn.cursor()
+        with self.write_tx() as cursor:
+            cursor.execute("UPDATE workflow_runs SET status = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE status = 'active' AND project_id = ?", (pid,))
             cursor.execute("INSERT INTO workflow_runs (workflow_type, goal, current_state, acceptance_criteria, checkpoint_id, metadata_json, status, project_id) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)", (workflow_type, goal, initial_state, acceptance_criteria, checkpoint_id, json.dumps(metadata or {}), pid))
             wf_id = int(cursor.lastrowid)
             cursor.execute("INSERT INTO workflow_transitions (workflow_id, from_state, to_state, summary, verification_passed) VALUES (?, 'IDLE', ?, ?, 1)", (wf_id, initial_state, f"Initialized {workflow_type} workflow: {goal}"))
-            self.conn.commit()
             return wf_id
 
     def _hydrate_workflow_row(self, row: Optional[Tuple[Any, ...]]) -> Optional[Dict[str, Any]]:
@@ -490,18 +497,15 @@ class MemoryStore:
             return self._hydrate_workflow_row(cursor.fetchone())
 
     def update_workflow_metadata(self, workflow_id: int, updates: Dict[str, Any]) -> None:
-        with self._lock:
-            cursor = self.conn.cursor()
+        with self.write_tx() as cursor:
             cursor.execute("SELECT metadata_json FROM workflow_runs WHERE id = ?", (workflow_id,))
             row = cursor.fetchone()
             meta: Dict[str, Any] = json.loads(row[0] or "{}") if row and row[0] else {}
             meta.update(updates)
             cursor.execute("UPDATE workflow_runs SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (json.dumps(meta), workflow_id))
-            self.conn.commit()
 
     def update_workflow_state(self, workflow_id: int, from_state: str, to_state: str, summary: str, status: str = "active", checkpoint_id: Optional[str] = None, verification_passed: bool = True, metadata_updates: Optional[Dict[str, Any]] = None, acceptance_criteria: Optional[str] = None) -> None:
-        with self._lock:
-            cursor = self.conn.cursor()
+        with self.write_tx() as cursor:
             cursor.execute("SELECT metadata_json, checkpoint_id FROM workflow_runs WHERE id = ?", (workflow_id,))
             row = cursor.fetchone()
             meta: Dict[str, Any] = json.loads(row[0] or "{}") if row and row[0] else {}
@@ -513,23 +517,20 @@ class MemoryStore:
                 (to_state, status, final_cp, json.dumps(meta), acceptance_criteria or None, workflow_id),
             )
             cursor.execute("INSERT INTO workflow_transitions (workflow_id, from_state, to_state, summary, verification_passed) VALUES (?, ?, ?, ?, ?)", (workflow_id, from_state, to_state, summary, 1 if verification_passed else 0))
-            self.conn.commit()
 
     def restore_superseded_workflow(self, workflow_id: int) -> None:
-        with self._lock:
-            self.conn.execute("UPDATE workflow_runs SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'superseded'", (int(workflow_id),))
-            self.conn.commit()
+        with self.write_tx() as cursor:
+            cursor.execute("UPDATE workflow_runs SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'superseded'", (int(workflow_id),))
 
     def rebind_workflow_project(self, workflow_id: int, project_id: str, task_ids: Optional[List[int]] = None, checkpoint_id: Optional[str] = None) -> None:
         pid = _eff_pid(project_id)
-        with self._lock:
+        with self.write_tx() as cursor:
             self._ensure_project_record(pid)
-            self.conn.execute("UPDATE workflow_runs SET status = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE status = 'active' AND project_id = ? AND id != ?", (pid, int(workflow_id)))
-            self.conn.execute("UPDATE workflow_runs SET project_id = ?, checkpoint_id = COALESCE(?, checkpoint_id), updated_at = CURRENT_TIMESTAMP WHERE id = ?", (pid, checkpoint_id, int(workflow_id)))
-            self.conn.execute("UPDATE work_items SET project_id = ? WHERE workflow_id = ?", (pid, int(workflow_id)))
+            cursor.execute("UPDATE workflow_runs SET status = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE status = 'active' AND project_id = ? AND id != ?", (pid, int(workflow_id)))
+            cursor.execute("UPDATE workflow_runs SET project_id = ?, checkpoint_id = COALESCE(?, checkpoint_id), updated_at = CURRENT_TIMESTAMP WHERE id = ?", (pid, checkpoint_id, int(workflow_id)))
+            cursor.execute("UPDATE work_items SET project_id = ? WHERE workflow_id = ?", (pid, int(workflow_id)))
             if task_ids:
-                self.conn.execute(f"UPDATE work_items SET project_id = ? WHERE id IN ({','.join('?' for _ in task_ids)})", (pid, *(int(t) for t in task_ids)))
-            self.conn.commit()
+                cursor.execute(f"UPDATE work_items SET project_id = ? WHERE id IN ({','.join('?' for _ in task_ids)})", (pid, *(int(t) for t in task_ids)))
 
     def get_workflow_transitions(self, workflow_id: int) -> List[Dict[str, Any]]:
         cols = ["id", "from_state", "to_state", "summary", "verification_passed", "created_at"]
@@ -539,18 +540,23 @@ class MemoryStore:
         default_md = settings.memory_md_path if self.db_path.resolve() == settings.db_path.resolve() else (self.db_path.parent / "MEMORY.md")
         out_path = target_path or default_md
         profile, adrs, active_wf = self.get_user_profile(), self.get_adrs(), self.get_active_workflow()
-        pending_tasks, backlog_items, notes = self.get_pending_tasks(), self.get_backlog(), self.get_system_notes(limit=12)
-
-        lines: List[str] = ["# Companion AI OS — Persistent Memory", "Authoritative living memory synchronized with `data/conversations.db`.", "", "## 1. User Profile & Partnership Ethos", *[f"- **{k}**: {v}" for k, v in profile.items()], "", "## 2. Active State-Machine Workflow"]
-        if active_wf:
-            lines.extend([f"- **Workflow ID**: #{active_wf['id']} (`{active_wf['workflow_type']}`)", f"- **Goal**: {active_wf['goal']}", f"- **Current State**: `{active_wf['current_state']}`"])
-        else:
-            lines.append("- **Current State**: `IDLE` (Ready for new engineering or companion workflow)")
-        lines.extend(["", "## 3. Architecture Decision Records (ADRs)", *[f"- **{a['title']}** [{a['status']}]: {a['decision']} *(Outcome: {a['consequences']})*" for a in adrs if a.get("status", "accepted") == "accepted"][-20:]])
-        lines.extend(["", "## 4. Active Work Items", *([f"- `[Item #{tid} | P{prio} | {st}]` {desc}" for tid, desc, st, prio in pending_tasks] if pending_tasks else ["- No pending immediate work items."])])
-        lines.extend(["", "## 5. Backlog Items", *([f"- [{'x' if st in ('completed', 'done') else ' '}] `[Backlog #{bid} | {cat} | {st}]` {desc}" for bid, desc, cat, st in backlog_items] if backlog_items else ["- Backlog is currently empty."])])
-        lines.extend(["", "## 6. System Notes & Lessons Learned", *([f"- **[{cat}]** {note_text}" for note_text, cat, _ in notes] if notes else ["- Always use `run_python` for multiline Python execution on Windows."]), ""])
-        out_path.write_text("\n".join(lines), encoding="utf-8")
+        pending_tasks, backlog_items, notes = self.get_pending_tasks()[:5], self.get_backlog()[:4], self.get_system_notes(limit=5)
+        facts = self.query_knowledge_facts(limit=6)
+        core_keys = ("companion_name", "user_name", "role", "companion_tone", "background_autonomy", "self_dev_mode", "active_project_id")
+        prof_lines = [f"- **{k}**: {profile[k][:90]}" for k in core_keys if k in profile]
+        lines: List[str] = ["# Companion AI OS — Persistent Memory", "", "## 1. User Profile & Partnership Ethos", *prof_lines, "", "## 2. Active Workflow"]
+        lines.append(f"- **Workflow #{active_wf['id']}** (`{active_wf['current_state']}`): {active_wf['goal'][:90]}" if active_wf else "- **State**: `IDLE`")
+        accepted_adrs = [a for a in adrs if a.get("status", "accepted") == "accepted"]
+        adr_codes = ", ".join(str(a["title"]).split(":", 1)[0].strip() for a in accepted_adrs)
+        lines.extend(["", "## 3. Architecture Decision Records (ADRs)", f"- Active ({len(accepted_adrs)}): {adr_codes or 'none'}"])
+        if facts:
+            lines.extend(["", "## 4. Durable Knowledge Facts", *[f"- `{f['key']}`: {str(f['value'])[:80]}" for f in facts]])
+        lines.extend(["", "## 5. Active Work & Backlog", *([f"- `[#{tid} | {st}]` {desc[:75]}" for tid, desc, st, _ in pending_tasks] or ["- No pending work items."]), *([f"- `[Backlog #{bid}]` {desc[:65]}" for bid, desc, _c, _s in backlog_items])])
+        lines.extend(["", "## 6. Recent Lessons", *([f"- **[{cat}]** {nt[:90]}" for nt, cat, _ in notes] or ["- Use `run_python` for multiline Python snippets."]), ""])
+        text = "\n".join(lines)
+        if len(text.encode("utf-8")) > 1980:
+            text = text[:1950].rsplit("\n", 1)[0] + "\n"
+        out_path.write_text(text, encoding="utf-8")
         return out_path
 
     def export_state_snapshot(self, project_id: Optional[str] = None) -> Dict[str, Any]:
@@ -574,8 +580,7 @@ class MemoryStore:
         pid = str(snapshot.get("project_id") or _eff_pid(project_id))
         scoped = (("work_items", " WHERE project_id = ?", (pid,)), ("milestones", " WHERE project_id = ?", (pid,)), ("knowledge_facts", " WHERE project_id = ?", (pid,)))
         global_tbls = (("architecture_decisions", "", ()),) if pid == SELF_PROJECT_ID else ()
-        with self._lock:
-            cur = self.conn.cursor()
+        with self.write_tx() as cur:
             for tbl, where_sql, params in (*scoped, *global_tbls):
                 if tbl not in snapshot:
                     continue
@@ -583,17 +588,44 @@ class MemoryStore:
                 for row in snapshot[tbl]:
                     cols = list(row.keys())
                     cur.execute(f"INSERT INTO {tbl} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})", [row[c] for c in cols])
-            self.conn.commit()
         if rollback_reason.strip():
             self.add_system_note(rollback_reason.strip()[:500], category="rollback_lesson")
 
+    def _is_usable(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            with self._lock:
+                self.conn.execute("SELECT 1")
+            return True
+        except sqlite3.Error:
+            return False
+
     def close(self) -> None:
+        global _store_instance
+        self._closed = True
+        key = _db_cache_key(self.db_path)
+        with _store_lock:
+            if _PATH_STORES.get(key) is self:
+                _PATH_STORES.pop(key, None)
+            if _LIVE_STORES.get(key) is self:
+                _LIVE_STORES.pop(key, None)
+            if _store_instance is self:
+                _store_instance = None
+        notify_db_closed(self.db_path)
         with self._lock:
             with contextlib.suppress(Exception):
                 self.conn.close()
 
 
+def _db_cache_key(db_path: Path) -> str:
+    resolved = str(Path(db_path).resolve())
+    return resolved.lower() if os.name == "nt" else resolved
+
+
 _store_instance: Optional[MemoryStore] = None
+_PATH_STORES: Dict[str, MemoryStore] = {}
+_LIVE_STORES: "weakref.WeakValueDictionary[str, MemoryStore]" = weakref.WeakValueDictionary()
 _store_lock = threading.Lock()
 _STORE_OVERRIDE: contextvars.ContextVar[Optional[MemoryStore]] = contextvars.ContextVar("companion_store_override", default=None)
 
@@ -618,17 +650,34 @@ def has_memory_store_override() -> bool:
 
 
 def get_memory_store(db_path: Optional[Path] = None) -> MemoryStore:
-    """Return the active scoped `MemoryStore`, or the singleton `MemoryStore` instance."""
+    """Return the active scoped `MemoryStore`, live/cached per-path store, or default singleton `MemoryStore`."""
     global _store_instance
     if db_path is not None:
-        return MemoryStore(db_path=db_path)
+        resolved = Path(db_path).resolve()
+        key = _db_cache_key(resolved)
+        with _store_lock:
+            cached = _PATH_STORES.get(key) or _LIVE_STORES.get(key)
+            if cached is not None and cached._is_usable():
+                return cached
+        created = MemoryStore(db_path=resolved)
+        with _store_lock:
+            _PATH_STORES[key] = created
+        return created
     override = _STORE_OVERRIDE.get()
     if override is not None:
         return override
+    target_default = settings.db_path.resolve()
+    def_key = _db_cache_key(target_default)
     with _store_lock:
-        if _store_instance is None:
-            _store_instance = MemoryStore()
-        return _store_instance
+        live = _LIVE_STORES.get(def_key)
+        if live is not None and live._is_usable():
+            return live
+        if _store_instance is not None and _store_instance._is_usable():
+            return _store_instance
+    fresh = MemoryStore(db_path=target_default)
+    with _store_lock:
+        _store_instance = fresh
+        return fresh
 
 
 settings.register_self_dev_resolver(lambda _d: get_memory_store().is_self_dev_mode_enabled())

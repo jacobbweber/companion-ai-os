@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from companion.config import CAPABILITY_TIERS, TierConfig, settings
@@ -27,11 +28,23 @@ from companion.llm_wire import (
     read_wire_response,
     urlopen_safe,
 )
-from companion.streaming import emit_stream_event, has_stream_sink, rescue_text_tool_calls, strip_thinking_tags
+from companion.streaming import (
+    check_cancelled,
+    emit_stream_event,
+    get_active_cancel_scope,
+    has_stream_sink,
+    rescue_text_tool_calls,
+    strip_thinking_tags,
+)
 from companion.telemetry import telemetry
 
 
 _CALL_PRIORITY: contextvars.ContextVar[str] = contextvars.ContextVar("companion_llm_priority", default="foreground")
+__all__ = [
+    "ModelGate", "_sanitize_wire_messages", "active_swap_status", "chat", "check_model_endpoints",
+    "current_tier_name", "get_endpoint_gate", "model_gate", "normalize_assistant_message",
+    "recover_empty_synthesis", "rescue_text_tool_calls", "tier_context",
+]
 _ABORT_CHECK: contextvars.ContextVar[Optional[Callable[[], bool]]] = contextvars.ContextVar("companion_llm_abort_check", default=None)
 _ACTIVE_TIER: contextvars.ContextVar[str] = contextvars.ContextVar("companion_llm_tier", default="")
 _GLOBAL_FG_LOCK = threading.Lock()
@@ -51,6 +64,7 @@ class ModelGate:
         self.loaded_model: Optional[str] = None
         self.loaded_checked_mono: float = 0.0
         self._swap_info: Optional[Dict[str, Any]] = None
+        self._health_unsupported: bool = False
 
     @contextlib.contextmanager
     def foreground_turn(self) -> Iterator[None]:
@@ -96,8 +110,21 @@ class ModelGate:
             _CALL_PRIORITY.reset(p_tok)
 
     @contextlib.contextmanager
+    def _acquire_exec_lock_cancelable(self) -> Iterator[None]:
+        while not self._exec_lock.acquire(timeout=0.05):
+            check_cancelled()
+            abort_fn = _ABORT_CHECK.get()
+            if abort_fn is not None and abort_fn():
+                raise InterruptedError("LLM call aborted while waiting for endpoint lock.")
+        try:
+            yield
+        finally:
+            self._exec_lock.release()
+
+    @contextlib.contextmanager
     def acquire_call(self, priority: Optional[str] = None, serialize: bool = True) -> Iterator[None]:
         """Serialize same-endpoint local LLM calls (`_exec_lock`) while yielding background calls to foreground turns."""
+        check_cancelled()
         eff_prio = (priority or _CALL_PRIORITY.get() or "foreground").lower()
         abort_fn = _ABORT_CHECK.get()
         tid = threading.get_ident()
@@ -105,7 +132,7 @@ class ModelGate:
             on_fg_thread = tid in _GLOBAL_FG_THREADS
         if eff_prio != "background" or on_fg_thread:
             if serialize:
-                with self._exec_lock:
+                with self._acquire_exec_lock_cancelable():
                     yield
             else:
                 yield
@@ -115,6 +142,7 @@ class ModelGate:
             self._bg_waiting += 1
             try:
                 while True:
+                    check_cancelled()
                     if abort_fn is not None and abort_fn():
                         raise InterruptedError("Background LLM call preempted by foreground user activity.")
                     with _GLOBAL_FG_LOCK:
@@ -127,7 +155,7 @@ class ModelGate:
                 self._bg_waiting = max(0, self._bg_waiting - 1)
         try:
             if serialize:
-                with self._exec_lock:
+                with self._acquire_exec_lock_cancelable():
                     yield
             else:
                 yield
@@ -340,9 +368,17 @@ def _sanitize_wire_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def normalize_assistant_message(msg_obj: Dict[str, Any]) -> Tuple[str, str, List[Dict[str, Any]]]:
-    """Normalize `msg_obj` in place: strip `<think>`, consolidate `thinking`, and rescue text `<tool_call>` blocks."""
+    """Normalize `msg_obj` in place: rescue `<tool_call>` (even inside unclosed `<think>`), strip `<think>`, and ensure unique IDs."""
     raw_content = str(msg_obj.get("content") or "")
     raw_reasoning = str(msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or msg_obj.get("thinking") or "").strip()
+    existing_tcalls = list(msg_obj.get("tool_calls") or [])
+    if not existing_tcalls and "<tool_call>" in raw_content.lower():
+        raw_content, rescued_tcalls = rescue_text_tool_calls(raw_content)
+        if rescued_tcalls:
+            existing_tcalls = rescued_tcalls
+            if telemetry.active_trace_id:
+                telemetry.log("INFO", "llm", f"Rescued {len(rescued_tcalls)} text `<tool_call>` block(s) from assistant content.")
+
     clean_content, tag_thinking = strip_thinking_tags(raw_content)
     parts: List[str] = []
     for chunk in (raw_reasoning, tag_thinking):
@@ -350,14 +386,19 @@ def normalize_assistant_message(msg_obj: Dict[str, Any]) -> Tuple[str, str, List
             parts.append(chunk)
     combined_thinking = "\n\n".join(parts)
 
-    existing_tcalls = list(msg_obj.get("tool_calls") or [])
-    if not existing_tcalls:
-        clean_content, rescued_tcalls = rescue_text_tool_calls(clean_content)
-        if rescued_tcalls:
-            existing_tcalls = rescued_tcalls
-            msg_obj["tool_calls"] = rescued_tcalls
-            if telemetry.active_trace_id:
-                telemetry.log("INFO", "llm", f"Rescued {len(rescued_tcalls)} text `<tool_call>` block(s) from assistant content.")
+    if existing_tcalls:
+        seen_ids: set[str] = set()
+        norm_tcalls: List[Dict[str, Any]] = []
+        for tc in existing_tcalls:
+            tc_copy = dict(tc) if isinstance(tc, dict) else {"type": "function", "function": {"name": "unknown", "arguments": "{}"}}
+            raw_id = str(tc_copy.get("id") or "").strip()
+            eff_id = raw_id if (raw_id and raw_id.lower() != "null" and raw_id not in seen_ids) else f"call_{uuid.uuid4().hex[:8]}"
+            seen_ids.add(eff_id)
+            tc_copy["id"] = eff_id
+            tc_copy.setdefault("type", "function")
+            norm_tcalls.append(tc_copy)
+        existing_tcalls = norm_tcalls
+        msg_obj["tool_calls"] = existing_tcalls
 
     msg_obj["content"] = clean_content
     if combined_thinking:
@@ -396,6 +437,8 @@ def recover_empty_synthesis(
             if telemetry.active_trace_id:
                 telemetry.log("WARN", "llm", "Recovered from empty LLM synthesis on 1-shot retry (t81 guard).")
             return clean_retry.strip()
+    except InterruptedError:
+        raise
     except Exception as exc:
         if telemetry.active_trace_id:
             telemetry.log("WARN", "llm", f"Empty synthesis retry failed: {exc}")
@@ -415,13 +458,29 @@ def _fail_llm(span_label: str, t0: float, msg: str) -> RuntimeError:
     return RuntimeError(msg)
 
 
+def _endpoint_shares_tiers(base_url: str) -> bool:
+    norm = base_url.rstrip("/").lower()
+    models = {settings.resolve_tier(t).model for t in ("default", "fast", "coding", "reasoning") if settings.resolve_tier(t).base_url.rstrip("/").lower() == norm}
+    return len(models) > 1
+
+
 def _resolve_swap_window(gate: ModelGate, base_url: str, model: str, api_key: str, base_timeout: int) -> Tuple[int, bool]:
     """Detect whether `model` triggers a container/VRAM swap on `base_url` and promote timeout to `swap_timeout`."""
+    shares = _endpoint_shares_tiers(base_url) or settings.tiers_share_endpoint("fast", "reasoning") or settings.tiers_share_endpoint("default", "coding")
+    if not shares or gate._health_unsupported or ":11434" in base_url:
+        gate._health_unsupported = gate._health_unsupported or (":11434" in base_url)
+        return base_timeout, False
     stale = (time.monotonic() - gate.loaded_checked_mono) > 15.0
     if gate.loaded_model == model and not stale:
         return base_timeout, False
     prev = gate.loaded_model
-    remote_loaded, healthy = (probe_gateway_loaded_model(base_url, api_key) if (prev is None or stale) else (prev, True))
+    if prev is None or stale:
+        remote_loaded, healthy = probe_gateway_loaded_model(base_url, api_key)
+        if remote_loaded is None and healthy is None:
+            gate._health_unsupported = True
+            return base_timeout, False
+    else:
+        remote_loaded, healthy = prev, True
     if remote_loaded == model and healthy is not False:
         gate.end_swap(model)
         return base_timeout, False
@@ -432,7 +491,7 @@ def _resolve_swap_window(gate: ModelGate, base_url: str, model: str, api_key: st
         telemetry.log("INFO", "llm", f"Model swap detected on {base_url}: {remote_loaded or 'cold'} -> {model} (timeout={swap_to}s)")
         print(f"  [gpu-swap] Switching model on {base_url}: {remote_loaded or 'cold'} -> {model}...", file=sys.stderr, flush=True)
         return swap_to, True
-    return (swap_to, False) if (settings.tiers_share_endpoint("fast", "reasoning") or settings.tiers_share_endpoint("default", "coding")) else (base_timeout, False)
+    return swap_to, False
 
 
 def _resolve_ollama_fallback_or_hint(base_url: str, model: str, api_key: str) -> Tuple[Optional[str], str]:
@@ -449,7 +508,7 @@ def _post_completion(
     messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], tool_choice: str,
     target_base_url: str, target_model: str, target_key: str, target_temp: float, target_max_tokens: int,
     target_timeout: int, max_retries: int, priority: Optional[str], tier_label: str,
-    dialect: str = "openai_compat", reasoning_effort: str = "",
+    dialect: str = "openai_compat", reasoning_effort: str = "", has_tier_fallback: bool = False,
 ) -> Dict[str, Any]:
     """Execute one serialized HTTP completion cycle across OpenAI/Anthropic/Gemini dialects with Privacy Lock & swap guard."""
     eff_dialect = (dialect or "openai_compat").strip().lower()
@@ -467,6 +526,7 @@ def _post_completion(
     is_local = is_local_or_lan_endpoint(target_base_url)
     is_local_oai = eff_dialect == "openai_compat" and is_local
     healed_400, tried_ollama_fb = False, False
+    scope = get_active_cancel_scope()
 
     with gate.acquire_call(priority=priority, serialize=is_local):
         eff_timeout, is_swap = _resolve_swap_window(gate, target_base_url, target_model, target_key, target_timeout) if is_local_oai else (target_timeout, False)
@@ -474,10 +534,15 @@ def _post_completion(
         try:
             attempt = 0
             while attempt < max_attempts:
+                check_cancelled()
                 req = urllib.request.Request(target_url, data=payload, method="POST", headers=headers)
                 try:
                     with urlopen_safe(req, timeout=eff_timeout, allow_private_lan=True, allow_redirects=False) as resp:
-                        data = read_wire_response(eff_dialect, resp)
+                        if scope is not None:
+                            with scope.track_response(resp):
+                                data = read_wire_response(eff_dialect, resp)
+                        else:
+                            data = read_wire_response(eff_dialect, resp)
                     if not isinstance(data, dict) or not data.get("choices"):
                         raise RuntimeError(f"Malformed LLM response (missing choices): {str(data)[:300]}")
                     gate.end_swap(target_model)
@@ -490,7 +555,10 @@ def _post_completion(
                     detail = f"tier={tier_label} dialect={eff_dialect} temp={target_temp:.2f}{swap_tag} msgs={len(messages)} tools_called={len(tcalls)} tokens={toks} chars={len(clean_content)} think_chars={len(thinking_text)}"
                     telemetry.record_span("llm_call", span_label, dur_ms, status="ok", detail=detail)
                     return data
+                except InterruptedError:
+                    raise
                 except urllib.error.HTTPError as exc:
+                    check_cancelled()
                     err_body = exc.read().decode("utf-8", errors="replace")[:500] if hasattr(exc, "read") else ""
                     if exc.code == 400 and not healed_400:
                         healed = heal_http_400_request(eff_dialect, target_url, body, err_body)
@@ -498,7 +566,7 @@ def _post_completion(
                             healed_400, (target_url, body) = True, healed
                             payload = json.dumps(body).encode("utf-8")
                             continue
-                    if exc.code == 404 and is_local_oai and ":11434" in target_base_url and not tried_ollama_fb:
+                    if exc.code == 404 and is_local_oai and ":11434" in target_base_url and not tried_ollama_fb and not has_tier_fallback:
                         tried_ollama_fb = True
                         fb_model, hint = _resolve_ollama_fallback_or_hint(target_base_url, target_model, target_key)
                         if fb_model:
@@ -515,7 +583,8 @@ def _post_completion(
                         time.sleep(5.0 if is_swap else 1.0 * attempt)
                         continue
                     raise _fail_llm(span_label, call_start, err_text)
-                except (urllib.error.URLError, TimeoutError) as exc:
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    check_cancelled()
                     err_text = f"could not reach {target_base_url}: {getattr(exc, 'reason', str(exc))}"
                     within_window = (time.perf_counter() - call_start) < eff_timeout
                     if attempt + 1 < max_attempts and within_window:
@@ -527,8 +596,10 @@ def _post_completion(
                         err_text += " (Tip: Start Ollama and run `ollama pull qwen2.5:7b`, or configure your LLM provider in System -> Models.)"
                     raise _fail_llm(span_label, call_start, err_text)
                 except RuntimeError as exc:
+                    check_cancelled()
                     raise _fail_llm(span_label, call_start, str(exc))
                 except Exception as exc:
+                    check_cancelled()
                     raise _fail_llm(span_label, call_start, f"LLM request failed: {type(exc).__name__}: {exc}")
         finally:
             gate.end_swap()
@@ -551,10 +622,12 @@ def chat(
     target_max_tok, target_timeout = max_tokens or tier_cfg.max_tokens, http_timeout or settings.http_timeout
     target_dialect = dialect or tier_cfg.dialect
     target_effort = reasoning_effort if reasoning_effort is not None else tier_cfg.reasoning_effort
+    has_fb = bool(base_url is None and tier_cfg.fallback_model)
     try:
         return _post_completion(
             messages, tools, tool_choice, target_base_url, target_model, target_key, target_temp, target_max_tok,
             target_timeout, max_retries, priority, tier_cfg.tier, dialect=target_dialect, reasoning_effort=target_effort,
+            has_tier_fallback=has_fb,
         )
     except InterruptedError:
         raise
@@ -562,12 +635,13 @@ def chat(
         if base_url is not None:
             raise
         priv = settings.effective_privacy_mode()
-        if tier_cfg.fallback_base_url and tier_cfg.fallback_model and (priv != "local_only" or is_local_or_lan_endpoint(tier_cfg.fallback_base_url)):
+        fb_base = (tier_cfg.fallback_base_url or target_base_url).rstrip("/")
+        if tier_cfg.fallback_model and (priv != "local_only" or is_local_or_lan_endpoint(fb_base)):
             telemetry.log("WARN", "llm", f"Tier `{tier_cfg.tier}` (`{target_model}`) failed ({exc}); failing over to tier fallback `{tier_cfg.fallback_model}`.")
             return _post_completion(
-                messages, tools, tool_choice, tier_cfg.fallback_base_url, tier_cfg.fallback_model, tier_cfg.fallback_api_key,
+                messages, tools, tool_choice, fb_base, tier_cfg.fallback_model, tier_cfg.fallback_api_key or target_key,
                 target_temp, target_max_tok, target_timeout, max_retries, priority, f"{tier_cfg.tier}:fallback",
-                dialect=tier_cfg.fallback_dialect, reasoning_effort="",
+                dialect=tier_cfg.fallback_dialect or target_dialect, reasoning_effort="",
             )
         def_cfg = settings.resolve_tier("default")
         same_box, err_s = target_base_url.lower() == def_cfg.base_url.lower(), str(exc)

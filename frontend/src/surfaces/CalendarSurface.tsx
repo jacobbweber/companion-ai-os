@@ -355,7 +355,15 @@ export const CalendarSurface: React.FC<CalendarSurfaceProps> = ({
                   className="input mono"
                   style={{ width: 122, padding: '4px 8px' }}
                   value={evStartTime}
-                  onChange={(e) => setEvStartTime(e.target.value)}
+                  onChange={(e) => {
+                    const nextStart = e.target.value;
+                    setEvStartTime(nextStart);
+                    if (nextStart && nextStart >= evEndTime) {
+                      const [hh, mm] = nextStart.split(':').map((x) => Number(x || 0));
+                      const nextEnd = hh >= 23 ? '23:59' : `${String(hh + 1).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+                      setEvEndTime(nextEnd);
+                    }
+                  }}
                 />
                 <span style={{ color: 'var(--text-muted)' }}>–</span>
                 <input

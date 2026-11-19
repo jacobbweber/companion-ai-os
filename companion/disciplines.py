@@ -26,7 +26,10 @@ from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from companion.config import SKIP_DIRS
 
-_SCRIPT_TAG_RE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", re.I | re.S)
+_SCRIPT_TAG_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.I | re.S)
+_SCRIPT_SRC_ATTR_RE = re.compile(r"\bsrc\s*=", re.I)
+_SCRIPT_TYPE_ATTR_RE = re.compile(r"""\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.I)
+_JS_SCRIPT_TYPES = frozenset({"", "text/javascript", "application/javascript", "text/ecmascript", "application/ecmascript", "module"})
 _PY_SLICE_IN_JS_RE = re.compile(r"\b[A-Za-z_$][\w$]*\[\s*\d*\s*:\s*\d+\s*\]")
 _PY_BOOL_IN_JS_TPL_RE = re.compile(r"\$\{[^}\n]*\b(?:or|and)\b[^}\n]*\}")
 
@@ -307,23 +310,69 @@ class CodeAnalysisResult:
     warnings: List[str] = field(default_factory=list)
 
 
-def validate_javascript_syntax(js_source: str, label: str = "<script>") -> Optional[str]:
-    """Validate JavaScript syntax via `node --check` (when Node is present) plus deterministic Pythonism guards."""
+def _is_abstract_class_or_fn(cls_node: Optional[ast.ClassDef], fn_node: ast.AST) -> bool:
+    for dec in getattr(fn_node, "decorator_list", ()):
+        dec_name = dec.id if isinstance(dec, ast.Name) else (dec.attr if isinstance(dec, ast.Attribute) else "")
+        if dec_name in ("abstractmethod", "abstractclassmethod", "abstractstaticmethod", "abstractproperty"):
+            return True
+    if cls_node is not None:
+        for base in cls_node.bases:
+            bname = base.id if isinstance(base, ast.Name) else (base.attr if isinstance(base, ast.Attribute) else "")
+            if bname in ("ABC", "Protocol"):
+                return True
+        for kw in cls_node.keywords:
+            kval = kw.value.id if isinstance(kw.value, ast.Name) else (kw.value.attr if isinstance(kw.value, ast.Attribute) else "")
+            if kw.arg == "metaclass" and kval == "ABCMeta":
+                return True
+    return False
+
+
+def find_non_abstract_stubs(content: str, suffix: str = ".py") -> List[Tuple[int, str]]:
+    """Detect unfinished stubs while exempting valid Python `ABC` / `Protocol` / `@abstractmethod` `NotImplementedError`s."""
+    hits: List[Tuple[int, str]] = []
+    exempt_lines: set[int] = set()
+    if suffix.lower() == ".py" and "NotImplementedError" in content:
+        try:
+            tree = ast.parse(content)
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_abstract_class_or_fn(None, node):
+                    exempt_lines.update(range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1))
+                elif isinstance(node, ast.ClassDef):
+                    for sub in node.body:
+                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_abstract_class_or_fn(node, sub):
+                            exempt_lines.update(range(sub.lineno, getattr(sub, "end_lineno", sub.lineno) + 1))
+        except SyntaxError:
+            pass
+    for rx, label in STUB_PATTERNS:
+        for m in rx.finditer(content):
+            lineno = content[: m.start()].count("\n") + 1
+            if "NotImplementedError" in label and lineno in exempt_lines:
+                continue
+            hits.append((lineno, label))
+    return hits
+
+
+def validate_javascript_syntax(
+    js_source: str, label: str = "<script>", check_pythonisms: bool = False, is_module: bool = False,
+) -> Optional[str]:
+    """Validate JavaScript syntax via `node --check` (plus Companion-internal Pythonism guards when `check_pythonisms=True`)."""
     code = (js_source or "").strip()
     if not code:
         return None
-    m_slice = _PY_SLICE_IN_JS_RE.search(code)
-    if m_slice:
-        return f"JavaScript SyntaxError in `{label}`: Python slice syntax `{m_slice.group(0)}` is invalid in JS (use `.slice(...)`)."
-    m_bool = _PY_BOOL_IN_JS_TPL_RE.search(code)
-    if m_bool:
-        return f"JavaScript SyntaxError in `{label}`: Python `or`/`and` inside `{m_bool.group(0)[:60]}` is invalid in JS (use `||` / `&&`)."
+    if check_pythonisms:
+        m_slice = _PY_SLICE_IN_JS_RE.search(code)
+        if m_slice:
+            return f"JavaScript SyntaxError in `{label}`: Python slice syntax `{m_slice.group(0)}` is invalid in JS (use `.slice(...)`)."
+        m_bool = _PY_BOOL_IN_JS_TPL_RE.search(code)
+        if m_bool:
+            return f"JavaScript SyntaxError in `{label}`: Python `or`/`and` inside `{m_bool.group(0)[:60]}` is invalid in JS (use `||` / `&&`)."
     node_bin = shutil.which("node")
     if not node_bin:
         return None
     tmp_path = ""
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tmp_f:
+        ext = ".mjs" if is_module else ".js"
+        with tempfile.NamedTemporaryFile("w", suffix=ext, delete=False, encoding="utf-8") as tmp_f:
             tmp_f.write(code)
             tmp_path = tmp_f.name
         proc = subprocess.run(
@@ -350,13 +399,20 @@ def validate_javascript_syntax(js_source: str, label: str = "<script>") -> Optio
     return None
 
 
-def validate_embedded_scripts(content: str, filename: str = "<script>") -> Optional[str]:
-    """Validate standalone `.js` source or inline `<script>` blocks inside `.html` content."""
+def validate_embedded_scripts(content: str, filename: str = "<script>", check_pythonisms: bool = False) -> Optional[str]:
+    """Validate standalone `.js`/`.mjs` source or executable `<script>` blocks inside `.html` (skipping JSON-LD/importmap)."""
     low = filename.lower()
-    if low.endswith(".js"):
-        return validate_javascript_syntax(content, filename)
+    if low.endswith((".js", ".mjs", ".cjs")):
+        return validate_javascript_syntax(content, filename, check_pythonisms=check_pythonisms, is_module=low.endswith(".mjs"))
     for idx, match in enumerate(_SCRIPT_TAG_RE.finditer(content or ""), 1):
-        err = validate_javascript_syntax(match.group(1), f"{filename}#script[{idx}]")
+        attrs_raw, body = match.group(1) or "", match.group(2) or ""
+        if _SCRIPT_SRC_ATTR_RE.search(attrs_raw):
+            continue
+        tm = _SCRIPT_TYPE_ATTR_RE.search(attrs_raw)
+        stype = ((tm.group(1) or tm.group(2) or tm.group(3) or "") if tm else "").strip().lower().split(";", 1)[0].strip()
+        if stype not in _JS_SCRIPT_TYPES:
+            continue
+        err = validate_javascript_syntax(body, f"{filename}#script[{idx}]", check_pythonisms=check_pythonisms, is_module=(stype == "module"))
         if err:
             return err
     return None
@@ -366,17 +422,20 @@ def _check_python_embedded_js(tree: ast.Module, filename: str) -> Optional[str]:
     norm = filename.replace("\\", "/")
     if "/tests/" in f"/{norm}" or norm.startswith("tests/"):
         return None
+    is_self_surface = "/surfaces/" in f"/{norm}" or norm.startswith("surfaces/")
+    if not is_self_surface:
+        return None
     for node in tree.body:
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             val = node.value.value
             for tgt in node.targets:
                 if isinstance(tgt, ast.Name):
                     if tgt.id.endswith(("_SCRIPT", "_JS")):
-                        err = validate_javascript_syntax(val, f"{norm}:{tgt.id}")
+                        err = validate_javascript_syntax(val, f"{norm}:{tgt.id}", check_pythonisms=True)
                         if err:
                             return err
                     elif tgt.id.endswith(("_HTML", "_TEMPLATE")) and "<script" in val.lower():
-                        err = validate_embedded_scripts(val, f"{norm}:{tgt.id}")
+                        err = validate_embedded_scripts(val, f"{norm}:{tgt.id}", check_pythonisms=True)
                         if err:
                             return err
     return None
@@ -453,17 +512,21 @@ def walk_pruned_files(root: Path) -> List[Path]:
 def verify_repository_syntax(root: Path) -> Tuple[bool, List[CodeAnalysisResult]]:
     """Verify that every .py file (and Web UI `.js`/`.html` asset) in the repository has valid syntax."""
     all_files = walk_pruned_files(root)
+    is_self = (root / "companion").is_dir()
     results = [analyze_python_file(p) for p in all_files if p.suffix.lower() == ".py"]
     for asset in (p for p in all_files if p.suffix.lower() in {".js", ".html"} and "surfaces" in p.parts):
-        js_err = validate_embedded_scripts(asset.read_text(encoding="utf-8", errors="replace"), str(asset.relative_to(root)))
+        js_err = validate_embedded_scripts(asset.read_text(encoding="utf-8", errors="replace"), str(asset.relative_to(root)), check_pythonisms=is_self)
         if js_err:
             results.append(CodeAnalysisResult(path=str(asset), valid_syntax=False, syntax_error=js_err))
     return all(r.valid_syntax for r in results), results
 
 
 GENERAL_TRACKED_EXTENSIONS: FrozenSet[str] = frozenset({
-    ".py", ".md", ".json", ".toml", ".yaml", ".yml", ".ini",
-    ".html", ".css", ".js", ".ts", ".txt", ".sh", ".ps1", ".sql", ".csv", ".xml",
+    ".py", ".pyi", ".md", ".mdx", ".json", ".jsonc", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+    ".html", ".htm", ".css", ".scss", ".less", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".txt", ".rst", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".sql", ".graphql", ".proto",
+    ".csv", ".xml", ".svg", ".cs", ".csproj", ".sln", ".razor", ".go", ".mod", ".rs",
+    ".java", ".kt", ".kts", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".rb", ".php", ".lua",
 })
 
 
@@ -497,19 +560,19 @@ _R0_ACTIONS: Dict[str, FrozenSet[str]] = {
     "sdd_manage": frozenset({"", "verify", "status", "read_spec", "get_adrs"}),
     "project_manage": frozenset({"", "status", "current", "list"}),
     "job_manage": frozenset({"", "list", "status"}),
-    "wiki_manage": frozenset({"", "list", "read", "search", "graph", "list_templates", "read_template", "tag_authority", "inspect_graduation", "validate_curation", "curation_history"}),
+    "wiki_manage": frozenset({"", "list", "tree", "read", "search", "graph", "diff", "list_stale", "list_trash", "list_templates", "read_template", "tag_authority", "inspect_graduation", "validate_curation", "curation_history"}),
     "vault_manage": frozenset({"", "list", "check_secret", "list_missing", "audit"}),
     "endpoint_manage": frozenset({"", "list", "test", "inspect_host", "ssh_read_file"}),
     "mcp_manage": frozenset({"", "list", "discover", "list_partners", "handshake_partner", "check_partner_job"}),
     "routine_manage": frozenset({"", "list", "autonomy_status", "morning", "list_approvals", "sandbox_list", "sandbox_diff", "prompt_list"}),
-    "agile_manage": frozenset({"", "board_view", "roadmap", "list_boards", "list_epics", "list_sprints", "capacity"}),
+    "agile_manage": frozenset({"", "board_view", "list_items", "roadmap", "list_boards", "list_epics", "list_sprints", "capacity"}),
 }
 
 
 def classify_action_risk(tool_name: str, args: Optional[Dict[str, Any]] = None) -> ActionRiskTier:
     """Classify `(tool_name, args)` into `R0`..`R3` without domain-specific hardcoding."""
     payload, action = args or {}, str((args or {}).get("action") or (args or {}).get("subaction") or "").strip().lower()
-    if tool_name in ("read_file", "list_dir", "search", "web_fetch", "system_doctor"):
+    if tool_name in ("read_file", "list_dir", "search", "web_fetch", "web_search", "system_doctor"):
         return ActionRiskTier.R0_READ_ONLY
     if tool_name == "telemetry_manage":
         return ActionRiskTier.R0_READ_ONLY if action != "log_event" else ActionRiskTier.R1_LOCAL_REVERSIBLE

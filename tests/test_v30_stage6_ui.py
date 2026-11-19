@@ -230,6 +230,100 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
                     srv.server_close()
                     store.close()
 
+    def test_web_resilience_cursor_sse_meta_hydration_and_attachment_followup(self) -> None:
+        """Verify persistent CSRF, proxy HTTPS cookie, coalesced cursor SSE, meta_json hydration, and Turn 2+ doc excerpt."""
+        import base64
+        from companion.attachments import ingest_attachment
+        from companion.project_graph import get_project_graph
+        from surfaces.api_extensions import record_coalesced_job_event
+        from surfaces.web_server import verify_lan_client_auth
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            tmp_root = Path(tmp)
+            db_path = tmp_root / "data" / "companion.db"
+
+            def _stub_chat(*args: object, **kwargs: object) -> dict:
+                return {"choices": [{"message": {"role": "assistant", "content": "Analyzed attachment."}}]}
+
+            with patch.dict(os.environ, {"COMPANION_DATA_DIR": str(tmp_root / "data")}):
+                store = MemoryStore(db_path=db_path)
+                with patch.object(sys.modules["companion.config"].settings, "web_token", "lan-secret-99"):
+                    ok_unauth, _ = verify_lan_client_auth({"X-Forwarded-For": "192.168.1.55"}, "127.0.0.1", qs={})
+                    self.assertFalse(ok_unauth)
+                    ok_pair, cookie_hdr = verify_lan_client_auth(
+                        {"X-Forwarded-For": "192.168.1.55", "X-Forwarded-Proto": "https"}, "127.0.0.1", qs={"token": ["lan-secret-99"]},
+                    )
+                    self.assertTrue(ok_pair)
+                    self.assertIn("SameSite=Lax; Max-Age=2592000; Path=/; Secure", cookie_hdr)
+
+                srv1, sess1 = create_web_server(host="127.0.0.1", port=0, store=store, chat_fn=_stub_chat)
+                srv2, sess2 = create_web_server(host="127.0.0.1", port=0, store=store, chat_fn=_stub_chat)
+                try:
+                    self.assertEqual(sess1.csrf_token, sess2.csrf_token)
+
+                    # `meta_json` hydration via `/api/history`
+                    store.log_message(
+                        "assistant",
+                        "Saved note.",
+                        session_tag="web_ui",
+                        meta={"thinking": "Quick check", "tool_steps": [{"tool": "wiki_manage", "ok": True}], "duration_ms": 1400},
+                    )
+                    h_code, h_raw = dispatch_raw_http(srv1, "GET", "/api/history")
+                    self.assertEqual(h_code, 200)
+                    h_msg = json.loads(h_raw)["messages"][-1]
+                    self.assertEqual(h_msg["thinking"], "Quick check")
+                    self.assertEqual(h_msg["tool_steps"][0]["tool"], "wiki_manage")
+                    self.assertEqual(h_msg["duration_ms"], 1400)
+
+                    # Coalescing >4,000 deltas + `?cursor=` / `Last-Event-ID` SSE replay
+                    job: dict = {"job_id": "j_sse_1", "status": "completed", "response": "Done!", "error": "", "events": [], "stream_text": "", "stream_thinking": "", "tool_steps": []}
+                    for idx in range(4200):
+                        record_coalesced_job_event(job, {"type": "text_delta", "delta": f"{idx} "})
+                    record_coalesced_job_event(job, {"type": "done", "status": "completed", "response": "Done!"})
+                    self.assertLessEqual(len(job["events"]), 2000)
+                    self.assertEqual(job["events"][-1]["type"], "done")
+                    sess1._jobs["j_sse_1"] = job
+                    sse_code, sse_body = dispatch_raw_http(
+                        srv1, "GET", f"/api/jobs/j_sse_1/stream?cursor={len(job['events']) - 1}"
+                    )
+                    self.assertEqual(sse_code, 200)
+                    self.assertIn(f"id: {len(job['events'])}", sse_body)
+                    self.assertIn('"type": "done"', sse_body)
+
+                    # Post-lock `focus_project_id` isolation on 409 + Turn 2+ `followup_doc_note`
+                    pg = get_project_graph(store=store)
+                    p1 = pg.create_project(title="Proj One")["project_id"]
+                    p2 = pg.create_project(title="Proj Two")["project_id"]
+                    pg.set_focus_project(p1)
+                    sess1.busy = True
+                    busy_code, _ = dispatch_raw_http(
+                        srv1,
+                        "POST",
+                        "/api/chat",
+                        body=json.dumps({"message": "Blocked", "project_id": p2, "async": True}).encode("utf-8"),
+                        headers={"Origin": "http://127.0.0.1", "X-Companion-CSRF": sess1.csrf_token},
+                    )
+                    self.assertEqual(busy_code, 409)
+                    self.assertEqual(pg.get_board_projection()["project"]["project_id"], p1)
+                    sess1.busy = False
+
+                    b64_doc = base64.b64encode(b"Critical spec line 42").decode("ascii")
+                    att = ingest_attachment("spec.txt", b64_doc, "text/plain", store=store)
+                    att_id = att["attachment"]["id"]
+                    ok_code, _ = dispatch_raw_http(
+                        srv1,
+                        "POST",
+                        "/api/chat",
+                        body=json.dumps({"message": "Summarize attached spec", "attachment_ids": [att_id], "async": False}).encode("utf-8"),
+                        headers={"Origin": "http://127.0.0.1", "X-Companion-CSRF": sess1.csrf_token},
+                    )
+                    self.assertEqual(ok_code, 200)
+                    self.assertTrue(any("Critical spec line 42" in str(m.get("content", "")) for m in sess1.messages if m.get("role") == "user"))
+                finally:
+                    srv1.server_close()
+                    srv2.server_close()
+                    store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

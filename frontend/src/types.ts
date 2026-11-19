@@ -71,6 +71,13 @@ export interface SessionNudge {
   created_at?: string;
 }
 
+export interface ToolStepMeta {
+  tool: string;
+  summary: string;
+  ok?: boolean;
+  duration_ms?: number;
+}
+
 export interface ActiveWebJob {
   job_id: string;
   mode: string;
@@ -83,6 +90,8 @@ export interface ActiveWebJob {
   active_tool: string;
   stream_text: string;
   stream_thinking: string;
+  tool_steps?: ToolStepMeta[];
+  event_cursor?: number;
   passed: boolean | null;
   awaiting_approval: boolean;
   response: string;
@@ -169,6 +178,9 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   thinking?: string;
+  tool_steps?: ToolStepMeta[];
+  duration_ms?: number;
+  model?: string;
   timestamp: string;
   session_tag?: string;
   activePhase?: string;
@@ -463,6 +475,8 @@ export interface ApprovalRequest {
   fingerprint: string;
   requester: string;
   status: 'waiting' | 'approved' | 'denied' | string;
+  payload_json?: string;
+  payload?: Record<string, unknown>;
   resolution_note?: string;
   created_at: string;
   resolved_at?: string;
@@ -946,8 +960,10 @@ export interface DagNodeRunEntry {
   node_id: string;
   status: string;
   attempt?: number;
+  attempts?: number;
   duration_ms?: number;
   output?: unknown;
+  output_json?: string;
   error?: string;
 }
 

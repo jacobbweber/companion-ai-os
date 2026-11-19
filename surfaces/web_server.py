@@ -2,7 +2,7 @@
 Exposes Companion AI OS over `ThreadingHTTPServer` (`127.0.0.1:<port>` default, token-gated on LAN) with CSRF, SSE streaming, and WAL status APIs.
 """
 
-import contextvars, io, ipaddress, json, os, secrets, socket, sqlite3, sys, threading, time, urllib.parse
+import contextvars, copy, io, ipaddress, json, os, secrets, socket, sys, threading, time, urllib.parse
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,20 +11,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from companion.agent import handle_slash_command, run_agent_turn
 from companion.autonomy import run_autonomous_goal
 from companion.blueprint import create_or_revise_blueprint, is_awaiting_blueprint_approval
-from companion.checkpoints import get_active_checkpoint_manager
 from companion.config import settings
 from companion.context import build_system_prompt, manage_active_project, manage_companion_tone, manage_model_tier
-from companion.llm import active_swap_status, chat, model_gate
+from companion.llm import chat, model_gate
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
 from companion.project_graph import get_project_graph
 from companion.safety import run_system_doctor
-from companion.streaming import stream_event_context
-from companion.telemetry import TelemetryEngine, telemetry
-from companion.workflow_graph import WorkflowEngine
+from companion.streaming import CancelScope, cancel_scope_context, get_active_cancel_scope, stream_event_context
+from companion.telemetry import notify_db_closed, read_ro_rows, telemetry
 from surfaces.api_extensions import (
-    create_session_idle_watcher, dispatch_chat_or_job_with_attachments, enrich_web_status,
-    handle_extended_get, handle_extended_post, handle_extended_raw_get,
-    register_service_reload_handler, spawn_companion_reload, wait_for_port_release,
+    build_history_payload, build_telemetry_payload, build_web_status_payload, cancel_web_or_bg_job, commit_cancelled_turn,
+    create_session_idle_watcher, dispatch_chat_or_job_with_attachments, handle_extended_get, handle_extended_post,
+    handle_extended_raw_get, load_or_create_csrf_token, record_coalesced_job_event, register_service_reload_handler,
+    spawn_companion_reload, wait_for_port_release,
 )
 from surfaces.web_assets import read_static_asset, render_web_index_html
 
@@ -91,8 +90,13 @@ def _is_loopback_client(client_ip: str) -> bool:
 
 
 def verify_lan_client_auth(headers: Any, client_ip: str, qs: Optional[Dict[str, List[str]]] = None) -> Tuple[bool, str]:
-    """Allow loopback clients directly; require `COMPANION_WEB_TOKEN` (Bearer, Cookie, or `?token=`) for non-loopback LAN clients."""
+    """Allow direct loopback clients; honor `X-Forwarded-For` from loopback reverse proxies; require `COMPANION_WEB_TOKEN` for LAN."""
+    eff_ip = client_ip
     if _is_loopback_client(client_ip):
+        xff = str(headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if xff:
+            eff_ip = xff
+    if _is_loopback_client(eff_ip):
         return True, ""
     expected = settings.web_token.strip()
     if not expected:
@@ -114,7 +118,8 @@ def verify_lan_client_auth(headers: Any, client_ip: str, qs: Optional[Dict[str, 
             pass
     q_tok = str(((qs or {}).get("token") or [""])[0]).strip()
     if q_tok and secrets.compare_digest(q_tok.encode("utf-8"), expected.encode("utf-8")):
-        return True, f"companion_token={q_tok}; HttpOnly; SameSite=Strict; Path=/"
+        sec_attr = "; Secure" if str(headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower() == "https" else ""
+        return True, f"companion_token={q_tok}; HttpOnly; SameSite=Lax; Max-Age=2592000; Path=/{sec_attr}"
     return False, ""
 
 
@@ -127,13 +132,15 @@ def verify_post_request_security(headers: Any, expected_csrf: str) -> Optional[s
         return f"Cross-site request blocked (Sec-Fetch-Site={sec_site})"
     origin = str(headers.get("Origin") or "").strip()
     host_hdr = str(headers.get("Host") or "").strip()
+    xf_host = str(headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+    allowed_hosts = {h.lower() for h in (host_hdr, xf_host) if h and is_allowed_lan_host(h)}
     if origin:
         if origin.lower() == "null":
             return "Cross-origin null Origin blocked"
         parsed_orig = urllib.parse.urlsplit(origin)
         if not parsed_orig.netloc or not is_allowed_lan_host(parsed_orig.netloc):
             return f"Cross-origin request blocked ({origin})"
-        if host_hdr and parsed_orig.netloc.lower() != host_hdr.lower():
+        if (host_hdr or xf_host) and parsed_orig.netloc.lower() not in allowed_hosts:
             return f"Origin mismatch ({parsed_orig.netloc} != {host_hdr})"
     sent_token = str(headers.get("X-Companion-CSRF") or "").strip()
     if not sent_token or not secrets.compare_digest(sent_token, expected_csrf):
@@ -142,16 +149,8 @@ def verify_post_request_security(headers: Any, expected_csrf: str) -> Optional[s
 
 
 def _read_rows(db_path: Path, sql: str, params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
-    """Execute a thread-isolated WAL read query against SQLite so status polling never blocks turns."""
-    if not db_path.is_file():
-        return []
-    conn = sqlite3.connect(str(db_path), timeout=15.0)
-    try:
-        return conn.execute(sql, params).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
-        conn.close()
+    """Execute a thread-local `?mode=ro` WAL read query against SQLite so status polling never churns connections."""
+    return read_ro_rows(db_path, sql, params)
 
 
 class CompanionWebSession:
@@ -162,16 +161,24 @@ class CompanionWebSession:
         self.db_path = self.store.db_path.resolve()
         self.chat_fn = chat_fn
         self.lan_url = lan_url
-        self.csrf_token = secrets.token_urlsafe(24)
+        self.csrf_token = load_or_create_csrf_token(self.db_path)
         self._turn_lock = threading.Lock()
         self._jobs_lock = threading.Lock()
         self._stream_cond = threading.Condition(self._jobs_lock)
         self._jobs: Dict[str, Dict[str, Any]] = {}
+        self._active_cancel_scope: Optional[CancelScope] = None
         self.active_job_id, self.busy, self.active_action, self._busy_started = "", False, "", 0.0
         self.idle_watcher = create_session_idle_watcher(self)
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": build_system_prompt(store=self.store)}]
         cut = _read_rows(self.db_path, "SELECT COALESCE(MAX(id), 0) FROM conversations WHERE session_tag = 'focus_marker'")
-        rows = _read_rows(self.db_path, "SELECT role, content FROM (SELECT id, role, content FROM conversations WHERE id > ? AND role IN ('user', 'assistant') AND COALESCE(session_tag, '') NOT IN ('focus_marker', 'compact_marker') ORDER BY id DESC LIMIT 12) ORDER BY id ASC", (int(cut[0][0]) if cut else 0,))
+        rows = _read_rows(
+            self.db_path,
+            "SELECT role, content FROM (SELECT id, role, content FROM conversations WHERE id > ? AND role IN ('user', 'assistant') "
+            "AND COALESCE(session_tag, '') NOT IN ('focus_marker', 'compact_marker') "
+            "AND COALESCE(session_tag, '') NOT LIKE 'subagent:%' AND COALESCE(session_tag, '') NOT LIKE 'autonomy:%' "
+            "ORDER BY id DESC LIMIT 12) ORDER BY id ASC",
+            (int(cut[0][0]) if cut else 0,),
+        )
         self.messages.extend({"role": str(r), "content": str(c)} for r, c in rows)
 
     def _serialize_job(self, job: Dict[str, Any], include_live_spans: bool = False) -> Dict[str, Any]:
@@ -185,6 +192,7 @@ class CompanionWebSession:
             "elapsed_seconds": elapsed, "created_at": job["created_at"], "workflow_state": str(wf_rows[0][0]) if wf_rows else "IDLE",
             "active_phase": job.get("active_phase", ""), "active_tool": job.get("active_tool", ""),
             "stream_text": job.get("stream_text", ""), "stream_thinking": job.get("stream_thinking", ""),
+            "tool_steps": list(job.get("tool_steps") or []), "event_cursor": len(job.get("events") or []),
             "passed": job.get("passed"), "awaiting_approval": job.get("awaiting_approval", False),
             "response": job.get("response", ""), "error": job.get("error", ""),
         }
@@ -195,74 +203,49 @@ class CompanionWebSession:
 
     def get_status_payload(self) -> Dict[str, Any]:
         """Build non-blocking live status JSON for `GET /api/status`."""
-        prof = {str(k): str(v) for k, v in _read_rows(self.db_path, "SELECT key, value FROM user_profile")}
-        wf_engine = WorkflowEngine(store=self.store)
-        active_wf = self.store.get_active_workflow()
-        tasks = [{"id": tid, "description": desc, "status": st, "priority": prio} for tid, desc, st, prio in self.store.get_pending_tasks()[:10]]
-        backlog = [{"id": bid, "description": desc, "category": cat, "status": st} for bid, desc, cat, st in self.store.get_backlog(status="pending")[:10]]
-        ws = settings.get_workspace()
-        f_cfg, r_cfg = settings.resolve_tier("fast"), settings.resolve_tier("reasoning")
-        busy_sec = int(max(0.0, time.monotonic() - self._busy_started)) if self.busy else 0
-        try:
-            savepoints = get_active_checkpoint_manager().list_git_savepoints(limit=5)
-        except Exception:
-            savepoints = []
-        with self._jobs_lock:
-            active_job = self._serialize_job(self._jobs[self.active_job_id], include_live_spans=True) if self.active_job_id in self._jobs else None
-        return {
-            "ok": True, "csrf_token": self.csrf_token,
-            "companion_name": prof.get("companion_name") or settings.companion_name or "Companion",
-            "user_name": prof.get("user_name") or settings.user_name or "Partner",
-            "tone": prof.get("companion_tone", "balanced"), "active_model_tier": prof.get("active_model_tier", "auto"),
-            "fast_model": f_cfg.model, "reasoning_model": r_cfg.model,
-            "workspace": {"project_id": ws.project_id, "project_root": str(ws.project_root), "is_self_project": ws.is_self_project},
-            "busy": self.busy, "active_action": self.active_action, "busy_seconds": busy_sec,
-            "model_swap": active_swap_status(), "active_job": active_job, "lan_url": self.lan_url, "workflow": active_wf,
-            "awaiting_approval": bool((active_wf or {}).get("metadata", {}).get("awaiting_plan_approval") and (active_wf or {}).get("current_state") == "PLAN"),
-            "workflow_hud": wf_engine.render_hud(), "pending_tasks": tasks, "pending_backlog": backlog, "recent_savepoints": savepoints,
-            **enrich_web_status(self.store),
-        }
+        return build_web_status_payload(self)
 
     def get_history_payload(self, limit: int = 60, include_tools: bool = False, before_id: int = 0) -> Dict[str, Any]:
-        cap = max(1, min(int(limit), 200))
-        clauses = ([] if include_tools else ["role IN ('user', 'assistant')"]) + (["id < ?"] if before_id > 0 else [])
-        where_sql = f"WHERE {' AND '.join(clauses)} " if clauses else ""
-        rows = _read_rows(self.db_path, f"SELECT id, role, content, timestamp, COALESCE(session_tag, '') FROM conversations {where_sql}ORDER BY id DESC LIMIT ?", (*((int(before_id),) if before_id > 0 else ()), cap + 1))
-        items = [{"id": int(cid), "role": str(role), "content": str(content), "timestamp": str(ts), "session_tag": str(tag)} for cid, role, content, ts, tag in reversed(rows[:cap])]
-        return {"ok": True, "count": len(items), "has_more": len(rows) > cap, "messages": items}
+        return build_history_payload(self.db_path, limit=limit, include_tools=include_tools, before_id=before_id)
 
     def get_search_payload(self, query: str = "", limit: int = 20) -> Dict[str, Any]:
         rows = self.store.search_conversations(query=query, limit=min(max(1, limit), 100))
         return {"ok": True, "query": query, "count": len(rows), "results": [{"id": r[0], "role": r[1], "content": r[2], "timestamp": r[3]} for r in rows]}
 
     def get_telemetry_payload(self, limit: int = 12, trace_id: str = "") -> Dict[str, Any]:
-        tel = telemetry if self.db_path == settings.db_path.resolve() else TelemetryEngine(db_path=self.db_path)
-        try:
-            kpis = tel.get_kpis()
-        finally:
-            if tel is not telemetry:
-                tel.close()
-        cap = max(1, min(int(limit), 50))
-        tr_rows = _read_rows(self.db_path, "SELECT trace_id, trace_type, name, status, duration_ms, span_count, error_count, created_at FROM telemetry_traces ORDER BY rowid DESC LIMIT ?", (cap,))
-        traces = [{"trace_id": str(tid), "trace_type": str(tt), "name": str(nm), "status": str(st), "duration_ms": round(float(dur or 0.0), 1), "span_count": int(sc or 0), "error_count": int(ec or 0), "created_at": str(ts)} for tid, tt, nm, st, dur, sc, ec, ts in tr_rows]
-        chosen_tid = trace_id.strip() or (traces[0]["trace_id"] if traces else "")
-        sp_rows = _read_rows(self.db_path, "SELECT id, span_type, name, status, offset_ms, duration_ms, detail FROM telemetry_spans WHERE trace_id = ? ORDER BY id ASC", (chosen_tid,)) if chosen_tid else []
-        spans = [{"id": int(sid), "span_type": str(st), "name": str(nm), "status": str(stat), "offset_ms": round(float(off or 0.0), 1), "duration_ms": round(float(dur or 0.0), 1), "detail": str(det)} for sid, st, nm, stat, off, dur, det in sp_rows]
-        log_rows = _read_rows(self.db_path, "SELECT id, level, component, trace_id, message, created_at FROM telemetry_logs ORDER BY id DESC LIMIT 30")
-        logs = [{"id": int(lid), "level": str(lv), "component": str(cp), "trace_id": str(tid), "message": str(msg), "created_at": str(ts)} for lid, lv, cp, tid, msg, ts in log_rows]
-        return {"ok": True, "kpis": kpis, "selected_trace_id": chosen_tid, "traces": traces, "spans": spans, "logs": logs}
+        return build_telemetry_payload(self.db_path, limit=limit, trace_id=trace_id)
 
-    def execute_chat(self, message: str, mode: str = "chat") -> Tuple[int, Dict[str, Any]]:
+    def cancel_active_turn(self, job_id: str = "") -> Tuple[int, Dict[str, Any]]:
+        clean_id = (job_id or "").strip()
+        with self._jobs_lock:
+            target = (self._jobs.get(self.active_job_id) if clean_id in ("", "active") else self._jobs.get(clean_id)) if (clean_id or self.active_job_id) else None
+            scope = (target.get("cancel_scope") if target else None) or self._active_cancel_scope
+            eff_id = str(target["job_id"]) if target else (self.active_job_id or clean_id or "active")
+        if scope is None and target is None and not self.busy:
+            return (404, {"ok": False, "error": f"Unknown job_id: {clean_id}"}) if clean_id not in ("", "active") else (200, {"ok": True, "cancelled": False, "status": "idle"})
+        if scope is not None:
+            scope.cancel()
+        return 200, {"ok": True, "cancelled": True, "job_id": eff_id, "status": "cancelled"}
+
+    def execute_chat(
+        self, message: str, mode: str = "chat", cancel_scope: Optional[CancelScope] = None,
+        focus_project_id: str = "", followup_doc_note: str = "",
+    ) -> Tuple[int, Dict[str, Any]]:
         """Execute a foreground chat message, `/slash` command, or multi-phase autonomous goal."""
         clean_msg = (message or "").strip()
         if not clean_msg:
             return 400, {"ok": False, "error": "message is required"}
         if not self._turn_lock.acquire(timeout=2.0):
             return 409, {"ok": False, "error": "Companion is currently busy processing an active turn. Please wait.", "active_job_id": self.active_job_id}
+        scope = cancel_scope or get_active_cancel_scope() or CancelScope()
+        self._active_cancel_scope = scope
         self.busy, self._busy_started = True, time.monotonic()
         self.active_action = "blueprint plan" if mode == "plan" else ("autonomous goal" if mode == "goal" else (clean_msg.split()[0] if clean_msg.startswith("/") else "chat turn"))
+        if focus_project_id:
+            get_project_graph(store=self.store).set_focus_project(focus_project_id)
+        pre_msgs = copy.deepcopy(self.messages)
         try:
-            with memory_store_context(self.store):
+            with cancel_scope_context(scope), memory_store_context(self.store):
                 try:
                     slash_out = handle_slash_command(clean_msg, self.messages, store=self.store, chat_fn=self.chat_fn, interactive=False)
                     if slash_out is not None:
@@ -281,58 +264,59 @@ class CompanionWebSession:
                         res = create_or_revise_blueprint(clean_msg, chat_fn=self.chat_fn, store=self.store, verbose=False) if mode == "plan" else run_autonomous_goal(clean_msg, chat_fn=self.chat_fn, store=self.store, verbose=False)
                         reply = str(res.get("summary", ""))
                         self.store.log_message("assistant", reply, session_tag=tag)
-                        self.messages.extend([{"role": "user", "content": clean_msg}, {"role": "assistant", "content": reply}])
+                        u_hist = f"{clean_msg}\n\n{followup_doc_note}".strip() if followup_doc_note else clean_msg
+                        self.messages.extend([{"role": "user", "content": u_hist}, {"role": "assistant", "content": reply}])
                         return 200, {"ok": True, "role": "assistant", "mode": mode, "passed": res.get("passed", False), "awaiting_approval": res.get("awaiting_approval", False), "response": reply}
+                except InterruptedError:
+                    return commit_cancelled_turn(self, pre_msgs, clean_msg, mode, is_awaiting_blueprint_approval(self.store))
                 except Exception as exc:
                     err_text = f"{mode.title()} error: {type(exc).__name__}: {exc}"
                     telemetry.log("ERROR", "web_ui", err_text)
                     return 500, {"ok": False, "error": err_text}
-            pre_msgs = list(self.messages)
-            self.messages.append({"role": "user", "content": clean_msg})
-            try:
-                with model_gate.foreground_turn():
-                    reply = run_agent_turn(self.messages, chat_fn=self.chat_fn, store=self.store, session_tag="web_ui", verbose=False)
-                return 200, {"ok": True, "role": "assistant", "mode": "chat", "awaiting_approval": is_awaiting_blueprint_approval(self.store), "response": reply}
-            except Exception as exc:
-                self.messages[:] = pre_msgs
-                err_text = f"Turn error: {type(exc).__name__}: {exc}"
-                telemetry.log("ERROR", "web_ui", err_text)
-                return 500, {"ok": False, "error": err_text}
+                u_idx = len(self.messages)
+                self.messages.append({"role": "user", "content": clean_msg})
+                try:
+                    with model_gate.foreground_turn():
+                        reply = run_agent_turn(self.messages, chat_fn=self.chat_fn, store=self.store, session_tag="web_ui", verbose=False)
+                    if followup_doc_note and u_idx < len(self.messages) and self.messages[u_idx].get("role") == "user":
+                        self.messages[u_idx]["content"] = f"{self.messages[u_idx]['content']}\n\n{followup_doc_note}".strip()
+                    return 200, {"ok": True, "role": "assistant", "mode": "chat", "awaiting_approval": is_awaiting_blueprint_approval(self.store), "response": reply}
+                except InterruptedError:
+                    return commit_cancelled_turn(self, pre_msgs, clean_msg, mode, is_awaiting_blueprint_approval(self.store))
+                except Exception as exc:
+                    self.messages[:] = pre_msgs
+                    err_text = f"Turn error: {type(exc).__name__}: {exc}"
+                    telemetry.log("ERROR", "web_ui", err_text)
+                    return 500, {"ok": False, "error": err_text}
         finally:
+            self._active_cancel_scope = None
             self.busy, self.active_action = False, ""
             self._turn_lock.release()
 
     def _record_job_stream_event(self, job: Dict[str, Any], ev: Dict[str, Any]) -> None:
         with self._jobs_lock:
-            etype = str(ev.get("type") or "")
-            if etype == "text_delta":
-                job["stream_text"] = job.get("stream_text", "") + str(ev.get("delta") or "")
-            elif etype == "thinking_delta":
-                job["stream_thinking"] = job.get("stream_thinking", "") + str(ev.get("delta") or "")
-            elif etype == "phase":
-                job["active_phase"] = str(ev.get("phase") or "")
-            elif etype in ("tool_start", "tool_end"):
-                job["active_tool"] = str(ev.get("tool") or "") if etype == "tool_start" else ""
-            if len(job["events"]) < 4000:
-                job["events"].append(ev)
+            record_coalesced_job_event(job, ev)
             self._stream_cond.notify_all()
 
-    def submit_async_chat(self, message: str, mode: str = "chat") -> Tuple[int, Dict[str, Any]]:
+    def submit_async_chat(
+        self, message: str, mode: str = "chat", focus_project_id: str = "", followup_doc_note: str = "",
+    ) -> Tuple[int, Dict[str, Any]]:
         """Launch a disconnect-proof background turn/goal job (`202 Accepted`) with live SSE event streaming."""
         clean_msg = (message or "").strip()
         if not clean_msg:
             return 400, {"ok": False, "error": "message is required"}
         if clean_msg.startswith(("/", ".")) and not clean_msg.lower().startswith(("/goal ", "/plan ", "/blueprint ", "/approve", "/eval", "/subagent ", "/doctor")):
-            return self.execute_chat(clean_msg, mode=mode)
+            return self.execute_chat(clean_msg, mode=mode, focus_project_id=focus_project_id, followup_doc_note=followup_doc_note)
+        scope = CancelScope()
         with self._jobs_lock:
             if self.busy or (self.active_job_id and self._jobs.get(self.active_job_id, {}).get("status") == "running"):
                 return 409, {"ok": False, "error": "Companion is currently busy processing an active job.", "active_job_id": self.active_job_id}
             job_id = f"job_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
             job: Dict[str, Any] = {
-                "job_id": job_id, "message": clean_msg, "mode": mode, "status": "running",
+                "job_id": job_id, "message": clean_msg, "mode": mode, "status": "running", "cancel_scope": scope,
                 "started_mono": time.monotonic(), "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "passed": None, "awaiting_approval": False, "response": "", "error": "", "elapsed_seconds": None,
-                "stream_text": "", "stream_thinking": "", "active_phase": "", "active_tool": "", "events": [],
+                "stream_text": "", "stream_thinking": "", "active_phase": "", "active_tool": "", "tool_steps": [], "events": [],
             }
             self._jobs[job_id] = job
             if len(self._jobs) > 40:
@@ -344,16 +328,18 @@ class CompanionWebSession:
         def _bg_job_runner() -> None:
             try:
                 with stream_event_context(lambda ev: self._record_job_stream_event(job, ev)):
-                    code, payload = self.execute_chat(clean_msg, mode=mode)
+                    code, payload = self.execute_chat(clean_msg, mode=mode, cancel_scope=scope, focus_project_id=focus_project_id, followup_doc_note=followup_doc_note)
             except Exception as exc:
                 code, payload = 500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             with self._jobs_lock:
                 job["elapsed_seconds"] = round(max(0.0, time.monotonic() - float(job["started_mono"])), 2)
-                if code < 400 and payload.get("ok"):
+                if payload.get("cancelled"):
+                    job.update({"status": "cancelled", "response": str(payload.get("response") or "*(Stopped by user.)*"), "awaiting_approval": bool(payload.get("awaiting_approval"))})
+                elif code < 400 and payload.get("ok"):
                     job.update({"status": "completed", "response": str(payload.get("response") or ""), "passed": payload.get("passed"), "awaiting_approval": bool(payload.get("awaiting_approval"))})
                 else:
                     job.update({"status": "error", "error": str(payload.get("error") or f"HTTP {code}")})
-                job["events"].append({"type": "done", "status": job["status"], "response": job["response"], "error": job["error"], "passed": job["passed"], "awaiting_approval": job["awaiting_approval"]})
+                job["events"].append({"type": "done", "status": job["status"], "cancelled": bool(payload.get("cancelled")), "response": job["response"], "error": job["error"], "passed": job["passed"], "awaiting_approval": job["awaiting_approval"]})
                 if self.active_job_id == job_id:
                     self.active_job_id = ""
                 self._stream_cond.notify_all()
@@ -421,6 +407,7 @@ class CompanionHTTPServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self.session.idle_watcher.stop()
+        notify_db_closed(self.session.db_path)
         super().server_close()
 
 
@@ -453,7 +440,9 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         self._send_bytes(status, "application/json; charset=utf-8", json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
     def _check_host_guard(self) -> bool:
-        if is_allowed_lan_host(str(self.headers.get("Host") or "")):
+        host_hdr = str(self.headers.get("Host") or "").strip()
+        xf_host = str(self.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+        if is_allowed_lan_host(host_hdr) and (not xf_host or is_allowed_lan_host(xf_host)):
             return True
         self._send_json(403, {"ok": False, "error": "DNS rebinding guard: non-LAN Host header rejected"})
         return False
@@ -478,7 +467,7 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return 400, {"ok": False, "error": "Malformed JSON body"}
 
-    def _stream_job_sse(self, job_id: str) -> None:
+    def _stream_job_sse(self, job_id: str, qs: Optional[Dict[str, List[str]]] = None) -> None:
         sess = self.server.session
         if sess.wait_job_events(job_id, 0, timeout=0.0)[0] is None:
             self._send_json(404, {"ok": False, "error": f"Unknown job_id: {job_id}"})
@@ -488,17 +477,20 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             self.send_header(hdr, val)
         self._send_security_headers()
         self.end_headers()
-        cursor = 0
+        raw_cur = str(((qs or {}).get("cursor") or [self.headers.get("Last-Event-ID") or "0"])[0] or "0").strip()
+        cursor = max(0, int(raw_cur)) if raw_cur.isdigit() else 0
         try:
             while True:
+                base_cur = cursor
                 job_now, batch, cursor = sess.wait_job_events(job_id, cursor, timeout=10.0)
                 if job_now is None:
                     return
                 if not batch and job_now.get("status") == "running":
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
-                for ev in (batch or ([{"type": "done", "status": job_now.get("status"), "response": job_now.get("response", ""), "error": job_now.get("error", "")}] if job_now.get("status") != "running" else [])):
-                    self.wfile.write(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8"))
+                frames = batch or ([{"type": "done", "status": job_now.get("status"), "response": job_now.get("response", ""), "error": job_now.get("error", "")}] if job_now.get("status") != "running" else [])
+                for offset, ev in enumerate(frames, 1):
+                    self.wfile.write(f"id: {base_cur + offset}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8"))
                     self.wfile.flush()
                     if ev.get("type") == "done":
                         return
@@ -522,10 +514,10 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
                 payload["csrf_token"] = sess.csrf_token
             else:
                 payload["auth_required"] = True
-            self._send_json(200, payload)
+            self._send_bytes(200, "application/json; charset=utf-8", json.dumps(payload, ensure_ascii=False).encode("utf-8"), extra_cookie)
             return
         if not auth_ok and route != "/api/mcp":
-            self._send_json(401, {"ok": False, "error": "LAN access requires a valid COMPANION_WEB_TOKEN (Bearer header, cookie, or ?token=)."})
+            self._send_json(401, {"ok": False, "auth_required": True, "error": "LAN access requires a valid COMPANION_WEB_TOKEN (Bearer header, cookie, or ?token=)."})
             return
         raw_ext = handle_extended_raw_get(route, sess.store)
         if raw_ext is not None:
@@ -545,7 +537,7 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         elif route == "/api/status":
             self._send_json(200, sess.get_status_payload())
         elif route.startswith("/api/jobs/") and route.endswith("/stream"):
-            self._stream_job_sse(route[len("/api/jobs/") : -len("/stream")].strip("/"))
+            self._stream_job_sse(route[len("/api/jobs/") : -len("/stream")].strip("/"), qs=qs)
         elif route == "/api/jobs" or route.startswith("/api/jobs/"):
             self._send_json(*sess.get_job_payload(route.split("/api/jobs/", 1)[1] if route.startswith("/api/jobs/") else ""))
         elif route == "/api/history":
@@ -602,14 +594,17 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             sess.idle_watcher.record_human_activity()
         ext_act = handle_extended_post(route, body, self.headers, sess.store)
         if ext_act is not None:
-            if route == "/api/actions/autonomy":
+            if route in ("/api/actions/autonomy", "/api/actions/identity", "/api/actions/trust", "/api/actions/models"):
                 fresh_sys = build_system_prompt(store=sess.store)
                 with sess._turn_lock:
                     if sess.messages and sess.messages[0].get("role") == "system":
                         sess.messages[0]["content"] = fresh_sys
             self._send_json(ext_act[0], ext_act[1])
             return
-        if route in ("/api/chat", "/api/jobs"):
+        if route == "/api/jobs/cancel" or (route.startswith("/api/jobs/") and route.endswith("/cancel")):
+            jid = "" if route == "/api/jobs/cancel" else route[len("/api/jobs/") : -len("/cancel")].strip("/")
+            self._send_json(*cancel_web_or_bg_job(sess, jid or str(body.get("job_id") or "")))
+        elif route in ("/api/chat", "/api/jobs"):
             self._send_json(*dispatch_chat_or_job_with_attachments(sess, body, route == "/api/jobs" or bool(body.get("async"))))
         elif route == "/api/settings":
             self._send_json(200, sess.update_settings(body))

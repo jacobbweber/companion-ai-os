@@ -130,8 +130,9 @@ class TestConfigAndArchitecture(unittest.TestCase):
             {"role": "system", "content": "late instruction"},
         ]
         wire = _sanitize_wire_messages(raw)
-        self.assertEqual([m["role"] for m in wire], ["system", "user", "user"])
+        self.assertEqual([m["role"] for m in wire], ["system", "user"])
         self.assertIn("sys2", wire[0]["content"])
+        self.assertIn("late instruction", wire[1]["content"])
 
         with patch.dict(os.environ, {"COMPANION_BASE_URL": "http://192.168.1.100:8099", "COMPANION_REASONING_BASE_URL": "http://192.168.1.100:8099", "COMPANION_REASONING_MODEL": "deepseek-r1-distill-32b"}):
             same_box_cfg = Settings(reload_env=False)

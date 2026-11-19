@@ -14,14 +14,67 @@ import contextvars
 import os
 import re
 import sqlite3
-import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from companion.config import settings
+
+
+def _norm_db_key(db_path: Path) -> str:
+    resolved = str(Path(db_path).resolve())
+    return resolved.lower() if os.name == "nt" else resolved
+
+
+_DB_WRITER_LOCKS: Dict[str, threading.RLock] = {}
+_DB_CLOSE_HOOKS: List[Callable[[Path], None]] = []
+_DB_REGISTRY_LOCK = threading.Lock()
+
+
+def get_db_writer_lock(db_path: Optional[Path]) -> threading.RLock:
+    """Return the shared re-entrant SQLite writer lock for `db_path` across `MemoryStore` and `TelemetryEngine`."""
+    if db_path is None or str(db_path) == ":memory:":
+        return threading.RLock()
+    key = _norm_db_key(db_path)
+    with _DB_REGISTRY_LOCK:
+        lk = _DB_WRITER_LOCKS.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _DB_WRITER_LOCKS[key] = lk
+        return lk
+
+
+def register_db_close_hook(hook: Callable[[Path], None]) -> None:
+    """Register a cleanup callback invoked when a `MemoryStore` closes `db_path`."""
+    with _DB_REGISTRY_LOCK:
+        if hook not in _DB_CLOSE_HOOKS:
+            _DB_CLOSE_HOOKS.append(hook)
+
+
+def notify_db_closed(db_path: Path) -> None:
+    """Notify registered readers/engines to release pooled handles for `db_path`."""
+    with _DB_REGISTRY_LOCK:
+        hooks = list(_DB_CLOSE_HOOKS)
+    for hook in hooks:
+        with contextlib.suppress(Exception):
+            hook(db_path)
+
+
+@contextlib.contextmanager
+def sqlite_write_tx(conn: sqlite3.Connection, lock: threading.RLock) -> Iterator[sqlite3.Cursor]:
+    """Execute an atomic SQLite write transaction under `lock`, rolling back cleanly on any `BaseException`."""
+    with lock:
+        cur = conn.cursor()
+        try:
+            yield cur
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                with contextlib.suppress(Exception):
+                    conn.rollback()
+            raise
 
 
 _SECRET_REGEXES: Tuple[Tuple[re.Pattern[str], str], ...] = (
@@ -121,6 +174,7 @@ _CTX_REFCOUNTS: Dict[str, int] = {}
 def _init_telemetry_conn(conn: sqlite3.Connection, wal: bool = True) -> sqlite3.Connection:
     if wal:
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=15000")
     for ddl in TELEMETRY_DDL:
         conn.execute(ddl)
@@ -152,10 +206,8 @@ def telemetry_db_context(db_path: Optional[Path]) -> Iterator[None]:
                     _CTX_REFCOUNTS.pop(key, None)
                     c = _CTX_CONNS.pop(key, None)
                     if c is not None:
-                        try:
+                        with contextlib.suppress(Exception):
                             c.close()
-                        except Exception:
-                            pass
                 else:
                     _CTX_REFCOUNTS[key] = rem
 
@@ -164,9 +216,9 @@ class TelemetryEngine:
     """Thread-safe SQLite-backed Waterfall Tracer, Structured Logger, and KPI Aggregator."""
 
     def __init__(self, db_path: Optional[Path] = None):
-        self._lock = threading.RLock()
         self._explicit_db = db_path is not None
         self.db_path = Path(db_path or settings.db_path)
+        self._lock = get_db_writer_lock(self.db_path) if self._explicit_db else threading.RLock()
         self.conn: Optional[sqlite3.Connection] = None
         self._conn_path: Optional[Path] = None
         self._test_mem_conn: Optional[sqlite3.Connection] = None
@@ -183,15 +235,29 @@ class TelemetryEngine:
         if self.conn is not None and self._conn_path == resolved:
             return self.conn
         if self.conn is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self.conn.close()
-            except Exception:
-                pass
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = _init_telemetry_conn(sqlite3.connect(str(resolved), timeout=30.0, check_same_thread=False), wal=True)
+        with get_db_writer_lock(resolved):
+            self.conn = _init_telemetry_conn(sqlite3.connect(str(resolved), timeout=30.0, check_same_thread=False), wal=True)
         self._conn_path = resolved
         self.db_path = resolved
         return self.conn
+
+    def reset_db_connections(self, target_path: Optional[Path] = None) -> None:
+        """Close cached telemetry connections for `target_path` (or all disk connections) during backup/restore/close."""
+        target_key = _norm_db_key(target_path) if target_path is not None else ""
+        with self._lock, _CTX_DB_LOCK:
+            if self.conn is not None and (not target_key or (self._conn_path and _norm_db_key(self._conn_path) == target_key)):
+                with contextlib.suppress(Exception):
+                    self.conn.close()
+                self.conn, self._conn_path = None, None
+            for k in list(_CTX_CONNS.keys()):
+                if not target_key or _norm_db_key(Path(k)) == target_key:
+                    c = _CTX_CONNS.pop(k, None)
+                    if c is not None:
+                        with contextlib.suppress(Exception):
+                            c.close()
 
     @property
     def active_trace_id(self) -> Optional[str]:
@@ -201,27 +267,51 @@ class TelemetryEngine:
     def active_trace_id(self, value: Optional[str]) -> None:
         self._active_trace_var.set(value)
 
-    def _active_conn(self) -> sqlite3.Connection:
-        """Resolve the active SQLite connection (honoring explicit DBs, `telemetry_db_context`, and test isolation)."""
+    @contextlib.contextmanager
+    def trace_scope(self, trace_type: str = "user_turn", name: str = "turn") -> Iterator[str]:
+        """Run a waterfall trace inside a strict `ContextVar` token scope so exceptions never leak trace IDs."""
+        tid = self.start_trace(trace_type=trace_type, name=name)
+        tok = self._active_trace_var.set(tid)
+        status = "ok"
+        try:
+            yield tid
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            try:
+                self.end_trace(tid, status=status)
+            finally:
+                self._active_trace_var.reset(tok)
+
+    def _active_target(self) -> Tuple[sqlite3.Connection, threading.RLock]:
+        """Resolve `(connection, db_writer_lock)` honoring explicit DBs, `telemetry_db_context`, and `COMPANION_TEST_MODE`."""
         if self._explicit_db:
-            return self._ensure_disk_conn(self.db_path)
+            resolved = Path(self.db_path).resolve()
+            return self._ensure_disk_conn(resolved), get_db_writer_lock(resolved)
         ctx_db = _CONTEXTUAL_TELEMETRY_DB.get()
         if ctx_db is not None:
-            key = str(ctx_db.resolve())
-            with _CTX_DB_LOCK:
+            resolved = ctx_db.resolve()
+            key = str(resolved)
+            lk = get_db_writer_lock(resolved)
+            with lk, _CTX_DB_LOCK:
                 c = _CTX_CONNS.get(key)
                 if c is None:
-                    ctx_db.parent.mkdir(parents=True, exist_ok=True)
+                    resolved.parent.mkdir(parents=True, exist_ok=True)
                     c = _init_telemetry_conn(sqlite3.connect(key, timeout=30.0, check_same_thread=False), wal=True)
                     _CTX_CONNS[key] = c
-                return c
-        if "unittest" in sys.modules:
+                return c, lk
+        if self.conn is not None and self._conn_path is not None and self._conn_path != settings.db_path.resolve():
+            return self.conn, get_db_writer_lock(self._conn_path)
+        if os.environ.get("COMPANION_TEST_MODE") == "1":
             if self._test_mem_conn is None:
-                self._test_mem_conn = _init_telemetry_conn(
-                    sqlite3.connect(":memory:", check_same_thread=False), wal=False
-                )
-            return self._test_mem_conn
-        return self._ensure_disk_conn(settings.db_path)
+                self._test_mem_conn = _init_telemetry_conn(sqlite3.connect(":memory:", check_same_thread=False), wal=False)
+            return self._test_mem_conn, self._lock
+        resolved = settings.db_path.resolve()
+        return self._ensure_disk_conn(resolved), get_db_writer_lock(resolved)
+
+    def _active_conn(self) -> sqlite3.Connection:
+        return self._active_target()[0]
 
     def start_trace(self, trace_type: str = "user_turn", name: str = "turn") -> str:
         """Start a new waterfall trace and set it as the active trace in the current `ContextVar`."""
@@ -230,13 +320,13 @@ class TelemetryEngine:
         safe_name = redact_secrets(str(name).replace("\n", " "))[:120]
         self.active_trace_id = tid
         with self._lock:
-            conn = self._active_conn()
+            conn, db_lock = self._active_target()
             self._trace_starts[tid] = now
-            conn.execute(
-                "INSERT INTO telemetry_traces (trace_id, trace_type, name, status, started_epoch) VALUES (?, ?, ?, 'active', ?)",
-                (tid, trace_type[:40], safe_name, time.time()),
-            )
-            conn.commit()
+            with sqlite_write_tx(conn, db_lock) as cur:
+                cur.execute(
+                    "INSERT INTO telemetry_traces (trace_id, trace_type, name, status, started_epoch) VALUES (?, ?, ?, 'active', ?)",
+                    (tid, trace_type[:40], safe_name, time.time()),
+                )
         return tid
 
     def end_trace(self, trace_id: Optional[str] = None, status: str = "ok") -> None:
@@ -245,23 +335,22 @@ class TelemetryEngine:
             tid = trace_id or self.active_trace_id
             if not tid:
                 return
-            conn = self._active_conn()
+            conn, db_lock = self._active_target()
             start_perf = self._trace_starts.pop(tid, None)
             dur_ms = round((time.perf_counter() - start_perf) * 1000.0, 2) if start_perf is not None else 0.0
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT COUNT(*), SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), COALESCE(SUM(duration_ms), 0.0) FROM telemetry_spans WHERE trace_id = ?",
-                (tid,),
-            )
-            row = cur.fetchone() or (0, 0, 0.0)
-            spans, errs, sum_ms = int(row[0] or 0), int(row[1] or 0), float(row[2] or 0.0)
-            final_dur = dur_ms if dur_ms > 0 else round(sum_ms, 2)
-            final_status = status if status != "ok" or errs == 0 else "warn"
-            conn.execute(
-                "UPDATE telemetry_traces SET status = ?, duration_ms = ?, span_count = ?, error_count = ? WHERE trace_id = ?",
-                (final_status, final_dur, spans, errs, tid),
-            )
-            conn.commit()
+            with sqlite_write_tx(conn, db_lock) as cur:
+                cur.execute(
+                    "SELECT COUNT(*), SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), COALESCE(SUM(duration_ms), 0.0) FROM telemetry_spans WHERE trace_id = ?",
+                    (tid,),
+                )
+                row = cur.fetchone() or (0, 0, 0.0)
+                spans, errs, sum_ms = int(row[0] or 0), int(row[1] or 0), float(row[2] or 0.0)
+                final_dur = dur_ms if dur_ms > 0 else round(sum_ms, 2)
+                final_status = status if status != "ok" or errs == 0 else "warn"
+                cur.execute(
+                    "UPDATE telemetry_traces SET status = ?, duration_ms = ?, span_count = ?, error_count = ? WHERE trace_id = ?",
+                    (final_status, final_dur, spans, errs, tid),
+                )
             if self.active_trace_id == tid:
                 self.active_trace_id = None
             self._ended_counter += 1
@@ -273,21 +362,14 @@ class TelemetryEngine:
         """Retain the newest `max_traces` waterfall traces (plus their spans) and `max_logs` application logs."""
         t_cap, l_cap = max(1, int(max_traces)), max(1, int(max_logs))
         with self._lock:
-            conn = self._active_conn()
-            cur = conn.cursor()
-            cur.execute(
-                "DELETE FROM telemetry_traces WHERE rowid NOT IN (SELECT rowid FROM telemetry_traces ORDER BY rowid DESC LIMIT ?)",
-                (t_cap,),
-            )
-            pruned_traces = max(0, int(cur.rowcount or 0))
-            cur.execute("DELETE FROM telemetry_spans WHERE trace_id NOT IN (SELECT trace_id FROM telemetry_traces)")
-            pruned_spans = max(0, int(cur.rowcount or 0))
-            cur.execute(
-                "DELETE FROM telemetry_logs WHERE id NOT IN (SELECT id FROM telemetry_logs ORDER BY id DESC LIMIT ?)",
-                (l_cap,),
-            )
-            pruned_logs = max(0, int(cur.rowcount or 0))
-            conn.commit()
+            conn, db_lock = self._active_target()
+            with sqlite_write_tx(conn, db_lock) as cur:
+                cur.execute("DELETE FROM telemetry_traces WHERE rowid NOT IN (SELECT rowid FROM telemetry_traces ORDER BY rowid DESC LIMIT ?)", (t_cap,))
+                pruned_traces = max(0, int(cur.rowcount or 0))
+                cur.execute("DELETE FROM telemetry_spans WHERE trace_id NOT IN (SELECT trace_id FROM telemetry_traces)")
+                pruned_spans = max(0, int(cur.rowcount or 0))
+                cur.execute("DELETE FROM telemetry_logs WHERE id NOT IN (SELECT id FROM telemetry_logs ORDER BY id DESC LIMIT ?)", (l_cap,))
+                pruned_logs = max(0, int(cur.rowcount or 0))
         return {"pruned_traces": pruned_traces, "pruned_spans": pruned_spans, "pruned_logs": pruned_logs}
 
     def record_span(
@@ -304,20 +386,16 @@ class TelemetryEngine:
             tid = trace_id or self.active_trace_id
             if not tid:
                 return 0
-            conn = self._active_conn()
+            conn, db_lock = self._active_target()
             start_perf = self._trace_starts.get(tid)
-            offset_ms = 0.0
-            if start_perf is not None:
-                offset_ms = max(0.0, round((time.perf_counter() - start_perf) * 1000.0 - duration_ms, 2))
+            offset_ms = max(0.0, round((time.perf_counter() - start_perf) * 1000.0 - duration_ms, 2)) if start_perf is not None else 0.0
             safe_detail = redact_secrets(str(detail))[:400]
-            cur = conn.cursor()
-            cur.execute(
-                """INSERT INTO telemetry_spans (trace_id, span_type, name, status, offset_ms, duration_ms, detail)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (tid, span_type[:40], name[:80], status[:16], offset_ms, round(float(duration_ms), 2), safe_detail),
-            )
-            conn.commit()
-            return int(cur.lastrowid)
+            with sqlite_write_tx(conn, db_lock) as cur:
+                cur.execute(
+                    "INSERT INTO telemetry_spans (trace_id, span_type, name, status, offset_ms, duration_ms, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (tid, span_type[:40], name[:80], status[:16], offset_ms, round(float(duration_ms), 2), safe_detail),
+                )
+                return int(cur.lastrowid)
 
     def log(self, level: str, component: str, message: str, trace_id: Optional[str] = None) -> int:
         """Write a structured application log event (DEBUG, INFO, WARN, ERROR)."""
@@ -326,15 +404,14 @@ class TelemetryEngine:
             lvl = "INFO"
         safe_msg = redact_secrets(str(message))[:600]
         with self._lock:
-            conn = self._active_conn()
+            conn, db_lock = self._active_target()
             tid = trace_id if trace_id is not None else (self.active_trace_id or "")
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO telemetry_logs (level, component, trace_id, message) VALUES (?, ?, ?, ?)",
-                (lvl, (component or "core").strip().lower()[:40], tid, safe_msg),
-            )
-            conn.commit()
-            return int(cur.lastrowid)
+            with sqlite_write_tx(conn, db_lock) as cur:
+                cur.execute(
+                    "INSERT INTO telemetry_logs (level, component, trace_id, message) VALUES (?, ?, ?, ?)",
+                    (lvl, (component or "core").strip().lower()[:40], tid, safe_msg),
+                )
+                return int(cur.lastrowid)
 
     def get_kpis(self) -> Dict[str, Any]:
         """Compute live system KPIs across traces, LLM calls, tools, safety guards, and logs."""
@@ -495,4 +572,72 @@ class TelemetryEngine:
             self._test_mem_conn = None
 
 
+_RO_LOCAL = threading.local()
+_RO_POOL_LOCK = threading.Lock()
+_RO_ALL_CONNS: Dict[str, List[sqlite3.Connection]] = {}
+
+
+def _close_ro_readers(db_path: Path) -> None:
+    key = _norm_db_key(db_path)
+    with _RO_POOL_LOCK:
+        conns = _RO_ALL_CONNS.pop(key, [])
+    cache: Dict[str, Tuple[int, sqlite3.Connection]] = getattr(_RO_LOCAL, "conns", None) or {}
+    cache.pop(key, None)
+    for c in conns:
+        with contextlib.suppress(Exception):
+            c.close()
+
+
+def read_ro_rows(db_path: Path, sql: str, params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
+    """Execute a fast read-only WAL query using a thread-local `?mode=ro` connection pool."""
+    if not db_path.is_file():
+        return []
+    resolved = db_path.resolve()
+    key = _norm_db_key(resolved)
+    try:
+        ctime_ns = resolved.stat().st_ctime_ns
+    except OSError:
+        return []
+    cache: Optional[Dict[str, Tuple[int, sqlite3.Connection]]] = getattr(_RO_LOCAL, "conns", None)
+    if cache is None:
+        cache = {}
+        _RO_LOCAL.conns = cache
+    entry = cache.get(key)
+    conn: Optional[sqlite3.Connection] = None
+    if entry is not None and entry[0] == ctime_ns:
+        conn = entry[1]
+    if conn is None:
+        if entry is not None:
+            with contextlib.suppress(Exception):
+                entry[1].close()
+        try:
+            conn = sqlite3.connect(f"file:{resolved.as_posix()}?mode=ro", uri=True, timeout=15.0, check_same_thread=False)
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA busy_timeout=15000")
+        except sqlite3.Error:
+            return []
+        cache[key] = (ctime_ns, conn)
+        with _RO_POOL_LOCK:
+            _RO_ALL_CONNS.setdefault(key, []).append(conn)
+    try:
+        return conn.execute(sql, params).fetchall()
+    except sqlite3.Error:
+        cache.pop(key, None)
+        with contextlib.suppress(Exception):
+            conn.close()
+        return []
+
+
 telemetry = TelemetryEngine()
+register_db_close_hook(telemetry.reset_db_connections)
+register_db_close_hook(_close_ro_readers)
+
+
+@contextlib.contextmanager
+def trace_scope(trace_type: str = "user_turn", name: str = "turn", enabled: bool = True) -> Iterator[Optional[str]]:
+    """Run an optional waterfall trace inside `telemetry.trace_scope` without leaking `ContextVar` tokens."""
+    if not enabled:
+        yield None
+        return
+    with telemetry.trace_scope(trace_type=trace_type, name=name) as tid:
+        yield tid

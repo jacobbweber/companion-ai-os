@@ -444,8 +444,11 @@ def verify_sdd(root: Optional[Path] = None, store: Optional[MemoryStore] = None)
                     if req_section not in block:
                         report.contract_issues.append(f"Missing `{req_section}` in `{header}` of specs/CONTRACTS.md")
 
+    has_tests_dir = (target_root / "tests").is_dir()
     all_referenced = sorted(arch_refs | contract_refs)
     for ref_rel in all_referenced:
+        if not has_tests_dir and ref_rel.startswith("tests/"):
+            continue
         if not (target_root / ref_rel).is_file():
             report.missing_referenced_files.append(ref_rel)
 

@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue
+from companion.archive_and_approvals import get_approval_queue, get_trust_mode
+from companion.config import get_execution_origin
 from companion.semantic_memory import semantic_similarity
 from companion.telemetry import redact_secrets
 from companion.wiki_engine import WikiEngine
@@ -176,19 +177,23 @@ def _parse_outputs_arg(outputs_raw: Any, fallback: Dict[str, Any]) -> Tuple[List
             return [], f"Invalid JSON in `outputs_json`: {exc}"
     if isinstance(outputs_raw, list) and outputs_raw:
         return [dict(x) for x in outputs_raw if isinstance(x, dict)], None
-    if fallback.get("target_path") or fallback.get("content"):
+    fb_content = fallback.get("content") or fallback.get("body") or fallback.get("markdown") or fallback.get("text")
+    fb_path_raw = str(fallback.get("target_path") or "").strip()
+    if not fb_path_raw and str(fallback.get("path") or "").strip().replace("\\", "/").lstrip("/").startswith("02_knowledge/"):
+        fb_path_raw = str(fallback.get("path") or "").strip()
+    if fb_path_raw or fb_content:
         dom = slugify_wiki(str(fallback.get("domain") or "general"), "general")
         top = slugify_wiki(str(fallback.get("topic") or ""), "") if fallback.get("topic") else ""
         slug = slugify_wiki(str(fallback.get("new_slug") or fallback.get("title") or "curated-note"))
         default_p = f"02_knowledge/{dom}/{top}/{slug}.md" if top else f"02_knowledge/{dom}/{slug}.md"
         return [{
-            "path": str(fallback.get("target_path") or default_p),
+            "path": fb_path_raw or default_p,
             "title": str(fallback.get("title") or ""), "summary": str(fallback.get("summary") or ""),
             "template": str(fallback.get("template") or ""), "domain": dom, "topic": top,
             "tags": fallback.get("tags"), "ontology": fallback.get("ontology"),
-            "content": str(fallback.get("content") or ""),
+            "content": str(fb_content or ""),
         }], None
-    return [], "Provide `outputs_json` (list of curated output note specs) or target note fields (`target_path`/`domain`, `template`, `summary`, `content`)."
+    return [], "Provide `outputs_json` (list of curated output note specs) or target note fields (`target_path`/`path`, `template`, `summary`, `content`)."
 
 
 def _load_curation_session(engine: WikiEngine, curation_id: str) -> Optional[Dict[str, Any]]:
@@ -352,7 +357,9 @@ def commit_curation_plan(
     inbox_paths = [str(p) for p in plan["inbox_paths"]]
     touches_user = any(str(o.get("old_author") or "").lower() in ("user", "human", "partner") for o in plan["outputs"])
 
-    if actor.strip().lower() not in ("user", "cli", "web"):
+    is_user = actor.strip().lower() in ("user", "cli", "web")
+    is_fg_safe = (not is_user) and (not touches_user) and get_execution_origin() == "foreground_turn" and get_trust_mode(store=engine.store) != "strict"
+    if not is_user and not is_fg_safe:
         allowed, apr = get_approval_queue(engine.store).check_or_enqueue(
             category="wiki_edit", action_name="commit_curation",
             target=f"{', '.join(inbox_paths)} -> {', '.join(out_paths)}",

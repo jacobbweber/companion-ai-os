@@ -64,6 +64,7 @@ class PreparedAttachmentTurn:
     wire_doc_context: str
     wire_image_uris: Tuple[str, ...]
     attachments: List[Dict[str, Any]]
+    followup_doc_note: str = ""
 
 
 class _HTMLTextExtractor(html.parser.HTMLParser):
@@ -545,4 +546,14 @@ def prepare_turn_attachments(
         base_msg = "Please inspect the attached file(s) and summarize or extract the key details."
     badge_block = "\n\n".join(badges)
     display = f"{base_msg}\n\n{badge_block}".strip() if badge_block else base_msg
-    return PreparedAttachmentTurn(display, "\n\n".join(doc_blocks).strip(), tuple(image_uris), loaded_meta)
+    followup_parts: List[str] = []
+    for meta in loaded_meta:
+        if meta["kind"] not in ("image", "audio", "video"):
+            if meta["wiki_resource_path"]:
+                followup_parts.append(f"[Attached Document `{meta['filename']}` filed in Wiki `{meta['wiki_resource_path']}`]")
+            else:
+                rec_rows = mem._fetch_rows("SELECT extracted_text FROM chat_attachments WHERE attachment_id = ? LIMIT 1", (meta["id"],))
+                ex_s = str(rec_rows[0][0])[:4000].strip() if rec_rows else ""
+                if ex_s:
+                    followup_parts.append(f"[Attached Document Excerpt (`{meta['filename']}`)]\n{ex_s}\n[/Attached Document Excerpt]")
+    return PreparedAttachmentTurn(display, "\n\n".join(doc_blocks).strip(), tuple(image_uris), loaded_meta, "\n\n".join(followup_parts))

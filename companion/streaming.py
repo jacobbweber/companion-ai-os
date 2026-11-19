@@ -1,15 +1,21 @@
 """
-Live Token, Reasoning & Harness Activity Event Streaming (`companion/streaming.py` — A-Frame Infrastructure Layer).
+Live Token, Reasoning, Harness Event Streaming & `<100ms` Cooperative `CancelScope`
+(`companion/streaming.py` — A-Frame Infrastructure Layer).
 
-Provides a zero-dependency `ContextVar` event sink and an OpenAI-compatible Server-Sent Events (SSE)
-stream assembler so CLI and LAN Web UI surfaces receive real-time token, `<think>`, phase, and tool
-activity updates while preserving 100% backward compatibility with synchronous `chat_fn` signatures.
+Provides:
+1. `ContextVar`-isolated event sink (`emit_stream_event`), multimodal wire attachment scopes,
+   and transient `<turn_context>` wire scope (preserving 100% static `messages[0]` KV-cache prefix).
+2. `CancelScope` aborting blocked HTTP sockets (`shutdown(SHUT_RDWR)`) and `Popen` subprocesses in `<100ms`.
+3. Hardened `<think>` / prefix-orphan `</think>` stream splitter, JSON-array `<tool_call>` rescue,
+   and distinct-`id` parallel `tool_calls` delta assembly.
 """
 
 import contextlib
 import contextvars
 import json
 import re
+import socket
+import threading
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 StreamCallback = Callable[[Dict[str, Any]], None]
@@ -19,6 +25,139 @@ _STREAM_SINK: contextvars.ContextVar[Optional[StreamCallback]] = contextvars.Con
 )
 _WIRE_DOC_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar("companion_wire_doc_context", default="")
 _WIRE_IMAGES: contextvars.ContextVar[Tuple[str, ...]] = contextvars.ContextVar("companion_wire_images", default=())
+_WIRE_TURN_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar("companion_wire_turn_context", default="")
+
+
+class CancelScope:
+    """Socket- & subprocess-aware cancellation scope waking blocked C-level reads/waits in `<100ms`."""
+
+    def __init__(self, cancel_event: Optional[threading.Event] = None) -> None:
+        self.cancel_event = cancel_event or threading.Event()
+        self._lock = threading.Lock()
+        self._sockets: List[Any] = []
+        self._responses: List[Any] = []
+        self._procs: List[Any] = []
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def check(self) -> None:
+        if self.cancel_event.is_set():
+            raise InterruptedError("Operation cancelled by user.")
+
+    @staticmethod
+    def _extract_raw_socket(resp_or_sock: Any) -> Any:
+        if hasattr(resp_or_sock, "shutdown"):
+            return resp_or_sock
+        fp = getattr(resp_or_sock, "fp", None)
+        raw = getattr(fp, "raw", fp) if fp is not None else None
+        return getattr(raw, "_sock", None) or getattr(resp_or_sock, "_sock", None) or getattr(resp_or_sock, "sock", None)
+
+    @staticmethod
+    def _abort_socket_obj(sock_obj: Any) -> None:
+        if sock_obj is None:
+            return
+        with contextlib.suppress(Exception):
+            sock_obj.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(Exception):
+            sock_obj.close()
+
+    @staticmethod
+    def _terminate_proc(proc: Any) -> None:
+        if proc is None:
+            return
+        with contextlib.suppress(Exception):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            proc.terminate()
+
+    def register_socket(self, sock_obj: Any) -> None:
+        if sock_obj is None:
+            return
+        with self._lock:
+            if self.cancel_event.is_set():
+                self._abort_socket_obj(sock_obj)
+                raise InterruptedError("Operation cancelled by user.")
+            if sock_obj not in self._sockets:
+                self._sockets.append(sock_obj)
+
+    def unregister_socket(self, sock_obj: Any) -> None:
+        with self._lock:
+            self._sockets = [s for s in self._sockets if s is not sock_obj]
+
+    @contextlib.contextmanager
+    def track_response(self, resp: Any) -> Iterator[Any]:
+        raw_sock = self._extract_raw_socket(resp)
+        with self._lock:
+            if self.cancel_event.is_set():
+                self._abort_socket_obj(raw_sock)
+                with contextlib.suppress(Exception):
+                    resp.close()
+                raise InterruptedError("Operation cancelled by user.")
+            self._responses.append((raw_sock, resp))
+        try:
+            yield resp
+        finally:
+            with self._lock:
+                self._responses = [pair for pair in self._responses if pair[1] is not resp]
+                if raw_sock is not None:
+                    self._sockets = [s for s in self._sockets if s is not raw_sock]
+
+    @contextlib.contextmanager
+    def track_popen(self, proc: Any) -> Iterator[Any]:
+        with self._lock:
+            if self.cancel_event.is_set():
+                self._terminate_proc(proc)
+                raise InterruptedError("Operation cancelled by user.")
+            self._procs.append(proc)
+        try:
+            yield proc
+        finally:
+            with self._lock:
+                self._procs = [p for p in self._procs if p is not proc]
+
+    def cancel(self) -> None:
+        with self._lock:
+            self.cancel_event.set()
+            socks = list(self._sockets)
+            resps = list(self._responses)
+            procs = list(self._procs)
+        for s in socks:
+            self._abort_socket_obj(s)
+        for rs, resp in resps:
+            self._abort_socket_obj(rs)
+            with contextlib.suppress(Exception):
+                resp.close()
+        for p in procs:
+            self._terminate_proc(p)
+
+
+_CANCEL_SCOPE: contextvars.ContextVar[Optional[CancelScope]] = contextvars.ContextVar(
+    "companion_cancel_scope", default=None
+)
+
+
+@contextlib.contextmanager
+def cancel_scope_context(scope: Optional[CancelScope]) -> Iterator[Optional[CancelScope]]:
+    """Bind a `CancelScope` for the active foreground turn or background job."""
+    tok = _CANCEL_SCOPE.set(scope)
+    try:
+        yield scope
+    finally:
+        _CANCEL_SCOPE.reset(tok)
+
+
+def get_active_cancel_scope() -> Optional[CancelScope]:
+    """Return the active `CancelScope`, if any."""
+    return _CANCEL_SCOPE.get()
+
+
+def check_cancelled() -> None:
+    """Raise `InterruptedError` immediately if the active `CancelScope` has been cancelled."""
+    scope = _CANCEL_SCOPE.get()
+    if scope is not None and scope.is_cancelled:
+        raise InterruptedError("Operation cancelled by user.")
 
 
 def get_active_wire_doc_context() -> str:
@@ -29,6 +168,21 @@ def get_active_wire_doc_context() -> str:
 def get_active_wire_images() -> Tuple[str, ...]:
     """Return active per-turn base64 `data:image/...` URIs for OpenAI multimodal wire injection."""
     return _WIRE_IMAGES.get()
+
+
+def get_active_wire_turn_context() -> str:
+    """Return transient `<turn_context>` block injected onto the current user turn without mutating `messages[0]`."""
+    return _WIRE_TURN_CONTEXT.get()
+
+
+@contextlib.contextmanager
+def turn_context_scope(turn_context: str) -> Iterator[None]:
+    """Bind dynamic per-turn HUD/skill/approval context without mutating the cached `messages[0]` prefix."""
+    tok = _WIRE_TURN_CONTEXT.set((turn_context or "").strip())
+    try:
+        yield
+    finally:
+        _WIRE_TURN_CONTEXT.reset(tok)
 
 
 @contextlib.contextmanager
@@ -43,6 +197,22 @@ def wire_attachment_context(doc_context: str = "", image_data_uris: Iterable[str
         _WIRE_DOC_CONTEXT.reset(tok_doc)
 
 
+@contextlib.contextmanager
+def clean_subagent_wire_context() -> Iterator[None]:
+    """Clear `_WIRE_IMAGES`, `_WIRE_DOC_CONTEXT`, `_WIRE_TURN_CONTEXT`, and `_STREAM_SINK` for isolated subagents."""
+    t_img = _WIRE_IMAGES.set(())
+    t_doc = _WIRE_DOC_CONTEXT.set("")
+    t_trn = _WIRE_TURN_CONTEXT.set("")
+    t_snk = _STREAM_SINK.set(None)
+    try:
+        yield
+    finally:
+        _STREAM_SINK.reset(t_snk)
+        _WIRE_TURN_CONTEXT.reset(t_trn)
+        _WIRE_DOC_CONTEXT.reset(t_doc)
+        _WIRE_IMAGES.reset(t_img)
+
+
 def has_stream_sink() -> bool:
     """Return `True` when a live stream event listener is bound in the current execution context."""
     return _STREAM_SINK.get() is not None
@@ -53,10 +223,8 @@ def emit_stream_event(event: Dict[str, Any]) -> None:
     sink = _STREAM_SINK.get()
     if sink is None:
         return
-    try:
+    with contextlib.suppress(Exception):
         sink(event)
-    except Exception:
-        pass
 
 
 @contextlib.contextmanager
@@ -70,11 +238,13 @@ def stream_event_context(sink: Optional[StreamCallback]) -> Iterator[None]:
 
 
 class _ThinkTagStreamSplitter:
-    """Incremental state machine splitting `<think>...</think>` chunks from visible answer deltas."""
+    """Incremental state machine splitting `<think>...</think>` and prefix-orphan `</think>` from visible deltas."""
 
     def __init__(self) -> None:
         self.in_think = False
         self.in_tool_xml = False
+        self.saw_open_think = False
+        self._emitted_pre_text: List[str] = []
         self._buf = ""
 
     def feed(self, text: str) -> None:
@@ -85,6 +255,13 @@ class _ThinkTagStreamSplitter:
 
     def flush(self) -> None:
         self._drain(final=True)
+
+    def _emit_visible(self, chunk: str) -> None:
+        if not chunk:
+            return
+        if not self.saw_open_think:
+            self._emitted_pre_text.append(chunk)
+        emit_stream_event({"type": "text_delta", "delta": chunk})
 
     def _drain(self, final: bool) -> None:
         while self._buf:
@@ -99,34 +276,51 @@ class _ThinkTagStreamSplitter:
                 self.in_tool_xml = False
                 continue
             if not self.in_think:
-                tc_idx = low.find("<tool_call>")
+                orphan_end = low.find("</think>")
                 th_idx = low.find("<think>")
+                if orphan_end != -1 and (th_idx == -1 or orphan_end < th_idx):
+                    pre_thought = "".join(self._emitted_pre_text) + self._buf[:orphan_end]
+                    self._emitted_pre_text.clear()
+                    self.saw_open_think = True
+                    emit_stream_event({"type": "orphan_think_closed", "thinking": pre_thought})
+                    self._buf = self._buf[orphan_end + len("</think>") :]
+                    continue
+                tc_idx = low.find("<tool_call>")
                 candidates = [i for i in (tc_idx, th_idx) if i != -1]
                 if not candidates:
                     hold = 0 if final else min(len(self._buf), 11)
-                    safe_upto = len(self._buf) - hold if "<" in self._buf[-hold:] and hold else len(self._buf)
+                    safe_upto = len(self._buf) - hold if ("<" in self._buf[-hold:] and hold) else len(self._buf)
                     if safe_upto <= 0:
                         return
                     chunk, self._buf = self._buf[:safe_upto], self._buf[safe_upto:]
-                    if chunk:
-                        emit_stream_event({"type": "text_delta", "delta": chunk})
+                    self._emit_visible(chunk)
                     if not final:
                         return
                     continue
                 first = min(candidates)
                 if first > 0:
-                    emit_stream_event({"type": "text_delta", "delta": self._buf[:first]})
+                    self._emit_visible(self._buf[:first])
                 if first == th_idx:
                     self._buf = self._buf[first + len("<think>") :]
                     self.in_think = True
+                    self.saw_open_think = True
+                    self._emitted_pre_text.clear()
                 else:
                     self._buf = self._buf[first + len("<tool_call>") :]
                     self.in_tool_xml = True
             else:
                 end_idx = low.find("</think>")
                 if end_idx == -1:
-                    hold = 0 if final else min(len(self._buf), 8)
-                    safe_upto = len(self._buf) - hold if "<" in self._buf[-hold:] and hold else len(self._buf)
+                    tc_in_think = low.find("<tool_call>")
+                    if tc_in_think != -1:
+                        if tc_in_think > 0:
+                            emit_stream_event({"type": "thinking_delta", "delta": self._buf[:tc_in_think]})
+                        self._buf = self._buf[tc_in_think + len("<tool_call>") :]
+                        self.in_think = False
+                        self.in_tool_xml = True
+                        continue
+                    hold = 0 if final else min(len(self._buf), 11)
+                    safe_upto = len(self._buf) - hold if ("<" in self._buf[-hold:] and hold) else len(self._buf)
                     if safe_upto <= 0:
                         return
                     chunk, self._buf = self._buf[:safe_upto], self._buf[safe_upto:]
@@ -142,16 +336,21 @@ class _ThinkTagStreamSplitter:
 
 
 def _merge_tool_call_deltas(acc: Dict[int, Dict[str, Any]], tc_deltas: List[Dict[str, Any]]) -> None:
-    """Merge streamed `delta.tool_calls` fragments by `index` (or distinct `id`) into OpenAI `tool_calls` dicts."""
+    """Merge streamed `delta.tool_calls` fragments; allocate a new slot whenever `tc['id']` differs from `acc[slot]['id']`."""
     for item in tc_deltas:
         if not isinstance(item, dict):
             continue
         raw_idx, tc_id = item.get("index"), str(item.get("id") or "")
-        if raw_idx is not None:
-            idx = int(raw_idx or 0)
-        elif tc_id and (hit := next((k for k, v in acc.items() if v.get("id") == tc_id), None)) is not None:
-            idx = hit
-        elif tc_id and 0 in acc and acc[0].get("id") not in ("", "call_0", tc_id):
+        matched_slot = next((k for k, v in acc.items() if tc_id and v.get("id") == tc_id), None)
+        if matched_slot is not None:
+            idx = matched_slot
+        elif raw_idx is not None:
+            cand = int(raw_idx or 0)
+            if tc_id and cand in acc and acc[cand].get("id") not in ("", f"call_{cand}", tc_id):
+                idx = max(acc) + 1
+            else:
+                idx = cand
+        elif tc_id and acc and acc[max(acc)].get("id") not in ("", f"call_{max(acc)}", tc_id):
             idx = max(acc) + 1
         else:
             idx = max(acc) if acc else 0
@@ -174,10 +373,12 @@ ThinkTagStreamSplitter = _ThinkTagStreamSplitter
 
 def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
     """Read either a standard JSON response or an OpenAI `text/event-stream` SSE response into a unified dict."""
+    check_cancelled()
     headers = getattr(resp, "headers", None)
     ctype = str(headers.get("Content-Type", "") if headers is not None and hasattr(headers, "get") else "").lower()
     if "text/event-stream" not in ctype:
         raw = resp.read().decode("utf-8", errors="replace")
+        check_cancelled()
         data = json.loads(raw)
         if has_stream_sink() and isinstance(data, dict) and data.get("choices"):
             msg = (data["choices"][0] or {}).get("message") or {}
@@ -197,6 +398,7 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
     splitter = _ThinkTagStreamSplitter()
 
     for raw_line in resp:
+        check_cancelled()
         line = (raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, (bytes, bytearray)) else str(raw_line)).strip()
         if not line or line.startswith(":") or not line.startswith("data:"):
             continue
@@ -250,11 +452,19 @@ _XML_PARAM_RE = re.compile(r"<parameter\s*=\s*([a-zA-Z0-9_.-]+)\s*>(.*?)</parame
 
 
 def strip_thinking_tags(text: str) -> Tuple[str, str]:
-    """Extract `<think>...</think>` blocks from text and return `(clean_content, thinking_text)`."""
+    """Extract `<think>...</think>`, prefix-orphan `</think>`, and unclosed `<think>` into `(clean_content, thinking_text)`."""
     if not text:
         return "", ""
     raw = str(text)
-    thoughts: List[str] = [m.strip() for m in _THINK_BLOCK_RE.findall(raw) if m.strip()]
+    thoughts: List[str] = []
+    low = raw.lower()
+    close_idx, open_idx = low.find("</think>"), low.find("<think>")
+    if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+        prefix_thought = raw[:close_idx].strip()
+        if prefix_thought:
+            thoughts.append(prefix_thought)
+        raw = raw[close_idx + len("</think>") :]
+    thoughts.extend(m.strip() for m in _THINK_BLOCK_RE.findall(raw) if m.strip())
     cleaned = _THINK_BLOCK_RE.sub("", raw)
     unclosed = _UNCLOSED_THINK_RE.search(cleaned)
     if unclosed:
@@ -264,31 +474,7 @@ def strip_thinking_tags(text: str) -> Tuple[str, str]:
     return cleaned.strip(), "\n\n".join(thoughts)
 
 
-def _parse_single_tool_block(inner: str, idx: int) -> Optional[Dict[str, Any]]:
-    """Parse one `<tool_call>` body in either JSON (`{"name": ...}`) or Qwen XML (`<function=...>`) syntax."""
-    body = inner.strip()
-    if body.startswith("```"):
-        body = re.sub(r"^```(?:json|xml)?\s*|\s*```$", "", body, flags=re.IGNORECASE).strip()
-    xml_m = _XML_FUNC_RE.search(body)
-    if xml_m:
-        fn_name = xml_m.group(1).strip()
-        args_dict: Dict[str, Any] = {}
-        for p_key, p_val in _XML_PARAM_RE.findall(xml_m.group(2)):
-            val_clean = p_val.strip()
-            if val_clean.startswith(("{", "[")):
-                try:
-                    args_dict[p_key] = json.loads(val_clean)
-                    continue
-                except Exception:
-                    pass
-            args_dict[p_key] = val_clean
-        return {"id": f"rescued_tc_{idx}", "type": "function", "function": {"name": fn_name, "arguments": json.dumps(args_dict)}}
-    try:
-        parsed = json.loads(body)
-    except Exception:
-        return None
-    if not isinstance(parsed, dict):
-        return None
+def _normalize_parsed_tc_obj(parsed: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
     fn_obj = parsed.get("function") if isinstance(parsed.get("function"), dict) else parsed
     name = str(fn_obj.get("name") or fn_obj.get("tool") or "").strip()
     if not name:
@@ -298,11 +484,45 @@ def _parse_single_tool_block(inner: str, idx: int) -> Optional[Dict[str, Any]]:
     return {"id": f"rescued_tc_{idx}", "type": "function", "function": {"name": name, "arguments": arg_str}}
 
 
+def _parse_tool_block_items(inner: str, base_idx: int) -> List[Dict[str, Any]]:
+    """Parse one `<tool_call>` body in JSON object, JSON array (`[...]`), or Qwen XML (`<function=...>`) syntax."""
+    body = inner.strip()
+    if body.startswith("```"):
+        body = re.sub(r"^```(?:json|xml)?\s*|\s*```$", "", body, flags=re.IGNORECASE).strip()
+    xml_matches = list(_XML_FUNC_RE.finditer(body))
+    if xml_matches:
+        out_xml: List[Dict[str, Any]] = []
+        for offset, xml_m in enumerate(xml_matches):
+            fn_name = xml_m.group(1).strip()
+            args_dict: Dict[str, Any] = {}
+            for p_key, p_val in _XML_PARAM_RE.findall(xml_m.group(2)):
+                val_clean = p_val.strip()
+                if val_clean.startswith(("{", "[")):
+                    with contextlib.suppress(Exception):
+                        args_dict[p_key] = json.loads(val_clean)
+                        continue
+                args_dict[p_key] = val_clean
+            out_xml.append({"id": f"rescued_tc_{base_idx + offset}", "type": "function", "function": {"name": fn_name, "arguments": json.dumps(args_dict)}})
+        return out_xml
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return []
+    if isinstance(parsed, list):
+        return [tc for off, item in enumerate(parsed) if isinstance(item, dict) and (tc := _normalize_parsed_tc_obj(item, base_idx + off)) is not None]
+    if isinstance(parsed, dict):
+        single = _normalize_parsed_tc_obj(parsed, base_idx)
+        return [single] if single is not None else []
+    return []
+
+
 def rescue_text_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Rescue `<tool_call>...</tool_call>` JSON/XML blocks emitted inside assistant text into OpenAI `tool_calls`."""
+    """Rescue `<tool_call>...</tool_call>` JSON/array/XML blocks emitted inside assistant text into OpenAI `tool_calls`."""
     if not text or "<tool_call>" not in text.lower():
         return text, []
-    rescued = [tc for idx, match in enumerate(_TOOL_CALL_TAG_RE.finditer(text), 1) if (tc := _parse_single_tool_block(match.group(1), idx)) is not None]
+    rescued: List[Dict[str, Any]] = []
+    for match in _TOOL_CALL_TAG_RE.finditer(text):
+        rescued.extend(_parse_tool_block_items(match.group(1), len(rescued) + 1))
     if not rescued:
         return text, []
     return _TOOL_CALL_TAG_RE.sub("", text).strip(), rescued

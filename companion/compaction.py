@@ -4,7 +4,9 @@ Lossless Context Window Compaction & Phase Handoff Engine (A-Frame Application L
 Provides:
 1. Deterministic `KeyTokens` extraction & lossless verification (paths, numbers, snake_case/ADR/SPEC IDs)
 2. `build_lossless_phase_handoff()` for multi-phase autonomous workflows (zero lossy `[:1500]` slicing)
-3. Adaptive 2-stage conversation compaction (Stage 1 stale-tool pruning + Stage 2 structured handoff)
+3. Adaptive 2-stage conversation compaction (`75%` default trigger, tool-schema token accounting,
+   active-turn `<70%` pruning protection, paired `user`/`assistant` checkpoint handoff with zero mid-array
+   `system` roles, and atomic single-turn tool-boundary Stage-2 splits)
 """
 
 import json
@@ -21,7 +23,7 @@ from companion.telemetry import telemetry
 
 _DASH_TO_HYPHEN = str.maketrans({c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"})
 _TOKEN_SPLIT_RE = re.compile(r"[`\"'(),;:<>\[\]{}\s]+")
-_PATH_EXT_RE = re.compile(r"(?:[a-zA-Z]:[\\/]|/)?[\w.\-/\\]+\.(?:py|md|json|db|sqlite|toml|yaml|yml|sh|env|html|js|css)\b", re.I)
+_PATH_EXT_RE = re.compile(r"(?:[a-zA-Z]:[\\/]|/)?[\w.\-/\\]+\.(?:py|md|json|db|sqlite|toml|yaml|yml|sh|env|html|js|ts|tsx|css)\b", re.I)
 _NUMBER_TOKEN_RE = re.compile(r"^\d+(?:[.\-:/]\d+)+$|^\d{2,}%?$")
 _NAME_TOKEN_RE = re.compile(r"^(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)+|(?:ADR|SPEC|TASK)-\d+|[A-Z][a-zA-Z0-9]*(?:Error|Exception))$", re.I)
 _FENCED_JSON_RE = re.compile(r"```json\s*\{.*?\}\s*```", re.S)
@@ -30,6 +32,7 @@ _VERIFY_ONLY_RE = re.compile(
     re.I,
 )
 _MUTATION_CUE_RE = re.compile(r"\b(?:create|write|implement|edit|modify|update|refactor|build|add)\b", re.I)
+_HANDOFF_PREFIXES = ("[Context Compaction Summary", "[CONTEXT CHECKPOINT HANDOFF")
 
 
 @dataclass(frozen=True)
@@ -76,13 +79,11 @@ def extract_key_tokens(older: List[Dict[str, Any]]) -> KeyTokens:
     numbers: List[str] = []
     names: List[str] = []
     seen: set[str] = set()
-    # Pass 1: user prompts and prior compaction summaries take first priority.
     for m in older:
         role = m.get("role")
         raw = str(m.get("content") or "")
-        if role == "user" or (role == "system" and raw.startswith("[Context Compaction Summary")):
+        if role == "user" or (role == "system" and raw.startswith(_HANDOFF_PREFIXES)):
             _harvest_tokens_from_text(normalize_compaction_text(raw), paths, numbers, names, seen)
-    # Pass 2: assistant outcomes and tool discoveries (first 800 chars per message so huge dumps don't crowd caps).
     for m in older:
         role = m.get("role")
         if role in ("assistant", "tool"):
@@ -164,9 +165,19 @@ def classify_task_autoskip(desc: str, built_rels: List[str], target_root: Path) 
     return pure_verify, already_built
 
 
-def estimate_messages_chars(messages: List[Dict[str, Any]]) -> int:
-    """Estimate total character count of the current message list."""
-    total = 0
+def estimate_tools_chars(tools: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Estimate JSON schema character footprint for active tool definitions."""
+    if not tools:
+        return 0
+    try:
+        return len(json.dumps(tools))
+    except Exception:
+        return len(tools) * 400
+
+
+def estimate_messages_chars(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Estimate total character count of the current message list plus optional tool schemas."""
+    total = estimate_tools_chars(tools)
     for m in messages:
         total += len(str(m.get("content") or ""))
         if m.get("tool_calls"):
@@ -177,15 +188,32 @@ def estimate_messages_chars(messages: List[Dict[str, Any]]) -> int:
     return total
 
 
-def estimate_messages_tokens(messages: List[Dict[str, Any]], last_usage_tokens: int = 0) -> int:
-    """Estimate active token count using server-reported usage or a ~4 chars/token + framing heuristic."""
-    char_est = (estimate_messages_chars(messages) // 4) + (len(messages) * 6)
+def estimate_messages_tokens(
+    messages: List[Dict[str, Any]], last_usage_tokens: int = 0, tools: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Estimate active token count (including `tools` schemas) using server usage or a ~4 chars/token heuristic."""
+    char_est = (estimate_messages_chars(messages, tools=tools) // 4) + (len(messages) * 6)
     return max(char_est, int(last_usage_tokens or 0))
 
 
-def prune_stale_tool_outputs(messages: List[Dict[str, Any]], keep_recent: int = 8, max_old_tool_chars: int = 600) -> int:
-    """Stage 1 Compaction: Slim oversized tool outputs in older messages without dropping conversation turns."""
-    cutoff, chars_freed = max(1, len(messages) - max(1, keep_recent)), 0
+def should_compact(
+    messages: List[Dict[str, Any]], tier: Optional[str] = None,
+    last_usage_tokens: int = 0, tools: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Return True when estimated context tokens (messages + tool schemas) exceed `compact_trigger_pct`."""
+    tier_win = settings.resolve_tier(tier).context_window_tokens
+    trig_tokens = int(tier_win * (settings.compact_trigger_pct / 100.0))
+    return estimate_messages_tokens(messages, last_usage_tokens=last_usage_tokens, tools=tools) > trig_tokens
+
+
+def prune_stale_tool_outputs(
+    messages: List[Dict[str, Any]], keep_recent: int = 8, max_old_tool_chars: int = 600, protect_from_idx: int = 0,
+) -> int:
+    """Stage 1 Compaction: Slim oversized tool outputs in older messages while protecting active-turn outputs."""
+    cutoff = max(1, len(messages) - max(1, keep_recent))
+    if protect_from_idx > 0:
+        cutoff = min(cutoff, protect_from_idx)
+    chars_freed = 0
     for idx in range(1, cutoff):
         msg = messages[idx]
         if msg.get("role") != "tool":
@@ -209,11 +237,11 @@ def _build_structured_handoff(older: List[Dict[str, Any]], summarizer_fn: Option
     for m in older:
         role = m.get("role")
         text = normalize_compaction_text(str(m.get("content") or "").strip()).replace("\n", " ")
-        if role == "system" and text.startswith("[Context Compaction Summary"):
+        if text.startswith(_HANDOFF_PREFIXES):
             prior_summaries.append(f"- {text[:320]}")
         elif role == "user" and text:
             user_goals.append(f"- {text[:220]}")
-        elif role == "assistant":
+        elif role == "assistant" and text != "Understood - continuing from checkpoint.":
             for tc in m.get("tool_calls") or []:
                 fn = (tc.get("function") or {}).get("name", "")
                 raw_a = str((tc.get("function") or {}).get("arguments") or "")[:90]
@@ -223,7 +251,7 @@ def _build_structured_handoff(older: List[Dict[str, Any]], summarizer_fn: Option
                 outcomes.append(f"- {text[:240]}")
 
     det_sections = [
-        f"[Context Compaction Summary of {len(older)} earlier messages — full transcript persisted in SQLite `conversations` table]",
+        f"[CONTEXT CHECKPOINT HANDOFF — Context Compaction Summary of {len(older)} earlier messages]",
         *(["0. Prior Compacted Session Context:\n" + "\n".join(prior_summaries[-3:])] if prior_summaries else []),
         "1. Earlier User Goals & Requests:\n" + ("\n".join(user_goals[-8:]) if user_goals else "- (session initialization)"),
         "2. Key Tools & Actions Executed:\n" + ("\n".join(tools_touched[-10:]) if tools_touched else "- (conversation only)"),
@@ -248,6 +276,32 @@ def _build_structured_handoff(older: List[Dict[str, Any]], summarizer_fn: Option
     return candidate
 
 
+def _find_stage2_split_index(body: List[Dict[str, Any]], eff_keep: int) -> Tuple[int, bool]:
+    """Find a clean `user` split boundary, or an atomic `(assistant_with_tool_calls + tool_results)` boundary in 1-turn loops."""
+    split_idx = max(1, len(body) - eff_keep)
+    while split_idx < len(body) and body[split_idx].get("role") != "user":
+        split_idx += 1
+    if split_idx < len(body) and body[split_idx].get("role") == "user":
+        return split_idx, False
+    split_idx = max(1, len(body) - eff_keep)
+    while split_idx > 1 and body[split_idx].get("role") != "user":
+        split_idx -= 1
+    if 0 < split_idx < len(body) and body[split_idx].get("role") == "user":
+        return split_idx, False
+    # Single-turn multi-step loop (`body` has only 1 `user` message at index 0): split at an atomic `assistant` step boundary!
+    cand = max(2, len(body) - eff_keep)
+    while cand < len(body) and body[cand].get("role") == "tool":
+        cand += 1
+    if 2 <= cand < len(body) and body[cand].get("role") == "assistant":
+        return cand, True
+    cand = max(2, len(body) - eff_keep)
+    while cand > 1 and body[cand].get("role") != "assistant":
+        cand -= 1
+    if 2 <= cand < len(body) and body[cand].get("role") == "assistant":
+        return cand, True
+    return -1, False
+
+
 def compact_messages_if_needed(
     messages: List[Dict[str, Any]],
     max_chars: Optional[int] = None,
@@ -258,21 +312,26 @@ def compact_messages_if_needed(
     summarizer_fn: Optional[Any] = None,
     tier: Optional[str] = None,
     system_prompt_fn: Optional[Callable[[], str]] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    active_turn_start_idx: int = 0,
 ) -> List[Dict[str, Any]]:
-    """Adaptive 2-stage compaction triggered by percentage of the active tier's context window."""
+    """Adaptive 2-stage compaction preserving strict `user`/`assistant` alternation with zero mid-array `system` roles."""
     mem = store or get_memory_store()
     eff_tier = tier or mem.get_user_profile().get("active_model_tier", "auto")
     tier_win = settings.resolve_tier(eff_tier).context_window_tokens
     trig_tokens = int(tier_win * (settings.compact_trigger_pct / 100.0))
+    schema_chars = estimate_tools_chars(tools)
     trigger_chars = max_chars if max_chars is not None else int(trig_tokens * 4)
     keep = keep_recent if keep_recent is not None else settings.keep_recent_messages
-    pre_chars = max(estimate_messages_chars(messages), int(last_usage_tokens or 0) * 4)
+    pre_chars = max(estimate_messages_chars(messages) + schema_chars, int(last_usage_tokens or 0) * 4)
     if not force and (pre_chars <= trigger_chars or len(messages) <= keep + 2):
         return messages
 
     is_live_db = mem.db_path.resolve() == settings.db_path.resolve()
-    freed = prune_stale_tool_outputs(messages, keep_recent=max(2, keep // 2) if not force else 1)
-    post_stage1_chars = estimate_messages_chars(messages)
+    exceeds_70pct = pre_chars > int(tier_win * 0.70 * 4)
+    protect_idx = 0 if (force or exceeds_70pct or max_chars is not None) else active_turn_start_idx
+    freed = prune_stale_tool_outputs(messages, keep_recent=max(2, keep // 2) if not force else 1, protect_from_idx=protect_idx)
+    post_stage1_chars = estimate_messages_chars(messages) + schema_chars
     if freed > 0 and is_live_db:
         telemetry.record_span("compaction", "stage1_tool_prune", 0.5, status="ok", detail=f"freed_chars={freed}")
         telemetry.log("INFO", "context", f"Stage-1 tool-output pruning freed {freed} chars ({post_stage1_chars} chars active).")
@@ -286,19 +345,22 @@ def compact_messages_if_needed(
     fallback_sys = system_prompt_fn() if system_prompt_fn else "Companion AI OS System Context"
     system_msg = messages[0] if messages and messages[0].get("role") == "system" else {"role": "system", "content": fallback_sys}
     body = messages[1:] if messages and messages[0].get("role") == "system" else list(messages)
-    split_idx = max(1, len(body) - eff_keep)
-    while split_idx < len(body) and body[split_idx].get("role") != "user":
-        split_idx += 1
-    if split_idx >= len(body):
-        split_idx = max(1, len(body) - eff_keep)
-        while split_idx > 1 and body[split_idx].get("role") != "user":
-            split_idx -= 1
-    if split_idx >= len(body) or body[split_idx].get("role") != "user":
+    split_idx, starts_with_assistant = _find_stage2_split_index(body, eff_keep)
+    if split_idx <= 0 or split_idx >= len(body):
         return messages
 
     older, recent = body[:split_idx], body[split_idx:]
     compacted_note = _build_structured_handoff(older, summarizer_fn=summarizer_fn)
-    messages[:] = [system_msg, {"role": "system", "content": compacted_note}, *recent]
+    if starts_with_assistant:
+        # `recent[0]` is `assistant(tool_calls)` inside a long single turn: a single `user` handoff precedes it cleanly!
+        messages[:] = [system_msg, {"role": "user", "content": compacted_note}, *recent]
+    else:
+        messages[:] = [
+            system_msg,
+            {"role": "user", "content": compacted_note},
+            {"role": "assistant", "content": "Understood — continuing from checkpoint."},
+            *recent,
+        ]
     after_chars = estimate_messages_chars(messages)
     if is_live_db:
         telemetry.record_span("compaction", "stage2_structured_handoff", 1.0, status="ok", detail=f"msgs={len(older)} chars={pre_chars}->{after_chars}")
@@ -306,19 +368,22 @@ def compact_messages_if_needed(
     return messages
 
 
-def format_context_budget_status(messages: List[Dict[str, Any]], last_usage_tokens: int = 0, tier: Optional[str] = None) -> str:
+def format_context_budget_status(
+    messages: List[Dict[str, Any]], last_usage_tokens: int = 0, tier: Optional[str] = None, tools: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """Format a plain-English summary of the active tier's Context Window & Adaptive Compaction watermarks."""
-    active_tokens = estimate_messages_tokens(messages, last_usage_tokens=last_usage_tokens)
+    active_tokens = estimate_messages_tokens(messages, last_usage_tokens=last_usage_tokens, tools=tools)
     t_cfg = settings.resolve_tier(tier)
     win = t_cfg.context_window_tokens
     trig = int(win * (settings.compact_trigger_pct / 100.0))
     targ = int(win * (settings.compact_target_pct / 100.0))
     win_pct, trig_pct = (active_tokens / max(1, win)) * 100.0, (active_tokens / max(1, trig)) * 100.0
+    comp_flag = "YES" if should_compact(messages, tier=tier, last_usage_tokens=last_usage_tokens, tools=tools) else "NO"
     return (
         "=== Adaptive Context Window & Compaction Status ===\n"
         f"Active Tier & Model   : `{t_cfg.tier}` (`{t_cfg.model}`)\n"
         f"Model Context Window  : {win:,} tokens\n"
-        f"High-Watermark Trigger: {settings.compact_trigger_pct:.1f}% ({trig:,} tokens — auto-compacts above this)\n"
+        f"High-Watermark Trigger: {settings.compact_trigger_pct:.1f}% ({trig:,} tokens — auto-compacts above this | compact_due={comp_flag})\n"
         f"Low-Watermark Target  : {settings.compact_target_pct:.1f}% ({targ:,} tokens — sweet-spot target)\n"
         f"Current Active Context: ~{active_tokens:,} tokens ({win_pct:.1f}% of window | {trig_pct:.1f}% of trigger budget)\n"
         f"Active Message Count  : {len(messages)} messages ({estimate_messages_chars(messages):,} chars)\n"

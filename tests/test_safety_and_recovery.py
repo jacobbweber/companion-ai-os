@@ -1,5 +1,6 @@
 """Unit tests for AST syntax guard, file backups, workspace checkpoints, and LoopGuard."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,19 +39,29 @@ class TestSafetyAndRecovery(unittest.TestCase):
             cp = cp_mgr.create_checkpoint(label="v1")
             self.assertEqual(cp["file_count"], 1)
 
-            # Backup, modify file, create sprawl file, and prematurely mark task completed
+            # Backup, modify file, create Companion-touched sprawl + untracked human file, and mark task completed
             cp_mgr.backup_file(target)
             target.write_text('"""Modified."""\nVALUE = 2\n', encoding="utf-8")
             sprawl = root / "sprawl_extra.py"
             sprawl.write_text('"""Sprawl."""\nX = 99\n', encoding="utf-8")
+            cp_mgr.record_file_touch(sprawl, False, None, sprawl.read_bytes())
+            human_untracked = root / "human_ide_draft.tsx"
+            human_untracked.write_text("export const Draft = () => <div>WIP</div>;\n", encoding="utf-8")
+            user_edited_sprawl = root / "companion_then_human.cs"
+            user_edited_sprawl.write_text("class A {}\n", encoding="utf-8")
+            cp_mgr.record_file_touch(user_edited_sprawl, False, None, user_edited_sprawl.read_bytes())
+            user_edited_sprawl.write_text("class A { public int UserWork = 1; }\n", encoding="utf-8")
             store.update_task(task_id, status="completed")
             self.assertEqual(len(store.get_pending_tasks()), 0)
 
-            # Rollback to checkpoint v1 must restore target, delete sprawl, rewind task to pending, and save lesson
+            # Rollback restores target, deletes Companion sprawl, preserves untracked & user-edited files, and rewinds DB
             rb = cp_mgr.rollback_checkpoint(cp["checkpoint_id"], reason="Unit test failed during feature X")
             self.assertTrue(rb["restored"])
             self.assertIn("VALUE = 1", target.read_text(encoding="utf-8"))
             self.assertFalse(sprawl.exists())
+            self.assertTrue(human_untracked.exists())
+            self.assertTrue(user_edited_sprawl.exists())
+            self.assertIn("companion_then_human.cs", rb["skipped_user_modified"])
             self.assertEqual(len(store.get_pending_tasks()), 1)
             lessons = store.get_system_notes(category="rollback_lesson")
             self.assertEqual(len(lessons), 1)
@@ -128,6 +139,57 @@ class TestSafetyAndRecovery(unittest.TestCase):
 
             env_err = check_path_safety(root / ".env", write=True, allowed_roots=[root])
             self.assertIn("SAFETY GUARD REJECTED path", str(env_err))
+
+    def test_external_linter_scoping_and_vault_subprocess_fence(self) -> None:
+        from companion.autonomy import scan_placeholder_violations
+        from companion.config import settings, workspace_context
+        from companion.grounding import LocalWorkspaceTarget
+        from companion.memory_store import memory_store_context
+        from companion.safety import lint_single_file_edit
+        from companion.tools import dispatch
+        from companion.vault import VaultManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ext = Path(tmp) / "user_webapp"
+            (ext / "skills").mkdir(parents=True)
+            js_ok, js_warn = lint_single_file_edit(ext / "app.js", "const msg = `${title || 'Yes or No'}`;\n")
+            self.assertIsNone(js_ok)
+            self.assertEqual(js_warn, "")
+            html_ld = '<html><head><script type="application/ld+json">{"@type": "Organization"}</script><script type="importmap">{"imports": {}}</script></head></html>'
+            html_err, _ = lint_single_file_edit(ext / "index.html", html_ld)
+            self.assertIsNone(html_err)
+            ext_skill_err, _ = lint_single_file_edit(ext / "skills" / "custom.py", "import requests\nprint(requests)\n")
+            self.assertIsNone(ext_skill_err)
+            abc_py = ext / "base.py"
+            abc_py.write_text("from abc import ABC, abstractmethod\nclass Port(ABC):\n    @abstractmethod\n    def run(self) -> None:\n        raise NotImplementedError\n", encoding="utf-8")
+            with workspace_context(ext, "user-webapp"):
+                self.assertEqual(scan_placeholder_violations([abc_py], root=ext), [])
+
+            for secret_cmd in ("cat data/secrets.env", "Get-Content .env", "type .comp_ssh_key"):
+                self.assertIsNotNone(check_command_safety(secret_cmd))
+
+            st = MemoryStore(db_path=Path(tmp) / "vault_fence.db")
+            orig_data = settings.data_dir
+            try:
+                settings.data_dir = Path(tmp) / "vdata"
+                settings.data_dir.mkdir(parents=True, exist_ok=True)
+                vm = VaultManager(store=st, secrets_path=settings.data_dir / "secrets.env")
+                vm.set_secret("leak-probe", "SUPER_SECRET_VAULT_TOKEN_987654", cred_type="api_key", actor="user")
+                os.environ["TEMP_TEST_API_KEY"] = "ENV_SECRET_VAL_123456"
+                try:
+                    with workspace_context(ext, "user-webapp"), memory_store_context(st):
+                        env_child, _ = LocalWorkspaceTarget().exec_env_and_cwd()
+                        self.assertNotIn("TEMP_TEST_API_KEY", env_child)
+                        blocked_py = dispatch("run_python", {"code": "print(open('secrets.env').read())"})
+                        self.assertIn("SAFETY GUARD REJECTED command", blocked_py)
+                        echoed = dispatch("run_python", {"code": "print('SUPER_SECRET_' + 'VAULT_TOKEN_987654')"})
+                        self.assertNotIn("SUPER_SECRET_VAULT_TOKEN_987654", echoed)
+                        self.assertIn("[REDACTED", echoed)
+                finally:
+                    os.environ.pop("TEMP_TEST_API_KEY", None)
+            finally:
+                settings.data_dir = orig_data
+                st.close()
 
 
 if __name__ == "__main__":

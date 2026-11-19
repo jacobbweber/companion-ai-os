@@ -24,6 +24,12 @@ MODEL_TIERS = ("default", "fast", "coding", "reasoning", "audio", "image", "vide
 CAPABILITY_TIERS = ("default", "fast", "coding", "reasoning", "image", "audio", "video", "embedding")
 SELF_PROJECT_ID = "companion-self"
 
+__all__ = [
+    "CAPABILITY_TIERS", "DEFAULT_ROOT", "MODEL_TIERS", "SELF_PROJECT_ID", "SKIP_DIRS", "Settings", "TierConfig",
+    "WorkspaceContext", "agent_tool_turn_context", "execution_origin_context", "get_execution_origin",
+    "is_in_agent_tool_turn", "self_dev_override_context", "settings", "slugify_project_id", "workspace_context",
+]
+
 _DEFAULT_TIER_TEMPS: Dict[str, float] = {"fast": 0.15, "coding": 0.15, "reasoning": 0.6}
 _DEFAULT_TIER_MAX_TOKENS: Dict[str, int] = {"reasoning": 4096}
 
@@ -61,13 +67,30 @@ class WorkspaceContext:
 
     @property
     def backup_dir(self) -> Path:
-        return self.project_root / ".companion_backups"
+        base = settings.effective_data_dir if "settings" in globals() else (self.self_root / "data")
+        return base / "checkpoints" / self.project_id
 
 
 _WORKSPACE_OVERRIDE: contextvars.ContextVar[Optional[WorkspaceContext]] = contextvars.ContextVar("companion_workspace_override", default=None)
 _TIER_OVERRIDE_MAP: contextvars.ContextVar[Optional[Dict[str, TierConfig]]] = contextvars.ContextVar("companion_tier_override_map", default=None)
 _SELF_DEV_OVERRIDE: contextvars.ContextVar[Optional[bool]] = contextvars.ContextVar("companion_self_dev_override", default=None)
 _IN_AGENT_TOOL_TURN: contextvars.ContextVar[bool] = contextvars.ContextVar("companion_in_agent_tool_turn", default=False)
+_EXECUTION_ORIGIN: contextvars.ContextVar[str] = contextvars.ContextVar("companion_execution_origin", default="direct")
+
+
+@contextlib.contextmanager
+def execution_origin_context(origin: str) -> Iterator[None]:
+    """Bind the active execution origin (`'foreground_turn'`, `'background_job'`, `'idle_routine'`, `'subagent'`)."""
+    tok = _EXECUTION_ORIGIN.set((origin or "direct").strip().lower())
+    try:
+        yield
+    finally:
+        _EXECUTION_ORIGIN.reset(tok)
+
+
+def get_execution_origin() -> str:
+    """Return active execution origin (`'foreground_turn'`, `'background_job'`, `'idle_routine'`, `'subagent'`, `'direct'`)."""
+    return _EXECUTION_ORIGIN.get()
 
 
 @contextlib.contextmanager
@@ -202,9 +225,9 @@ class Settings:
     out_limit: int = 8000
     search_limit: int = 200
     context_window_tokens: int = 262144
-    compact_trigger_pct: float = 25.0
-    compact_target_pct: float = 10.0
-    max_context_chars: int = 262144
+    compact_trigger_pct: float = 75.0
+    compact_target_pct: float = 35.0
+    max_context_chars: int = 786432
     keep_recent_messages: int = 16
     max_backups_per_file: int = 10
     idle_minutes: int = 120
@@ -260,8 +283,11 @@ class Settings:
         self.out_limit = max(1000, _env_int("COMPANION_OUT_LIMIT", 8000))
         self.search_limit = max(10, _env_int("COMPANION_SEARCH_LIMIT", 200))
         self.context_window_tokens = max(4096, _env_int("COMPANION_CONTEXT_WINDOW", 262144))
-        self.compact_trigger_pct = max(5.0, min(90.0, _env_float("COMPANION_COMPACT_TRIGGER_PCT", 25.0)))
-        self.compact_target_pct = max(3.0, min(self.compact_trigger_pct * 0.85, _env_float("COMPANION_COMPACT_TARGET_PCT", 10.0)))
+        _raw_trig = _env_float("COMPANION_COMPACT_TRIGGER_PCT", 75.0)
+        self.compact_trigger_pct = 75.0 if abs(_raw_trig - 25.0) < 1e-6 else max(5.0, min(90.0, _raw_trig))
+        _raw_targ = _env_float("COMPANION_COMPACT_TARGET_PCT", 35.0)
+        eff_targ = 35.0 if abs(_raw_targ - 10.0) < 1e-6 and abs(_raw_trig - 25.0) < 1e-6 else _raw_targ
+        self.compact_target_pct = max(3.0, min(self.compact_trigger_pct * 0.85, eff_targ))
         default_chars = int(self.context_window_tokens * (self.compact_trigger_pct / 100.0) * 4)
         self.max_context_chars = max(8000, _env_int("COMPANION_MAX_CONTEXT_CHARS", default_chars))
         self.keep_recent_messages = max(4, _env_int("COMPANION_KEEP_RECENT_MESSAGES", 16))

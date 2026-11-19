@@ -1,18 +1,6 @@
-"""
-Federated MCP Hub: Outbound MCP Client, Inbound "Order Counter" Server & Partner-Aware Federation
-(`companion/mcp_hub.py` — A-Frame Application Layer).
+"""Federated MCP Hub: Outbound MCP Client, Inbound "Order Counter" Server & Partner-Aware Federation (`companion/mcp_hub.py`)."""
 
-Implements Pillar 4 of the Companion 3.0 Harvest Blueprint:
-1. Outbound MCP Client Connector (`stdio` + Streamable HTTP/SSE JSON-RPC 2.0) with Vault JIT credentials,
-   `allowed_tools` narrowing, and SHA-256 `tools_fingerprint` approval (`Discovery != Authorization`).
-2. Inbound Hosted MCP Server ("The Order Counter", off by default, protected by a dedicated Vault token)
-   exposing ONLY safe high-level job/health/peer/wiki-read tools — never raw `run_shell` or `write_file`.
-3. Partner-Aware Federation (`federated_partners` table): exchanges live Peer Identity & Host Hardware
-   Profiles (`hostname`, `os_platform`, `cpu_count`, `ram_gb`, `gpu_summary`, `fast_model`) across paired
-   instances (e.g., Workstation <-> Lab GPU Node) and renders `[CONNECTED FEDERATED PARTNERS]` into Companion's HUD.
-"""
-
-import ctypes, hashlib, json, os, platform, re, secrets, shlex, shutil, socket, subprocess, time, urllib.error, urllib.request
+import contextlib, ctypes, hashlib, json, os, platform, re, secrets, shlex, shutil, socket, subprocess, threading, time, urllib.error, urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -141,6 +129,19 @@ class MCPHub:
         mem.ensure_schema("mcp_hub", lambda m: [m.conn.execute(ddl) for ddl in MCP_DDL] and None)
         return mem
 
+    def _validate_mcp_server_input(self, server_id: str, label: str, transport: str, command: str, url: str) -> Tuple[str, str, Optional[str]]:
+        sid, tr = _slug(server_id or label), (transport or "").strip().lower()
+        if not sid or tr not in ("stdio", "http"):
+            return sid, tr, "`server_id` and `transport` (`stdio` or `http`) are required."
+        if tr == "stdio" and not (command or "").strip():
+            return sid, tr, "`command` is required for `stdio` MCP servers."
+        if tr == "http":
+            if not (url or "").strip().startswith(("http://", "https://")):
+                return sid, tr, "Valid `http://` or `https://` `url` is required for `http` MCP servers."
+            if ssrf_err := check_url_ssrf(url, allow_private_lan=True):
+                return sid, tr, ssrf_err
+        return sid, tr, None
+
     def register_server(
         self, server_id: str, transport: str, label: str = "", command: str = "",
         args: Optional[List[str]] = None, url: str = "", credential_ref: str = "",
@@ -149,22 +150,12 @@ class MCPHub:
         """Register a `stdio` or `http` outbound MCP server using a symbolic Vault `credential_ref`."""
         if (actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn()) and not confirmed:
             return {"ok": False, "error": "MCP GUARD REJECTED: Only the user can register MCP servers directly; call `propose_server` to stage an approval request."}
-        sid, tr = _slug(server_id or label), (transport or "").strip().lower()
-        if not sid or tr not in ("stdio", "http"):
-            return {"ok": False, "error": "`server_id` and `transport` (`stdio` or `http`) are required."}
-        if tr == "stdio" and not (command or "").strip():
-            return {"ok": False, "error": "`command` is required for `stdio` MCP servers."}
-        if tr == "http":
-            if not (url or "").strip().startswith(("http://", "https://")):
-                return {"ok": False, "error": "Valid `http://` or `https://` `url` is required for `http` MCP servers."}
-            ssrf_err = check_url_ssrf(url, allow_private_lan=True)
-            if ssrf_err:
-                return {"ok": False, "error": ssrf_err}
+        sid, tr, v_err = self._validate_mcp_server_input(server_id, label, transport, command, url)
+        if v_err:
+            return {"ok": False, "error": v_err}
         cred_slug = normalize_secret_name(credential_ref) if credential_ref else ""
         if cred_slug:
-            get_vault_manager(store=self.store).declare_placeholder(
-                cred_slug, cred_type="bearer_token", description=f"Credential for MCP server `{sid}`", allow_list=[f"mcp:{sid}"], actor=actor,
-            )
+            get_vault_manager(store=self.store).declare_placeholder(cred_slug, cred_type="bearer_token", description=f"Credential for MCP server `{sid}`", allow_list=[f"mcp:{sid}"], actor=actor)
         with self.store._lock:
             self.store.conn.execute(
                 "INSERT INTO mcp_servers (server_id, label, transport, command, args_json, url, credential_ref, allowed_tools_json, enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(server_id) DO UPDATE SET label=excluded.label, transport=excluded.transport, command=excluded.command, args_json=excluded.args_json, url=excluded.url, credential_ref=excluded.credential_ref, allowed_tools_json=excluded.allowed_tools_json, enabled=excluded.enabled, updated_at=CURRENT_TIMESTAMP",
@@ -179,36 +170,15 @@ class MCPHub:
         allowed_tools: Optional[List[str]] = None, actor: str = "companion",
     ) -> Dict[str, Any]:
         """Stage a discovered `stdio` or `http` MCP server + symbolic Vault placeholder into `ApprovalQueue` (`actor='companion'` safe)."""
-        sid, tr = _slug(server_id or label), (transport or "").strip().lower()
-        if not sid or tr not in ("stdio", "http"):
-            return {"ok": False, "error": "`server_id` and `transport` (`stdio` or `http`) are required."}
-        if tr == "stdio" and not (command or "").strip():
-            return {"ok": False, "error": "`command` is required for `stdio` MCP servers."}
-        if tr == "http":
-            if not (url or "").strip().startswith(("http://", "https://")):
-                return {"ok": False, "error": "Valid `http://` or `https://` `url` is required for `http` MCP servers."}
-            ssrf_err = check_url_ssrf(url, allow_private_lan=True)
-            if ssrf_err:
-                return {"ok": False, "error": ssrf_err}
+        sid, tr, v_err = self._validate_mcp_server_input(server_id, label, transport, command, url)
+        if v_err:
+            return {"ok": False, "error": v_err}
         cred_slug = normalize_secret_name(credential_ref) if credential_ref else ""
         if cred_slug:
-            get_vault_manager(store=self.store).declare_placeholder(
-                cred_slug, cred_type="bearer_token", description=f"Proposed credential for MCP server `{sid}`", allow_list=[f"mcp:{sid}"], actor=actor,
-            )
-        payload = {
-            "server_id": sid, "transport": tr, "label": label.strip() or sid, "command": command.strip(),
-            "args": list(args or []), "url": url.strip(), "credential_ref": cred_slug, "allowed_tools": list(allowed_tools or []),
-        }
-        _allowed, apr = get_approval_queue(self.store).check_or_enqueue(
-            category="mcp_server", action_name="register_mcp_server", target=sid,
-            summary=f"Register `{tr}` MCP server `{label.strip() or sid}` (`{url.strip() or command.strip()}`, credential_ref=`{cred_slug or 'none'}`).",
-            payload=payload, requester=actor, confirmed=False, always_require_in_autonomous=True,
-        )
-        return {
-            "ok": True, "awaiting_approval": True, "approval_id": apr["approval_id"],
-            "server_id": sid, "credential_ref": cred_slug,
-            "summary": f"Staged `{tr}` MCP server `{sid}` for 1-click user approval (`{apr['approval_id']}`).",
-        }
+            get_vault_manager(store=self.store).declare_placeholder(cred_slug, cred_type="bearer_token", description=f"Proposed credential for MCP server `{sid}`", allow_list=[f"mcp:{sid}"], actor=actor)
+        payload = {"server_id": sid, "transport": tr, "label": label.strip() or sid, "command": command.strip(), "args": list(args or []), "url": url.strip(), "credential_ref": cred_slug, "allowed_tools": list(allowed_tools or [])}
+        _allowed, apr = get_approval_queue(self.store).check_or_enqueue("mcp_server", "register_mcp_server", sid, f"Register `{tr}` MCP server `{label.strip() or sid}` (`{url.strip() or command.strip()}`, credential_ref=`{cred_slug or 'none'}`).", payload=payload, requester=actor, confirmed=False, always_require_in_autonomous=True)
+        return {"ok": True, "awaiting_approval": True, "approval_id": apr["approval_id"], "server_id": sid, "credential_ref": cred_slug, "summary": f"Staged `{tr}` MCP server `{sid}` for 1-click user approval (`{apr['approval_id']}`)."}
 
     def get_server(self, server_id: str) -> Optional[Dict[str, Any]]:
         cols = ["server_id", "label", "transport", "command", "args_json", "url", "credential_ref", "allowed_tools_json", "discovered_tools_json", "tools_fingerprint", "approved_fingerprint", "session_id", "enabled", "updated_at"]
@@ -278,24 +248,59 @@ class MCPHub:
         init_line = json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "companion", "version": __version__}}})
         notif_line = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         stdin_payload = "\n".join([init_line, notif_line, json.dumps(rpc_req)]) + "\n"
+        proc: Optional[subprocess.Popen[str]] = None
         try:
             raw_cmd, raw_args = str(srv["command"]).strip(), list(srv.get("args", []))
             argv = [t.strip('"') for t in shlex.split(raw_cmd, posix=(os.name != "nt"))] if (not raw_args and (" " in raw_cmd or '"' in raw_cmd)) else [raw_cmd, *raw_args]
-            proc = subprocess.run(argv, input=stdin_payload, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
-            target_id = rpc_req.get("id")
-            parsed_last: Dict[str, Any] = {}
-            for ln in (proc.stdout or "").splitlines():
-                s = ln.strip()
-                if s.startswith("{"):
-                    obj = json.loads(s)
-                    parsed_last = obj
-                    if target_id is not None and obj.get("id") == target_id:
-                        return True, obj, ""
-            if target_id is None and parsed_last:
-                return True, parsed_last, ""
-            return False, {}, vault.scrub_output((proc.stderr or "Missing matching JSON-RPC response ID in stdio MCP output")[:300], extra_secrets=[secret_val] if secret_val else None)
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, encoding="utf-8", errors="replace")
+            target_id, found_box = rpc_req.get("id"), [None, "", ""]
+
+            def _pump_stdio() -> None:
+                assert proc is not None
+                if proc.stdin:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.write(stdin_payload)
+                        proc.stdin.flush()
+                if proc.stdout:
+                    for raw_ln in proc.stdout:
+                        s = raw_ln.strip()
+                        if s.startswith("{"):
+                            with contextlib.suppress(Exception):
+                                obj = json.loads(s)
+                                found_box[0] = obj
+                                if target_id is None or obj.get("id") == target_id:
+                                    found_box[1] = "matched"
+                                    return
+                if proc.stderr:
+                    with contextlib.suppress(Exception):
+                        found_box[2] = proc.stderr.read(4096)
+
+            worker = threading.Thread(target=_pump_stdio, daemon=True)
+            worker.start()
+            worker.join(timeout=max(1.0, float(timeout)))
+            if found_box[1] == "matched" and isinstance(found_box[0], dict):
+                return True, found_box[0], ""
+            if not worker.is_alive() and target_id is None and isinstance(found_box[0], dict):
+                return True, found_box[0], ""
+            err_raw = "Timed out waiting for stdio MCP response" if worker.is_alive() else (found_box[2] or "Missing matching JSON-RPC response ID in stdio MCP output")
+            return False, {}, vault.scrub_output(err_raw[:300], extra_secrets=[secret_val] if secret_val else None)
         except Exception as exc:
             return False, {}, vault.scrub_output(f"MCP stdio error: {type(exc).__name__}: {exc}", extra_secrets=[secret_val] if secret_val else None)
+        finally:
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    if proc.stdin:
+                        proc.stdin.close()
+                with contextlib.suppress(Exception):
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    proc.wait(timeout=0.5)
+                for pipe in (proc.stdout, proc.stderr):
+                    with contextlib.suppress(Exception):
+                        if pipe:
+                            pipe.close()
 
     def discover_server(self, server_id: str, actor: str = "user") -> Dict[str, Any]:
         """Run `initialize` + `tools/list`, apply `allowed_tools` narrowing, and record SHA-256 `tools_fingerprint`."""
@@ -320,18 +325,37 @@ class MCPHub:
                 (json.dumps(filtered), fp, approved_fp, srv["server_id"]),
             )
             self.store.conn.commit()
-        return {"ok": True, "server_id": srv["server_id"], "tools": filtered, "tools_fingerprint": fp, "is_approved": fp == approved_fp, "summary": f"Discovered {len(filtered)} tool(s) on `{srv['server_id']}` (fingerprint=`{fp}`, approved={fp == approved_fp})."}
+        return {"ok": True, "server_id": srv["server_id"], "tools": filtered, "tools_fingerprint": fp, "fingerprint": fp, "is_approved": fp == approved_fp, "summary": f"Discovered {len(filtered)} tool(s) on `{srv['server_id']}` (fingerprint=`{fp}`, approved={fp == approved_fp})."}
 
-    def approve_server(self, server_id: str, actor: str = "user") -> Dict[str, Any]:
+    def approve_server(self, server_id: str, actor: str = "user", expected_fingerprint: str = "") -> Dict[str, Any]:
         if actor.strip().lower() not in ("user", "cli", "web") or is_in_agent_tool_turn():
             return {"ok": False, "error": "MCP GUARD REJECTED: Only the user can approve an MCP server's tool fingerprint."}
         srv = self.get_server(server_id)
         if not srv or not srv["tools_fingerprint"]:
             return {"ok": False, "error": f"Run `discover` on MCP server `{server_id}` before approving."}
+        if expected_fingerprint and expected_fingerprint.strip() != srv["tools_fingerprint"]:
+            return {"ok": False, "error": f"MCP FINGERPRINT MISMATCH: expected `{expected_fingerprint.strip()}`, current discovered fingerprint is `{srv['tools_fingerprint']}`."}
         with self.store._lock:
             self.store.conn.execute("UPDATE mcp_servers SET approved_fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE server_id = ?", (srv["tools_fingerprint"], srv["server_id"]))
             self.store.conn.commit()
         return {"ok": True, "server_id": srv["server_id"], "approved_fingerprint": srv["tools_fingerprint"], "summary": f"Approved MCP server `{srv['server_id']}` tool fingerprint `{srv['tools_fingerprint']}`."}
+
+    def list_approved_openai_tools(self) -> List[Dict[str, Any]]:
+        """Expose enabled + fingerprint-approved MCP server tools natively as `mcp__<server_id>__<tool_name>`."""
+        schemas: List[Dict[str, Any]] = []
+        for srv in self.list_servers():
+            if not srv.get("enabled") or not srv.get("is_approved"):
+                continue
+            sid = re.sub(r"[^a-zA-Z0-9_-]", "_", str(srv["server_id"]))
+            for t in srv.get("discovered_tools") or []:
+                tname = str(t.get("name") or "").strip()
+                if not tname:
+                    continue
+                safe_t = re.sub(r"[^a-zA-Z0-9_-]", "_", tname)
+                in_schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {"type": "object", "properties": {}}
+                params = {"type": "object", "properties": dict(in_schema.get("properties") or {}), **({"required": list(in_schema["required"])} if isinstance(in_schema.get("required"), list) else {})}
+                schemas.append({"type": "function", "function": {"name": f"mcp__{sid}__{safe_t}", "description": f"[MCP `{srv['server_id']}`] {t.get('description') or tname}", "parameters": params}})
+        return schemas
 
     def call_mcp_tool(
         self, server_id: str, tool_name: str, arguments: Optional[Dict[str, Any]] = None,
@@ -347,15 +371,15 @@ class MCPHub:
                 return disc
             srv = self.get_server(server_id) or srv
 
-        known_names = {str(t.get("name")) for t in srv.get("discovered_tools", [])}
-        if tool_name not in known_names:
-            return {"ok": False, "error": f"Tool `{tool_name}` is not in the discovered/allowed tool list for `{srv['server_id']}` ({sorted(known_names)})."}
+        by_name = {str(t.get("name")): t for t in srv.get("discovered_tools", [])}
+        if tool_name not in by_name:
+            return {"ok": False, "error": f"Tool `{tool_name}` is not in the discovered/allowed tool list for `{srv['server_id']}` ({sorted(by_name)})."}
 
         is_human = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
         if not is_human and srv["approved_fingerprint"] != srv["tools_fingerprint"]:
             allowed, apr = get_approval_queue(self.store).check_or_enqueue(
                 category="mcp_server", action_name="approve_mcp_tools", target=srv["server_id"],
-                summary=f"Approve MCP server `{srv['label']}` (`{srv['server_id']}`) tool list fingerprint `{srv['tools_fingerprint']}` ({sorted(known_names)}).",
+                summary=f"Approve MCP server `{srv['label']}` (`{srv['server_id']}`) tool list fingerprint `{srv['tools_fingerprint']}` ({sorted(by_name)}).",
                 payload={"server_id": srv["server_id"], "fingerprint": srv["tools_fingerprint"]},
                 requester=actor, confirmed=confirmed and is_human, always_require_in_autonomous=True,
             )
@@ -364,6 +388,18 @@ class MCPHub:
             with self.store._lock:
                 self.store.conn.execute("UPDATE mcp_servers SET approved_fingerprint = ? WHERE server_id = ?", (srv["tools_fingerprint"], srv["server_id"]))
                 self.store.conn.commit()
+
+        t_spec = by_name[tool_name]
+        destructive = bool((t_spec.get("annotations") or {}).get("destructiveHint") or t_spec.get("destructiveHint"))
+        if not is_human and (get_trust_mode(store=self.store) == "strict" or destructive):
+            allowed_t, apr_t = get_approval_queue(self.store).check_or_enqueue(
+                category="mcp_tool", action_name="call_mcp_tool", target=f"{srv['server_id']}:{tool_name}",
+                summary=f"Invoke MCP tool `{srv['server_id']}.{tool_name}` ({'destructive' if destructive else 'strict trust'}).",
+                payload={"server_id": srv["server_id"], "tool_name": tool_name, "arguments": arguments or {}},
+                requester=actor, confirmed=confirmed and is_human, always_require_in_autonomous=destructive,
+            )
+            if not allowed_t:
+                return {"ok": False, "awaiting_approval": True, "approval_id": apr_t["approval_id"], "error": f"MCP TOOL APPROVAL REQUIRED (`{apr_t['approval_id']}`): `{srv['server_id']}.{tool_name}` awaits approval."}
 
         ok, resp, err = self._send_rpc(srv, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": tool_name, "arguments": arguments or {}}})
         if not ok:
@@ -398,7 +434,7 @@ class MCPHub:
         self.store.set_user_profile("hosted_mcp_enabled", "on" if enabled else "off")
         self.store.set_user_profile("hosted_mcp_token_ref", tok_slug)
         self.store.set_user_profile("hosted_mcp_allow_wiki_read", "on" if allow_wiki_read else "off")
-        return {"ok": True, "enabled": enabled, "token_ref": tok_slug, "allow_wiki_read": allow_wiki_read, "summary": f"Hosted MCP Order Counter={'ON' if enabled else 'OFF'} (token_ref=`{tok_slug}`, wiki_read={allow_wiki_read})."}
+        return {"ok": True, "enabled": enabled, "token_ref": tok_slug, "hosted_mcp_token_ref": tok_slug, "allow_wiki_read": allow_wiki_read, "summary": f"Hosted MCP Order Counter={'ON' if enabled else 'OFF'} (token_ref=`{tok_slug}`, wiki_read={allow_wiki_read})."}
 
     def verify_hosted_mcp_auth(self, auth_header_or_token: str) -> Tuple[bool, str]:
         prof = self.store.get_user_profile()
@@ -603,82 +639,38 @@ def format_connected_partners_hud(store: Optional[MemoryStore] = None) -> str:
     return "\n".join(lines)
 
 
-def harvest_mcp_capability_pack(
-    server_id: str,
-    pack_name: Optional[str] = None,
-    overwrite: bool = True,
-    store: Optional[MemoryStore] = None,
-    root: Optional[Path] = None,
-) -> Dict[str, Any]:
+def harvest_mcp_capability_pack(server_id: str, pack_name: Optional[str] = None, overwrite: bool = True, store: Optional[MemoryStore] = None, root: Optional[Path] = None) -> Dict[str, Any]:
     """Introspect an approved MCP server's `discovered_tools` into a complete `data/skills/<pack>/` Capability Pack."""
-    hub = MCPHub(store=store)
-    srv = hub.get_server(server_id)
+    srv = MCPHub(store=store).get_server(server_id)
     if not srv:
         return {"ok": False, "error": f"MCP server `{server_id}` not found."}
     if not srv["is_approved"] or not srv["discovered_tools"]:
         return {"ok": False, "error": f"MCP server `{server_id}` must be discovered and user-approved before harvesting a Capability Pack."}
     pack = re.sub(r"[^a-z0-9-]+", "-", (pack_name or f"mcp-{srv['server_id']}").strip().lower()).strip("-")[:48]
-    tools = list(srv["discovered_tools"])
-    first_tool = str(tools[0].get("name") or "ping")
-    dag_name = f"{pack}-pipeline"
-    dag_stem = dag_name.replace("-", "_")
-
-    ref_lines = [f"# MCP Tool Reference — `{srv['label']}` (`{srv['server_id']}`)", ""]
-    for t in tools:
-        ref_lines.extend([
-            f"## `{t.get('name')}`",
-            f"- **Description**: {t.get('description') or 'MCP tool.'}",
-            f"- **Input Schema**: `{json.dumps(t.get('inputSchema') or {})}`",
-            "",
-        ])
+    tools, first_tool, dag_name = list(srv["discovered_tools"]), str(srv["discovered_tools"][0].get("name") or "ping"), f"{pack}-pipeline"
+    ref_lines = [f"# MCP Tool Reference — `{srv['label']}` (`{srv['server_id']}`)", ""] + [
+        f"## `{t.get('name')}`\n- **Description**: {t.get('description') or 'MCP tool.'}\n- **Input Schema**: `{json.dumps(t.get('inputSchema') or {})}`\n" for t in tools
+    ]
     skill_md = (
-        f"---\nname: {pack}\n"
-        f"description: Harvested MCP capability pack for {srv['label']} ({len(tools)} approved tool(s)).\n"
-        "required_tools: [mcp_manage, workflow_manage]\n---\n\n"
-        f"# {srv['label']} Capability Pack (`{pack}`)\n\n"
-        "## When to Use This Skill\n"
-        f"Use this pack whenever orchestrating `{srv['server_id']}` MCP tools ({', '.join(str(t.get('name')) for t in tools[:8])}) deterministically.\n\n"
-        "## Step-by-Step Procedure\n"
-        "1. Read `references/mcp-tools.md` to inspect exact JSON input schemas.\n"
-        f"2. Run `workflow_manage(action='run_dag', dag='{dag_name}', params=...)` for deterministic multi-step execution.\n"
-        f"3. Or invoke `mcp_manage(action='call_tool', server_id='{srv['server_id']}', tool_name=..., arguments=...)`.\n"
+        f"---\nname: {pack}\ndescription: Harvested MCP capability pack for {srv['label']} ({len(tools)} approved tool(s)).\nrequired_tools: [mcp_manage, workflow_manage]\n---\n\n"
+        f"# {srv['label']} Capability Pack (`{pack}`)\n\n## When to Use This Skill\nUse this pack whenever orchestrating `{srv['server_id']}` MCP tools ({', '.join(str(t.get('name')) for t in tools[:8])}) deterministically.\n\n"
+        f"## Step-by-Step Procedure\n1. Read `references/mcp-tools.md` to inspect exact JSON input schemas.\n2. Run `workflow_manage(action='run_dag', dag='{dag_name}', params=...)` for deterministic multi-step execution.\n3. Or invoke `mcp_manage(action='call_tool', server_id='{srv['server_id']}', tool_name=..., arguments=...)`.\n"
     )
     helper_py = (
-        '"""Self-tested schema helper for harvested MCP capability pack."""\n\n'
-        "import json\nimport sys\n\n"
-        f"SERVER_ID = {srv['server_id']!r}\n"
-        f"TOOLS = json.loads({json.dumps(tools)!r})\n\n\n"
-        "def main() -> int:\n"
-        '    if "--self-test" in sys.argv:\n'
-        "        assert SERVER_ID and isinstance(TOOLS, list) and len(TOOLS) >= 1\n"
-        '        print(json.dumps({"ok": True, "server_id": SERVER_ID, "tool_count": len(TOOLS)}))\n'
-        "        return 0\n"
-        '    print(json.dumps({"server_id": SERVER_ID, "tools": [t.get("name") for t in TOOLS]}))\n'
-        "    return 0\n\n\n"
-        'if __name__ == "__main__":\n'
-        "    raise SystemExit(main())\n"
+        '"""Self-tested schema helper for harvested MCP capability pack."""\n\nimport json\nimport sys\n\n'
+        f"SERVER_ID = {srv['server_id']!r}\nTOOLS = json.loads({json.dumps(tools)!r})\n\n\n"
+        'def main() -> int:\n    if "--self-test" in sys.argv:\n        assert SERVER_ID and isinstance(TOOLS, list) and len(TOOLS) >= 1\n'
+        '        print(json.dumps({"ok": True, "server_id": SERVER_ID, "tool_count": len(TOOLS)}))\n        return 0\n'
+        '    print(json.dumps({"server_id": SERVER_ID, "tools": [t.get("name") for t in TOOLS]}))\n    return 0\n\n\nif __name__ == "__main__":\n    raise SystemExit(main())\n'
     )
     dag_py = (
-        f'"""Harvested deterministic Python DAG for MCP server `{srv["server_id"]}`."""\n\n'
-        "from companion.dag_runtime import DAGNode, DAGSpec\n\n\n"
-        "def _summarize_mcp(ctx):\n"
-        '    raw = ctx["nodes"].get("invoke_mcp", {})\n'
-        '    return {"ok": bool(raw.get("ok", True)), "summary": str(raw.get("output") or raw.get("summary") or "MCP call complete.")}\n\n\n'
-        "DAG = DAGSpec(\n"
-        f"    name={dag_name!r},\n"
-        f"    description={('Deterministic MCP pipeline for ' + srv['label'])!r},\n"
-        "    nodes=[\n"
-        f"        DAGNode(node_id='invoke_mcp', kind='mcp_step', server_id={srv['server_id']!r}, tool_name={first_tool!r}, args_builder=lambda ctx: dict(ctx['params'])),\n"
-        "        DAGNode(node_id='summarize', kind='python_step', depends_on=['invoke_mcp'], fn=_summarize_mcp, output_schema={'ok': 'bool', 'summary': 'str'}),\n"
-        "    ],\n"
-        "    self_test_fn=lambda: True,\n"
-        ")\n"
+        f'"""Harvested deterministic Python DAG for MCP server `{srv["server_id"]}`."""\n\nfrom companion.dag_runtime import DAGNode, DAGSpec\n\n\n'
+        'def _summarize_mcp(ctx):\n    raw = ctx["nodes"].get("invoke_mcp", {})\n    return {"ok": bool(raw.get("ok", True)), "summary": str(raw.get("output") or raw.get("summary") or "MCP call complete.")}\n\n\n'
+        f"DAG = DAGSpec(name={dag_name!r}, description={('Deterministic MCP pipeline for ' + srv['label'])!r}, nodes=[\n"
+        f"    DAGNode(node_id='invoke_mcp', kind='mcp_step', server_id={srv['server_id']!r}, tool_name={first_tool!r}, args_builder=lambda ctx: dict(ctx['params'])),\n"
+        "    DAGNode(node_id='summarize', kind='python_step', depends_on=['invoke_mcp'], fn=_summarize_mcp, output_schema={'ok': 'bool', 'summary': 'str'}),\n], self_test_fn=lambda: True)\n"
     )
-    res = stage_and_promote_skill(
-        name=pack, skill_md=skill_md, scripts={"mcp_client_helper.py": helper_py},
-        dags={f"{dag_stem}.py": dag_py}, references={"mcp-tools.md": "\n".join(ref_lines)},
-        overwrite=overwrite, root=root, scope="user",
-    )
+    res = stage_and_promote_skill(name=pack, skill_md=skill_md, scripts={"mcp_client_helper.py": helper_py}, dags={f"{dag_name.replace('-', '_')}.py": dag_py}, references={"mcp-tools.md": "\n".join(ref_lines)}, overwrite=overwrite, root=root, scope="user")
     hint = f" Harvested DAG `{dag_name}` (run via `workflow_manage(action='run_dag', dag='{dag_name}', params=...)` or `mcp_manage(action='call_tool', server_id='{srv['server_id']}', tool_name='{first_tool}', arguments=...)`)." if res.get("promoted") else ""
     return {**res, "ok": bool(res.get("promoted")), "pack_name": pack, "dag_name": dag_name, "summary": str(res.get("summary") or "") + hint}
 

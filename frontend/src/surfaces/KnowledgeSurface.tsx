@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  ArchiveRestore,
   ArrowLeft,
+  CheckCircle2,
   Edit3,
   Eye,
   FileDiff,
@@ -40,6 +42,7 @@ import { WikiFrontmatterDrawer, WikiNoteFrontmatterBar } from './WikiFrontmatter
 
 interface KnowledgeSurfaceProps {
   initialNotePath?: string;
+  openNonce?: number;
   initialMode?: 'notes' | 'mindmap' | 'study';
   onRefreshStatus: () => Promise<void>;
   onToast: (msg: string) => void;
@@ -60,6 +63,7 @@ function extractActiveTokens(q: string): string[] {
 
 export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
   initialNotePath = '',
+  openNonce = 0,
   initialMode = 'notes',
   onRefreshStatus,
   onToast,
@@ -88,6 +92,15 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
   const [showCapture, setShowCapture] = useState(false);
   const [capTitle, setCapTitle] = useState('');
   const [capBody, setCapBody] = useState('');
+  const [showTrash, setShowTrash] = useState(false);
+  const [trashItems, setTrashItems] = useState<Array<{ trash_id: string; original_path?: string; trashed_at?: string }>>([]);
+
+  const loadTrash = async () => {
+    const res = await callAction<{ trash?: Array<{ trash_id: string; original_path?: string; trashed_at?: string }> }>('wiki', {
+      subaction: 'list_trash',
+    });
+    if (res.trash) setTrashItems(res.trash);
+  };
 
   const toggleExplorerPanel = () => {
     if (typeof window !== 'undefined' && window.innerWidth <= 768) {
@@ -131,8 +144,19 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
     setSearchHits(res.hits || res.notes || res.results || []);
   };
 
-  const openNote = async (path: string, switchMobile = true) => {
+  const openNote = async (path: string, switchMobile = true, skipDirtyGuard = false) => {
     if (!path) return;
+    if (
+      !skipDirtyGuard &&
+      editing &&
+      selectedNote &&
+      selectedNote.path !== path &&
+      editBody !== (selectedNote.raw || selectedNote.body || '') &&
+      typeof window.confirm === 'function' &&
+      !window.confirm('Discard unsaved edits to this note?')
+    ) {
+      return;
+    }
     setDiff(null);
     setEditing(false);
     setSelectedAsset(null);
@@ -185,9 +209,9 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
   useEffect(() => {
     if (initialNotePath) {
       setMode('notes');
-      void openNote(initialNotePath, true);
+      void openNote(initialNotePath, true, true);
     }
-  }, [initialNotePath]);
+  }, [initialNotePath, openNonce]);
 
   useEffect(() => {
     if (mode === 'mindmap') {
@@ -329,12 +353,64 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
               </button>
             </div>
 
+            <button
+              type="button"
+              className={`btn btn-sm ${showTrash ? 'active-subtle' : ''}`}
+              data-testid="wiki-trash-drawer-btn"
+              onClick={() => {
+                const next = !showTrash;
+                setShowTrash(next);
+                if (next) void loadTrash();
+              }}
+            >
+              <ArchiveRestore size={12} /> Trash
+            </button>
             <button type="button" className="btn btn-primary btn-sm" onClick={() => setShowCapture((v) => !v)}>
               <Plus size={12} /> Capture
             </button>
           </div>
         )}
       </div>
+
+      {showTrash && mode === 'notes' && (
+        <div
+          data-testid="wiki-trash-drawer"
+          style={{ padding: '10px 16px', borderBottom: '1px solid var(--border-hairline)', background: 'var(--bg-panel)' }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+            <strong style={{ fontSize: 12.5 }}>Recoverable Wiki Trash ({trashItems.length})</strong>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowTrash(false)}>
+              Close
+            </button>
+          </div>
+          {trashItems.length === 0 ? (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Trash is empty.</div>
+          ) : (
+            <div className="card-group" style={{ marginBottom: 0 }}>
+              {trashItems.slice(0, 8).map((ti) => (
+                <div key={ti.trash_id} className="card-row" style={{ padding: '7px 12px' }}>
+                  <span className="mono" style={{ fontSize: 12 }}>{ti.original_path || ti.trash_id}</span>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={async () => {
+                      const r = await callAction<{ path?: string; summary?: string; error?: string }>('wiki', {
+                        subaction: 'restore',
+                        trash_id: ti.trash_id,
+                      });
+                      await Promise.all([loadTrash(), loadTreeAndFacets(false)]);
+                      if (r.path) await openNote(r.path, false, true);
+                      onToast(r.ok === false ? r.error || 'Could not restore note.' : r.summary || 'Restored note.');
+                    }}
+                  >
+                    <ArchiveRestore size={12} /> Restore
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {mode === 'notes' && (
         <WikiFrontmatterDrawer
@@ -459,6 +535,24 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                           }}
                         >
                           <Sparkles size={12} /> Graduate
+                        </button>
+                      )}
+                      {!isArchivedNote && selectedNote.path.startsWith('02_knowledge/') && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          data-testid="wiki-verify-fresh-btn"
+                          title="Verify freshness cadence"
+                          onClick={async () => {
+                            const r = await callAction('wiki', {
+                              subaction: 'verify_note',
+                              path: selectedNote.path,
+                            });
+                            await Promise.all([openNote(selectedNote.path, false, true), loadTreeAndFacets(false)]);
+                            onToast(r.ok === false ? r.error || 'Could not verify note.' : r.summary || 'Verified note freshness.');
+                          }}
+                        >
+                          <CheckCircle2 size={12} /> Verify Fresh
                         </button>
                       )}
                       <button type="button" className="btn btn-sm" onClick={() => void inspectNoteDiff()}>

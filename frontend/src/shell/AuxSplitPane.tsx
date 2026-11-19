@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Check, ExternalLink, Play, RotateCcw, X } from 'lucide-react';
+import { Check, ExternalLink, Eye, Play, Plus, RotateCcw, X } from 'lucide-react';
 import { callAction } from '../api';
+import { DiffView } from '../components/DiffView';
 import { MarkdownView } from '../components/MarkdownView';
 import { WorkItemInspector } from '../surfaces/WorkItemInspector';
 import type {
@@ -12,6 +13,7 @@ import type {
   RoutineItem,
   SurfaceId,
   VerifiedDagSummary,
+  WikiDiffPayload,
   WikiNoteDetail,
 } from '../types';
 
@@ -22,6 +24,20 @@ interface AuxSplitPaneProps {
   onToast: (msg: string) => void;
   onJumpToWiki: (notePath: string) => void;
   onSelectSurface: (s: SurfaceId) => void;
+}
+
+function formatApprovalPayloadPreview(apr: ApprovalRequest): string {
+  try {
+    const p = apr.payload || (apr.payload_json ? JSON.parse(apr.payload_json) : null);
+    if (!p || typeof p !== 'object') return `${apr.action_name} (${apr.target})`;
+    const rec = p as Record<string, unknown>;
+    if (typeof rec.command === 'string' && rec.command) {
+      return `# Target: ${rec.endpoint_id || rec.tool || apr.target}\n${rec.command}`;
+    }
+    return JSON.stringify(rec, null, 2);
+  } catch {
+    return apr.payload_json || `${apr.action_name} (${apr.target})`;
+  }
 }
 
 export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
@@ -44,7 +60,7 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
   const [rtKind, setRtKind] = useState('snapshot_backup');
   const [rtTargetName, setRtTargetName] = useState('');
 
-  // Skill / DAG / Wiki / Jobs state
+  // Skill / DAG / Wiki / Jobs / Approvals state
   const [skillFiles, setSkillFiles] = useState<string[]>([]);
   const [activeAsset, setActiveAsset] = useState('SKILL.md');
   const [skillContent, setSkillContent] = useState('');
@@ -53,12 +69,18 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
   const [dagOutput, setDagOutput] = useState('');
   const [dagRunDetail, setDagRunDetail] = useState<(DagRunSummary & { node_runs?: DagNodeRunEntry[] }) | null>(null);
   const [wikiDetail, setWikiDetail] = useState<WikiNoteDetail | null>(null);
+  const [wikiMissing, setWikiMissing] = useState(false);
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
   const [selectedJob, setSelectedJob] = useState<BackgroundJob | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [resolvingAprId, setResolvingAprId] = useState('');
+  const [previewAprId, setPreviewAprId] = useState('');
+  const [previewWikiDiff, setPreviewWikiDiff] = useState<WikiDiffPayload | null>(null);
 
   useEffect(() => {
     if (!target) return;
+    setPreviewAprId('');
+    setPreviewWikiDiff(null);
     if (target.kind === 'routine') {
       if (target.createNew || !target.routineId) {
         setRtId('');
@@ -109,17 +131,30 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
         }
       );
     } else if (target.kind === 'dag_run') {
-      void callAction<{ run?: DagRunSummary; node_runs?: DagNodeRunEntry[] }>('customizations', {
+      setDagRunDetail(null);
+      void callAction<{
+        dag_run?: DagRunSummary & { node_runs?: DagNodeRunEntry[] };
+        run?: DagRunSummary & { node_runs?: DagNodeRunEntry[] };
+        node_runs?: DagNodeRunEntry[];
+      }>('customizations', {
         subaction: 'get_dag_run',
         run_id: target.runId,
       }).then((res) => {
-        if (res.run) {
-          setDagRunDetail({ ...res.run, node_runs: res.node_runs || [] });
+        const rec = res.dag_run || res.run;
+        if (rec) {
+          setDagRunDetail({ ...rec, node_runs: rec.node_runs || res.node_runs || [] });
         }
       });
     } else if (target.kind === 'wiki_note') {
+      setWikiDetail(null);
+      setWikiMissing(false);
       void callAction<WikiNoteDetail>('wiki', { subaction: 'read', path: target.notePath }).then((res) => {
-        if (res.ok) setWikiDetail(res as unknown as WikiNoteDetail);
+        if (res.ok) {
+          setWikiDetail(res as unknown as WikiNoteDetail);
+          setWikiMissing(false);
+        } else {
+          setWikiMissing(true);
+        }
       });
     } else if (target.kind === 'job' || target.kind === 'approvals') {
       setSelectedJob(null);
@@ -186,6 +221,43 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
     }
   };
 
+  const toggleApprovalPreview = async (apr: ApprovalRequest) => {
+    if (previewAprId === apr.approval_id) {
+      setPreviewAprId('');
+      setPreviewWikiDiff(null);
+      return;
+    }
+    setPreviewAprId(apr.approval_id);
+    setPreviewWikiDiff(null);
+    if (apr.category === 'wiki_edit') {
+      const dRes = await callAction<WikiDiffPayload>('wiki', {
+        subaction: 'diff',
+        approval_id: apr.approval_id,
+      });
+      if (dRes.ok) setPreviewWikiDiff(dRes as unknown as WikiDiffPayload);
+    }
+  };
+
+  const handleResolveApproval = async (apr: ApprovalRequest, decision: 'approve' | 'deny') => {
+    if (resolvingAprId) return;
+    setResolvingAprId(apr.approval_id);
+    try {
+      const r = await callAction('approvals', {
+        subaction: decision,
+        approval_id: apr.approval_id,
+      });
+      if (r.ok === false) {
+        onToast(r.error || `Approval ${decision} failed.`);
+      } else {
+        setApprovals((prev) => prev.filter((x) => x.approval_id !== apr.approval_id));
+        onToast(r.summary || `Approval ${decision}d.`);
+      }
+      onChanged();
+    } finally {
+      setResolvingAprId('');
+    }
+  };
+
   return (
     <aside className="agy-aux-pane" data-testid="aux-split-pane" aria-label="Inspector Pane">
       <div className="sheet-drag-handle" />
@@ -240,16 +312,16 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                   <label className="field-label">Allowed Time Window (e.g. 22:00-06:00 or blank for anytime)</label>
                   <input className="input mono" placeholder="22:00-06:00" value={rtWin} onChange={(e) => setRtWin(e.target.value)} />
                 </div>
-              <div className="form-grid-2">
-                <div>
-                  <label className="field-label">Min Idle (sec)</label>
-                  <input type="number" className="input" value={rtIdleSec} onChange={(e) => setRtIdleSec(Number(e.target.value))} />
+                <div className="form-grid-2">
+                  <div>
+                    <label className="field-label">Min Idle (sec)</label>
+                    <input type="number" className="input" value={rtIdleSec} onChange={(e) => setRtIdleSec(Number(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="field-label">Cooldown (sec)</label>
+                    <input type="number" className="input" value={rtCoolSec} onChange={(e) => setRtCoolSec(Number(e.target.value))} />
+                  </div>
                 </div>
-                <div>
-                  <label className="field-label">Cooldown (sec)</label>
-                  <input type="number" className="input" value={rtCoolSec} onChange={(e) => setRtCoolSec(Number(e.target.value))} />
-                </div>
-              </div>
                 <div>
                   <label className="field-label">Eligibility Precheck (Optional)</label>
                   <select className="select" value={rtPrecheck} onChange={(e) => setRtPrecheck(e.target.value)}>
@@ -333,7 +405,19 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
               type="button"
               className="btn btn-primary"
               onClick={async () => {
-                const res = await callAction('customizations', { subaction: 'run_dag', dag: target.dagName, params: dagParamsText });
+                let parsedParams: Record<string, unknown> = {};
+                try {
+                  const p = JSON.parse(dagParamsText.trim() || '{}');
+                  if (!p || typeof p !== 'object' || Array.isArray(p)) {
+                    onToast('DAG params must be a JSON object (e.g. {}).');
+                    return;
+                  }
+                  parsedParams = p as Record<string, unknown>;
+                } catch (err) {
+                  onToast(`Invalid JSON in DAG params: ${err instanceof Error ? err.message : 'syntax error'}`);
+                  return;
+                }
+                const res = await callAction('customizations', { subaction: 'run_dag', dag: target.dagName, params: parsedParams });
                 setDagOutput(res.summary || res.error || JSON.stringify(res, null, 2));
                 onChanged();
               }}
@@ -356,14 +440,17 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                 {dagRunDetail.status}
               </span>
             </div>
-            {dagRunDetail.status !== 'completed' && (
+            {(dagRunDetail.status === 'waiting_approval' || dagRunDetail.status === 'failed') && (
               <button
                 type="button"
                 className="btn btn-primary btn-sm"
                 onClick={async () => {
-                  const r = await callAction('customizations', { subaction: 'resume_dag', run_id: dagRunDetail.run_id });
+                  const r = await callAction<{ dag_run?: DagRunSummary & { node_runs?: DagNodeRunEntry[] } }>('customizations', { subaction: 'resume_dag', run_id: dagRunDetail.run_id });
                   onToast(r.summary || r.error || 'Resumed DAG run.');
                   onChanged();
+                  const fresh = await callAction<{ dag_run?: DagRunSummary & { node_runs?: DagNodeRunEntry[] }; run?: DagRunSummary & { node_runs?: DagNodeRunEntry[] } }>('customizations', { subaction: 'get_dag_run', run_id: dagRunDetail.run_id });
+                  const rec = fresh.dag_run || fresh.run;
+                  if (rec) setDagRunDetail(rec);
                 }}
               >
                 <RotateCcw size={12} /> Approve &amp; Resume DAG
@@ -371,19 +458,22 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
             )}
             <div className="field-label">Step Checkpoints</div>
             <div className="card-group">
-              {(dagRunDetail.node_runs || []).map((nr) => (
-                <div key={nr.node_id} className="card-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <strong className="mono" style={{ fontSize: 12 }}>{nr.node_id}</strong>
-                    <span className={`badge ${nr.status === 'completed' ? 'ok' : ''}`}>{nr.status}</span>
+              {(dagRunDetail.node_runs || []).map((nr) => {
+                const outVal = nr.output ?? nr.output_json;
+                return (
+                  <div key={nr.node_id} className="card-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <strong className="mono" style={{ fontSize: 12 }}>{nr.node_id}</strong>
+                      <span className={`badge ${nr.status === 'completed' ? 'ok' : ''}`}>{nr.status}</span>
+                    </div>
+                    {(outVal !== undefined || nr.error) && (
+                      <pre className="mono" style={{ margin: 0, fontSize: 11, whiteSpace: 'pre-wrap', color: 'var(--text-secondary)' }}>
+                        {nr.error || (typeof outVal === 'string' ? outVal : JSON.stringify(outVal, null, 2))}
+                      </pre>
+                    )}
                   </div>
-                  {(nr.output !== undefined || nr.error) && (
-                    <pre className="mono" style={{ margin: 0, fontSize: 11, whiteSpace: 'pre-wrap', color: 'var(--text-secondary)' }}>
-                      {nr.error || (typeof nr.output === 'string' ? nr.output : JSON.stringify(nr.output, null, 2))}
-                    </pre>
-                  )}
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -394,7 +484,7 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() => onJumpToWiki(target.notePath)}
+                onClick={() => onJumpToWiki(wikiDetail?.path || target.notePath)}
               >
                 <ExternalLink size={12} /> Open in Knowledge
               </button>
@@ -405,6 +495,34 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                   content={wikiDetail.body || wikiDetail.raw}
                   onOpenWikiNote={(p) => onJumpToWiki(p)}
                 />
+              </div>
+            ) : wikiMissing ? (
+              <div className="card-group" style={{ padding: 14 }} data-testid="wiki-missing-note-card">
+                <div style={{ fontSize: 13, marginBottom: 10, color: 'var(--text-secondary)' }}>
+                  Note <code className="mono">{target.notePath}</code> was not found yet.
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  data-testid="wiki-create-missing-btn"
+                  onClick={async () => {
+                    const slug = target.notePath.split('/').pop()?.replace(/\.md$/i, '') || 'new-note';
+                    const r = await callAction<{ path?: string }>('wiki', {
+                      subaction: 'capture_inbox',
+                      title: slug.replace(/-/g, ' '),
+                      slug,
+                      content: `# ${slug.replace(/-/g, ' ')}\n\nCaptured stub from broken wikilink.`,
+                    });
+                    if (r.ok && r.path) {
+                      onToast(`Created ${r.path} in 01_inbox/.`);
+                      onJumpToWiki(r.path);
+                    } else {
+                      onToast(r.error || 'Could not create note.');
+                    }
+                  }}
+                >
+                  <Plus size={12} /> Note not found — Create in 01_inbox/
+                </button>
               </div>
             ) : (
               <div style={{ color: 'var(--text-muted)' }}>Loading note...</div>
@@ -420,38 +538,68 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
                 {approvals.length === 0 ? (
                   <div className="card-row"><span style={{ color: 'var(--text-muted)' }}>All caught up.</span></div>
                 ) : (
-                  approvals.map((apr) => (
-                    <div key={apr.approval_id} className="card-row">
-                      <div className="card-row-info">
-                        <div className="card-row-title">{apr.category}</div>
-                        <div className="card-row-desc">{(apr.summary || '').replace(/`/g, '')}</div>
+                  approvals.map((apr) => {
+                    const isPreviewOpen = previewAprId === apr.approval_id;
+                    return (
+                      <div key={apr.approval_id} className="card-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap' }}>
+                          <div className="card-row-info">
+                            <div className="card-row-title">{apr.category}</div>
+                            <div className="card-row-desc">{(apr.summary || `${apr.action_name} (${apr.target})`).replace(/`/g, '')}</div>
+                          </div>
+                          <div style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm"
+                              data-testid={`preview-approval-${apr.approval_id}`}
+                              onClick={() => void toggleApprovalPreview(apr)}
+                            >
+                              <Eye size={11} /> Preview Diff / Command
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              disabled={resolvingAprId === apr.approval_id}
+                              onClick={() => void handleResolveApproval(apr, 'approve')}
+                            >
+                              <Check size={11} /> Approve
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-danger btn-sm"
+                              disabled={resolvingAprId === apr.approval_id}
+                              onClick={() => void handleResolveApproval(apr, 'deny')}
+                            >
+                              Deny
+                            </button>
+                          </div>
+                        </div>
+
+                        {isPreviewOpen && (
+                          <div data-testid={`approval-preview-body-${apr.approval_id}`}>
+                            {previewWikiDiff ? (
+                              <DiffView diff={previewWikiDiff} onClose={() => setPreviewAprId('')} />
+                            ) : (
+                              <pre
+                                className="mono"
+                                style={{
+                                  margin: 0,
+                                  padding: 10,
+                                  borderRadius: 'var(--radius-sm)',
+                                  background: 'var(--code-bg)',
+                                  border: '1px solid var(--border-hairline)',
+                                  fontSize: 11.5,
+                                  whiteSpace: 'pre-wrap',
+                                }}
+                              >
+                                {formatApprovalPayloadPreview(apr)}
+                              </pre>
+                            )}
+                          </div>
+                        )}
                       </div>
-                      <div style={{ display: 'inline-flex', gap: 6 }}>
-                        <button
-                          type="button"
-                          className="btn btn-primary btn-sm"
-                          onClick={async () => {
-                            await callAction('approvals', { subaction: 'approve', approval_id: apr.approval_id });
-                            setApprovals((prev) => prev.filter((x) => x.approval_id !== apr.approval_id));
-                            onChanged();
-                          }}
-                        >
-                          <Check size={11} /> Approve
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          onClick={async () => {
-                            await callAction('approvals', { subaction: 'deny', approval_id: apr.approval_id });
-                            setApprovals((prev) => prev.filter((x) => x.approval_id !== apr.approval_id));
-                            onChanged();
-                          }}
-                        >
-                          Deny
-                        </button>
-                      </div>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
             </div>
@@ -501,29 +649,24 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
             )}
 
             <div>
-              <div className="field-label">Departures Board ({jobs.length})</div>
+              <div className="field-label">Departures Board — Background Tasks ({jobs.length})</div>
               <div className="card-group">
-                {jobs.length === 0 ? (
-                  <div className="card-row"><span style={{ color: 'var(--text-muted)' }}>No background jobs yet.</span></div>
-                ) : (
-                  jobs.map((j) => (
-                    <div
-                      key={j.job_id}
-                      className="card-row"
-                      style={{ cursor: 'pointer' }}
-                      onClick={async () => {
-                        const r = await callAction<{ job?: BackgroundJob }>('jobs', { subaction: 'get', job_id: j.job_id });
-                        setSelectedJob(r.job || j);
-                      }}
-                    >
-                      <div className="card-row-info">
-                        <div className="card-row-title">{j.title || j.goal}</div>
-                        <div className="card-row-desc">{j.envelope_summary || j.status}</div>
-                      </div>
-                      <span className={`badge ${j.status === 'done' ? 'ok' : ''}`}>{j.status}</span>
+                {jobs.map((j) => (
+                  <div
+                    key={j.job_id}
+                    className="card-row"
+                    style={{ cursor: 'pointer' }}
+                    onClick={() => setSelectedJob(j)}
+                  >
+                    <div className="card-row-info">
+                      <div className="card-row-title">{j.title || j.goal}</div>
+                      <div className="card-row-desc mono">{j.job_id} • {j.tier}</div>
                     </div>
-                  ))
-                )}
+                    <span className={`badge ${j.status === 'done' ? 'ok' : j.status === 'running' ? 'accent' : ''}`}>
+                      {j.status}
+                    </span>
+                  </div>
+                ))}
               </div>
             </div>
           </div>

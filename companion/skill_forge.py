@@ -419,7 +419,7 @@ def execute_customizations_action(p: Dict[str, Any], _actor: str = "user", store
         return {"ok": True, "skill": s_clean, "asset": asset, "files": files, "content": target.read_text(encoding="utf-8", errors="replace"), "summary": f"Loaded `{s_clean}/{asset}`."}
     if sub == "get_dag_run":
         rec = get_dag_run(str(p.get("run_id") or ""), store=mem)
-        return {"ok": rec is not None, "dag_run": rec, "error": "" if rec else "DAG run not found."}
+        return {"ok": rec is not None, "dag_run": rec, "run": rec, "node_runs": (rec or {}).get("node_runs", []), "error": "" if rec else "DAG run not found."}
     if sub in ("run_dag", "resume_dag"):
         from companion.agent import ensure_dag_runtime_bound
 
