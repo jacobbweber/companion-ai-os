@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Scissors, Trash2 } from 'lucide-react';
 import { callAction } from '../api';
 import { DeliverableReviewPanel } from './DeliverableReviewPanel';
@@ -34,6 +34,8 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
   const [dags, setDags] = useState<VerifiedDagSummary[]>([]);
   const [loadedItem, setLoadedItem] = useState<WorkItem | null>(null);
   const [activeTab, setActiveTab] = useState<'deliverable' | 'edit'>('edit');
+  const activeItemIdRef = useRef(itemId);
+  activeItemIdRef.current = itemId;
 
   const [title, setTitle] = useState('');
   const [desc, setDesc] = useState('');
@@ -52,6 +54,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
 
   const reloadWorkItem = async (resetDefaultTab = false) => {
     if (mode === 'project') return;
+    const reqItemId = itemId;
     const [bRes, cRes] = await Promise.all([
       callAction<ProjectBoardProjection>('agile', {
         subaction: 'board_view',
@@ -59,11 +62,12 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
       }),
       callAction<{ dags?: VerifiedDagSummary[] }>('customizations', { subaction: 'list' }),
     ]);
+    if (activeItemIdRef.current !== reqItemId) return;
     if (bRes.ok) {
       const view = bRes as unknown as ProjectBoardProjection;
       setBoard(view);
-      if (itemId) {
-        const found = (view.cards || []).find((c) => c.item_id === itemId) || null;
+      if (reqItemId) {
+        const found = (view.cards || []).find((c) => c.item_id === reqItemId) || null;
         setLoadedItem(found);
         if (found) {
           setTitle(found.title);
@@ -98,6 +102,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
   };
 
   useEffect(() => {
+    setLoadedItem((prev) => (prev && prev.item_id === itemId ? prev : null));
     void reloadWorkItem(true);
   }, [mode, itemId, projectId]);
 
@@ -214,8 +219,9 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
         </div>
       )}
 
-      {hasDeliverable && activeTab === 'deliverable' && loadedItem ? (
+      {hasDeliverable && activeTab === 'deliverable' && loadedItem && loadedItem.item_id === itemId ? (
         <DeliverableReviewPanel
+          key={loadedItem.item_id}
           item={loadedItem}
           project={board?.project}
           onChanged={() => {
