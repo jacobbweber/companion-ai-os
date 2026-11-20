@@ -154,7 +154,7 @@ Companion/
 │   ├── CONTRACTS.md             # 3. Bounded Subsystem Contracts (SPEC-01..SPEC-08) & Test Map
 │   └── DECISIONS.md             # 4. Self-Compacting Architecture Decision Records (ADRs)
 ├── skills/                      # Built-in 3-Tier Progressive-Disclosure Skill Packs (`skills/<name>/SKILL.md`)
-├── companion/                   # Headless Core A-Frame Engine (46 modules; `<=700L/module`, `<=100L/function`)
+├── companion/                   # Headless Core A-Frame Engine (47 modules; `<=700L/module`, `<=100L/function`)
 │   ├── config.py, telemetry.py, streaming.py, llm_wire.py, llm.py
 │   ├── checkpoints.py, safety.py, semantic_memory.py, memory_store.py, trigger_policy.py, project_graph.py
 │   ├── disciplines.py, grounding.py, archive_and_approvals.py, vault.py, model_registry.py, wiki_templates.py
@@ -162,7 +162,7 @@ Companion/
 │   ├── hygiene.py, sdd.py, workflow_graph.py, workflow_dag.py, dag_runtime.py
 │   ├── intake.py, skill_forge.py, compaction.py, tool_schemas.py, background_jobs.py
 │   ├── endpoints.py, mcp_hub.py, routines.py, calendar_engine.py, core_actions.py, harvest_tools.py
-│   └── sdlc_tools.py, os_tools.py, tools.py, context.py, autonomy.py, blueprint.py, eval_harness.py, agent.py
+│   └── sdlc_tools.py, worktree_runner.py, os_tools.py, tools.py, context.py, autonomy.py, blueprint.py, eval_harness.py, agent.py
 ├── frontend/                    # React 19 + TypeScript + Vite Multi-Studio UI source (-> surfaces/static/)
 ├── surfaces/                    # Presentation Layer: web_assets.py, api_extensions.py, web_server.py, windows_tray.py
 ├── configs/                     # Executable A-Frame Architecture component registry (architecture.py)

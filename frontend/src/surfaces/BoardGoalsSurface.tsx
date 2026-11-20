@@ -2,12 +2,17 @@ import React, { useEffect, useState } from 'react';
 import {
   CheckCircle2,
   Circle,
+  FileDiff,
+  FolderGit2,
   GitBranch,
   Lock,
+  Play,
   Plus,
-  SlidersHorizontal,
+  Settings,
   Sparkles,
+  Square,
   User,
+  Zap,
 } from 'lucide-react';
 import { callAction } from '../api';
 import type {
@@ -48,6 +53,7 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
   const [quickDrafts, setQuickDrafts] = useState<Record<string, string>>({});
   const [quickOwner, setQuickOwner] = useState<'companion' | 'human'>('companion');
   const [newMilestoneTitle, setNewMilestoneTitle] = useState('');
+  const [dispatchingId, setDispatchingId] = useState('');
 
   const loadBoard = async () => {
     const res = await callAction<ProjectBoardProjection>('agile', {
@@ -62,6 +68,17 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
   useEffect(() => {
     void loadBoard();
   }, [selectedProjectId, refreshNonce]);
+
+  const hasInProgress = Boolean((board?.cards || []).some((c) => c.column_key === 'in_progress'));
+  useEffect(() => {
+    if (!hasInProgress) return;
+    const id = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') {
+        void loadBoard();
+      }
+    }, 2500);
+    return () => window.clearInterval(id);
+  }, [hasInProgress, selectedProjectId]);
 
   const addQuickItem = async (colKey: string) => {
     const title = (quickDrafts[colKey] || '').trim();
@@ -104,12 +121,52 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
     }
   };
 
+  const startSingleItem = async (e: React.MouseEvent, item: WorkItem) => {
+    e.stopPropagation();
+    if (dispatchingId) return;
+    setDispatchingId(item.item_id);
+    try {
+      const res = await callAction('agile', {
+        subaction: 'start_item',
+        item_id: item.item_id,
+        project_id: item.project_id,
+      });
+      await loadBoard();
+      await onRefreshStatus();
+      onToast(res.ok === false ? res.error || 'Could not start card.' : res.summary || `Started "${item.title}".`);
+    } finally {
+      setDispatchingId('');
+    }
+  };
+
+  const stopCardWorker = async (e: React.MouseEvent, item: WorkItem) => {
+    e.stopPropagation();
+    if (!item.active_job_id) return;
+    const res = await callAction('jobs', { subaction: 'cancel', job_id: item.active_job_id });
+    await loadBoard();
+    await onRefreshStatus();
+    onToast(res.summary || `Stopped "${item.title}".`);
+  };
+
+  const runParallelReady = async () => {
+    if (!board?.project || dispatchingId) return;
+    setDispatchingId('parallel');
+    try {
+      const res = await callAction('agile', {
+        subaction: 'run_parallel_ready',
+        project_id: board.project.project_id,
+      });
+      await loadBoard();
+      await onRefreshStatus();
+      onToast(res.ok === false ? res.error || 'Could not dispatch ready cards.' : res.summary || 'Dispatched parallel agents.');
+    } finally {
+      setDispatchingId('');
+    }
+  };
+
   const seedDikwMilestones = async () => {
     if (!board?.project) return;
-    const res = await callAction('agile', {
-      subaction: 'seed_dikw',
-      project_id: board.project.project_id,
-    });
+    const res = await callAction('agile', { subaction: 'seed_dikw', project_id: board.project.project_id });
     await loadBoard();
     onToast(res.summary || 'Seeded 4 DIKW milestones.');
   };
@@ -138,11 +195,17 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
   const counts = board?.counts;
   const allItems = (board?.cards || []).filter(matchesFilter);
   const tp = proj?.trigger_policy;
+  const repoFolder = proj?.workspace_path
+    ? proj.workspace_path.replace(/\\/g, '/').split('/').filter(Boolean).pop() || proj.workspace_path
+    : '';
+  const readyCompanionCards = (board?.cards || []).filter(
+    (c) => c.column_key === 'ready' && c.owner !== 'human'
+  );
+  const batchTargetCount = Math.min(readyCompanionCards.length, proj?.max_parallel_workers ?? 2);
 
   return (
     <div className="surface-scroll" data-testid="boards-surface">
       <div className="surface-container">
-        {/* Top Clean Header & View Controls */}
         <div
           style={{
             display: 'flex',
@@ -153,10 +216,10 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
             marginBottom: 16,
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <select
               className="select"
-              style={{ width: 'auto', minWidth: 190, fontWeight: 600 }}
+              style={{ width: 'auto', minWidth: 185, fontWeight: 600 }}
               value={proj?.project_id || selectedProjectId}
               onChange={(e) => onSelectProject(e.target.value)}
             >
@@ -167,6 +230,16 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
               ))}
             </select>
 
+            <button
+              type="button"
+              className="btn btn-sm"
+              data-testid="new-project-btn"
+              onClick={() => onInspect({ kind: 'project', projectId: '', createNew: true })}
+              title="Create a new Personal Goal Board or Code Repository Project"
+            >
+              <Plus size={12} /> New Project
+            </button>
+
             {proj && (
               <>
                 <button
@@ -174,13 +247,16 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
                   className="btn btn-sm"
                   data-testid="configure-project-trigger-btn"
                   onClick={() => onInspect({ kind: 'project', projectId: proj.project_id })}
-                  title="Configure Repository Workspace, Delivery Policy & Idle Window"
+                  title={`Project Settings • Trigger: ${tp?.mode === 'on_idle' ? `On Idle (${tp.allowed_window || 'anytime'})` : 'Manual'}`}
                 >
-                  <SlidersHorizontal size={12} />
-                  <span>
-                    Trigger: {tp?.mode === 'on_idle' ? `On Idle (${tp.allowed_window || 'anytime'})` : 'Manual'}
-                  </span>
+                  <Settings size={12} />
+                  <span>Project Settings</span>
                 </button>
+                {repoFolder && (
+                  <span className="badge accent mono" data-testid="project-code-repo-badge" title={proj.workspace_path}>
+                    <FolderGit2 size={11} /> {repoFolder}
+                  </span>
+                )}
                 {(proj.workspace_path || (proj.delivery_policy && proj.delivery_policy !== 'local_only')) && (
                   <span className="badge" data-testid="project-delivery-badge" title={proj.workspace_path || 'OS Mode'}>
                     {proj.delivery_policy === 'remote_branch_pr'
@@ -195,41 +271,29 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
 
             {counts && (
               <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                {counts.human_pending} on you • {counts.companion_ready} Companion ready •{' '}
-                {counts.blocked} blocked
+                {counts.human_pending} on you • {counts.companion_ready} Companion ready • {counts.blocked} blocked
               </span>
             )}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <div className="segmented-pills">
-              {(
-                [
-                  ['all', 'All'],
-                  ['human', 'On Me'],
-                  ['companion', 'Companion'],
-                  ['blocked', 'Blocked'],
-                ] as const
-              ).map(([id, lbl]) => (
-                <button
-                  key={id}
-                  type="button"
-                  className={`segmented-pill ${ownerFilter === id ? 'active' : ''}`}
-                  onClick={() => setOwnerFilter(id)}
-                >
-                  {lbl}
-                </button>
-              ))}
+              {([['all', 'All'], ['human', 'On Me'], ['companion', 'Companion'], ['blocked', 'Blocked']] as const).map(
+                ([id, lbl]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className={`segmented-pill ${ownerFilter === id ? 'active' : ''}`}
+                    onClick={() => setOwnerFilter(id)}
+                  >
+                    {lbl}
+                  </button>
+                )
+              )}
             </div>
 
             <div className="segmented-pills">
-              {(
-                [
-                  ['board', 'Board'],
-                  ['list', 'List'],
-                  ['roadmap', 'Milestones'],
-                ] as const
-              ).map(([id, lbl]) => (
+              {([['board', 'Board'], ['list', 'List'], ['roadmap', 'Milestones']] as const).map(([id, lbl]) => (
                 <button
                   key={id}
                   type="button"
@@ -243,21 +307,38 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
           </div>
         </div>
 
-        {/* View 1: Kanban Board Columns */}
         {viewMode === 'board' && (
           <div className="board-columns-grid">
             {(board?.columns || []).map((col) => {
               const colCards = col.cards.filter(matchesFilter);
               return (
-                <div key={col.col_key} className="board-col">
-                  <div className="board-col-head">
-                    <span>{col.title}</span>
-                    <span className="count-pill">{colCards.length}</span>
+                <div key={col.col_key} className="board-col" data-testid={`board-col-${col.col_key}`}>
+                  <div className="board-col-head" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <span>{col.title}</span>
+                      <span className="count-pill">{colCards.length}</span>
+                    </span>
+                    {col.col_key === 'ready' && batchTargetCount > 0 && (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        style={{ padding: '2px 7px', fontSize: 11 }}
+                        data-testid="run-parallel-ready-btn"
+                        disabled={dispatchingId === 'parallel'}
+                        onClick={() => void runParallelReady()}
+                        title="Dispatch unblocked Ready cards in isolated git worktrees"
+                      >
+                        <Zap size={10} /> Run Ready ({batchTargetCount})
+                      </button>
+                    )}
                   </div>
 
                   {colCards.map((it) => {
                     const ob = OWNER_BADGE[it.owner] || OWNER_BADGE.companion;
                     const isDone = it.column_key === 'done';
+                    const isRunning = it.column_key === 'in_progress';
+                    const isVerify = it.column_key === 'verify';
+                    const canStart = it.column_key === 'ready' && it.owner !== 'human';
                     return (
                       <div
                         key={it.item_id}
@@ -265,21 +346,9 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
                         tabIndex={0}
                         data-testid={`work-card-${it.item_id}`}
                         className={`work-card ${selectedItemId === it.item_id ? 'selected' : ''}`}
-                        onClick={() =>
-                          onInspect({
-                            kind: 'work_item',
-                            itemId: it.item_id,
-                            projectId: it.project_id,
-                          })
-                        }
+                        onClick={() => onInspect({ kind: 'work_item', itemId: it.item_id, projectId: it.project_id })}
                         onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            onInspect({
-                              kind: 'work_item',
-                              itemId: it.item_id,
-                              projectId: it.project_id,
-                            });
-                          }
+                          if (e.key === 'Enter') onInspect({ kind: 'work_item', itemId: it.item_id, projectId: it.project_id });
                         }}
                       >
                         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 7 }}>
@@ -303,26 +372,62 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
                               textDecoration: isDone ? 'line-through' : 'none',
                               opacity: isDone ? 0.68 : 1,
                               margin: 0,
+                              flex: 1,
                             }}
                           >
                             {it.title}
                           </div>
                         </div>
 
-                        <div className="work-card-meta" style={{ marginTop: 8 }}>
-                          <span className={`badge ${ob.cls}`}>
-                            {it.owner === 'human' ? <User size={10} /> : <Sparkles size={10} />}
-                            {ob.label}
-                          </span>
-                          {it.depends_on?.length > 0 && it.column_key !== 'done' && (
-                            <span className="badge warn" title={`Depends on: ${it.depends_on.join(', ')}`}>
-                              <Lock size={10} /> Deps ({it.depends_on.length})
+                        <div className="work-card-meta" style={{ marginTop: 8, justifyContent: 'space-between' }}>
+                          <div style={{ display: 'inline-flex', gap: 5, flexWrap: 'wrap', alignItems: 'center' }}>
+                            <span className={`badge ${ob.cls}`}>
+                              {it.owner === 'human' ? <User size={10} /> : <Sparkles size={10} />}
+                              {ob.label}
                             </span>
+                            {it.depends_on?.length > 0 && !isDone && (
+                              <span className="badge warn" title={`Depends on: ${it.depends_on.join(', ')}`}>
+                                <Lock size={10} /> Deps ({it.depends_on.length})
+                              </span>
+                            )}
+                            {(it.branch_name || it.dag_name) && (
+                              <span className="badge mono" title={it.worktree_path || it.branch_name || it.dag_name}>
+                                {isRunning && <span className="status-dot busy" style={{ width: 6, height: 6 }} />}
+                                <GitBranch size={10} />
+                                {it.branch_name ? `wt: ${it.branch_name.replace(/^feat\//, '')}` : it.dag_name}
+                              </span>
+                            )}
+                            {isVerify && (
+                              <span className="badge ok" data-testid={`review-diff-badge-${it.item_id}`}>
+                                <FileDiff size={10} /> Review Diff
+                                {it.deliverable?.changed_files?.length ? ` (${it.deliverable.changed_files.length})` : ''}
+                              </span>
+                            )}
+                          </div>
+
+                          {canStart && (
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              style={{ padding: '2px 7px', fontSize: 11 }}
+                              data-testid={`start-card-btn-${it.item_id}`}
+                              disabled={dispatchingId === it.item_id}
+                              onClick={(e) => void startSingleItem(e, it)}
+                            >
+                              <Play size={10} /> Start
+                            </button>
                           )}
-                          {it.dag_name && (
-                            <span className="badge">
-                              <GitBranch size={10} /> {it.dag_name}
-                            </span>
+
+                          {isRunning && it.active_job_id && (
+                            <button
+                              type="button"
+                              className="btn btn-danger btn-sm"
+                              style={{ padding: '2px 7px', fontSize: 11 }}
+                              data-testid={`stop-card-btn-${it.item_id}`}
+                              onClick={(e) => void stopCardWorker(e, it)}
+                            >
+                              <Square size={9} fill="currentColor" /> Stop
+                            </button>
                           )}
                         </div>
                       </div>
@@ -330,32 +435,26 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
                   })}
 
                   {(col.col_key === 'ready' || col.col_key === 'backlog') && (
-                    <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 5 }}>
-                      <div style={{ display: 'flex', gap: 5 }}>
-                        <input
-                          type="text"
-                          className="input"
-                          style={{ fontSize: 12, padding: '5px 8px' }}
-                          placeholder={`+ Add ${col.title.toLowerCase()} item...`}
-                          value={quickDrafts[col.col_key] || ''}
-                          onChange={(e) =>
-                            setQuickDrafts((p) => ({ ...p, [col.col_key]: e.target.value }))
-                          }
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') void addQuickItem(col.col_key);
-                          }}
-                        />
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          title={`Owner: ${quickOwner} (click to switch)`}
-                          onClick={() =>
-                            setQuickOwner((o) => (o === 'companion' ? 'human' : 'companion'))
-                          }
-                        >
-                          {quickOwner === 'human' ? 'You' : 'AI'}
-                        </button>
-                      </div>
+                    <div style={{ marginTop: 4, display: 'flex', gap: 5 }}>
+                      <input
+                        type="text"
+                        className="input"
+                        style={{ fontSize: 12, padding: '5px 8px' }}
+                        placeholder={`+ Add ${col.title.toLowerCase()} item...`}
+                        value={quickDrafts[col.col_key] || ''}
+                        onChange={(e) => setQuickDrafts((p) => ({ ...p, [col.col_key]: e.target.value }))}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') void addQuickItem(col.col_key);
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        title={`Owner: ${quickOwner} (click to switch)`}
+                        onClick={() => setQuickOwner((o) => (o === 'companion' ? 'human' : 'companion'))}
+                      >
+                        {quickOwner === 'human' ? 'You' : 'AI'}
+                      </button>
                     </div>
                   )}
                 </div>
@@ -364,7 +463,6 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
           </div>
         )}
 
-        {/* View 2: Clean Linear List View */}
         {viewMode === 'list' && (
           <div className="card-group">
             {allItems.length === 0 ? (
@@ -379,9 +477,7 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
                     key={it.item_id}
                     className="card-row"
                     style={{ cursor: 'pointer' }}
-                    onClick={() =>
-                      onInspect({ kind: 'work_item', itemId: it.item_id, projectId: it.project_id })
-                    }
+                    onClick={() => onInspect({ kind: 'work_item', itemId: it.item_id, projectId: it.project_id })}
                   >
                     <div className="card-row-info" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                       <button
@@ -414,7 +510,6 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
           </div>
         )}
 
-        {/* View 3: Milestones & DIKW Prerequisite Stages */}
         {viewMode === 'roadmap' && (
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>

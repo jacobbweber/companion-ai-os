@@ -34,6 +34,7 @@ from companion.wiki_curation import commit_curation_plan, inspect_graduation, li
 from companion.wiki_engine import get_wiki_engine
 from companion.wiki_maintenance import execute_wiki_maintenance_subaction
 from companion.wiki_templates import get_template, list_templates, load_tag_authority, save_template, slugify_wiki
+from companion.worktree_runner import execute_agile_worktree_subaction
 
 __all__ = ["CORE_ACTIONS", "HARVEST_SLASH_VERBS", "ActionSpec", "execute_core_action", "handle_harvest_slash", "list_core_actions"]
 
@@ -545,27 +546,30 @@ def _act_agile_queries(mgr: Any, sub: str, pid: str, p: Dict[str, Any]) -> Optio
     return None
 
 
-def _act_agile(p: Dict[str, Any], _actor: str, mem: MemoryStore) -> Dict[str, Any]:
+def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
     """Project `agile` CoreActions cleanly over the Universal Project & Goal Graph (`ProjectGraphManager`)."""
     mgr = get_project_graph(store=mem)
     sub = str(p.get("subaction") or p.get("action") or "board_view").strip().lower()
     pid = str(p.get("project_id") or p.get("board_id") or "").strip()
     if pid == "all-active-sprint":
         pid = ""
+    if wt_res := execute_agile_worktree_subaction(sub, pid, p, actor, mem, job_mgr_fn=get_job_manager):
+        return wt_res
     if q_res := _act_agile_queries(mgr, sub, pid, p):
         return q_res
     if sub in ("create_board", "save_board", "create_project", "upsert_project"):
         tp_in = p.get("trigger_policy") if isinstance(p.get("trigger_policy"), dict) else None
+        mpw = int(p.get("max_parallel_workers") or 2)
         proj = mgr.create_project(
             title=str(p.get("title") or p.get("name") or "New Goal"), goal_summary=str(p.get("goal_summary") or p.get("description") or ""),
             slug=str(p.get("slug") or "") or None, kind=str(p.get("kind") or "goal"), workspace_path=str(p.get("workspace_path") or ""),
             delivery_policy=str(p.get("delivery_policy") or "local_only"), git_credential_ref=str(p.get("git_credential_ref") or ""),
-            test_command=str(p.get("test_command") or ""), preview_command=str(p.get("preview_command") or ""),
+            max_parallel_workers=mpw, test_command=str(p.get("test_command") or ""), preview_command=str(p.get("preview_command") or ""),
             trigger_policy=tp_in, project_id=pid or None,
         )
         return {"ok": True, "project": proj, "board": proj, "summary": f"Saved project/goal `{proj['title']}` (`{proj['project_id']}`, delivery_policy=`{proj['delivery_policy']}`)."}
     if sub == "update_project":
-        proj_upd = {k: v for k, v in p.items() if k in ("title", "goal_summary", "status", "wiki_hub_path", "workspace_path", "delivery_policy", "git_credential_ref", "test_command", "preview_command", "trigger_policy", "metadata")}
+        proj_upd = {k: v for k, v in p.items() if k in ("title", "goal_summary", "kind", "status", "wiki_hub_path", "workspace_path", "delivery_policy", "git_credential_ref", "max_parallel_workers", "test_command", "preview_command", "trigger_policy", "metadata")}
         if "goal_summary" not in proj_upd and "description" in p:
             proj_upd["goal_summary"] = str(p.get("description") or "")
         proj = mgr.update_project(pid or mgr.resolve_project_id(), **proj_upd)

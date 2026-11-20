@@ -30,18 +30,18 @@ __all__ = [
 ]
 
 PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
-    "local-default": {"id": "local-default", "label": "Local Default (Primary Ollama / LAN)", "dialect": "openai_compat", "base_url": "", "is_local": True, "credential_ref": "", "default_context": 262144, "models": []},
-    "ollama": {"id": "ollama", "label": "Ollama (Local / LAN)", "dialect": "openai_compat", "base_url": "http://127.0.0.1:11434", "is_local": True, "credential_ref": "", "default_context": 131072, "models": ["qwen2.5:7b", "llama3.2:latest", "qwen2.5-coder:7b", "deepseek-r1:14b"]},
-    "vllm": {"id": "vllm", "label": "vLLM / SGLang Gateway", "dialect": "openai_compat", "base_url": "http://127.0.0.1:8099", "is_local": True, "credential_ref": "", "default_context": 262144, "models": ["deepseek-r1-distill-32b", "qwen2.5-coder-32b-instruct"]},
-    "lmstudio": {"id": "lmstudio", "label": "LM Studio / llama.cpp", "dialect": "openai_compat", "base_url": "http://127.0.0.1:1234/v1", "is_local": True, "credential_ref": "", "default_context": 131072, "models": []},
-    "gemini": {"id": "gemini", "label": "Google Gemini (Native v1beta)", "dialect": "gemini_native", "base_url": "https://generativelanguage.googleapis.com/v1beta", "is_local": False, "credential_ref": "gemini-api-key", "default_context": 1048576, "models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-embedding-001"]},
-    "anthropic": {"id": "anthropic", "label": "Anthropic Claude (Messages API)", "dialect": "anthropic_messages", "base_url": "https://api.anthropic.com", "is_local": False, "credential_ref": "anthropic-api-key", "default_context": 200000, "models": ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"]},
-    "openai": {"id": "openai", "label": "OpenAI (GPT & o-Series)", "dialect": "openai_compat", "base_url": "https://api.openai.com/v1", "is_local": False, "credential_ref": "openai-api-key", "default_context": 200000, "models": ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3", "text-embedding-3-small"]},
-    "xai": {"id": "xai", "label": "xAI Grok", "dialect": "openai_compat", "base_url": "https://api.x.ai/v1", "is_local": False, "credential_ref": "xai-api-key", "default_context": 256000, "models": ["grok-4", "grok-4-fast", "grok-3", "grok-3-mini"]},
-    "openrouter": {"id": "openrouter", "label": "OpenRouter (Frontier Hub)", "dialect": "openai_compat", "base_url": "https://openrouter.ai/api/v1", "is_local": False, "credential_ref": "openrouter-api-key", "default_context": 200000, "models": ["anthropic/claude-sonnet-4.6", "google/gemini-2.5-pro", "openai/gpt-5", "x-ai/grok-4", "deepseek/deepseek-r1"]},
-    "deepseek": {"id": "deepseek", "label": "DeepSeek Official", "dialect": "openai_compat", "base_url": "https://api.deepseek.com/v1", "is_local": False, "credential_ref": "deepseek-api-key", "default_context": 128000, "models": ["deepseek-chat", "deepseek-reasoner"]},
-    "groq": {"id": "groq", "label": "Groq Cloud LPU", "dialect": "openai_compat", "base_url": "https://api.groq.com/openai/v1", "is_local": False, "credential_ref": "groq-api-key", "default_context": 131072, "models": ["llama-3.3-70b-versatile", "qwen/qwen3-32b"]},
-    "custom": {"id": "custom", "label": "Custom OpenAI-Compatible", "dialect": "openai_compat", "base_url": "http://127.0.0.1:8080/v1", "is_local": True, "credential_ref": "", "default_context": 131072, "models": []},
+    "local-default": {"id": "local-default", "label": "Local Default (Primary Ollama / LAN)", "dialect": "openai_compat", "base_url": "", "is_local": True, "credential_ref": "", "default_context": 262144, "max_concurrency": 1, "models": []},
+    "ollama": {"id": "ollama", "label": "Ollama (Local / LAN)", "dialect": "openai_compat", "base_url": "http://127.0.0.1:11434", "is_local": True, "credential_ref": "", "default_context": 131072, "max_concurrency": 1, "models": ["qwen2.5:7b", "llama3.2:latest", "qwen2.5-coder:7b", "deepseek-r1:14b"]},
+    "vllm": {"id": "vllm", "label": "vLLM / SGLang Gateway", "dialect": "openai_compat", "base_url": "http://127.0.0.1:8099", "is_local": True, "credential_ref": "", "default_context": 262144, "max_concurrency": 4, "models": ["deepseek-r1-distill-32b", "qwen2.5-coder-32b-instruct"]},
+    "lmstudio": {"id": "lmstudio", "label": "LM Studio / llama.cpp", "dialect": "openai_compat", "base_url": "http://127.0.0.1:1234/v1", "is_local": True, "credential_ref": "", "default_context": 131072, "max_concurrency": 1, "models": []},
+    "gemini": {"id": "gemini", "label": "Google Gemini (Native v1beta)", "dialect": "gemini_native", "base_url": "https://generativelanguage.googleapis.com/v1beta", "is_local": False, "credential_ref": "gemini-api-key", "default_context": 1048576, "max_concurrency": 4, "models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-embedding-001"]},
+    "anthropic": {"id": "anthropic", "label": "Anthropic Claude (Messages API)", "dialect": "anthropic_messages", "base_url": "https://api.anthropic.com", "is_local": False, "credential_ref": "anthropic-api-key", "default_context": 200000, "max_concurrency": 4, "models": ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"]},
+    "openai": {"id": "openai", "label": "OpenAI (GPT & o-Series)", "dialect": "openai_compat", "base_url": "https://api.openai.com/v1", "is_local": False, "credential_ref": "openai-api-key", "default_context": 200000, "max_concurrency": 4, "models": ["gpt-5", "gpt-5-mini", "gpt-4.1", "o4-mini", "o3", "text-embedding-3-small"]},
+    "xai": {"id": "xai", "label": "xAI Grok", "dialect": "openai_compat", "base_url": "https://api.x.ai/v1", "is_local": False, "credential_ref": "xai-api-key", "default_context": 256000, "max_concurrency": 4, "models": ["grok-4", "grok-4-fast", "grok-3", "grok-3-mini"]},
+    "openrouter": {"id": "openrouter", "label": "OpenRouter (Frontier Hub)", "dialect": "openai_compat", "base_url": "https://openrouter.ai/api/v1", "is_local": False, "credential_ref": "openrouter-api-key", "default_context": 200000, "max_concurrency": 4, "models": ["anthropic/claude-sonnet-4.6", "google/gemini-2.5-pro", "openai/gpt-5", "x-ai/grok-4", "deepseek/deepseek-r1"]},
+    "deepseek": {"id": "deepseek", "label": "DeepSeek Official", "dialect": "openai_compat", "base_url": "https://api.deepseek.com/v1", "is_local": False, "credential_ref": "deepseek-api-key", "default_context": 128000, "max_concurrency": 4, "models": ["deepseek-chat", "deepseek-reasoner"]},
+    "groq": {"id": "groq", "label": "Groq Cloud LPU", "dialect": "openai_compat", "base_url": "https://api.groq.com/openai/v1", "is_local": False, "credential_ref": "groq-api-key", "default_context": 131072, "max_concurrency": 4, "models": ["llama-3.3-70b-versatile", "qwen/qwen3-32b"]},
+    "custom": {"id": "custom", "label": "Custom OpenAI-Compatible", "dialect": "openai_compat", "base_url": "http://127.0.0.1:8080/v1", "is_local": True, "credential_ref": "", "default_context": 131072, "max_concurrency": 4, "models": []},
 }
 
 MODEL_REGISTRY_DDL: Tuple[str, ...] = (
@@ -49,7 +49,8 @@ MODEL_REGISTRY_DDL: Tuple[str, ...] = (
         provider_id TEXT PRIMARY KEY, label TEXT NOT NULL, preset TEXT NOT NULL DEFAULT 'custom',
         dialect TEXT NOT NULL DEFAULT 'openai_compat', base_url TEXT NOT NULL,
         credential_ref TEXT NOT NULL DEFAULT '', is_local INTEGER NOT NULL DEFAULT 1,
-        enabled INTEGER NOT NULL DEFAULT 1, models_json TEXT NOT NULL DEFAULT '[]',
+        enabled INTEGER NOT NULL DEFAULT 1, max_concurrency INTEGER NOT NULL DEFAULT 1,
+        models_json TEXT NOT NULL DEFAULT '[]',
         last_health TEXT NOT NULL DEFAULT '', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )""",
     """CREATE TABLE IF NOT EXISTS llm_tier_routes (
@@ -78,20 +79,31 @@ def _slugify_provider_id(raw: str) -> str:
     return re.sub(r"[^a-z0-9_-]+", "-", (raw or "").strip().lower()).strip("-")[:48]
 
 
+def _default_provider_concurrency(preset_id: str, base_url: str) -> int:
+    if preset_id in ("ollama", "lmstudio") or ":11434" in (base_url or ""):
+        return 1
+    return 4
+
+
 def _ensure_schema_and_seed(store: MemoryStore) -> None:
     def _init(st: MemoryStore) -> None:
         for ddl in MODEL_REGISTRY_DDL:
             st.conn.execute(ddl)
+        pcols = {str(r[1]) for r in st.conn.execute("PRAGMA table_info(llm_providers)").fetchall()}
+        if "max_concurrency" not in pcols:
+            st.conn.execute("ALTER TABLE llm_providers ADD COLUMN max_concurrency INTEGER NOT NULL DEFAULT 1")
+            st.conn.execute("UPDATE llm_providers SET max_concurrency = 4 WHERE base_url NOT LIKE '%:11434%' AND preset NOT IN ('ollama', 'lmstudio')")
         cur = st.conn.execute("SELECT COUNT(*) FROM llm_providers WHERE provider_id = 'local-default'").fetchone()
         if not cur or int(cur[0]) == 0:
             def_cfg = settings.tiers["default"]
             def_lbl = "Local Default (Ollama)" if ":11434" in def_cfg.base_url else "Local Default (Primary .env)"
             def_models = json.dumps([{"id": def_cfg.model, "label": def_cfg.model, "loaded": False, "context_window": def_cfg.context_window_tokens}]) if def_cfg.model else "[]"
+            def_conc = _default_provider_concurrency("local-default", def_cfg.base_url)
             st.conn.execute(
                 """INSERT OR IGNORE INTO llm_providers
-                   (provider_id, label, preset, dialect, base_url, credential_ref, is_local, enabled, models_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)""",
-                ("local-default", def_lbl, "local-default", def_cfg.dialect, def_cfg.base_url, "", 1 if is_local_or_lan_endpoint(def_cfg.base_url) else 0, def_models),
+                   (provider_id, label, preset, dialect, base_url, credential_ref, is_local, enabled, max_concurrency, models_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                ("local-default", def_lbl, "local-default", def_cfg.dialect, def_cfg.base_url, "", 1 if is_local_or_lan_endpoint(def_cfg.base_url) else 0, def_conc, def_models),
             )
             seen_urls = {def_cfg.base_url.rstrip("/").lower()}
             for t_name, t_cfg in settings.tiers.items():
@@ -105,9 +117,9 @@ def _ensure_schema_and_seed(store: MemoryStore) -> None:
                 m_json = json.dumps([{"id": t_cfg.model, "label": t_cfg.model, "loaded": False, "context_window": t_cfg.context_window_tokens}])
                 st.conn.execute(
                     """INSERT OR IGNORE INTO llm_providers
-                       (provider_id, label, preset, dialect, base_url, credential_ref, is_local, enabled, models_json)
-                       VALUES (?, ?, ?, ?, ?, '', ?, 1, ?)""",
-                    (pid, lbl, "ollama" if is_oll else "vllm", t_cfg.dialect, t_cfg.base_url, 1 if is_local_or_lan_endpoint(t_cfg.base_url) else 0, m_json),
+                       (provider_id, label, preset, dialect, base_url, credential_ref, is_local, enabled, max_concurrency, models_json)
+                       VALUES (?, ?, ?, ?, ?, '', ?, 1, ?, ?)""",
+                    (pid, lbl, "ollama" if is_oll else "vllm", t_cfg.dialect, t_cfg.base_url, 1 if is_local_or_lan_endpoint(t_cfg.base_url) else 0, 1 if is_oll else 4, m_json),
                 )
         st.conn.commit()
 
@@ -129,7 +141,7 @@ def _resolve_provider_secret(store: MemoryStore, provider_id: str, cred_ref: str
 
 def _list_provider_rows(store: MemoryStore) -> List[Dict[str, Any]]:
     _ensure_schema_and_seed(store)
-    cols = ["provider_id", "label", "preset", "dialect", "base_url", "credential_ref", "is_local", "enabled", "models_json", "last_health", "updated_at"]
+    cols = ["provider_id", "label", "preset", "dialect", "base_url", "credential_ref", "is_local", "enabled", "max_concurrency", "models_json", "last_health", "updated_at"]
     rows = store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM llm_providers ORDER BY is_local DESC, provider_id ASC")
     out: List[Dict[str, Any]] = []
     for r in rows:
@@ -139,6 +151,8 @@ def _list_provider_rows(store: MemoryStore) -> List[Dict[str, Any]]:
             models = []
         r["is_local"] = bool(r["is_local"]) and is_local_or_lan_endpoint(str(r["base_url"]))
         r["enabled"] = bool(r["enabled"])
+        def_c = _default_provider_concurrency(str(r.get("preset") or ""), str(r.get("base_url") or ""))
+        r["max_concurrency"] = max(1, min(8, int(r.get("max_concurrency") or def_c)))
         r["discovered_models"] = models if isinstance(models, list) else []
         preset_models = PROVIDER_PRESETS.get(str(r["preset"]), {}).get("models", [])
         seen = {str(m.get("id")) for m in r["discovered_models"] if isinstance(m, dict) and m.get("id")}
@@ -190,9 +204,17 @@ def _compute_resolved_map(store: MemoryStore, base_tiers: Dict[str, TierConfig])
             fallback_api_key=_pkey(fb_p["provider_id"]) if fb_p else "",
             fallback_dialect=str(fb_p["dialect"]) if fb_p else "openai_compat",
             fallback_provider_id=fb_p["provider_id"] if fb_p else "",
+            max_concurrency=int(dp["max_concurrency"]),
         )
     else:
-        resolved["default"] = def_base
+        def_p = providers.get("local-default")
+        resolved["default"] = TierConfig(
+            tier=def_base.tier, base_url=def_base.base_url, model=def_base.model, api_key=def_base.api_key,
+            context_window_tokens=def_base.context_window_tokens, temperature=def_base.temperature,
+            is_dedicated=def_base.is_dedicated, max_tokens=def_base.max_tokens, provider_id=def_base.provider_id,
+            dialect=def_base.dialect, reasoning_effort=def_base.reasoning_effort,
+            max_concurrency=int(def_p["max_concurrency"]) if def_p else def_base.max_concurrency,
+        )
 
     eff_def = resolved["default"]
     for t in CAPABILITY_TIERS:
@@ -213,9 +235,17 @@ def _compute_resolved_map(store: MemoryStore, base_tiers: Dict[str, TierConfig])
                 fallback_api_key=_pkey(fb_p["provider_id"]) if fb_p else "",
                 fallback_dialect=str(fb_p["dialect"]) if fb_p else "openai_compat",
                 fallback_provider_id=fb_p["provider_id"] if fb_p else "",
+                max_concurrency=int(tp["max_concurrency"]),
             )
         elif env_t.is_dedicated:
-            resolved[t] = env_t
+            matched_p = next((p for p in providers.values() if str(p["base_url"]).rstrip("/").lower() == env_t.base_url.rstrip("/").lower()), None)
+            resolved[t] = TierConfig(
+                tier=env_t.tier, base_url=env_t.base_url, model=env_t.model, api_key=env_t.api_key,
+                context_window_tokens=env_t.context_window_tokens, temperature=env_t.temperature,
+                is_dedicated=True, max_tokens=env_t.max_tokens, provider_id=matched_p["provider_id"] if matched_p else env_t.provider_id,
+                dialect=env_t.dialect, reasoning_effort=env_t.reasoning_effort,
+                max_concurrency=int(matched_p["max_concurrency"]) if matched_p else env_t.max_concurrency,
+            )
         else:
             resolved[t] = TierConfig(
                 tier=t, base_url=eff_def.base_url, model=eff_def.model, api_key=eff_def.api_key,
@@ -224,7 +254,7 @@ def _compute_resolved_map(store: MemoryStore, base_tiers: Dict[str, TierConfig])
                 dialect=eff_def.dialect, reasoning_effort=eff_def.reasoning_effort,
                 fallback_base_url=eff_def.fallback_base_url, fallback_model=eff_def.fallback_model,
                 fallback_api_key=eff_def.fallback_api_key, fallback_dialect=eff_def.fallback_dialect,
-                fallback_provider_id=eff_def.fallback_provider_id,
+                fallback_provider_id=eff_def.fallback_provider_id, max_concurrency=eff_def.max_concurrency,
             )
     return resolved, eff_priv
 
@@ -379,22 +409,27 @@ def _save_provider(params: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict
         if actor.strip().lower() in ("user", "cli", "web"):
             vault.grant_scope(cred_ref, f"llm:{pid}", actor=actor)
     enabled = 0 if params.get("enabled") is False else 1
+    raw_conc = params.get("max_concurrency")
     with mem._lock:
-        existing = mem.conn.execute("SELECT models_json, last_health FROM llm_providers WHERE provider_id = ?", (pid,)).fetchone()
+        existing = mem.conn.execute("SELECT models_json, last_health, max_concurrency, preset FROM llm_providers WHERE provider_id = ?", (pid,)).fetchone()
+        eff_preset = preset_id if ("preset" in params or "preset_id" in params or not existing) else str(existing[3] or preset_id)
         m_json = existing[0] if existing else json.dumps([{"id": m, "label": m, "loaded": False, "context_window": preset["default_context"]} for m in preset.get("models", [])])
         last_h = existing[1] if existing else ""
+        def_c = int(existing[2]) if existing and existing[2] else _default_provider_concurrency(eff_preset, base_url)
+        max_conc = max(1, min(8, int(raw_conc))) if raw_conc not in (None, "") else def_c
         mem.conn.execute(
-            """INSERT INTO llm_providers (provider_id, label, preset, dialect, base_url, credential_ref, is_local, enabled, models_json, last_health, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """INSERT INTO llm_providers (provider_id, label, preset, dialect, base_url, credential_ref, is_local, enabled, max_concurrency, models_json, last_health, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                ON CONFLICT(provider_id) DO UPDATE SET
                  label=excluded.label, preset=excluded.preset, dialect=excluded.dialect, base_url=excluded.base_url,
-                 credential_ref=excluded.credential_ref, is_local=excluded.is_local, enabled=excluded.enabled, updated_at=CURRENT_TIMESTAMP""",
-            (pid, label, preset_id, dialect, base_url, cred_ref, 1 if is_loc else 0, enabled, m_json, last_h),
+                 credential_ref=excluded.credential_ref, is_local=excluded.is_local, enabled=excluded.enabled,
+                 max_concurrency=excluded.max_concurrency, updated_at=CURRENT_TIMESTAMP""",
+            (pid, label, eff_preset, dialect, base_url, cred_ref, 1 if is_loc else 0, enabled, max_conc, m_json, last_h),
         )
         mem.conn.commit()
     bump_model_registry_cache()
     snap = get_model_matrix_snapshot(mem)
-    return {**snap, "provider_id": pid, "summary": f"Saved provider `{pid}` (`{dialect}` @ `{base_url}`{f', Vault=`{cred_ref}`' if cred_ref else ''})."}
+    return {**snap, "provider_id": pid, "summary": f"Saved provider `{pid}` (`{dialect}` @ `{base_url}`, max_concurrency={max_conc}{f', Vault=`{cred_ref}`' if cred_ref else ''})."}
 
 
 def _discover_or_test_provider(params: Dict[str, Any], mem: MemoryStore) -> Dict[str, Any]:

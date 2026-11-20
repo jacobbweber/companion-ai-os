@@ -21,6 +21,7 @@ interface AuxSplitPaneProps {
   target: AuxInspectorTarget;
   onClose: () => void;
   onChanged: () => void;
+  onSelectProject?: (projectId: string) => void;
   onToast: (msg: string) => void;
   onJumpToWiki: (notePath: string) => void;
   onSelectSurface: (s: SurfaceId) => void;
@@ -44,6 +45,7 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
   target,
   onClose,
   onChanged,
+  onSelectProject,
   onToast,
   onJumpToWiki,
 }) => {
@@ -173,9 +175,11 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
 
   const headerTitle =
     target.kind === 'work_item'
-      ? 'Work Item Inspector'
+      ? 'Card & Deliverable'
       : target.kind === 'project'
-        ? 'Goal & Idle Policy'
+        ? target.createNew
+          ? 'New Project'
+          : 'Project Settings'
         : target.kind === 'routine'
           ? target.createNew
             ? 'New Routine'
@@ -270,7 +274,9 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
             mode={target.kind}
             itemId={target.kind === 'work_item' ? target.itemId : undefined}
             projectId={target.projectId}
+            createNewProject={target.kind === 'project' ? Boolean(target.createNew) : false}
             onSaved={onChanged}
+            onCreatedProject={onSelectProject}
             onClose={onClose}
             onToast={onToast}
           />

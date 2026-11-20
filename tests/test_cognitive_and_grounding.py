@@ -402,7 +402,7 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             self.assertNotIn(".rglob(", py_f.read_text(encoding="utf-8"), f"Unpruned `.rglob(` left in {py_f.name}")
 
         stems = sorted(p.stem for p in (settings.root / "companion").glob("*.py") if p.name != "__init__.py")
-        self.assertEqual(len(stems), 46)
+        self.assertEqual(len(stems), 47)
         readme_txt = (settings.root / "README.md").read_text(encoding="utf-8")
         sdd_skill_txt = (settings.root / "skills" / "sdd-compliance" / "SKILL.md").read_text(encoding="utf-8")
         patterns_txt = (settings.root / "skills" / "knowledge-wiki" / "references" / "agentic-patterns.md").read_text(encoding="utf-8")

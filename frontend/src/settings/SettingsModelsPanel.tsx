@@ -23,6 +23,7 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
   const [provDialect, setProvDialect] = useState('openai_compat');
   const [provUrl, setProvUrl] = useState('http://127.0.0.1:11434');
   const [provCredRef, setProvCredRef] = useState('');
+  const [provConcurrency, setProvConcurrency] = useState(1);
   const apiKeyRef = useRef<HTMLInputElement | null>(null);
 
   // Compaction state
@@ -58,6 +59,7 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
       dialect: provDialect,
       base_url: provUrl.trim(),
       credential_ref: provCredRef.trim(),
+      max_concurrency: provConcurrency,
       api_key_value: rawKey,
     });
     if (res.ok) {
@@ -70,6 +72,21 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
     } else {
       onToast(res.error || 'Could not save provider.');
     }
+  };
+
+  const updateProviderConcurrency = async (p: LlmProviderEntry, nextConc: number) => {
+    const res = await callAction('models', {
+      subaction: 'save_provider',
+      provider_id: p.provider_id,
+      label: p.label,
+      dialect: p.dialect,
+      base_url: p.base_url,
+      credential_ref: p.credential_ref,
+      max_concurrency: nextConc,
+    });
+    await loadMatrix();
+    await onRefreshStatus();
+    onToast(res.ok === false ? res.error || 'Could not update concurrency.' : `Set ${p.label} max concurrency to ${nextConc}.`);
   };
 
   const probeProvider = async (p: LlmProviderEntry) => {
@@ -157,7 +174,30 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
             </div>
             <div>
               <label className="field-label">Base URL</label>
-              <input className="input" value={provUrl} onChange={(e) => setProvUrl(e.target.value)} />
+              <input
+                className="input"
+                value={provUrl}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setProvUrl(v);
+                  setProvConcurrency(v.includes(':11434') ? 1 : 4);
+                }}
+              />
+            </div>
+            <div>
+              <label className="field-label">Max Concurrent Requests</label>
+              <select
+                className="select"
+                data-testid="new-provider-concurrency"
+                value={provConcurrency}
+                onChange={(e) => setProvConcurrency(Number(e.target.value))}
+              >
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                  <option key={n} value={n}>
+                    {n} {n === 1 ? '(Serial / Ollama)' : 'Concurrent'}
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="field-label">Vault Credential Ref (Optional)</label>
@@ -199,7 +239,21 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
                   {p.last_health ? ` • ${p.last_health}` : ''}
                 </div>
               </div>
-              <div style={{ display: 'inline-flex', gap: 6 }}>
+              <div style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                <select
+                  className="select"
+                  style={{ width: 'auto', fontSize: 11.5, padding: '4px 8px' }}
+                  title="Max Concurrent LLM Requests"
+                  data-testid={`provider-concurrency-${p.provider_id}`}
+                  value={p.max_concurrency ?? (p.base_url.includes(':11434') ? 1 : 4)}
+                  onChange={(e) => void updateProviderConcurrency(p, Number(e.target.value))}
+                >
+                  {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                    <option key={n} value={n}>
+                      {n}x slots
+                    </option>
+                  ))}
+                </select>
                 <button
                   type="button"
                   className="btn btn-sm"

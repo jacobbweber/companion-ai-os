@@ -37,6 +37,7 @@ class CancelScope:
         self._sockets: List[Any] = []
         self._responses: List[Any] = []
         self._procs: List[Any] = []
+        self._children: List["CancelScope"] = []
 
     @property
     def is_cancelled(self) -> bool:
@@ -120,18 +121,35 @@ class CancelScope:
             with self._lock:
                 self._procs = [p for p in self._procs if p is not proc]
 
+    def spawn_child(self) -> "CancelScope":
+        """Create and register a child `CancelScope` that aborts immediately when this parent scope cancels."""
+        child = CancelScope()
+        with self._lock:
+            if self.cancel_event.is_set():
+                child.cancel()
+            else:
+                self._children.append(child)
+        return child
+
+    def unregister_child(self, child: "CancelScope") -> None:
+        with self._lock:
+            self._children = [c for c in self._children if c is not child]
+
     def cancel(self) -> None:
         with self._lock:
             self.cancel_event.set()
             socks = list(self._sockets)
             resps = list(self._responses)
             procs = list(self._procs)
+            kids = list(self._children)
         for s in socks:
             self._abort_socket_obj(s)
         for rs, _resp in resps:
             self._abort_socket_obj(rs)
         for p in procs:
             self._terminate_proc(p)
+        for k in kids:
+            k.cancel()
 
 
 _CANCEL_SCOPE: contextvars.ContextVar[Optional[CancelScope]] = contextvars.ContextVar(
@@ -217,6 +235,11 @@ def clean_subagent_wire_context() -> Iterator[None]:
 def has_stream_sink() -> bool:
     """Return `True` when a live stream event listener is bound in the current execution context."""
     return _STREAM_SINK.get() is not None
+
+
+def get_active_stream_sink() -> Optional[StreamCallback]:
+    """Return the active live stream callback, if any."""
+    return _STREAM_SINK.get()
 
 
 def emit_stream_event(event: Dict[str, Any]) -> None:

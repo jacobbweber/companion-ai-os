@@ -49,6 +49,7 @@ proj = pg.create_project(title="Garage & Truck Reset", goal_summary="Fix truck a
 h_item = pg.create_item(proj["project_id"], title="Measure garage wall", owner="human", status="ready")
 pg.create_item(proj["project_id"], title="Draft shelving cut-list", owner="companion", depends_on=[h_item["item_id"]])
 execute_core_action("prompts", {"subaction": "save", "name": "morning-scan", "template": "Summarize my open items."}, actor="user", store=store)
+execute_core_action("vault", {"subaction": "declare", "name": "github-pat", "cred_type": "api_key", "description": "GitHub PAT"}, actor="user", store=store)
 execute_core_action("education", {"subaction": "save_course", "title": "ZFS Basics", "modules": ["Pools"]}, actor="user", store=store)
 execute_core_action("education", {"subaction": "upsert_items", "course_id": "zfs-basics", "items": [{"prompt": "What is a vdev?", "answer": "Virtual device"}]}, actor="user", store=store)
 get_endpoint_manager(store=store).propose_endpoint("test-metrics", "http_api", "http://127.0.0.1:9191", actor="companion")
@@ -357,15 +358,22 @@ describe('Companion v3.5 Progressive-Disclosure UI & Headless Core Parity', () =
     expect(container.querySelector('[data-testid="aux-split-pane"]')).toBeTruthy();
     expect(container.querySelector('[data-testid="work-item-inspector"]')).toBeTruthy();
 
-    // Open Project Inspector and configure SDLC Delivery Policy + Blind Vault Git Credential Ref
+    // Open Project Inspector: Personal Goal Board hides Git clutter until switched to Code Repository mode
     const cfgProjBtn = container.querySelector('[data-testid="configure-project-trigger-btn"]') as HTMLButtonElement;
     expect(cfgProjBtn).toBeTruthy();
     await act(async () => {
       cfgProjBtn.click();
     });
     await flushUi(120);
+    expect(container.querySelector('[data-testid="project-delivery-policy-select"]')).toBeNull();
+    const codeModeBtn = container.querySelector('[data-testid="project-mode-code"]') as HTMLButtonElement;
+    expect(codeModeBtn).toBeTruthy();
+    await act(async () => {
+      codeModeBtn.click();
+    });
+    await flushUi(60);
     const delivSelect = container.querySelector('[data-testid="project-delivery-policy-select"]') as HTMLSelectElement;
-    const gitCredInput = container.querySelector('[data-testid="project-git-cred-input"]') as HTMLInputElement;
+    const gitCredInput = container.querySelector('[data-testid="project-git-cred-input"]') as HTMLSelectElement;
     expect(delivSelect).toBeTruthy();
     expect(gitCredInput).toBeTruthy();
     await act(async () => {

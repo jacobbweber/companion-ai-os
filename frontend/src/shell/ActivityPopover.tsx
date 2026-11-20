@@ -3,6 +3,7 @@ import {
   Check,
   Clock,
   Eye,
+  GitBranch,
   Layers,
   ShieldAlert,
   Sparkles,
@@ -11,7 +12,13 @@ import {
   X,
 } from 'lucide-react';
 import { callAction, cancelActiveJob } from '../api';
-import type { AuxInspectorTarget, BackgroundJob, SurfaceId, WebStatus } from '../types';
+import type {
+  AuxInspectorTarget,
+  BackgroundJob,
+  ProjectBoardProjection,
+  SurfaceId,
+  WebStatus,
+} from '../types';
 
 interface ActivityPopoverProps {
   status: WebStatus | null;
@@ -33,10 +40,13 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
   const [resolvingId, setResolvingId] = useState('');
 
+  const refreshJobs = async () => {
+    const res = await callAction<{ jobs?: BackgroundJob[] }>('jobs', { subaction: 'list' });
+    if (res.jobs) setJobs(res.jobs.slice(0, 8));
+  };
+
   useEffect(() => {
-    void callAction<{ jobs?: BackgroundJob[] }>('jobs', { subaction: 'list' }).then((res) => {
-      if (res.jobs) setJobs(res.jobs.slice(0, 6));
-    });
+    void refreshJobs();
   }, []);
 
   const approvals = status?.pending_approvals || [];
@@ -44,6 +54,9 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
   const nudges = (status?.session_nudges || []).filter((n) => n.category !== 'approval');
   const unseenAutonomy = status?.unseen_autonomy_count || 0;
   const activeForeground = status?.active_job?.status === 'running' ? status.active_job : null;
+  const hasForeground = Boolean(status?.busy || activeForeground);
+  const runningBgJobs = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
+  const totalActiveCount = runningBgJobs.length + (hasForeground ? 1 : 0);
 
   const resolveApproval = async (approvalId: string, decision: 'approve' | 'deny') => {
     if (resolvingId) return;
@@ -70,6 +83,47 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
     onToast(r.ok === false ? r.error || 'Could not stop turn.' : 'Stopped active turn.');
   };
 
+  const stopOneJob = async (e: React.MouseEvent, jobId: string) => {
+    e.stopPropagation();
+    const res = await callAction('jobs', { subaction: 'cancel', job_id: jobId });
+    await Promise.all([refreshJobs(), onRefreshStatus()]);
+    onToast(res.summary || `Stopped job ${jobId}.`);
+  };
+
+  const stopAllWorkers = async () => {
+    const ops: Array<Promise<unknown>> = runningBgJobs.map((j) =>
+      callAction('jobs', { subaction: 'cancel', job_id: j.job_id })
+    );
+    if (hasForeground) {
+      ops.push(cancelActiveJob(activeForeground?.job_id || 'active'));
+    }
+    await Promise.all(ops);
+    await Promise.all([refreshJobs(), onRefreshStatus()]);
+    onToast('Stopped all active turns and parallel workers.');
+  };
+
+  const openJobOrCard = async (job: BackgroundJob) => {
+    if (job.starter === 'worktree' && job.project_id) {
+      const bRes = await callAction<ProjectBoardProjection>('agile', {
+        subaction: 'board_view',
+        project_id: job.project_id,
+      });
+      if (bRes.ok) {
+        const matched = (bRes.cards || []).find(
+          (c) => c.active_job_id === job.job_id || c.deliverable?.job_id === job.job_id
+        );
+        if (matched) {
+          onSelectSurface('boards');
+          onInspect({ kind: 'work_item', itemId: matched.item_id, projectId: job.project_id });
+          onClose();
+          return;
+        }
+      }
+    }
+    onInspect({ kind: 'job', jobId: job.job_id });
+    onClose();
+  };
+
   const clearNotifications = async () => {
     const ops: Array<Promise<unknown>> = [
       callAction('approvals', { subaction: 'dismiss_nudges' }),
@@ -92,17 +146,30 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
           padding: '4px 8px 8px',
           borderBottom: '1px solid var(--border-hairline)',
           marginBottom: 4,
+          gap: 6,
         }}
       >
         <strong style={{ fontSize: 12.5 }}>Workspace Activity</strong>
-        {(nudges.length > 0 || unseenAutonomy > 0) && (
-          <button type="button" className="btn btn-ghost btn-sm" onClick={() => void clearNotifications()}>
-            Clear Read
-          </button>
-        )}
+        <div style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+          {totalActiveCount >= 2 && (
+            <button
+              type="button"
+              className="btn btn-danger btn-sm"
+              data-testid="activity-stop-all-btn"
+              onClick={() => void stopAllWorkers()}
+            >
+              <Square size={9} fill="currentColor" /> Stop All ({totalActiveCount})
+            </button>
+          )}
+          {(nudges.length > 0 || unseenAutonomy > 0) && (
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => void clearNotifications()}>
+              Clear Read
+            </button>
+          )}
+        </div>
       </div>
 
-      {(status?.busy || activeForeground) && (
+      {hasForeground && (
         <div className="popover-approval-card" style={{ marginBottom: 6 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
             <span style={{ fontSize: 12, fontWeight: 600 }}>
@@ -194,7 +261,7 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
       )}
 
       <div className="popover-group-label">
-        <span>Background Tasks</span>
+        <span>Parallel Workers &amp; Tasks</span>
         <span className="count-pill">{jobs.length}</span>
       </div>
       {jobs.length === 0 ? (
@@ -202,27 +269,56 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
           No recent background tasks.
         </div>
       ) : (
-        jobs.map((job) => (
-          <button
-            key={job.job_id}
-            type="button"
-            className="popover-row"
-            onClick={() => {
-              onInspect({ kind: 'job', jobId: job.job_id });
-              onClose();
-            }}
-          >
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-              <Terminal size={13} style={{ flexShrink: 0, color: 'var(--text-muted)' }} />
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {job.title || job.goal}
+        jobs.map((job) => {
+          const isJobRunning = job.status === 'running' || job.status === 'queued';
+          const brMatch = /^\[([^\]]+)\]\s*(.*)$/.exec(job.title || '');
+          const branchTag = job.starter === 'worktree' && brMatch ? brMatch[1] : '';
+          const displayTitle = branchTag && brMatch ? brMatch[2] : job.title || job.goal;
+          return (
+            <div
+              key={job.job_id}
+              role="button"
+              tabIndex={0}
+              className="popover-row"
+              onClick={() => void openJobOrCard(job)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void openJobOrCard(job);
+              }}
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0, flex: 1 }}>
+                {branchTag ? (
+                  <GitBranch size={13} style={{ flexShrink: 0, color: 'var(--accent-primary)' }} />
+                ) : (
+                  <Terminal size={13} style={{ flexShrink: 0, color: 'var(--text-muted)' }} />
+                )}
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {displayTitle}
+                </span>
+                {branchTag && (
+                  <span className="badge mono" style={{ fontSize: 10 }}>
+                    {branchTag.replace(/^feat\//, '')}
+                  </span>
+                )}
               </span>
-            </span>
-            <span className={`badge ${job.status === 'done' ? 'ok' : job.status === 'running' ? 'accent' : ''}`}>
-              {job.status}
-            </span>
-          </button>
-        ))
+              <span style={{ display: 'inline-flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
+                <span className={`badge ${job.status === 'done' ? 'ok' : isJobRunning ? 'accent' : ''}`}>
+                  {job.status}
+                </span>
+                {isJobRunning && (
+                  <button
+                    type="button"
+                    className="btn btn-danger btn-sm"
+                    style={{ padding: '2px 6px', fontSize: 10.5 }}
+                    data-testid={`activity-stop-job-${job.job_id}`}
+                    onClick={(e) => void stopOneJob(e, job.job_id)}
+                  >
+                    <Square size={8} fill="currentColor" /> Stop
+                  </button>
+                )}
+              </span>
+            </div>
+          );
+        })
       )}
 
       {nudges.length > 0 && (

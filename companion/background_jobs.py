@@ -93,6 +93,7 @@ _DEFAULT_WORKER_TOOLS: Tuple[str, ...] = (
 
 _RECOVERED_DBS: Set[str] = set()
 _CANCEL_SCOPES: Dict[str, CancelScope] = {}
+_COMPLETION_HOOKS: Dict[str, Callable[[Dict[str, Any]], None]] = {}
 _JOBS_LOCK = threading.RLock()
 
 
@@ -234,6 +235,8 @@ class BackgroundJobManager:
         recipe_params: Optional[Dict[str, Any]] = None,
         dag_name: str = "",
         dag_params: Optional[Dict[str, Any]] = None,
+        on_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
+        job_id_override: str = "",
     ) -> Dict[str, Any]:
         """Enqueue and start a background job, returning immediately (`queued`/`running`) or synchronously when `run_in_background=False`."""
         clean_goal = redact_secrets((goal or "").strip())
@@ -245,7 +248,7 @@ class BackgroundJobManager:
         eff_kind = "dag" if kind in ("dag", "recipe") and eff_dag else (kind if kind in ("worker", "dag", "routine", "mcp_inbound") else "worker")
         eff_tier = (tier or "fast").strip().lower()
         paired_tools = resolve_paired_worker_tools(allowed_tools)
-        job_id = f"bgj_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+        job_id = job_id_override.strip() or f"bgj_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
         pid = settings.get_workspace().project_id
 
         meta_goal = json.dumps({"dag": eff_dag, "params": eff_params, "goal": clean_goal}) if eff_kind == "dag" and eff_dag else clean_goal
@@ -257,13 +260,15 @@ class BackgroundJobManager:
                 (
                     job_id, eff_title, meta_goal, eff_kind, (starter or "chat")[:32],
                     (session_id or "main")[:64], pid, eff_tier, json.dumps(paired_tools),
-                    max(1, min(int(max_iters or 8), 20)), max(5, int(timeout_sec or 600)),
+                    max(1, min(int(max_iters or 8), 25)), max(5, int(timeout_sec or 600)),
                 ),
             )
             self.store.conn.commit()
 
         with _JOBS_LOCK:
             _CANCEL_SCOPES[job_id] = CancelScope()
+            if on_complete is not None:
+                _COMPLETION_HOOKS[job_id] = on_complete
 
         if run_in_background:
             self._spawn_clean_worker_thread(job_id)
@@ -354,6 +359,7 @@ class BackgroundJobManager:
 
         deadline = time.monotonic() + float(job.get("timeout_sec") or 600)
         is_live_db = mem.db_path.resolve() == settings.db_path.resolve()
+        eff_prio = "foreground" if str(job.get("starter") or "") in ("worktree", "board_worktree") else "background"
         st, raw_out, meta_err = "failed", "", ""
         try:
             with (
@@ -364,7 +370,7 @@ class BackgroundJobManager:
                 memory_store_context(mem),
                 get_project_graph(store=mem).project_workspace_scope(job.get("project_id")),
                 tier_context(job.get("tier") or "fast"),
-                model_gate.background_context(abort_check=lambda: self.is_cancel_requested(job_id)),
+                model_gate.background_context(abort_check=lambda: self.is_cancel_requested(job_id), priority=eff_prio),
             ):
                 if job["kind"] in ("dag", "recipe") and str(job["goal"]).startswith("{"):
                     spec = json.loads(job["goal"])
@@ -436,6 +442,18 @@ class BackgroundJobManager:
                 )
                 mem.conn.commit()
             enqueue_session_nudge(f"Job `{job['title']}` ended with status `{st}`: {err_clean[:140]}", category="job", session_id=job["session_id"], ref_id=job_id, store=mem)
+        self._fire_completion_hook(job_id)
+
+    def _fire_completion_hook(self, job_id: str) -> None:
+        with _JOBS_LOCK:
+            hook = _COMPLETION_HOOKS.pop(job_id, None)
+        if hook is not None:
+            done_job = self.get_job(job_id)
+            if done_job is not None:
+                try:
+                    hook(done_job)
+                except Exception:
+                    pass
 
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         cols = [
@@ -452,8 +470,8 @@ class BackgroundJobManager:
 
     def list_jobs(self, status: str = "", limit: int = 20) -> List[Dict[str, Any]]:
         cols = [
-            "job_id", "title", "kind", "starter", "session_id", "tier", "status",
-            "envelope_summary", "overflow_wiki_path", "approval_id", "error", "created_at", "started_at", "finished_at",
+            "job_id", "title", "kind", "starter", "session_id", "project_id", "tier", "status",
+            "envelope_summary", "partial_output", "overflow_wiki_path", "approval_id", "error", "created_at", "started_at", "finished_at",
         ]
         if status and status.strip().lower() not in ("", "all"):
             return self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM background_jobs WHERE status = ? ORDER BY rowid DESC LIMIT ?", (status.strip().lower(), max(1, int(limit))))
@@ -471,6 +489,8 @@ class BackgroundJobManager:
             with self.store._lock:
                 self.store.conn.execute("UPDATE background_jobs SET status = 'cancelled', error = 'Cancelled by user.', finished_at = CURRENT_TIMESTAMP WHERE job_id = ?", (row["job_id"],))
                 self.store.conn.commit()
+        if row["status"] in ("queued", "waiting_approval"):
+            self._fire_completion_hook(row["job_id"])
         return {"ok": True, "job_id": row["job_id"], "status": "cancelled", "summary": f"Cancelled background job `{row['job_id']}`."}
 
     def resume_job(self, job_id: str, run_in_background: bool = True, resolution_note: str = "", approved_node_id: str = "") -> Dict[str, Any]:

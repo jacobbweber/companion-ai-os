@@ -284,6 +284,10 @@ def tool_workflow_manage(args: Dict[str, Any]) -> str:
         skill = (str_arg(args, "skill") or str_arg(args, "skill_name")) or None
         tier = str_arg(args, "tier") or None
         return f"=== Subagent Worker Result (`{skill or 'worker'}` | tier=`{tier or 'fast'}`) ===\n{run_subagent(goal=goal, skill_name=skill, max_iters=int_arg(args, 'max_iters', 8), verbose=False, tier=tier)}"
+    if action == "parallel_subagents":
+        from companion.worktree_runner import format_parallel_subagents_tool
+
+        return format_parallel_subagents_tool(args)
     if action in ("list_dags", "list_recipes"):
         return workflow_engine.format_dags_catalog()
     if action in ("check_skill", "bootstrap_skill", "promote_skill", "run_script"):
@@ -417,6 +421,9 @@ def summarize_tool_step(name: str, args: Dict[str, Any]) -> str:
         return f"{'Web search' if name == 'web_search' else 'Searched'} \"{q[:48]}\""
     if name in ("run_shell", "run_python"):
         return f"Ran {str_arg(a, 'command')[:52]}" if name == "run_shell" else "Executed Python snippet"
+    if name == "workflow_manage" and act == "parallel_subagents":
+        raw_t = a.get("tasks")
+        return f"Ran {len(raw_t) if isinstance(raw_t, list) else 1} parallel subagents"
     if name == "wiki_manage":
         tgt = pth or str_arg(a, "title") or str_arg(a, "query") or str_arg(a, "domain")
         verb = "Saved Wiki" if act in ("save", "curate", "capture_inbox") else f"Wiki {act or 'list'}"

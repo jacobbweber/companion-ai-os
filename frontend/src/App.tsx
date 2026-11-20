@@ -183,20 +183,10 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleCreateProject = async (title: string) => {
-    const res = await callAction<{ project?: ProjectGraphEntry }>('agile', {
-      subaction: 'create_project',
-      title,
-      kind: 'project',
-    });
-    if (res.ok && res.project) {
-      syncProjectFocus(res.project.project_id);
-      await refreshStatusAndProjects();
-      handleSelectSurface('boards');
-      showToast(`Created project "${res.project.title}".`);
-    } else {
-      showToast(res.error || 'Could not create project.');
-    }
+  const openNewProjectInspector = () => {
+    setShowActivity(false);
+    handleSelectSurface('boards');
+    setAuxTarget({ kind: 'project', projectId: '', createNew: true });
   };
 
   const activeProjTitle =
@@ -220,7 +210,7 @@ export const App: React.FC = () => {
         onToggleCollapse={() => setRailCollapsed((c) => !c)}
         onSelectSurface={handleSelectSurface}
         onSelectProject={handleSelectProject}
-        onCreateProject={handleCreateProject}
+        onOpenNewProject={openNewProjectInspector}
         onOpenSearch={() => setSearchOpen(true)}
         onOpenSettings={() => {
           setShowActivity(false);
@@ -395,6 +385,7 @@ export const App: React.FC = () => {
             setDataRefreshNonce((n) => n + 1);
             void refreshStatusAndProjects();
           }}
+          onSelectProject={(pid) => syncProjectFocus(pid)}
           onToast={showToast}
           onJumpToWiki={(notePath) => {
             setWikiInitialPath(notePath);

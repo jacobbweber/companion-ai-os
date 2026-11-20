@@ -102,10 +102,12 @@ TOOLS: List[Dict[str, Any]] = [
         "verification_result": _p("string", "Evidence or test output proving task completion."),
         "estimated_effort": _p("string", "T-shirt or time estimate (`S`, `M`, `L`, `30m`)."),
     }, ["action"]),
-    _tool("workflow_manage", "Drive the Software Engineering State-Machine Workflow (`INTAKE..COMPLETE` with code snapshots & unit-test gates), draft/approve code Blueprints, run `/goal` software builds, forge/run 3-Tier Capability Packs, spawn subagents, or execute/resume code-controlled Python DAGs (`dags/*.py`). NEVER use `start`/`autonomy`/`blueprint` for personal, home, or work goals — use `agile_manage` instead.", {
-        "action": _p("string", "Workflow state-machine, Skill Forge, or code-controlled DAG runtime action.", enum=["start", "status", "transition", "recover", "blueprint", "approve", "autonomy", "http_smoke", "subagent", "list_dags", "run_dag", "resume_dag", "check_skill", "bootstrap_skill", "promote_skill", "run_script", "abort", "complete"]),
+    _tool("workflow_manage", "Drive the Software Engineering State-Machine Workflow (`INTAKE..COMPLETE` with code snapshots & unit-test gates), draft/approve code Blueprints, run `/goal` software builds, forge/run 3-Tier Capability Packs, spawn subagents (`subagent` or `parallel_subagents`), or execute/resume code-controlled Python DAGs (`dags/*.py`). NEVER use `start`/`autonomy`/`blueprint` for personal, home, or work goals — use `agile_manage` instead.", {
+        "action": _p("string", "Workflow state-machine, Skill Forge, subagent, or code-controlled DAG runtime action.", enum=["start", "status", "transition", "recover", "blueprint", "approve", "autonomy", "http_smoke", "subagent", "parallel_subagents", "list_dags", "run_dag", "resume_dag", "check_skill", "bootstrap_skill", "promote_skill", "run_script", "abort", "complete"]),
         "workflow_type": _p("string", "Software workflow classification (never use for personal goals — use `agile_manage` instead).", enum=["self_evolution", "engineering_feature", "bug_fix", "architecture_refactor"]),
         "goal": _p("string", "Objective text (pass `'resume'` with `action='autonomy'` to resume an interrupted goal)."),
+        "tasks": {"type": "array", "description": "Array of 1-4 `{goal, skill, tier, worktree_branch}` subagent task objects when `action='parallel_subagents'`.", "items": {"type": "object"}},
+        "max_concurrency": _p("integer", "Maximum concurrent subagent workers (1-4, default 3) when `action='parallel_subagents'`."),
         "module": _p("string", "Target Python web server module for `http_smoke` (default `surfaces.web_server`)."),
         "endpoints": _p("array", "URL paths to probe during `http_smoke` (e.g. `['/','/api/status']`).", items_type="string"),
         "skill": _p("string", "Skill name (`skills/<skill>/` or `data/skills/<skill>/`) for `subagent`, `check_skill`, `bootstrap_skill`, or `run_script`."),
@@ -165,13 +167,7 @@ TOOLS: List[Dict[str, Any]] = [
         "allowed_tools": _p("string", "Optional comma-separated tool names to grant the worker."),
     }, ["action"]),
     _tool("wiki_manage", "Operate the Co-Owned 4-Folder Knowledge Wiki Warehouse (`01_inbox`..`04_archive`), 11 governed templates, Multi-Turn Deliberate Curation (`inspect_graduation` -> `read` -> `validate_curation` -> `commit_curation`), `ontology` cross-domain bridges, Never-Delete lineage (`curation_history`/`revert_curation`), and 2D Mind Map.", {
-        "action": _p("string", "Wiki Warehouse, Template, Maintenance, or Deliberate Curation operation (`capture_inbox` stages in `01_inbox/`; `curate`/`save` writes governed notes; `inspect_graduation` -> `validate_curation` -> `commit_curation` graduates into `02_knowledge/`).", enum=[
-            "list", "tree", "read", "search", "capture_inbox", "save", "curate", "graduate",
-            "inspect_graduation", "validate_curation", "commit_curation", "curation_history", "revert_curation",
-            "list_templates", "read_template", "save_template", "tag_authority", "create_proxy_note", "deep_curate_job",
-            "diff", "consolidate_ontology", "verify_note", "list_stale", "stage_turn",
-            "trash", "list_trash", "restore", "graph", "reindex", "export_chat",
-        ]),
+        "action": _p("string", "Wiki Warehouse, Template, Maintenance, or Deliberate Curation operation (`capture_inbox` stages in `01_inbox/`; `curate`/`save` writes governed notes; `inspect_graduation` -> `validate_curation` -> `commit_curation` graduates into `02_knowledge/`).", enum=["list", "tree", "read", "search", "capture_inbox", "save", "curate", "graduate", "inspect_graduation", "validate_curation", "commit_curation", "curation_history", "revert_curation", "list_templates", "read_template", "save_template", "tag_authority", "create_proxy_note", "deep_curate_job", "diff", "consolidate_ontology", "verify_note", "list_stale", "stage_turn", "trash", "list_trash", "restore", "graph", "reindex", "export_chat"]),
         "path": _p("string", "Relative Wiki note path or stem (e.g. `01_inbox/my-note.md` or `02_knowledge/homelab/esxi-host.md`)."),
         "title": _p("string", "Human-readable note or template title."),
         "summary": _p("string", "1-2 sentence executive summary required in `02_knowledge/` frontmatter (or asset summary for `create_proxy_note`)."),
@@ -257,8 +253,8 @@ TOOLS: List[Dict[str, Any]] = [
         "name": _p("string", "Template slug for `prompt_save` or `prompt_render`."),
         "template": _p("string", "Reusable prompt text (with optional `{{var}}` placeholders) for `prompt_save`."),
     }, ["action"]),
-    _tool("agile_manage", "Operate the Universal Headless Project & Goal Graph (`projects`, `milestones`, `timeboxes`, `work_items` with `owner`, `depends_on`, DIKW `stage_kind`, and `TriggerPolicy`) plus Kanban/Sprint projections.", {
-        "action": _p("string", "Project & Goal Graph or Kanban projection sub-action (`create_milestone`/`save_epic` for goals; `create_item`/`save_card` for work items).", enum=["board_view", "list_items", "roadmap", "list_boards", "create_project", "update_project", "save_board", "list_epics", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "list_sprints", "create_timebox", "start_sprint", "rollover_sprint", "capacity", "create_item", "update_item", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker"]),
+    _tool("agile_manage", "Operate the Universal Headless Project & Goal Graph (`projects`, `milestones`, `timeboxes`, `work_items` with `owner`, `depends_on`, DIKW `stage_kind`, parallel `git worktree` card execution, and `TriggerPolicy`) plus Kanban/Sprint projections.", {
+        "action": _p("string", "Project & Goal Graph, Kanban projection, or isolated worktree card sub-action.", enum=["board_view", "list_items", "roadmap", "list_boards", "probe_repo", "create_project", "update_project", "save_board", "list_epics", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "list_sprints", "create_timebox", "start_sprint", "rollover_sprint", "capacity", "create_item", "update_item", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker", "start_item", "run_parallel_ready", "merge_item", "push_item_pr", "request_changes", "discard_worktree"]),
         "project_id": _p("string", "Project ID (`prj_...` or board slug such as `life-home`, `work-career`, `software-companion`)."),
         "board_id": _p("string", "Board slug alias (`all-active-sprint`, `life-home`, `work-career`, `software-companion`, or custom project ID)."),
         "epic_id": _p("string", "Milestone/Epic ID (`ms_...` or `ep_...`) when updating/deleting or linking a child work item."),
@@ -286,6 +282,8 @@ TOOLS: List[Dict[str, Any]] = [
         "workspace_path": _p("string", "Optional local Git repository directory bound to this project (`create_project` or `update_project`)."),
         "delivery_policy": _p("string", "Per-project Git delivery posture (`local_only` default, `remote_branch_pr`, or `ask_me`).", enum=["local_only", "remote_branch_pr", "ask_me"]),
         "git_credential_ref": _p("string", "Optional symbolic Blind Vault slug (`vault://...`) for authenticated Git SSH/PAT operations."),
+        "max_parallel_workers": _p("integer", "Maximum parallel worktree card workers for this project (1-4, default 2)."),
+        "feedback": _p("string", "Optional human review feedback when `action='request_changes'` or `'start_item'`."),
         "test_command": _p("string", "Optional custom test command override for this project."),
         "preview_command": _p("string", "Optional custom `dev_preview` startup command template (supports `{port}`)."),
     }, ["action"]),
@@ -450,16 +448,12 @@ _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "sdd_manage": frozenset({"sync", "add_adr"}),
     "workflow_manage": frozenset({"start", "transition", "abort", "complete", "recover", "autonomy", "blueprint", "approve", "run_dag", "resume_dag", "run_recipe", "bootstrap_skill", "run_script"}),
     "job_manage": frozenset({"dispatch", "cancel", "resume"}),
-    "wiki_manage": frozenset({
-        "capture_inbox", "save", "curate", "graduate", "commit_curation", "revert_curation",
-        "save_template", "create_proxy_note", "deep_curate_job", "consolidate_ontology",
-        "verify_note", "stage_turn", "trash", "restore", "export_chat",
-    }),
+    "wiki_manage": frozenset({"capture_inbox", "save", "curate", "graduate", "commit_curation", "revert_curation", "save_template", "create_proxy_note", "deep_curate_job", "consolidate_ontology", "verify_note", "stage_turn", "trash", "restore", "export_chat"}),
     "vault_manage": frozenset({"declare", "request_scope"}),
     "endpoint_manage": frozenset({"propose", "register", "remove", "ssh_exec", "winrm_exec", "api_request"}),
     "mcp_manage": frozenset({"propose_server", "register_server", "call_tool", "harvest_skill", "register_partner", "delegate_partner"}),
     "routine_manage": frozenset({"create", "enable", "disable", "delete", "tick", "run_now", "autonomy_on", "autonomy_off", "prompt_save"}),
-    "agile_manage": frozenset({"create_project", "update_project", "save_board", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "create_timebox", "start_sprint", "rollover_sprint", "create_item", "create_card", "update_item", "update_card", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker"}),
+    "agile_manage": frozenset({"create_project", "update_project", "save_board", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "create_timebox", "start_sprint", "rollover_sprint", "create_item", "create_card", "update_item", "update_card", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker", "start_item", "start_card", "dispatch_item", "run_parallel_ready", "run_ready", "merge_item", "merge_local", "push_item_pr", "push_and_pr", "request_changes", "discard_worktree"}),
     "calendar_manage": frozenset({"add_event", "delete_event"}),
     "education_manage": frozenset({"save_course", "set_active", "advance_stage", "upsert_items", "grade_item", "curate_note"}),
     "git_manage": frozenset({"branch", "worktree_add", "worktree_remove", "commit", "fetch", "pull", "push"}),
@@ -467,10 +461,7 @@ _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
 }
 
 _PHASE_ACTION_EXCEPTIONS: Dict[str, FrozenSet[Tuple[str, str]]] = {
-    "VERIFY": frozenset({
-        ("workflow_manage", "run_script"), ("dev_preview", "start"), ("dev_preview", "vision_critique"),
-        ("dev_preview", "stop"), ("dev_preview", "stop_all"),
-    }),
+    "VERIFY": frozenset({("workflow_manage", "run_script"), ("dev_preview", "start"), ("dev_preview", "vision_critique"), ("dev_preview", "stop"), ("dev_preview", "stop_all")}),
     "REFLECT": frozenset({("memory_manage", "upsert_fact"), ("memory_manage", "add_note"), ("wiki_manage", "capture_inbox")}),
 }
 

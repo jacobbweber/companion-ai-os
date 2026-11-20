@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React from 'react';
 import {
   BookOpen,
   Calendar,
   Clock,
   Folder,
+  FolderGit2,
   FolderKanban,
   FolderPlus,
   MessageSquare,
@@ -24,7 +25,7 @@ interface LeftSidebarProps {
   onToggleCollapse: () => void;
   onSelectSurface: (surface: SurfaceId) => void;
   onSelectProject: (projectId: string, openBoard?: boolean) => void;
-  onCreateProject: (title: string) => Promise<void>;
+  onOpenNewProject: () => void;
   onOpenSearch: () => void;
   onOpenSettings: () => void;
   onRefresh: () => void;
@@ -48,23 +49,11 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   onToggleCollapse,
   onSelectSurface,
   onSelectProject,
-  onCreateProject,
+  onOpenNewProject,
   onOpenSearch,
   onOpenSettings,
   onRefresh,
 }) => {
-  const [creatingProj, setCreatingProj] = useState(false);
-  const [projDraft, setProjDraft] = useState('');
-
-  const submitNewProject = async (ev: React.FormEvent) => {
-    ev.preventDefault();
-    const clean = projDraft.trim();
-    if (!clean) return;
-    setProjDraft('');
-    setCreatingProj(false);
-    await onCreateProject(clean);
-  };
-
   const openCards = status?.agile_summary?.open_cards || 0;
   const unseenAutonomy = status?.unseen_autonomy_count || 0;
   const dueStudy = status?.education_summary?.due_total || 0;
@@ -155,31 +144,20 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
         <button
           type="button"
           className="icon-btn"
+          data-testid="sidebar-new-project-btn"
           style={{ width: 22, height: 22 }}
-          title="New Goal / Project"
-          onClick={() => setCreatingProj((v) => !v)}
+          title="New Personal or Code Repository Project"
+          onClick={onOpenNewProject}
         >
           <FolderPlus size={13} />
         </button>
       </div>
 
-      {creatingProj && (
-        <form onSubmit={(e) => void submitNewProject(e)} style={{ marginBottom: 8 }}>
-          <input
-            type="text"
-            className="input"
-            placeholder="Project or goal title..."
-            value={projDraft}
-            onChange={(e) => setProjDraft(e.target.value)}
-            autoFocus
-          />
-        </form>
-      )}
-
       <div className="rail-projects-scroll">
         {projects.map((proj) => {
           const isActive =
             selectedProjectId === proj.project_id || selectedProjectId === proj.slug;
+          const isCodeRepo = Boolean(proj.workspace_path && proj.workspace_path.trim());
           return (
             <div
               key={proj.project_id}
@@ -192,7 +170,11 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
               }}
             >
               <span className="rail-nav-left">
-                <Folder size={14} style={{ flexShrink: 0, opacity: 0.78 }} />
+                {isCodeRepo ? (
+                  <FolderGit2 size={14} style={{ flexShrink: 0, color: 'var(--accent-primary)' }} />
+                ) : (
+                  <Folder size={14} style={{ flexShrink: 0, opacity: 0.78 }} />
+                )}
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{proj.title}</span>
               </span>
               <button

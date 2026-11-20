@@ -10,7 +10,7 @@ Provides:
    OS process-group lifecycle, live ring-buffer logs, loopback HTTP probes, vision critique, and guaranteed teardown.
 """
 
-import atexit, base64, collections, contextlib, json, os, re, shutil, signal, socket, subprocess, sys  # noqa: E401
+import atexit, base64, collections, contextlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys  # noqa: E401
 import tempfile, threading, time, urllib.error, urllib.request, uuid  # noqa: E401
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,9 +28,9 @@ from companion.tool_schemas import bool_arg, int_arg, str_arg
 from companion.vault import _lock_windows_owner_dacl, get_vault_manager
 
 __all__ = [
-    "PreviewInstance", "PreviewProcessManager", "check_git_stage_safety",
-    "discover_repo_sdlc_context", "preview_manager", "preview_turn_cleanup_scope",
-    "tool_dev_preview", "tool_git_manage",
+    "PreviewInstance", "PreviewProcessManager", "_current_branch", "_run_git_cmd",
+    "check_git_stage_safety", "discover_repo_sdlc_context", "preview_manager",
+    "preview_turn_cleanup_scope", "tool_dev_preview", "tool_git_manage",
 ]
 
 _PROTECTED_BRANCHES = frozenset({"main", "master", "production", "release"})
@@ -247,6 +247,8 @@ def _handle_git_worktree(action: str, repo_root: Path, args: Dict[str, Any]) -> 
     wt_dir = Path(wt_raw).resolve() if wt_raw else (repo_root.parent / ".worktrees" / repo_root.name / slug).resolve()
     if wt_dir.is_relative_to(settings.root.resolve()):
         return "SAFETY GUARD REJECTED: worktree_path must live outside Companion's installed `app/` directory."
+    if (wt_dir / ".git").exists():
+        return json.dumps({"ok": True, "reused": True, "branch": _current_branch(wt_dir), "worktree_path": str(wt_dir), "summary": f"Reusing existing worktree `{wt_dir}` on branch `{_current_branch(wt_dir)}`."})
     wt_dir.parent.mkdir(parents=True, exist_ok=True)
     chk_rc, _ = _run_git_cmd(repo_root, ["show-ref", "--verify", f"refs/heads/{raw_br}"])
     wt_args = ["worktree", "add", str(wt_dir), raw_br] if chk_rc == 0 else ["worktree", "add", "-b", raw_br, str(wt_dir)]
@@ -456,10 +458,6 @@ def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
         proc.kill()
     with contextlib.suppress(Exception):
         proc.wait(timeout=3)
-    for pipe in (proc.stdout, proc.stderr):
-        if pipe is not None:
-            with contextlib.suppress(Exception):
-                pipe.close()
 
 
 class PreviewProcessManager:
@@ -520,7 +518,9 @@ class PreviewProcessManager:
             return {"ok": False, "error": cmd_err}
         alloc_port = _allocate_loopback_port(port)
         if command.strip():
-            cmd_spec, use_shell, eff_health = command.replace("{port}", str(alloc_port)), True, (health_path or "/")
+            expanded, eff_health = command.replace("{port}", str(alloc_port)), (health_path or "/")
+            use_shell = any(op in expanded for op in ("|", "&", ";", ">", "<", "\n"))
+            cmd_spec = expanded if use_shell else [t.strip('"') for t in shlex.split(expanded, posix=(os.name != "nt"))]
         else:
             cmd_spec, use_shell, auto_health = _auto_detect_preview_command(target_cwd, alloc_port)
             eff_health = health_path or auto_health

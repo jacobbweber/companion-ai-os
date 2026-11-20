@@ -6,35 +6,17 @@ Uses Python standard library urllib.request across `openai_compat`, `anthropic_m
 per-endpoint `ModelGate` swap scheduling, `<think>` extraction, and `<tool_call>` rescue.
 """
 
-import contextlib
-import contextvars
-import json
-import re
-import sys
-import threading
-import time
-import urllib.error
-import urllib.request
-import uuid
+import contextlib, contextvars, json, re, sys, threading, time, urllib.error, urllib.request, uuid  # noqa: E401
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from companion.config import CAPABILITY_TIERS, TierConfig, settings
 from companion.llm_wire import (
-    build_openai_resource_url,
-    heal_http_400_request,
-    inject_openai_turn_attachments,
-    is_local_or_lan_endpoint,
-    prepare_wire_request,
-    read_wire_response,
-    urlopen_safe,
+    build_openai_resource_url, heal_http_400_request, inject_openai_turn_attachments,
+    is_local_or_lan_endpoint, prepare_wire_request, read_wire_response, urlopen_safe,
 )
 from companion.streaming import (
-    check_cancelled,
-    emit_stream_event,
-    get_active_cancel_scope,
-    has_stream_sink,
-    rescue_text_tool_calls,
-    strip_thinking_tags,
+    check_cancelled, emit_stream_event, get_active_cancel_scope,
+    has_stream_sink, rescue_text_tool_calls, strip_thinking_tags,
 )
 from companion.telemetry import telemetry
 
@@ -53,11 +35,14 @@ _GLOBAL_FG_THREADS: Dict[int, int] = {}
 
 
 class ModelGate:
-    """Per-endpoint serialized execution & foreground-priority gate with live Docker/VRAM swap tracking."""
+    """Per-endpoint `BoundedSemaphore` concurrency, foreground-priority & VRAM-swap execution gate."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_concurrency: int = 1) -> None:
         self._cond = threading.Condition()
-        self._exec_lock = threading.RLock()
+        self._max_concurrency = max(1, min(8, int(max_concurrency or 1)))
+        self._semaphore = threading.BoundedSemaphore(self._max_concurrency)
+        self._in_flight = 0
+        self._thread_depth: Dict[int, int] = {}
         self._fg_active = 0
         self._bg_waiting = 0
         self._bg_in_flight = 0
@@ -65,6 +50,18 @@ class ModelGate:
         self.loaded_checked_mono: float = 0.0
         self._swap_info: Optional[Dict[str, Any]] = None
         self._health_unsupported: bool = False
+
+    @property
+    def max_concurrency(self) -> int:
+        return self._max_concurrency
+
+    def set_max_concurrency(self, limit: int) -> None:
+        eff = max(1, min(8, int(limit or 1)))
+        with self._cond:
+            if self._in_flight == 0 and self._max_concurrency != eff:
+                self._max_concurrency = eff
+                self._semaphore = threading.BoundedSemaphore(eff)
+                self._cond.notify_all()
 
     @contextlib.contextmanager
     def foreground_turn(self) -> Iterator[None]:
@@ -99,9 +96,9 @@ class ModelGate:
             _CALL_PRIORITY.reset(tok)
 
     @contextlib.contextmanager
-    def background_context(self, abort_check: Optional[Callable[[], bool]] = None) -> Iterator[None]:
-        """Run a block (such as an idle hobby cycle) at background priority with optional keyboard abort check."""
-        p_tok = _CALL_PRIORITY.set("background")
+    def background_context(self, abort_check: Optional[Callable[[], bool]] = None, priority: str = "background") -> Iterator[None]:
+        """Run a block (idle routine at `'background'` or card worker at `'foreground'`) with optional abort check."""
+        p_tok = _CALL_PRIORITY.set((priority or "background").strip().lower())
         a_tok = _ABORT_CHECK.set(abort_check)
         try:
             yield
@@ -110,20 +107,60 @@ class ModelGate:
             _CALL_PRIORITY.reset(p_tok)
 
     @contextlib.contextmanager
-    def _acquire_exec_lock_cancelable(self) -> Iterator[None]:
-        while not self._exec_lock.acquire(timeout=0.05):
-            check_cancelled()
-            abort_fn = _ABORT_CHECK.get()
-            if abort_fn is not None and abort_fn():
-                raise InterruptedError("LLM call aborted while waiting for endpoint lock.")
+    def _acquire_slot_cancelable(self, limit: Optional[int] = None, exclusive: bool = False) -> Iterator[None]:
+        tid = threading.get_ident()
+        with self._cond:
+            depth = self._thread_depth.get(tid, 0)
+            if depth > 0:
+                self._thread_depth[tid] = depth + 1
+                reentrant = True
+            else:
+                reentrant = False
+        if reentrant:
+            try:
+                yield
+            finally:
+                with self._cond:
+                    rem = self._thread_depth.get(tid, 1) - 1
+                    if rem <= 0:
+                        self._thread_depth.pop(tid, None)
+                    else:
+                        self._thread_depth[tid] = rem
+            return
+
+        eff_limit = 1 if exclusive else max(1, min(8, int(limit if limit is not None else self._max_concurrency)))
+        with self._cond:
+            while True:
+                check_cancelled()
+                abort_fn = _ABORT_CHECK.get()
+                if abort_fn is not None and abort_fn():
+                    raise InterruptedError("LLM call aborted while waiting for endpoint semaphore.")
+                must_drain = (exclusive and self._in_flight > 0) or (eff_limit != self._max_concurrency and self._in_flight > 0)
+                if not must_drain:
+                    if self._max_concurrency != eff_limit:
+                        self._max_concurrency = eff_limit
+                        self._semaphore = threading.BoundedSemaphore(eff_limit)
+                    if self._semaphore.acquire(blocking=False):
+                        sem = self._semaphore
+                        self._in_flight += 1
+                        self._thread_depth[tid] = 1
+                        break
+                self._cond.wait(timeout=0.02)
         try:
             yield
         finally:
-            self._exec_lock.release()
+            with self._cond:
+                self._thread_depth.pop(tid, None)
+                self._in_flight = max(0, self._in_flight - 1)
+                sem.release()
+                self._cond.notify_all()
 
     @contextlib.contextmanager
-    def acquire_call(self, priority: Optional[str] = None, serialize: bool = True) -> Iterator[None]:
-        """Serialize same-endpoint local LLM calls (`_exec_lock`) while yielding background calls to foreground turns."""
+    def acquire_call(
+        self, priority: Optional[str] = None, serialize: bool = True,
+        max_concurrency: Optional[int] = None, exclusive: bool = False,
+    ) -> Iterator[None]:
+        """Acquire a `BoundedSemaphore` endpoint slot while yielding `'background'` idle calls to foreground turns."""
         check_cancelled()
         eff_prio = (priority or _CALL_PRIORITY.get() or "foreground").lower()
         abort_fn = _ABORT_CHECK.get()
@@ -132,7 +169,7 @@ class ModelGate:
             on_fg_thread = tid in _GLOBAL_FG_THREADS
         if eff_prio != "background" or on_fg_thread:
             if serialize:
-                with self._acquire_exec_lock_cancelable():
+                with self._acquire_slot_cancelable(limit=max_concurrency, exclusive=exclusive):
                     yield
             else:
                 yield
@@ -149,13 +186,13 @@ class ModelGate:
                         any_fg = _GLOBAL_FG_COUNT > 0
                     if self._fg_active == 0 and not any_fg:
                         break
-                    self._cond.wait(timeout=0.05)
+                    self._cond.wait(timeout=0.02)
                 self._bg_in_flight += 1
             finally:
                 self._bg_waiting = max(0, self._bg_waiting - 1)
         try:
             if serialize:
-                with self._acquire_exec_lock_cancelable():
+                with self._acquire_slot_cancelable(limit=max_concurrency, exclusive=exclusive):
                     yield
             else:
                 yield
@@ -166,19 +203,12 @@ class ModelGate:
 
     def begin_swap(self, from_model: Optional[str], to_model: str, base_url: str) -> None:
         with self._cond:
-            self._swap_info = {
-                "swapping": True,
-                "from_model": from_model or "unloaded",
-                "to_model": to_model,
-                "base_url": base_url,
-                "started_mono": time.monotonic(),
-            }
+            self._swap_info = {"swapping": True, "from_model": from_model or "unloaded", "to_model": to_model, "base_url": base_url, "started_mono": time.monotonic()}
 
     def end_swap(self, loaded_model: Optional[str] = None) -> None:
         with self._cond:
             if loaded_model:
-                self.loaded_model = loaded_model
-                self.loaded_checked_mono = time.monotonic()
+                self.loaded_model, self.loaded_checked_mono = loaded_model, time.monotonic()
             self._swap_info = None
 
     def swap_status(self) -> Optional[Dict[str, Any]]:
@@ -186,22 +216,14 @@ class ModelGate:
             if not self._swap_info:
                 return None
             elapsed = round(max(0.0, time.monotonic() - float(self._swap_info["started_mono"])), 1)
-            return {
-                "swapping": True,
-                "from_model": self._swap_info["from_model"],
-                "to_model": self._swap_info["to_model"],
-                "base_url": self._swap_info["base_url"],
-                "elapsed_seconds": elapsed,
-            }
+            return {"swapping": True, "from_model": self._swap_info["from_model"], "to_model": self._swap_info["to_model"], "base_url": self._swap_info["base_url"], "elapsed_seconds": elapsed}
 
     def status(self) -> Dict[str, Any]:
         with self._cond:
             return {
-                "foreground_active": self._fg_active,
-                "background_waiting": self._bg_waiting,
-                "background_in_flight": self._bg_in_flight,
-                "loaded_model": self.loaded_model,
-                "swap": self.swap_status(),
+                "foreground_active": self._fg_active, "background_waiting": self._bg_waiting,
+                "background_in_flight": self._bg_in_flight, "in_flight": self._in_flight,
+                "max_concurrency": self._max_concurrency, "loaded_model": self.loaded_model, "swap": self.swap_status(),
             }
 
 
@@ -509,39 +531,31 @@ def _post_completion(
     target_base_url: str, target_model: str, target_key: str, target_temp: float, target_max_tokens: int,
     target_timeout: int, max_retries: int, priority: Optional[str], tier_label: str,
     dialect: str = "openai_compat", reasoning_effort: str = "", has_tier_fallback: bool = False,
+    max_concurrency: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Execute one serialized HTTP completion cycle across OpenAI/Anthropic/Gemini dialects with Privacy Lock & swap guard."""
-    eff_dialect = (dialect or "openai_compat").strip().lower()
-    span_label = f"{tier_label}:{target_model}" if tier_label else target_model
-    call_start = time.perf_counter()
+    """Execute one bounded-concurrency HTTP completion cycle across OpenAI/Anthropic/Gemini dialects with Privacy Lock & swap guard."""
+    eff_dialect, span_label, call_start = (dialect or "openai_compat").strip().lower(), (f"{tier_label}:{target_model}" if tier_label else target_model), time.perf_counter()
     if settings.effective_privacy_mode() == "local_only" and not is_local_or_lan_endpoint(target_base_url):
         raise _fail_llm(span_label, call_start, f"Privacy Lock (`local_only`) blocked outbound cloud LLM call to `{target_base_url}` (`{target_model}`).")
     want_stream = bool(has_stream_sink() and settings.stream_tokens)
-    target_url, headers, body = prepare_wire_request(
-        eff_dialect, messages, tools, tool_choice, target_base_url, target_model, target_key,
-        target_temp, target_max_tokens, reasoning_effort=reasoning_effort, stream=want_stream,
-    )
-    payload = json.dumps(body).encode("utf-8")
-    gate = get_endpoint_gate(target_base_url)
-    is_local = is_local_or_lan_endpoint(target_base_url)
-    is_local_oai = eff_dialect == "openai_compat" and is_local
+    target_url, headers, body = prepare_wire_request(eff_dialect, messages, tools, tool_choice, target_base_url, target_model, target_key, target_temp, target_max_tokens, reasoning_effort=reasoning_effort, stream=want_stream)
+    payload, gate, scope = json.dumps(body).encode("utf-8"), get_endpoint_gate(target_base_url), get_active_cancel_scope()
+    is_local_oai = eff_dialect == "openai_compat" and is_local_or_lan_endpoint(target_base_url)
     healed_400, tried_ollama_fb = False, False
-    scope = get_active_cancel_scope()
+    eff_conc = max(1, min(8, int(max_concurrency if max_concurrency is not None else (1 if ":11434" in target_base_url else 4))))
+    shares_multi_model = is_local_oai and _endpoint_shares_tiers(target_base_url) and not gate._health_unsupported and ":11434" not in target_base_url
+    swap_excl = bool(shares_multi_model and (gate.swap_status() is not None or (gate.loaded_model is not None and gate.loaded_model != target_model)))
 
-    with gate.acquire_call(priority=priority, serialize=is_local):
+    with gate.acquire_call(priority=priority, serialize=True, max_concurrency=eff_conc, exclusive=swap_excl):
         eff_timeout, is_swap = _resolve_swap_window(gate, target_base_url, target_model, target_key, target_timeout) if is_local_oai else (target_timeout, False)
-        max_attempts = max(max_retries + 1, 8) if is_swap else (max_retries + 1)
+        max_attempts, attempt = (max(max_retries + 1, 8) if is_swap else (max_retries + 1)), 0
         try:
-            attempt = 0
             while attempt < max_attempts:
                 check_cancelled()
                 req = urllib.request.Request(target_url, data=payload, method="POST", headers=headers)
                 try:
                     with urlopen_safe(req, timeout=eff_timeout, allow_private_lan=True, allow_redirects=False) as resp:
-                        if scope is not None:
-                            with scope.track_response(resp):
-                                data = read_wire_response(eff_dialect, resp)
-                        else:
+                        with (scope.track_response(resp) if scope is not None else contextlib.nullcontext()):
                             data = read_wire_response(eff_dialect, resp)
                     if not isinstance(data, dict) or not data.get("choices"):
                         raise RuntimeError(f"Malformed LLM response (missing choices): {str(data)[:300]}")
@@ -551,8 +565,7 @@ def _post_completion(
                         print(f"  [gpu-swap] Model {target_model} loaded and responded ({dur_ms / 1000.0:.1f}s).", file=sys.stderr, flush=True)
                     clean_content, thinking_text, tcalls = normalize_assistant_message(data["choices"][0].get("message") or {})
                     toks = (data.get("usage") or {}).get("total_tokens", 0) if isinstance(data.get("usage"), dict) else 0
-                    swap_tag = " swapped=1" if is_swap else ""
-                    detail = f"tier={tier_label} dialect={eff_dialect} temp={target_temp:.2f}{swap_tag} msgs={len(messages)} tools_called={len(tcalls)} tokens={toks} chars={len(clean_content)} think_chars={len(thinking_text)}"
+                    detail = f"tier={tier_label} dialect={eff_dialect} temp={target_temp:.2f}{' swapped=1' if is_swap else ''} msgs={len(messages)} tools_called={len(tcalls)} tokens={toks} chars={len(clean_content)} think_chars={len(thinking_text)}"
                     telemetry.record_span("llm_call", span_label, dur_ms, status="ok", detail=detail)
                     return data
                 except InterruptedError:
@@ -576,8 +589,7 @@ def _post_completion(
                             continue
                         err_body = f"{err_body} ({hint})".strip()
                     err_text = f"HTTP {exc.code} {exc.reason}: {err_body}"
-                    within_window = (time.perf_counter() - call_start) < eff_timeout
-                    if exc.code in (408, 429, 500, 502, 503, 504) and attempt + 1 < max_attempts and within_window:
+                    if exc.code in (408, 429, 500, 502, 503, 504) and attempt + 1 < max_attempts and (time.perf_counter() - call_start) < eff_timeout:
                         attempt += 1
                         telemetry.log("WARN", "llm", f"Retry {attempt}/{max_attempts - 1} on {err_text[:180]}")
                         time.sleep(5.0 if is_swap else 1.0 * attempt)
@@ -586,8 +598,7 @@ def _post_completion(
                 except (urllib.error.URLError, TimeoutError, OSError) as exc:
                     check_cancelled()
                     err_text = f"could not reach {target_base_url}: {getattr(exc, 'reason', str(exc))}"
-                    within_window = (time.perf_counter() - call_start) < eff_timeout
-                    if attempt + 1 < max_attempts and within_window:
+                    if attempt + 1 < max_attempts and (time.perf_counter() - call_start) < eff_timeout:
                         attempt += 1
                         telemetry.log("WARN", "llm", f"Retry {attempt}/{max_attempts - 1} on {err_text[:180]}")
                         time.sleep(5.0 if is_swap else 1.0 * attempt)
@@ -627,7 +638,7 @@ def chat(
         return _post_completion(
             messages, tools, tool_choice, target_base_url, target_model, target_key, target_temp, target_max_tok,
             target_timeout, max_retries, priority, tier_cfg.tier, dialect=target_dialect, reasoning_effort=target_effort,
-            has_tier_fallback=has_fb,
+            has_tier_fallback=has_fb, max_concurrency=tier_cfg.max_concurrency,
         )
     except InterruptedError:
         raise
@@ -642,6 +653,7 @@ def chat(
                 messages, tools, tool_choice, fb_base, tier_cfg.fallback_model, tier_cfg.fallback_api_key or target_key,
                 target_temp, target_max_tok, target_timeout, max_retries, priority, f"{tier_cfg.tier}:fallback",
                 dialect=tier_cfg.fallback_dialect or target_dialect, reasoning_effort="",
+                max_concurrency=1 if ":11434" in fb_base else tier_cfg.max_concurrency,
             )
         def_cfg = settings.resolve_tier("default")
         same_box, err_s = target_base_url.lower() == def_cfg.base_url.lower(), str(exc)
@@ -654,5 +666,5 @@ def chat(
         return _post_completion(
             messages, tools, tool_choice, def_cfg.base_url, def_cfg.model, def_cfg.api_key,
             fallback_temp, max_tokens or def_cfg.max_tokens, target_timeout, max_retries, priority, "default",
-            dialect=def_cfg.dialect, reasoning_effort=def_cfg.reasoning_effort,
+            dialect=def_cfg.dialect, reasoning_effort=def_cfg.reasoning_effort, max_concurrency=def_cfg.max_concurrency,
         )

@@ -46,7 +46,8 @@ _ITEM_COLS = [
     "id", "item_id", "project_id", "milestone_id", "timebox_id", "workflow_id", "item_kind",
     "title", "description", "category", "status", "owner", "stage_kind", "priority",
     "depends_on_json", "verification_json", "dag_name", "checkpoint_id",
-    "acceptance_criteria", "verification_result", "estimate_minutes",
+    "acceptance_criteria", "verification_result", "active_job_id", "worktree_path",
+    "branch_name", "deliverable_json", "estimate_minutes",
     "planned_date", "due_date", "checklist_json", "tags_json", "position",
     "created_at", "updated_at", "completed_at",
 ]
@@ -75,15 +76,16 @@ def _norm_column_key(status: str, item_kind: str = "task") -> str:
 def _hydrate_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(raw)
     for jcol, key, default in (
-        ("depends_on_json", "depends_on", []),
-        ("verification_json", "verification", {}),
-        ("checklist_json", "checklist", []),
-        ("tags_json", "tags", []),
+        ("depends_on_json", "depends_on", []), ("verification_json", "verification", {}),
+        ("deliverable_json", "deliverable", {}), ("checklist_json", "checklist", []), ("tags_json", "tags", []),
     ):
         try:
             out[key] = json.loads(out.get(jcol) or ("[]" if isinstance(default, list) else "{}"))
         except Exception:
             out[key] = list(default) if isinstance(default, list) else dict(default)
+    out["active_job_id"] = str(out.get("active_job_id") or "")
+    out["worktree_path"] = str(out.get("worktree_path") or "")
+    out["branch_name"] = str(out.get("branch_name") or "")
     out["column_key"] = _norm_column_key(str(out.get("status") or ""), str(out.get("item_kind") or "task"))
     out["card_id"] = out["item_id"]
     out["epic_id"] = out.get("milestone_id") or ""
@@ -120,6 +122,7 @@ def _hydrate_project(raw: Dict[str, Any]) -> Dict[str, Any]:
     dp = str(out.get("delivery_policy") or meta.get("delivery_policy") or "local_only").strip().lower()
     out["delivery_policy"] = dp if dp in VALID_DELIVERY_POLICIES else "local_only"
     out["git_credential_ref"] = str(out.get("git_credential_ref") or meta.get("git_credential_ref") or "").strip()
+    out["max_parallel_workers"] = max(1, min(4, int(out.get("max_parallel_workers") or meta.get("max_parallel_workers") or 2)))
     out["test_command"] = str(meta.get("test_command") or "").strip()
     out["preview_command"] = str(meta.get("preview_command") or "").strip()
     out["trigger_policy"] = TriggerPolicy.from_dict(tp_raw).to_dict() if tp_raw else TriggerPolicy(mode="manual").to_dict()
@@ -202,8 +205,8 @@ class ProjectGraphManager:
     def create_project(
         self, title: str, goal_summary: str = "", slug: Optional[str] = None, kind: str = "goal",
         workspace_id: Optional[str] = None, workspace_path: str = "", delivery_policy: str = "local_only",
-        git_credential_ref: str = "", test_command: str = "", preview_command: str = "", wiki_hub_path: str = "",
-        risk_ceiling: str = "R2", trigger_policy: Optional[Union[TriggerPolicy, Dict[str, Any]]] = None,
+        git_credential_ref: str = "", max_parallel_workers: int = 2, test_command: str = "", preview_command: str = "",
+        wiki_hub_path: str = "", risk_ceiling: str = "R2", trigger_policy: Optional[Union[TriggerPolicy, Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None, project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         clean_title = (title or "").strip()
@@ -216,6 +219,7 @@ class ProjectGraphManager:
         ws_p = str(Path(workspace_path).resolve()) if (workspace_path or "").strip() else ""
         dp_clean = _clean_delivery_policy(delivery_policy)
         cred_clean = _clean_git_cred_ref(git_credential_ref)
+        mpw = max(1, min(4, int(max_parallel_workers or 2)))
         eff_meta = dict(metadata or {})
         if test_command.strip():
             eff_meta["test_command"] = test_command.strip()
@@ -226,21 +230,21 @@ class ProjectGraphManager:
             if self.store.conn.execute("SELECT 1 FROM projects WHERE slug = ? AND project_id != ?", (final_slug, pid)).fetchone():
                 final_slug = f"{base_slug}-{uuid.uuid4().hex[:4]}"
             self.store.conn.execute(
-                "INSERT INTO projects (project_id, slug, title, goal_summary, kind, status, workspace_id, workspace_path, delivery_policy, git_credential_ref, wiki_hub_path, risk_ceiling, trigger_policy_json, metadata_json) "
-                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO projects (project_id, slug, title, goal_summary, kind, status, workspace_id, workspace_path, delivery_policy, git_credential_ref, max_parallel_workers, wiki_hub_path, risk_ceiling, trigger_policy_json, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET title = excluded.title, goal_summary = excluded.goal_summary, kind = excluded.kind, "
                 "workspace_path = CASE WHEN excluded.workspace_path != '' THEN excluded.workspace_path ELSE projects.workspace_path END, "
-                "delivery_policy = excluded.delivery_policy, "
+                "delivery_policy = excluded.delivery_policy, max_parallel_workers = excluded.max_parallel_workers, "
                 "git_credential_ref = CASE WHEN excluded.git_credential_ref != '' THEN excluded.git_credential_ref ELSE projects.git_credential_ref END, "
                 "wiki_hub_path = excluded.wiki_hub_path, risk_ceiling = excluded.risk_ceiling, trigger_policy_json = excluded.trigger_policy_json, metadata_json = excluded.metadata_json, updated_at = CURRENT_TIMESTAMP",
-                (pid, final_slug, clean_title, goal_summary.strip(), kind, ws_id, ws_p, dp_clean, cred_clean, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(eff_meta)),
+                (pid, final_slug, clean_title, goal_summary.strip(), kind, ws_id, ws_p, dp_clean, cred_clean, mpw, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(eff_meta)),
             )
             self.store.conn.commit()
         return self.get_project(pid)
 
     def get_project(self, project_id: Optional[str] = None) -> Dict[str, Any]:
         pid = self.resolve_project_id(project_id)
-        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "delivery_policy", "git_credential_ref", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
+        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "delivery_policy", "git_credential_ref", "max_parallel_workers", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
         rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM projects WHERE project_id = ?", (pid,))
         if not rows:
             with self.store._lock:
@@ -250,12 +254,8 @@ class ProjectGraphManager:
         return _hydrate_project(rows[0])
 
     def list_projects(self, status: Optional[str] = None, kind: Optional[str] = None) -> List[Dict[str, Any]]:
-        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "delivery_policy", "git_credential_ref", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
-        clauses: List[Tuple[str, Any]] = []
-        if status:
-            clauses.append(("status = ?", status))
-        if kind:
-            clauses.append(("kind = ?", kind))
+        cols = ["project_id", "slug", "title", "goal_summary", "kind", "status", "workspace_id", "workspace_path", "delivery_policy", "git_credential_ref", "max_parallel_workers", "wiki_hub_path", "risk_ceiling", "trigger_policy_json", "metadata_json", "created_at", "updated_at"]
+        clauses: List[Tuple[str, Any]] = ([("status = ?", status)] if status else []) + ([("kind = ?", kind)] if kind else [])
         where = (" WHERE " + " AND ".join(c for c, _ in clauses)) if clauses else ""
         rows = self.store._fetch_dicts(cols, f"SELECT {', '.join(cols)} FROM projects{where} ORDER BY updated_at DESC, created_at ASC", tuple(v for _, v in clauses))
         return [_hydrate_project(r) for r in rows]
@@ -274,15 +274,17 @@ class ProjectGraphManager:
         title = str(updates.get("title") or proj["title"]).strip()
         goal_s = str(updates.get("goal_summary") if updates.get("goal_summary") is not None else proj["goal_summary"]).strip()
         status = str(updates.get("status") or proj["status"]).strip()
+        kind = str(updates.get("kind") or proj["kind"]).strip()
         wiki_p = str(updates.get("wiki_hub_path") if updates.get("wiki_hub_path") is not None else proj["wiki_hub_path"]).strip()
         raw_ws_p = updates.get("workspace_path")
         ws_p = (str(Path(str(raw_ws_p).strip()).resolve()) if str(raw_ws_p).strip() else "") if raw_ws_p is not None else str(proj.get("workspace_path") or "")
         dp_clean = _clean_delivery_policy(str(updates["delivery_policy"])) if updates.get("delivery_policy") is not None else str(proj.get("delivery_policy") or "local_only")
         cred_clean = _clean_git_cred_ref(str(updates["git_credential_ref"])) if updates.get("git_credential_ref") is not None else str(proj.get("git_credential_ref") or "")
+        mpw = max(1, min(4, int(updates["max_parallel_workers"]))) if updates.get("max_parallel_workers") not in (None, "") else int(proj.get("max_parallel_workers") or 2)
         with self.store._lock:
             self.store.conn.execute(
-                "UPDATE projects SET title = ?, goal_summary = ?, status = ?, workspace_path = ?, delivery_policy = ?, git_credential_ref = ?, wiki_hub_path = ?, trigger_policy_json = ?, metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
-                (title, goal_s, status, ws_p, dp_clean, cred_clean, wiki_p, json.dumps(tp_dict), json.dumps(meta), pid),
+                "UPDATE projects SET title = ?, goal_summary = ?, kind = ?, status = ?, workspace_path = ?, delivery_policy = ?, git_credential_ref = ?, max_parallel_workers = ?, wiki_hub_path = ?, trigger_policy_json = ?, metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ?",
+                (title, goal_s, kind, status, ws_p, dp_clean, cred_clean, mpw, wiki_p, json.dumps(tp_dict), json.dumps(meta), pid),
             )
             self.store.conn.commit()
         return self.get_project(pid)
@@ -357,28 +359,12 @@ class ProjectGraphManager:
         return rows
 
     def create_item(
-        self,
-        project_id: Optional[str],
-        title: str,
-        description: str = "",
-        owner: str = "companion",
-        stage_kind: str = "DELIVER_AND_VERIFY",
-        status: str = "ready",
-        priority: int = 3,
-        depends_on: Optional[List[str]] = None,
-        milestone_id: str = "",
-        timebox_id: str = "",
-        workflow_id: Optional[int] = None,
-        verification: Optional[Dict[str, Any]] = None,
-        dag_name: str = "",
-        acceptance_criteria: str = "",
-        estimate_minutes: int = 30,
-        planned_date: str = "",
-        due_date: str = "",
-        checklist: Optional[List[Any]] = None,
-        tags: Optional[List[str]] = None,
-        category: str = "general",
-        item_kind: str = "task",
+        self, project_id: Optional[str], title: str, description: str = "", owner: str = "companion",
+        stage_kind: str = "DELIVER_AND_VERIFY", status: str = "ready", priority: int = 3,
+        depends_on: Optional[List[str]] = None, milestone_id: str = "", timebox_id: str = "",
+        workflow_id: Optional[int] = None, verification: Optional[Dict[str, Any]] = None, dag_name: str = "",
+        acceptance_criteria: str = "", estimate_minutes: int = 30, planned_date: str = "", due_date: str = "",
+        checklist: Optional[List[Any]] = None, tags: Optional[List[str]] = None, category: str = "general", item_kind: str = "task",
     ) -> Dict[str, Any]:
         clean_title = (title or "").strip()
         if not clean_title:
@@ -433,34 +419,33 @@ class ProjectGraphManager:
         chk = updates["checklist"] if "checklist" in updates and updates["checklist"] is not None else cur["checklist"]
         tags = updates["tags"] if "tags" in updates and updates["tags"] is not None else cur["tags"]
         ver = updates["verification"] if "verification" in updates and updates["verification"] is not None else cur["verification"]
+        deliv = updates["deliverable"] if "deliverable" in updates and updates["deliverable"] is not None else cur.get("deliverable", {})
+        if isinstance(deliv, str):
+            deliv = json.loads(deliv) if deliv.strip().startswith("{") else {}
+        act_jid = str(updates["active_job_id"]) if "active_job_id" in updates and updates["active_job_id"] is not None else str(cur.get("active_job_id") or "")
+        wt_p = str(updates["worktree_path"]) if "worktree_path" in updates and updates["worktree_path"] is not None else str(cur.get("worktree_path") or "")
+        br_n = str(updates["branch_name"]) if "branch_name" in updates and updates["branch_name"] is not None else str(cur.get("branch_name") or "")
         own = str(updates.get("owner") or cur["owner"]).strip().lower()
         sk = str(updates.get("stage_kind") or cur["stage_kind"]).strip()
         with self.store._lock:
             self.store.conn.execute(
                 "UPDATE work_items SET title = ?, description = ?, status = ?, owner = ?, stage_kind = ?, priority = ?, milestone_id = ?, timebox_id = ?, "
-                "depends_on_json = ?, verification_json = ?, dag_name = ?, checkpoint_id = ?, verification_result = ?, estimate_minutes = ?, planned_date = ?, due_date = ?, "
+                "depends_on_json = ?, verification_json = ?, dag_name = ?, checkpoint_id = ?, verification_result = ?, active_job_id = ?, worktree_path = ?, branch_name = ?, deliverable_json = ?, estimate_minutes = ?, planned_date = ?, due_date = ?, "
                 "checklist_json = ?, tags_json = ?, completed_at = ?, updated_at = CURRENT_TIMESTAMP WHERE item_id = ?",
                 (
                     str(updates.get("title") or cur["title"]).strip(),
                     str(updates["description"] if "description" in updates and updates["description"] is not None else cur["description"]),
-                    new_status,
-                    own if own in VALID_ITEM_OWNERS else cur["owner"],
-                    sk if sk in VALID_STAGE_KINDS else cur["stage_kind"],
+                    new_status, own if own in VALID_ITEM_OWNERS else cur["owner"], sk if sk in VALID_STAGE_KINDS else cur["stage_kind"],
                     max(1, min(5, int(updates.get("priority", cur["priority"])))),
                     str(updates.get("milestone_id", updates.get("epic_id", cur["milestone_id"])) or ""),
                     str(updates.get("timebox_id", updates.get("sprint_id", cur["timebox_id"])) or ""),
-                    json.dumps(list(deps)),
-                    json.dumps(dict(ver)),
-                    str(updates.get("dag_name", cur["dag_name"]) or ""),
+                    json.dumps(list(deps)), json.dumps(dict(ver)), str(updates.get("dag_name", cur["dag_name"]) or ""),
                     str(updates.get("checkpoint_id", cur["checkpoint_id"]) or ""),
                     str(updates.get("verification_result", cur["verification_result"]) or ""),
+                    act_jid, wt_p, br_n, json.dumps(dict(deliv)),
                     int(updates.get("estimate_minutes", cur["estimate_minutes"])),
-                    str(updates.get("planned_date", cur["planned_date"]) or ""),
-                    str(updates.get("due_date", cur["due_date"]) or ""),
-                    json.dumps(list(chk)),
-                    json.dumps(list(tags)),
-                    comp_at,
-                    iid,
+                    str(updates.get("planned_date", cur["planned_date"]) or ""), str(updates.get("due_date", cur["due_date"]) or ""),
+                    json.dumps(list(chk)), json.dumps(list(tags)), comp_at, iid,
                 ),
             )
             self.store.conn.commit()

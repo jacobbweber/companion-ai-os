@@ -13,8 +13,8 @@
                                    /      \
   [ UPPER A-FRAME (APPLICATION): agent.py, autonomy.py, blueprint.py, intake.py,      ]
   [   skill_forge.py, eval_harness.py, context.py, compaction.py, tools.py,           ]
-  [   sdlc_tools.py, os_tools.py, harvest_tools.py, tool_schemas.py, routines.py,     ]
-  [   core_actions.py                                                                 ]
+  [   sdlc_tools.py, worktree_runner.py, os_tools.py, harvest_tools.py,               ]
+  [   tool_schemas.py, routines.py, core_actions.py                                   ]
      Cognitive Triage, Blueprint Gate, Skill/DAG Forge, Phase-Gated Tools (28), Eval
                                /              \
                               /================\
@@ -50,7 +50,7 @@ Every module in the system has a single cohesive responsibility and is subject t
 | `companion/telemetry.py` | `Infrastructure` | Thread-safe (`RLock` + `ContextVar`) SQLite Waterfall Tracer, Structured App Logger, SecretRedactor, retention pruner, and KPI Scorecard | `SPEC-04`, `SPEC-06` |
 | `companion/streaming.py` | `Infrastructure` | `ContextVar` stream event bus (`stream_event_context`, `emit_stream_event`), `<100ms` `CancelScope` (`cancel_scope_context`), `<turn_context>` wire scope (`wire_turn_context`), `<think>` tag stream splitter (`ThinkTagStreamSplitter`), `<tool_call>` rescue, and OpenAI SSE delta/tool assembler (`read_completion_or_sse_stream`) | `SPEC-01`, `SPEC-06` |
 | `companion/llm_wire.py` | `Infrastructure` | Pure-stdlib wire request, multimodal (`image`/`audio`/`video`/`pdf`), reasoning, and SSE stream translators for `openai_compat`, `anthropic_messages`, and `gemini_native` (`thoughtSignature` & `thinking` signature preservation) plus `is_local_or_lan_endpoint` | `SPEC-01` |
-| `companion/llm.py` | `Infrastructure` | Multi-dialect HTTP/SSE LLM client, `discover_provider_models`, `ModelGate`, HTTP 400 parameter self-healing, `local_only` LAN Privacy Lock, and per-tier + global failover | `SPEC-01` |
+| `companion/llm.py` | `Infrastructure` | Multi-dialect HTTP/SSE LLM client, `discover_provider_models`, cancelable `BoundedSemaphore` `ModelGate` (with exclusive VRAM-swap fallback), HTTP 400 parameter self-healing, `local_only` LAN Privacy Lock, and per-tier + global failover | `SPEC-01` |
 | `companion/checkpoints.py` | `Domain` | External Copy-on-Write file ledger (`effective_data_dir / "checkpoints"`), `WorkspaceContext`-bound atomic file backups, non-destructive `rollback_checkpoint`, `snapshot_readonly_tree`/`enforce_readonly_tree` guards, local Git save-points, and post-exec syntax healing | `SPEC-04` |
 | `companion/safety.py` | `Domain` | `ADR-007` path & `.env`/`secrets.env` confinement, `is_companion_self_repo`-scoped `<5ms` inline post-edit micro-linter (`lint_single_file_edit`), `LoopGuard`, and `run_system_doctor` (supporting packaged `app/` `7/7` verification without `tests/`) | `SPEC-04` |
 | `companion/hygiene.py` | `Domain` | Import-qualified AST dead-code & unused-private-method scanner across `companion/`, `surfaces/`, and `configs/`, `<15ms` AST Repo Headroom Map, and symbol slicer | `SPEC-04`, `SPEC-06` |
@@ -85,6 +85,7 @@ Every module in the system has a single cohesive responsibility and is subject t
 | `companion/core_actions.py` | `Application` | Unified actor-aware `CORE_ACTIONS` registry (including 1-click `endpoint_register`, `register_mcp_server`, and `dag_gate` `resume_dag_run` execution), `execute_core_action`, and `handle_harvest_slash` | `SPEC-03`, `SPEC-07`, `SPEC-08` |
 | `companion/harvest_tools.py` | `Application` | Thin `actor="companion"` tool adapters (`job_manage`, `wiki_manage`, `vault_manage`, `endpoint_manage`, `mcp_manage`, `routine_manage`, `agile_manage`, `calendar_manage`, `education_manage`) | `SPEC-07`, `SPEC-08` |
 | `companion/sdlc_tools.py` | `Application` | Orthogonal local SDLC primitives: repo rulebook/stack discovery (`discover_repo_sdlc_context`), secret-shielded `git_manage` (branches, worktrees, Blind-Vault SSH/PAT auth, `delivery_policy` gates), and OS-process-group `PreviewProcessManager` (`dev_preview` with guaranteed turn/exit teardown) | `SPEC-06`, `SPEC-07`, `SPEC-08` |
+| `companion/worktree_runner.py` | `Application` | Read-only repo workspace probe (`probe_repo_workspace`), parallel isolated `git worktree` Board card orchestrator (`dispatch_work_item_agent`, `dispatch_parallel_ready_items`, `collect_worktree_deliverable_receipt`), 1-click deliverable merge/push-PR/revision actions (`merge_worktree_into_base`, `push_worktree_branch_and_pr`, `request_worktree_changes`), and `<50ms`-cancelable `run_parallel_subagents` fan-out | `SPEC-06`, `SPEC-08` |
 | `companion/os_tools.py` | `Application` | Companion OS state, Hot+Cold memory/KnowledgePort, task, workflow/DAG/Skill Forge, checkpoint, SDD, project, telemetry, privacy-aware `web_search`, and doctor tool handlers | `SPEC-06`, `SPEC-07` |
 | `companion/tools.py` | `Application` | 28 `WorkspaceContext`-bound, phase- and `R3`-risk-gated tools (plus native `mcp__*` dispatch) with `ExecutionTarget` isolation, AST symbol reading, and inline linting | `SPEC-06`, `SPEC-07`, `SPEC-08` |
 | `companion/context.py` | `Application` | KV-cache-stable `~700`-token `messages[0]` system prompt + per-turn `<turn_context>` (`build_turn_context_block`) with `<10ms` Epistemic Grounding, Project Graph HUD, `[CONNECTED FEDERATED PARTNERS]` HUD, Trust Mode, Workspace Radar, and Skill catalog | `SPEC-06`, `SPEC-07`, `SPEC-08` |
@@ -97,7 +98,7 @@ Every module in the system has a single cohesive responsibility and is subject t
 | `surfaces/api_extensions.py` | `Presentation` | Headless `GET/POST /api/actions` CoreActions adapter, `POST /api/reload` live service reload coordinator, `GET /api/status` Autonomy + Project Graph enrichments, `IdleAutonomyWatcher` factory, and Bearer-token `POST /api/mcp` Order Counter adapter | `SPEC-05`, `SPEC-06`, `SPEC-07` |
 | `surfaces/web_server.py` | `Presentation` | Stdlib `ThreadingHTTPServer` web server (`127.0.0.1` default + `COMPANION_WEB_TOKEN` non-loopback LAN/Tailscale auth) with `Host`/`Origin`/`Sec-Fetch-Site`/unconditional `X-Companion-CSRF`, live SSE (`GET /api/jobs/<id>/stream`), CoreActions, Hosted MCP, and WAL reads | `SPEC-06`, `SPEC-07` |
 | `surfaces/windows_tray.py` | `Presentation` | Zero-dependency Win32 `ctypes` System Tray controller (`--tray`, including 1-click `Reload Companion`), single-instance `/api/health` detection, user `data/` folder opener, and graceful port-conflict diagnostics | `SPEC-06` |
-| `configs/architecture.py` | `Domain` | Executable A-Frame component registry (52 core components), unregistered-module detector, dependency name validator, and downward layer dependency verifier | `SPEC-01`, `SPEC-03`, `SPEC-07`, `SPEC-08` |
+| `configs/architecture.py` | `Domain` | Executable A-Frame component registry (53 core components), unregistered-module detector, dependency name validator, and downward layer dependency verifier | `SPEC-01`, `SPEC-03`, `SPEC-07`, `SPEC-08` |
 | `memory/chat_memory.py` | `Domain` | Backward-compatible `ChatMemory` facade over `companion/memory_store.py` | `SPEC-02` |
 
 ---

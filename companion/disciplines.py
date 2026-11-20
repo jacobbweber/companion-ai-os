@@ -92,7 +92,7 @@ MODULE_LAYER_MAP: Dict[str, ArchitectureLayer] = {
     "companion.mcp_hub": ArchitectureLayer.APPLICATION, "companion.routines": ArchitectureLayer.APPLICATION,
     "companion.calendar_engine": ArchitectureLayer.APPLICATION, "companion.core_actions": ArchitectureLayer.APPLICATION,
     "companion.harvest_tools": ArchitectureLayer.APPLICATION, "companion.os_tools": ArchitectureLayer.APPLICATION,
-    "companion.sdlc_tools": ArchitectureLayer.APPLICATION,
+    "companion.sdlc_tools": ArchitectureLayer.APPLICATION, "companion.worktree_runner": ArchitectureLayer.APPLICATION,
     "companion.tools": ArchitectureLayer.APPLICATION, "companion.context": ArchitectureLayer.APPLICATION,
     "companion.agent": ArchitectureLayer.APPLICATION,
     "configs": ArchitectureLayer.DOMAIN, "configs.architecture": ArchitectureLayer.DOMAIN,

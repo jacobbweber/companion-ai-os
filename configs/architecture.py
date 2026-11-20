@@ -299,6 +299,13 @@ CORE_COMPONENTS: List[ComponentSpec] = [
         dependencies=["Configuration & .env Loader", "Universal Headless Project & Goal Graph", "Zero-Reveal Blind Credential Vault & Snapshot Backups", "Safety, Inline Micro-Linter & System Doctor"],
     ),
     ComponentSpec(
+        name="Parallel Subagents & Worktree Card Orchestrator",
+        layer=ArchitectureLayer.APPLICATION,
+        module_path="companion/worktree_runner.py",
+        description="Repo workspace probe, isolated parallel git worktree card runners, unified/split diff & screenshot deliverable receipts, 1-click merge/PR/revision actions, and cancelable parallel_subagents fan-out",
+        dependencies=["Orthogonal Local SDLC, Git/Worktree & Preview Tools", "Forever-Chat Background Job Dispatcher", "Universal Headless Project & Goal Graph", "Multimodal Chat Attachments & Document Extractor"],
+    ),
+    ComponentSpec(
         name="OS State & Governance Tools",
         layer=ArchitectureLayer.APPLICATION,
         module_path="companion/os_tools.py",

@@ -54,6 +54,7 @@ class TierConfig:
     fallback_api_key: str = ""
     fallback_dialect: str = "openai_compat"
     fallback_provider_id: str = ""
+    max_concurrency: int = 1
 
 
 @dataclass(frozen=True)
@@ -313,10 +314,12 @@ class Settings:
     def _load_tiers(self) -> None:
         """Load configurable model tiers (`default`, `fast`, `coding`, `reasoning`, `audio`, `image`, `video`, `embedding`)."""
         def_dialect = os.environ.get("COMPANION_DIALECT", "openai_compat").strip().lower() or "openai_compat"
+        def_url = self.base_url.rstrip("/")
+        def_conc = max(1, min(8, _env_int("COMPANION_MAX_CONCURRENCY", 1 if ":11434" in def_url else 4)))
         self.tiers["default"] = TierConfig(
-            tier="default", base_url=self.base_url.rstrip("/"), model=self.model, api_key=self.api_key,
+            tier="default", base_url=def_url, model=self.model, api_key=self.api_key,
             context_window_tokens=self.context_window_tokens, temperature=self.temperature, max_tokens=self.max_tokens,
-            is_dedicated=True, dialect=def_dialect,
+            is_dedicated=True, dialect=def_dialect, max_concurrency=def_conc,
         )
         for t in ("fast", "coding", "reasoning", "audio", "image", "video", "embedding"):
             pfx = f"COMPANION_{t.upper()}_"
@@ -326,14 +329,17 @@ class Settings:
             raw_ctx, raw_temp_str = _env_int(f"{pfx}CONTEXT_WINDOW", 0), os.environ.get(f"{pfx}TEMP", "").strip()
             tier_temp = max(0.0, min(2.0, _env_float(f"{pfx}TEMP", _DEFAULT_TIER_TEMPS.get(t, self.temperature))))
             tier_max_tok = max(256, _env_int(f"{pfx}MAX_TOKENS", _DEFAULT_TIER_MAX_TOKENS.get(t, self.max_tokens)))
+            eff_url = (raw_url or self.base_url).rstrip("/")
+            t_conc = max(1, min(8, _env_int(f"{pfx}MAX_CONCURRENCY", 1 if ":11434" in eff_url else def_conc)))
             self.tiers[t] = TierConfig(
-                tier=t, base_url=(raw_url or self.base_url).rstrip("/"), model=raw_model or self.model,
+                tier=t, base_url=eff_url, model=raw_model or self.model,
                 api_key=raw_key if raw_key else self.api_key,
                 context_window_tokens=max(4096, raw_ctx) if raw_ctx > 0 else self.context_window_tokens,
                 temperature=tier_temp, max_tokens=tier_max_tok,
                 is_dedicated=bool(raw_url or raw_model or raw_ctx > 0 or raw_temp_str or raw_dialect or raw_effort),
                 dialect=raw_dialect or def_dialect,
                 reasoning_effort=raw_effort if raw_effort in ("low", "medium", "high") else "",
+                max_concurrency=t_conc,
             )
 
     def register_runtime_resolver(

@@ -32,7 +32,7 @@ _LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".home.arpa", ".localdo
 _LOCAL_HOSTNAME = socket.gethostname().strip().lower()
 _READONLY_SUBACTIONS = frozenset({
     "list", "status", "get", "read", "search", "graph", "metadata", "check",
-    "check_secret", "list_missing", "audit", "window", "progress", "board_view", "matrix",
+    "check_secret", "list_missing", "audit", "window", "progress", "board_view", "matrix", "probe_repo",
 })
 
 

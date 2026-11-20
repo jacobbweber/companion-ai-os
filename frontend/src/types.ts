@@ -451,15 +451,19 @@ export interface BackgroundJob {
   kind: string;
   starter: string;
   session_id: string;
+  project_id?: string;
   tier: string;
   status: 'queued' | 'running' | 'waiting_approval' | 'done' | 'failed' | 'cancelled' | 'interrupted' | string;
   envelope_summary: string;
   partial_output: string;
+  full_output?: string;
   overflow_wiki_path: string;
   approval_id: string;
   error: string;
   created_at: string;
-  updated_at: string;
+  updated_at?: string;
+  started_at?: string;
+  finished_at?: string;
 }
 
 export interface ApprovalRequest {
@@ -652,6 +656,50 @@ export interface TelemetryPayload {
   }>;
 }
 
+export interface RepoProbeResult {
+  ok: boolean;
+  exists: boolean;
+  is_git_repo: boolean;
+  repo_root?: string;
+  branch?: string;
+  clean?: boolean;
+  changed_count?: number;
+  remote_url?: string;
+  stack_summary?: string;
+  rules_files?: string[];
+  summary?: string;
+  error?: string;
+}
+
+export interface WorkItemDeliverable {
+  kind?: 'code_worktree' | 'personal_deliverable' | string;
+  worker_status?: string;
+  branch_name?: string;
+  base_branch?: string;
+  worktree_path?: string;
+  commit_sha?: string;
+  changed_files?: string[];
+  diff_stat?: string;
+  unified_diff?: string;
+  diff_payload?: WikiDiffPayload;
+  summary?: string;
+  test_summary?: string;
+  screenshot_ids?: string[];
+  job_id?: string;
+  has_remote?: boolean;
+  remote_url?: string;
+  pushed?: boolean;
+  pr_url?: string;
+  pr_number?: number;
+  merged?: boolean;
+  merged_commit?: string;
+  merged_into?: string;
+  merged_at?: string;
+  revision_history?: Array<{ feedback: string; requested_at: string }>;
+  error?: string;
+  updated_at?: string;
+}
+
 export interface ProjectGraphEntry {
   project_id: string;
   slug: string;
@@ -662,6 +710,7 @@ export interface ProjectGraphEntry {
   workspace_path?: string;
   delivery_policy?: 'local_only' | 'remote_branch_pr' | 'ask_me' | string;
   git_credential_ref?: string;
+  max_parallel_workers?: number;
   test_command?: string;
   preview_command?: string;
   trigger_policy: TriggerPolicySpec;
@@ -715,6 +764,10 @@ export interface WorkItem {
   due_date: string;
   checklist: Array<string | WorkItemChecklistEntry>;
   tags: string[];
+  active_job_id?: string;
+  worktree_path?: string;
+  branch_name?: string;
+  deliverable?: WorkItemDeliverable;
   created_at?: string;
   updated_at?: string;
 }
@@ -856,6 +909,7 @@ export interface ProviderPreset {
   is_local: boolean;
   credential_ref: string;
   default_context: number;
+  max_concurrency?: number;
   models: string[];
 }
 
@@ -876,6 +930,7 @@ export interface LlmProviderEntry {
   credential_set: boolean;
   is_local: boolean;
   enabled: boolean;
+  max_concurrency?: number;
   discovered_models: DiscoveredModelEntry[];
   suggested_models: string[];
   last_health: string;
@@ -969,7 +1024,7 @@ export interface CustomizationsSnapshot {
 
 export type AuxInspectorTarget =
   | { kind: 'work_item'; itemId: string; projectId?: string }
-  | { kind: 'project'; projectId: string }
+  | { kind: 'project'; projectId: string; createNew?: boolean }
   | { kind: 'routine'; routineId?: string; createNew?: boolean }
   | { kind: 'skill'; skillName: string; asset?: string }
   | { kind: 'dag'; dagName: string }
