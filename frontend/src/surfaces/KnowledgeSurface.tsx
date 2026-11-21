@@ -39,6 +39,7 @@ import {
   findFirstReadableFile,
 } from './WikiExplorerSidebar';
 import { WikiFrontmatterDrawer, WikiNoteFrontmatterBar } from './WikiFrontmatterFilterBar';
+import { WikiGraduateModal } from './WikiGraduateModal';
 
 interface KnowledgeSurfaceProps {
   initialNotePath?: string;
@@ -86,6 +87,7 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState('');
   const [diff, setDiff] = useState<WikiDiffPayload | null>(null);
+  const [graduatingPath, setGraduatingPath] = useState('');
   const [graph, setGraph] = useState<MindMapGraph | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -158,6 +160,7 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
       return;
     }
     setDiff(null);
+    setGraduatingPath('');
     setEditing(false);
     setSelectedAsset(null);
     if (switchMobile) setMobilePane('reading');
@@ -521,18 +524,9 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                       {selectedNote.path.startsWith('01_inbox/') && (
                         <button
                           type="button"
-                          className="btn btn-sm"
-                          onClick={async () => {
-                            const r = await callAction<{ path?: string; summary?: string; error?: string }>('wiki', {
-                              subaction: 'graduate',
-                              path: selectedNote.path,
-                              domain: selectedNote.domain || 'general',
-                              confirmed: true,
-                            });
-                            await loadTreeAndFacets(false);
-                            if (r.path) await openNote(r.path, false);
-                            onToast(r.summary || r.error || 'Graduated note.');
-                          }}
+                          className="btn btn-primary btn-sm"
+                          data-testid="wiki-graduate-btn"
+                          onClick={() => setGraduatingPath(selectedNote.path)}
                         >
                           <Sparkles size={12} /> Graduate
                         </button>
@@ -578,6 +572,20 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                       expanded={showFrontmatterTable}
                       onToggleExpanded={() => setShowFrontmatterTable((v) => !v)}
                       onApplyToken={applyFilterToken}
+                    />
+                  )}
+
+                  {graduatingPath === selectedNote.path && selectedNote.path.startsWith('01_inbox/') && (
+                    <WikiGraduateModal
+                      key={graduatingPath}
+                      inboxPath={graduatingPath}
+                      onCancel={() => setGraduatingPath('')}
+                      onCommitted={async (gradPath, msg) => {
+                        setGraduatingPath('');
+                        await loadTreeAndFacets(false);
+                        await openNote(gradPath, false, true);
+                        onToast(msg);
+                      }}
                     />
                   )}
 

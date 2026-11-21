@@ -536,6 +536,35 @@ class TestWikiV3TemplatesAndCuration(unittest.TestCase):
         self.assertTrue(ok_rat["ok"], ok_rat)
         self.assertTrue(execute_core_action("wiki", {"subaction": "commit_curation", "curation_id": audit["curation_id"]}, actor="companion", store=self.store)["ok"])
 
+    def test_ai_librarian_graduation_strips_inbox_and_it_bias_on_recipes(self) -> None:
+        from companion.wiki_curation import propose_ai_graduation
+        from companion.wiki_templates import save_template
+
+        save_template(self.wiki.root, "cooking-recipe", "Cooking Recipe", "reference", "Culinary dish recipes.", ["ingredients", "details", "instructions"], "# <Title>\n\n## ingredients\n\n## details\n\n## instructions\n")
+        cap = self.wiki.capture_inbox(
+            "Test: Chicken Stir Fry (Granular Details)",
+            "## ingredients\n- 1 lb chicken thighs\n- 2 tbsp vegetable oil\n\n## details\n- Prep: 15m\n\n## instructions\n1. Stir-fry on high heat.\n",
+            slug="cooking-recipe", tags=["inbox"], ontology=["operational-runbook", "preventive-maintenance"], actor="companion",
+        )
+        self.assertEqual(cap["template"], "cooking-recipe")
+        rd = self.wiki.read_note(cap["path"])
+        self.assertEqual(rd["domain"], "")
+        bad_inbox_dom = self.wiki.graduate_note(cap["path"], domain="01-inbox", actor="user")
+        self.assertFalse(bad_inbox_dom["ok"])
+
+        fake_llm = lambda *_a, **_kw: {"choices": [{"message": {"role": "assistant", "content": '{"domain":"cooking","topic":"stir-fry","slug":"chicken-stir-fry","title":"Chicken Stir Fry","summary":"High-heat weeknight chicken thigh and bell pepper stir-fry ready in 27 minutes.","template":"cooking-recipe","tags":["cooking","recipe","stir-fry","chicken"],"ontology":["culinary-recipe","meal-prep"],"related":[],"rationale":"Grouped under cooking/stir-fry with cooking-recipe template."}'}}]}
+        prop = propose_ai_graduation(self.wiki, cap["path"], chat_fn=fake_llm)
+        self.assertTrue(prop["ok"], prop)
+        self.assertEqual(prop["proposed"]["path"], "02_knowledge/cooking/stir-fry/chicken-stir-fry.md")
+        self.assertNotIn("inbox", prop["proposed"]["tags"])
+        self.assertNotIn("preventive-maintenance", prop["proposed"]["ontology"])
+        committed = execute_core_action("wiki", {"subaction": "commit_curation", "curation_id": prop["curation_id"], "confirmed": True}, actor="web", store=self.store)
+        self.assertTrue(committed["ok"], committed)
+        final_note = self.wiki.read_note("02_knowledge/cooking/stir-fry/chicken-stir-fry.md")
+        self.assertTrue(final_note["ok"])
+        self.assertEqual(final_note["domain"], "cooking")
+        self.assertEqual(final_note["topic"], "stir-fry")
+
 
 if __name__ == "__main__":
     unittest.main()

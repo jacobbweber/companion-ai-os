@@ -17,7 +17,7 @@ from companion.semantic_memory import hybrid_rrf_rank
 from companion.telemetry import redact_secrets
 from companion.wiki_templates import (
     BUILTIN_TEMPLATE_MAP, as_slug_list, canonicalize_ontology, compute_body_metrics, default_review_days,
-    extract_wikilinks, hydrate_note_meta, parse_frontmatter, recommend_templates, render_frontmatter,
+    extract_wikilinks, get_template, hydrate_note_meta, parse_frontmatter, recommend_templates, render_frontmatter,
     scaffold_foreground_body, scrub_conversational_chatter, seed_templates_and_authority, sha16_bytes, slugify_wiki, validate_curated_note,
 )
 
@@ -337,7 +337,7 @@ class WikiEngine:
             "ok": True, "path": rel, "title": str(meta.get("title") or cand.stem), "summary": str(meta.get("summary") or ""), "note_summary": str(meta.get("summary") or ""),
             "author": str(meta.get("author") or "companion"), "status": str(meta.get("status") or ("inbox" if parts[0] == "01_inbox" else "active")),
             "template": tpl_s, "document_type": str(meta.get("document_type") or ""),
-            "domain": str(meta.get("domain") or (parts[1] if parts[0] == "02_knowledge" and len(parts) >= 3 else parts[0])),
+            "domain": ("" if parts[0] == "01_inbox" and str(meta.get("domain") or "").strip().lower() in ("", "inbox", "01-inbox", "01_inbox") else str(meta.get("domain") or (parts[1] if parts[0] == "02_knowledge" and len(parts) >= 3 else ""))),
             "topic": str(meta.get("topic") or (parts[2] if parts[0] == "02_knowledge" and len(parts) == 4 else "")),
             "tags": as_slug_list(meta.get("tags")), "ontology": as_slug_list(meta.get("ontology")),
             "supersedes": meta.get("supersedes") if isinstance(meta.get("supersedes"), list) else [],
@@ -364,9 +364,10 @@ class WikiEngine:
                 self._archive_prior_version(full, "inbox_update")
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         req_tpl = slugify_wiki(template or str(in_meta.get("template") or ""), "")
-        chosen_tpl = req_tpl if req_tpl in BUILTIN_TEMPLATE_MAP else (recommend_templates(eff_title, clean_body, source)[0]["slug"] if eff_author == "companion" and source not in ("chat-export", "job-overflow") else "inbox-raw")
+        valid_req_tpl = bool(req_tpl and req_tpl != "inbox-raw" and (req_tpl in BUILTIN_TEMPLATE_MAP or get_template(self.root, req_tpl).get("ok")))
+        chosen_tpl = req_tpl if valid_req_tpl else (recommend_templates(eff_title, clean_body, source, wiki_root=self.root)[0]["slug"] if eff_author == "companion" and source not in ("chat-export", "job-overflow") else "inbox-raw")
         body_out = clean_body if clean_body.startswith("#") else f"# {eff_title}\n\n{clean_body}"
-        meta = hydrate_note_meta({**in_meta, "source": source}, eff_title, body_out, eff_author, "inbox", chosen_tpl, slugify_wiki(domain_hint or str(in_meta.get("domain") or "inbox"), "inbox"), "", as_slug_list(tags if tags is not None else in_meta.get("tags")) or ["inbox"], canonicalize_ontology(self.root, ontology if ontology is not None else in_meta.get("ontology")), now_iso, summary=summary)
+        meta = hydrate_note_meta({**in_meta, "source": source}, eff_title, body_out, eff_author, "inbox", chosen_tpl, slugify_wiki(domain_hint or str(in_meta.get("domain") or "inbox"), "inbox"), "", as_slug_list(tags if tags is not None else in_meta.get("tags")) or ["inbox"], canonicalize_ontology(self.root, ontology if ontology is not None else in_meta.get("ontology")), now_iso, summary=summary, wiki_root=self.root)
         full.write_text(render_frontmatter(meta, body_out), encoding="utf-8", newline="\n")
         self._index_single_file(full)
         return {"ok": True, "path": rel, "author": eff_author, "template": chosen_tpl, "content_hash": sha16_bytes(full.read_bytes()), "summary": f"Captured note `{rel}` in `01_inbox/` (`author: {eff_author}`, `template: {chosen_tpl}`)."}
@@ -468,7 +469,9 @@ class WikiEngine:
         src_full, err = self._validate_rel_note_path(src_rel)
         if err or src_full is None or not src_full.is_file():
             return {"ok": False, "error": f"Inbox note `{src_rel}` not found."}
-        dom_slug = slugify_wiki(domain, fallback="general")
+        dom_slug = slugify_wiki(domain, fallback="")
+        if dom_slug in ("", "inbox", "01-inbox", "01_inbox"):
+            return {"ok": False, "error": "Graduation requires a real curated `domain` folder (cannot graduate into `01-inbox` or `inbox`). Use AI Graduation (`propose_graduation`) to infer taxonomy."}
         top_slug = slugify_wiki(topic, fallback="") if (topic or "").strip() else ""
         note_slug = slugify_wiki(new_slug or src_full.stem, fallback=src_full.stem)
         dst_rel = f"02_knowledge/{dom_slug}/{top_slug}/{note_slug}.md" if top_slug else f"02_knowledge/{dom_slug}/{note_slug}.md"
@@ -486,7 +489,8 @@ class WikiEngine:
         raw_tpl = slugify_wiki(template or str(meta.get("template") or ""), "")
         must_validate = bool(template.strip()) or raw_tpl in ("", "inbox-raw")
         cur_tpl = ("standard-note" if (is_fg and raw_tpl in ("", "inbox-raw")) else (raw_tpl or "inbox-raw")) if must_validate else raw_tpl
-        out_meta = hydrate_note_meta({**meta, "supersedes": [src_rel]}, str(meta.get("title") or note_slug), body, str(meta.get("author") or "companion"), "active", cur_tpl, dom_slug, top_slug, as_slug_list(meta.get("tags")) or [dom_slug], canonicalize_ontology(self.root, ontology if ontology is not None else meta.get("ontology")) or (["reference-knowledge"] if is_fg else []), now_iso, summary=summary)
+        clean_tags = [t for t in as_slug_list(meta.get("tags")) if t not in ("inbox", "01-inbox", "01_inbox")] or [dom_slug]
+        out_meta = hydrate_note_meta({**meta, "supersedes": [src_rel]}, str(meta.get("title") or note_slug), body, str(meta.get("author") or "companion"), "active", cur_tpl, dom_slug, top_slug, clean_tags, canonicalize_ontology(self.root, ontology if ontology is not None else meta.get("ontology")) or (["reference-knowledge"] if is_fg else []), now_iso, summary=summary, wiki_root=self.root)
         dom_others = self._count_other_domain_notes(dom_slug, dst_rel)
         if is_fg and dom_others > 0 and not extract_wikilinks(body + " " + " ".join(str(x) for x in (out_meta.get("related") or []))):
             if peer_lk := self._find_domain_peer_link(dom_slug, dst_rel):

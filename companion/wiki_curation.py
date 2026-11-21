@@ -21,19 +21,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from companion.archive_and_approvals import get_approval_queue, get_trust_mode
 from companion.config import get_execution_origin
+from companion.llm import chat, normalize_assistant_message, tier_context
 from companion.semantic_memory import semantic_similarity
 from companion.telemetry import redact_secrets
 from companion.wiki_engine import WikiEngine
 from companion.wiki_templates import (
     as_slug_list, canonicalize_ontology, compute_body_metrics, extract_wikilinks, hydrate_note_meta,
     list_templates, load_tag_authority, parse_frontmatter, recommend_templates,
-    register_authority_terms, render_frontmatter, scrub_conversational_chatter,
+    register_authority_terms, render_frontmatter, scaffold_foreground_body, scrub_conversational_chatter,
     slugify_wiki, validate_curated_note,
 )
 
 __all__ = [
     "CURATION_STRATEGIES", "commit_curation_plan", "inspect_graduation",
-    "list_curation_history", "pending_curation_nudge", "revert_curation", "validate_curation_plan",
+    "list_curation_history", "pending_curation_nudge", "propose_ai_graduation", "revert_curation", "validate_curation_plan",
 ]
 
 CURATION_STRATEGIES = ("CREATE_NEW", "MERGE_AND_REFINE", "SPLIT_MULTI", "KEEP_SEPARATE")
@@ -131,7 +132,7 @@ def inspect_graduation(engine: WikiEngine, inbox_paths: Any) -> Dict[str, Any]:
     top_candidates = candidates[:8]
     required_reads = [c["path"] for c in top_candidates if c["must_read"]]
     ont_bridges = engine.find_ontology_bridges(paths, combined_ont, [*paths, *(c["path"] for c in top_candidates)], limit=6)
-    rec_templates = recommend_templates(q_title, q_body)
+    rec_templates = recommend_templates(q_title, q_body, wiki_root=engine.root)
     all_tpls = [{"slug": t["slug"], "document_type": t["document_type"], "required_sections": t["required_sections"], "when_to_use": t["when_to_use"]} for t in list_templates(engine.root)]
     authority = load_tag_authority(engine.root)
     hub_nudges = [f"Domain `{d}` has {info['note_count']} notes without a `concept-map-system-hub` MOC." for d, info in domain_stats.items() if info["note_count"] >= 3 and not info["has_hub"]]
@@ -229,6 +230,8 @@ def _validate_single_output(
     rel_p = str(full_p.relative_to(engine.root)).replace("\\", "/")
     parts = rel_p.split("/")
     dom, top = (parts[1] if len(parts) >= 3 else "general"), (parts[2] if len(parts) == 4 else "")
+    if dom.lower() in ("", "inbox", "01-inbox", "01_inbox"):
+        errs.append(f"`{rel_p}`: Curated domain folder cannot be `{dom}` — choose a descriptive domain (e.g. `cooking`, `homelab`).")
 
     scrubbed = scrub_conversational_chatter(redact_secrets(str(item.get("content") or item.get("body") or "")))
     in_meta, body = parse_frontmatter(scrubbed)
@@ -248,13 +251,15 @@ def _validate_single_output(
     if body and not body.lstrip().startswith("#"):
         body = f"# {title}\n\n{body}"
     tpl = slugify_wiki(str(item.get("template") or in_meta.get("template") or old_meta.get("template") or ""), "")
-    tags = as_slug_list(item.get("tags") if item.get("tags") is not None else (in_meta.get("tags") or old_meta.get("tags")))
+    raw_tags = as_slug_list(item.get("tags") if item.get("tags") is not None else (in_meta.get("tags") or old_meta.get("tags")))
+    tags = [t for t in raw_tags if t not in ("inbox", "01-inbox", "01_inbox")]
     ont = canonicalize_ontology(engine.root, item.get("ontology") if item.get("ontology") is not None else (in_meta.get("ontology") or old_meta.get("ontology")))
+    rel_in = item.get("related") if item.get("related") is not None else (in_meta.get("related") or old_meta.get("related"))
     meta = hydrate_note_meta(
-        {**old_meta, **in_meta, "confidence": item.get("confidence", in_meta.get("confidence", 0.95)), "sensitivity": str(item.get("sensitivity") or in_meta.get("sensitivity") or "internal")},
+        {**old_meta, **in_meta, "related": rel_in, "confidence": item.get("confidence", in_meta.get("confidence", 0.95)), "sensitivity": str(item.get("sensitivity") or in_meta.get("sensitivity") or "internal")},
         title, body, str(old_meta.get("author") or in_meta.get("author") or "companion"),
         str(item.get("status") or in_meta.get("status") or "active"), tpl, dom, top, tags, ont, now_iso,
-        summary=str(item.get("summary") or in_meta.get("summary") or ""),
+        summary=str(item.get("summary") or in_meta.get("summary") or ""), wiki_root=engine.root,
     )
     dom_cnt_rows = engine.store._fetch_rows("SELECT COUNT(*) FROM wiki_notes_index WHERE folder = '02_knowledge' AND domain = ? AND rel_path != ?", (dom, rel_p))
     existing_dom_cnt = int((dom_cnt_rows[0][0] if dom_cnt_rows else 0) or 0)
@@ -516,7 +521,7 @@ def pending_curation_nudge(
     """Return a continuation prompt if an active turn started/validated a Wiki curation without committing it."""
     try:
         rows = store._fetch_rows(
-            "SELECT curation_id, status, required_reads_json, read_paths_json FROM wiki_curation_sessions WHERE updated_at >= ? AND status IN ('open', 'validated') ORDER BY updated_at DESC LIMIT 1",
+            "SELECT curation_id, status, required_reads_json, read_paths_json FROM wiki_curation_sessions WHERE updated_at >= ? AND status IN ('open', 'validated') AND curation_id NOT LIKE 'ui_cur_%' ORDER BY updated_at DESC LIMIT 1",
             (since_iso,),
         )
     except Exception:
@@ -533,3 +538,149 @@ def pending_curation_nudge(
     if unread:
         return f"[CURATION CONTINUATION GATE]: Curation session `{cid}` is still `open`. Read remaining overlap candidate(s) {unread} via `wiki_manage(action='read', path=...)`, then call `validate_curation` and `commit_curation`."
     return f"[CURATION CONTINUATION GATE]: Curation session `{cid}` is still `open` (not yet validated or committed). Do NOT stop with narration — invoke `wiki_manage(action='validate_curation', curation_id='{cid}', strategy=..., outputs_json=...)` now, followed by `commit_curation`."
+
+
+def _extract_json_obj(raw_text: str) -> Dict[str, Any]:
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.DOTALL | re.IGNORECASE).strip()
+    if "</think>" in cleaned.lower():
+        cleaned = re.split(r"</think>", cleaned, flags=re.IGNORECASE)[-1].strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(cleaned[start : end + 1])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return {}
+
+
+def _query_librarian_graduation_json(
+    rd: Dict[str, Any], audit: Dict[str, Any], kb_tree: Dict[str, List[str]],
+    sibling_inbox: List[str], chat_fn: Any = None,
+) -> Tuple[Dict[str, Any], str]:
+    llm_call = chat_fn or chat
+    tpl_lines = [f"- `{t['slug']}` [{t['document_type']}] required_sections={t['required_sections']} — {t['when_to_use']}" for t in audit["available_templates"]]
+    sys_msg = (
+        "You are Companion's Senior Knowledge Librarian curating an `01_inbox/` note into `02_knowledge/`.\n"
+        "Rules:\n"
+        "1. Design an intuitive human folder taxonomy (`domain` + optional `topic` subfolder) considering BOTH existing `02_knowledge/` folders AND sibling `01_inbox/` notes so related notes land in a tidy, consistent folder hierarchy.\n"
+        "2. NEVER use `inbox`, `01-inbox`, or `01_inbox` as `domain`, `topic`, or `tags`.\n"
+        "3. `slug` MUST name this specific note's subject (e.g. `chicken-stir-fry`), NEVER the template name (`cooking-recipe`).\n"
+        "4. Strip scratch prefixes like `Test: ` from `title` when appropriate, and write a genuine 1-2 sentence prose `summary` (40-200 chars, NEVER a raw bullet list).\n"
+        "5. Pick the best matching `template` from Available Templates (preferring domain-specific templates like `cooking-recipe` when sections match). NEVER apply IT/server concepts (`operational-runbook`, `preventive-maintenance`) to everyday personal topics like cooking, home life, or hobbies.\n"
+        "6. Link genuinely related existing `02_knowledge/` notes in `related` using `[[stem]]` syntax.\n"
+        "Respond ONLY with a single valid JSON object matching:\n"
+        '{"domain":"...","topic":"...","slug":"...","title":"...","summary":"...","template":"...","tags":["..."],"ontology":["..."],"related":["[[...]]"],"rationale":"..."}'
+    )
+    usr_msg = (
+        f"Existing `02_knowledge/` Folder Tree & Notes:\n{json.dumps(kb_tree, indent=2) if kb_tree else '(empty)'}\n\n"
+        f"Other Sibling Notes Waiting in `01_inbox/`:\n{json.dumps(sibling_inbox) if sibling_inbox else '[]'}\n\n"
+        f"Available Governed Templates:\n" + "\n".join(tpl_lines) + "\n\n"
+        f"Target `01_inbox/` Note (`{rd['path']}`):\nCurrent Frontmatter: {json.dumps(rd.get('frontmatter') or {})}\n\n"
+        f"Markdown Body:\n{rd['body'][:6000]}"
+    )
+    msgs = [{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}]
+    for tier_name in ("reasoning", "fast"):
+        try:
+            with tier_context(tier_name):
+                resp = llm_call(msgs, None, "none", max_tokens=2048) if chat_fn is None else llm_call(msgs, None, "none")
+            txt, think_txt, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+            parsed = _extract_json_obj(txt) or _extract_json_obj(think_txt)
+            if parsed.get("domain") or parsed.get("title"):
+                return parsed, tier_name
+        except Exception:
+            continue
+    return {}, "fallback"
+
+
+def propose_ai_graduation(engine: WikiEngine, inbox_path: str, chat_fn: Any = None) -> Dict[str, Any]:
+    """Run an AI Librarian reasoning pass over `inbox_path` + vault taxonomy to propose a validated `02_knowledge/` graduation."""
+    src_norm = _normalize_inbox_list(inbox_path)
+    src_rel = src_norm[0] if src_norm else f"01_inbox/{Path(str(inbox_path or '')).name}"
+    rd = engine.read_note(src_rel)
+    if not rd.get("ok"):
+        return {"ok": False, "error": rd.get("error") or f"Inbox note `{src_rel}` not found."}
+    audit = inspect_graduation(engine, [rd["path"]])
+    if not audit.get("ok"):
+        return audit
+    cid = f"ui_{audit['curation_id']}"
+    with engine.store._lock:
+        engine.store.conn.execute("UPDATE wiki_curation_sessions SET curation_id = ? WHERE curation_id = ?", (cid, audit["curation_id"]))
+        engine.store.conn.commit()
+    for req_p in audit.get("required_reads") or []:
+        engine.read_note(req_p)
+
+    kb_notes = engine.list_notes(folder="02_knowledge", limit=200)
+    kb_tree: Dict[str, List[str]] = {}
+    valid_kb_stems = set()
+    for n in kb_notes:
+        valid_kb_stems.add(Path(str(n["rel_path"])).stem.lower())
+        parts_n = str(n["rel_path"]).split("/")
+        folder_key = "/".join(parts_n[1:-1]) if len(parts_n) >= 3 else "general"
+        kb_tree.setdefault(folder_key, []).append(f"{n['title']} [[{Path(str(n['rel_path'])).stem}]]")
+    sibling_inbox = [f"{n['title']} ({Path(str(n['rel_path'])).name})" for n in engine.list_notes(folder="01_inbox", limit=40) if n["rel_path"] != rd["path"]]
+
+    ai_obj, used_tier = _query_librarian_graduation_json(rd, audit, kb_tree, sibling_inbox, chat_fn=chat_fn)
+    avail_slugs = {t["slug"] for t in audit["available_templates"]}
+    rec_tpl = (audit["recommended_templates"][0]["slug"] if audit.get("recommended_templates") else "standard-note")
+    tpl_slug = slugify_wiki(str(ai_obj.get("template") or ""), "")
+    if tpl_slug not in avail_slugs or tpl_slug == "inbox-raw":
+        tpl_slug = rec_tpl if rec_tpl in avail_slugs else "standard-note"
+
+    clean_title = re.sub(r"^test:\s*", "", str(ai_obj.get("title") or rd["title"] or "").strip(), flags=re.IGNORECASE).strip() or rd["title"]
+    dom_slug = slugify_wiki(str(ai_obj.get("domain") or rd.get("domain") or ""), "")
+    if dom_slug in ("", "inbox", "01-inbox", "01_inbox"):
+        dom_slug = "general"
+    top_slug = slugify_wiki(str(ai_obj.get("topic") or ""), "")
+    if top_slug in (dom_slug, "inbox", "01-inbox", "01_inbox", "none", "null"):
+        top_slug = ""
+    note_slug = slugify_wiki(str(ai_obj.get("slug") or ""), "")
+    if not note_slug or note_slug in (tpl_slug, "inbox-note", "note") or Path(rd["path"]).stem.lower() == tpl_slug:
+        note_slug = slugify_wiki(re.sub(r"\s*\([^)]*\)\s*$", "", clean_title), fallback=Path(rd["path"]).stem)
+
+    dst_rel = f"02_knowledge/{dom_slug}/{top_slug}/{note_slug}.md" if top_slug else f"02_knowledge/{dom_slug}/{note_slug}.md"
+    raw_tags = [t for t in as_slug_list(ai_obj.get("tags") or rd.get("tags")) if t not in ("inbox", "01-inbox", "01_inbox")]
+    tags = list(dict.fromkeys(raw_tags or [dom_slug, *([top_slug] if top_slug else [])]))
+    it_bias = {"operational-runbook", "preventive-maintenance"}
+    raw_ont = canonicalize_ontology(engine.root, ai_obj.get("ontology") or rd.get("ontology"))
+    if tpl_slug != "sop-runbook" and dom_slug not in ("homelab", "automation", "equipment-ops", "work-ops"):
+        raw_ont = [o for o in raw_ont if o not in it_bias]
+    ont = raw_ont or [f"{dom_slug}-reference" if dom_slug != "general" else "reference-knowledge"]
+
+    ai_sum = str(ai_obj.get("summary") or "").strip()
+    old_sum = str(rd.get("summary") or "").strip()
+    eff_summary = ai_sum if len(ai_sum) >= 24 and not ai_sum.startswith(("- ", "* ")) else (old_sum if len(old_sum) >= 24 and not old_sum.startswith(("- ", "* ")) else f"Curated {dom_slug} reference note for {clean_title}.")
+
+    rel_links = [f"[[{lk}]]" for r in (ai_obj.get("related") or []) for lk in extract_wikilinks(str(r)) or [str(r).strip("[]")] if slugify_wiki(Path(lk).stem, "") in valid_kb_stems]
+    if engine._count_other_domain_notes(dom_slug, dst_rel) > 0 and not rel_links and not extract_wikilinks(rd["body"]):
+        if peer := engine._find_domain_peer_link(dom_slug, dst_rel):
+            rel_links.append(peer)
+
+    body_norm = re.sub(r"^\s*#\s+[^\n]+\n*", "", (rd["body"] or "").strip())
+    body_out = scaffold_foreground_body(engine.root, tpl_slug, clean_title, eff_summary, f"# {clean_title}\n\n{body_norm}", dst_rel)
+    rationale = str(ai_obj.get("rationale") or f"Organized into `02_knowledge/{dom_slug}{'/' + top_slug if top_slug else ''}` using template `{tpl_slug}`.").strip()
+
+    out_spec = {"path": dst_rel, "title": clean_title, "summary": eff_summary, "template": tpl_slug, "domain": dom_slug, "topic": top_slug, "tags": tags, "ontology": ont, "related": rel_links, "content": body_out}
+    val_res = validate_curation_plan(engine, cid, "CREATE_NEW", outputs=[out_spec], rationale=rationale)
+    if not val_res.get("ok") and tpl_slug != "standard-note":
+        tpl_slug = "standard-note"
+        out_spec["template"] = tpl_slug
+        out_spec["content"] = scaffold_foreground_body(engine.root, tpl_slug, clean_title, eff_summary, f"# {clean_title}\n\n{body_norm}", dst_rel)
+        val_res = validate_curation_plan(engine, cid, "CREATE_NEW", outputs=[out_spec], rationale=rationale)
+
+    sess_after = _load_curation_session(engine, cid)
+    rendered_preview = ""
+    if sess_after and sess_after.get("validated_plan") and sess_after["validated_plan"].get("outputs"):
+        vo = sess_after["validated_plan"]["outputs"][0]
+        rendered_preview = render_frontmatter(vo["meta"], vo["body"])
+
+    return {
+        "ok": bool(val_res.get("ok")), "curation_id": cid, "inbox_path": rd["path"], "used_tier": used_tier,
+        "validation_ok": bool(val_res.get("ok")), "validation_errors": val_res.get("validation_errors") or [],
+        "proposed": {**out_spec, "rendered_markdown": rendered_preview, "rationale": rationale},
+        "available_templates": audit["available_templates"], "existing_folders": sorted(kb_tree.keys()),
+        "sibling_inbox_count": len(sibling_inbox), "error": val_res.get("error") or "",
+        "summary": f"AI Librarian ({used_tier}) proposed `{dst_rel}` (`template: {tpl_slug}`). {rationale}",
+    }

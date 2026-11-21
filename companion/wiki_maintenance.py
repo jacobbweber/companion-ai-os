@@ -24,6 +24,7 @@ from companion.archive_and_approvals import get_approval_queue
 from companion.attachments import MAX_ATTACHMENT_BYTES, inspect_image_bytes
 from companion.disciplines import walk_pruned_files
 from companion.telemetry import redact_secrets
+from companion.wiki_curation import propose_ai_graduation
 from companion.wiki_engine import WIKI_FOLDERS, WikiEngine, compute_note_staleness
 from companion.wiki_templates import (
     BUILTIN_TEMPLATE_MAP, as_slug_list, canonicalize_ontology, default_review_days,
@@ -539,4 +540,13 @@ def execute_wiki_maintenance_subaction(wk: WikiEngine, sub: str, p: Dict[str, An
         return ingest_wiki_asset(wk, filename=str(p.get("filename") or "diagram.png"), data_base64=str(p.get("data_base64") or ""), alt_text=str(p.get("alt_text") or ""))
     if sub == "stage_turn":
         return stage_chat_turn_to_inbox(wk, assistant_content=str(p.get("content") or ""), user_prompt=str(p.get("user_prompt") or ""), title=str(p.get("title") or ""), actor=actor)
+    if sub in ("propose_graduation", "ai_graduate_preview"):
+        res = propose_ai_graduation(wk, str(p.get("path") or ""))
+        prop = res.get("proposed") if isinstance(res.get("proposed"), dict) else {}
+        if res.get("ok") and prop.get("rendered_markdown") and res.get("inbox_path"):
+            in_full = wk.root / str(res["inbox_path"])
+            old_raw = in_full.read_text(encoding="utf-8", errors="replace") if in_full.is_file() else ""
+            df = _build_diff_file(str(prop["path"]), f"{res['inbox_path']} (inbox)", f"{prop['path']} (curated)", old_raw, str(prop["rendered_markdown"]))
+            res["diff"] = {"ok": True, "mode": "graduation_preview", "files": [df], "total_additions": df["additions"], "total_deletions": df["deletions"], "unified_diff": df["unified_diff"], "summary": f"+{df['additions']} / -{df['deletions']} lines"}
+        return res
     return None

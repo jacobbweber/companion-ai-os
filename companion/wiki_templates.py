@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 __all__ = [
     "BUILTIN_TEMPLATES", "BUILTIN_TEMPLATE_MAP", "CANONICAL_FRONTMATTER_ORDER", "TemplateSpec",
@@ -206,25 +206,45 @@ def as_slug_list(val: Any) -> List[str]:
     return list(dict.fromkeys(slugify_wiki(str(x), "") for x in items if slugify_wiki(str(x), "")))
 
 
+def _normalize_related_links(raw_related: Any, body: str) -> List[str]:
+    explicit: List[str] = []
+    if isinstance(raw_related, (list, tuple)):
+        for x in raw_related:
+            s = str(x).strip()
+            if not s:
+                continue
+            links = extract_wikilinks(s)
+            explicit.extend(f"[[{lk}]]" for lk in (links or [s.strip("[]").removesuffix(".md")]))
+    inline = [f"[[{r}]]" for r in extract_wikilinks(body)]
+    return list(dict.fromkeys([*explicit, *inline]))
+
+
 def hydrate_note_meta(
     base_meta: Dict[str, Any], title: str, body: str, author: str, status: str,
     tpl_slug: str, domain: str, topic: str, tags: List[str], ontology: List[str],
-    now_iso: str, summary: str = "",
+    now_iso: str, summary: str = "", wiki_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     tpl_spec, metrics = BUILTIN_TEMPLATE_MAP.get(tpl_slug), compute_body_metrics(body)
-    eff_ont = ontology or (list(tpl_spec.default_ontology) if tpl_spec and tpl_slug != "inbox-raw" else [])
+    custom_tpl = (get_template(wiki_root, tpl_slug).get("template") if (wiki_root is not None and tpl_spec is None and tpl_slug and tpl_slug != "inbox-raw") else None)
+    default_ont = list(tpl_spec.default_ontology) if tpl_spec else (list(custom_tpl.get("default_ontology") or []) if custom_tpl else [])
+    eff_ont = ontology or (default_ont if tpl_slug != "inbox-raw" else [])
     raw_sum = summary.strip() or str(base_meta.get("summary") or "").strip()
-    if not raw_sum:
-        prose = [ln.strip() for ln in (body or "").splitlines() if ln.strip() and not ln.lstrip().startswith(("#", "|", "```", "---"))]
+    if not raw_sum or raw_sum.startswith(("- ", "* ")):
+        prose = [
+            re.sub(r"^[-*+]\s+|\*\*", "", ln.strip()).strip()
+            for ln in (body or "").splitlines()
+            if ln.strip() and not ln.lstrip().startswith(("#", "|", "```", "---"))
+        ]
         joined = re.sub(r"\s+", " ", " ".join(prose)).strip()
-        raw_sum = joined[:240] if len(joined) >= 24 else f"Reference knowledge note covering {title} ({len(body or '')} chars)."
+        raw_sum = summary.strip() or (joined[:220] if len(joined) >= 24 else f"Curated reference note covering {title}.")
     created_iso, raw_rev = str(base_meta.get("created_at") or now_iso), base_meta.get("review_after_days")
     rev_days = int(raw_rev) if str(raw_rev or "").isdigit() and int(raw_rev) > 0 else default_review_days(tpl_slug)
+    doc_type = tpl_spec.document_type if tpl_spec else (str(custom_tpl.get("document_type")) if custom_tpl and custom_tpl.get("document_type") else ("inbox-staging" if tpl_slug == "inbox-raw" else str(base_meta.get("document_type") or "reference")))
     return {
         **base_meta, "uid": str(base_meta.get("uid") or make_note_uid("wk")), "title": title[:140], "summary": raw_sum[:260],
         "author": author, "status": status, "template": tpl_slug, "domain": domain, "topic": topic, "tags": tags, "ontology": eff_ont,
-        "document_type": tpl_spec.document_type if tpl_spec else ("inbox-staging" if tpl_slug == "inbox-raw" else str(base_meta.get("document_type") or "reference")),
-        "related": [f"[[{r}]]" for r in extract_wikilinks(body)], "word_count": metrics["word_count"], "context_tokens": metrics["context_tokens"],
+        "document_type": doc_type, "related": _normalize_related_links(base_meta.get("related"), body),
+        "word_count": metrics["word_count"], "context_tokens": metrics["context_tokens"],
         "created_at": created_iso, "updated_at": now_iso, "last_verified_at": str(base_meta.get("last_verified_at") or created_iso), "review_after_days": rev_days,
     }
 
@@ -474,13 +494,25 @@ def register_authority_terms(
     return {"added_domains": new_dom, "added_tags": new_tags, "added_ontology": new_ont}
 
 
-def recommend_templates(title: str, body: str, source: str = "") -> List[Dict[str, Any]]:
+def recommend_templates(title: str, body: str, source: str = "", wiki_root: Optional[Path] = None) -> List[Dict[str, Any]]:
     hay = f"{title} {source} {body[:2500]}".lower()
+    headings_norm = [re.sub(r"[^a-z0-9]+", " ", h.lower()).strip() for h in _HEADING_RE.findall(body or "")]
+    custom_candidates: List[Tuple[int, Dict[str, Any]]] = []
+    if wiki_root is not None:
+        for ct in list_templates(wiki_root):
+            if ct.get("builtin"):
+                continue
+            req_s = [str(s).lower().strip() for s in (ct.get("required_sections") or []) if str(s).strip()]
+            sec_hits = sum(2 for rs in req_s if any(rs in h or h in rs for h in headings_norm if h))
+            tok_hits = sum(1 for tok in ct["slug"].split("-") if len(tok) >= 4 and tok in hay)
+            if sec_hits + tok_hits >= 2:
+                custom_candidates.append((sec_hits + tok_hits, ct))
+    custom_candidates.sort(key=lambda x: x[0], reverse=True)
     rules = (
         (("pdf", "attachment", "datasheet", "scanned", "03_resources/"), "proxy-asset-note"),
         (("vlan", "cidr", "subnet", "ipam", "/24", "firewall"), "homelab-network-matrix"),
         (("cpu", "ram", "ipmi", "cimc", "idrac", "chassis", "blade server", "esxi", "ucs", "hypervisor", "proxmox"), "homelab-host-spec"),
-        (("step 1", "prerequisites", "runbook", "procedure", "playbook", "maintenance", "oil", "torque", "rollback", "sop"), "sop-runbook"),
+        (("step 1", "prerequisites", "runbook", "playbook", "preventive maintenance", "oil change", "engine oil", "torque", "rollback", "sop"), "sop-runbook"),
         (("options considered", "decision", "adr", "consequences"), "adr-decision"),
         (("vs ", "versus", "comparison", "| :---", "tradeoff"), "concept-comparison"),
         (("worklog", "weekly", "completed work", "sprint"), "weekly-worklog"),
@@ -491,13 +523,16 @@ def recommend_templates(title: str, body: str, source: str = "") -> List[Dict[st
         [(sum(1 for k in keys if k in hay), slug) for keys, slug in rules],
         key=lambda x: x[0], reverse=True,
     )
-    picks = [slug for hits, slug in scored if hits > 0] + ["zettelkasten-atomic", "standard-note"]
-    seen: List[Dict[str, Any]] = []
+    seen: List[Dict[str, Any]] = [
+        {"slug": ct["slug"], "title": ct["title"], "document_type": ct["document_type"], "when_to_use": ct["when_to_use"], "required_sections": list(ct["required_sections"])}
+        for _, ct in custom_candidates[:2]
+    ]
+    picks = [slug for hits, slug in scored if hits > 0] + ["standard-note", "zettelkasten-atomic"]
     for slug in picks:
         if slug in BUILTIN_TEMPLATE_MAP and all(x["slug"] != slug for x in seen):
             sp = BUILTIN_TEMPLATE_MAP[slug]
             seen.append({"slug": sp.slug, "title": sp.title, "document_type": sp.document_type, "when_to_use": sp.when_to_use, "required_sections": list(sp.required_sections)})
-        if len(seen) >= 3:
+        if len(seen) >= 4:
             break
     return seen
 

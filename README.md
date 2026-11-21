@@ -75,7 +75,7 @@ docker compose up -d
   # Remove anytime (preserves your user data):
   powershell -ExecutionPolicy Bypass -File deploy\windows\uninstall-startup-service.ps1
   ```
-- **Build a standalone `CompanionSetup-v4.0.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
+- **Build a standalone `CompanionSetup-v4.1.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
   ```powershell
   powershell -ExecutionPolicy Bypass -File deploy\windows\build-installer.ps1
   ```
