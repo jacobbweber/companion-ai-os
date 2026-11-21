@@ -955,6 +955,21 @@ export interface TierRouteEntry {
   privacy_blocked: boolean;
 }
 
+export interface TierCalibrationResult {
+  ok: boolean;
+  tier: string;
+  model: string;
+  base_url: string;
+  streaming_ok: boolean;
+  thinking_detected: boolean;
+  tool_call_ok: boolean;
+  latency_ms: number;
+  ttft_ms: number;
+  detail: string;
+  summary?: string;
+  error?: string;
+}
+
 export interface ModelMatrixSnapshot {
   ok: boolean;
   active_mode: string;

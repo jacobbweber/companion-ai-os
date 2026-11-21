@@ -289,13 +289,31 @@ def lint_single_file_edit(
     return None, warn_str
 
 
+def _try_blank_normalized_replace(t_lines: List[str], o_lines: List[str], n_lines: List[str]) -> Optional[str]:
+    nz_o = [ln for ln in o_lines if ln.strip()]
+    if len(nz_o) < 2:
+        return None
+    nz_t = [(idx, ln) for idx, ln in enumerate(t_lines) if ln.strip()]
+    if len(nz_o) > len(nz_t):
+        return None
+    spans: List[Tuple[int, int]] = []
+    for pos in range(len(nz_t) - len(nz_o) + 1):
+        if all(nz_t[pos + k][1] == nz_o[k] for k in range(len(nz_o))):
+            if all((nz_t[pos + k + 1][0] - nz_t[pos + k][0]) <= 5 for k in range(len(nz_o) - 1)):
+                spans.append((nz_t[pos][0], nz_t[pos + len(nz_o) - 1][0]))
+    if len(spans) != 1:
+        return None
+    s_i, e_i = spans[0]
+    return "\n".join(t_lines[:s_i] + n_lines + t_lines[e_i + 1 :])
+
+
 def try_indent_shifted_replace(text: str, old: str, new: str) -> Optional[str]:
-    """If old matches a unique block in text shifted by a uniform leading-space offset, apply shifted new."""
+    """If old matches a unique block in text shifted by uniform leading spaces or minor blank-line count, apply new."""
     t_lines, o_lines, n_lines = text.split("\n"), old.split("\n"), new.split("\n")
-    if not o_lines or len(o_lines) > len(t_lines):
+    if not o_lines or len(o_lines) > len(t_lines) + 4:
         return None
     matches: List[Tuple[int, int]] = []
-    for i in range(len(t_lines) - len(o_lines) + 1):
+    for i in range(max(0, len(t_lines) - len(o_lines) + 1)):
         if any(t_lines[i + k].strip() != o_lines[k].strip() for k in range(len(o_lines))):
             continue
         rest_deltas = {
@@ -309,7 +327,7 @@ def try_indent_shifted_replace(text: str, old: str, new: str) -> Optional[str]:
         elif len(rest_deltas) == 1 and o_lines[0] == o_lines[0].lstrip(" "):
             matches.append((i, next(iter(rest_deltas))))
     if len(matches) != 1:
-        return None
+        return _try_blank_normalized_replace(t_lines, o_lines, n_lines)
     idx, delta = matches[0]
     t0_indent = len(t_lines[idx]) - len(t_lines[idx].lstrip(" "))
     adj_new: List[str] = []

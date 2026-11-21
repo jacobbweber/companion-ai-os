@@ -12,7 +12,7 @@ from companion.config import is_in_agent_tool_turn, settings, workspace_context
 from companion.llm import chat
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
 from companion.project_graph import get_project_graph
-from companion.sdlc_tools import _current_branch, _run_git_cmd, check_git_stage_safety, discover_repo_sdlc_context, preview_manager, tool_git_manage
+from companion.sdlc_tools import _current_branch, _run_git_cmd, check_git_stage_safety, discover_repo_sdlc_context, is_ephemeral_cache_path, preview_manager, tool_git_manage
 from companion.streaming import CancelScope, cancel_scope_context, check_cancelled, get_active_cancel_scope, get_active_stream_sink
 from companion.tool_schemas import int_arg
 
@@ -154,6 +154,7 @@ def _autocommit_clean_worktree_edits(worktree_path: Path, project_id: str, item_
         entry for ln in (st_out.splitlines() if rc_st == 0 else [])
         if (m := re.match(r"^[MADRCU?! ]{1,2}\s+(.+)$", ln))
         and (entry := m.group(1).split(" -> ")[-1].strip().strip('"'))
+        and not is_ephemeral_cache_path(entry)
         and check_git_stage_safety(worktree_path, [entry]) is None
     ]
     if cand_rels:
@@ -563,7 +564,7 @@ def run_parallel_subagents(
 
 
 def format_parallel_subagents_tool(args: Dict[str, Any]) -> str:
-    raw_tasks = args.get("tasks")
+    raw_tasks = next((args[k] for k in ("tasks", "subagents", "items") if args.get(k) is not None), None)
     if isinstance(raw_tasks, str) and raw_tasks.strip().startswith("["):
         with contextlib.suppress(Exception):
             raw_tasks = json.loads(raw_tasks)

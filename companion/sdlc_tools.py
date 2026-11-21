@@ -29,11 +29,13 @@ from companion.vault import _lock_windows_owner_dacl, get_vault_manager
 
 __all__ = [
     "PreviewInstance", "PreviewProcessManager", "_current_branch", "_run_git_cmd",
-    "check_git_stage_safety", "discover_repo_sdlc_context", "preview_manager",
-    "preview_turn_cleanup_scope", "tool_dev_preview", "tool_git_manage",
+    "check_git_stage_safety", "discover_repo_sdlc_context", "is_ephemeral_cache_path",
+    "preview_manager", "preview_turn_cleanup_scope", "tool_dev_preview", "tool_git_manage",
 ]
 
 _PROTECTED_BRANCHES = frozenset({"main", "master", "production", "release"})
+_EPHEMERAL_CACHE_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+_EPHEMERAL_CACHE_EXTS = frozenset({".pyc", ".pyo", ".pyd"})
 _BLOCKED_STAGE_NAMES = frozenset({".env", "secrets.env", "id_rsa", "id_ed25519", "id_ecdsa"})
 _BLOCKED_STAGE_EXTS = frozenset({
     ".pem", ".key", ".p12", ".pfx", ".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3",
@@ -109,14 +111,19 @@ def discover_repo_sdlc_context(root: Path, project: Optional[Dict[str, Any]] = N
     return "sdlc_repo_context: " + " | ".join(parts)
 
 
+def _resolve_repo_arg(raw_repo: str) -> Path:
+    active = settings.active_project_root.resolve()
+    clean = (raw_repo or "").strip()
+    if not clean or clean in (".", "./") or clean.replace("\\", "/").strip("/") == active.name:
+        return active
+    p = Path(clean)
+    return p.resolve() if p.is_absolute() else (active / p).resolve()
+
+
 def _is_allowed_sdlc_repo_dir(target: Path, mutating: bool) -> Optional[str]:
-    resolved = target.resolve()
-    self_root = settings.root.resolve()
+    resolved, self_root = target.resolve(), settings.root.resolve()
     if mutating and resolved == self_root:
-        return (
-            f"SAFETY GUARD REJECTED: Companion's installed `app/` directory (`{self_root}`) is permanently IMMUTABLE. "
-            "Run mutating Git/SDLC operations inside an external Project clone or worktree (`workspace_path`)."
-        )
+        return f"SAFETY GUARD REJECTED: Companion's installed `app/` directory (`{self_root}`) is permanently IMMUTABLE. Run mutating Git/SDLC operations inside an external Project clone or worktree (`workspace_path`)."
     ws = settings.get_workspace()
     allowed = [ws.project_root.resolve(), Path(tempfile.gettempdir()).resolve()]
     wt_base = (ws.project_root.resolve().parent / ".worktrees").resolve()
@@ -127,6 +134,11 @@ def _is_allowed_sdlc_repo_dir(target: Path, mutating: bool) -> Optional[str]:
     if not any(resolved.is_relative_to(a) for a in allowed) and resolved != self_root:
         return f"SAFETY GUARD REJECTED: Repository path `{resolved}` is outside the active WorkspaceContext (`{ws.project_root}`)."
     return None
+
+
+def is_ephemeral_cache_path(raw_rel: str) -> bool:
+    p = Path((raw_rel or "").replace("\\", "/").strip("/"))
+    return bool(({pt.lower() for pt in p.parts} & _EPHEMERAL_CACHE_DIRS) or p.suffix.lower() in _EPHEMERAL_CACHE_EXTS)
 
 
 def check_git_stage_safety(repo_root: Path, rel_paths: List[str]) -> Optional[str]:
@@ -239,11 +251,11 @@ def _handle_git_worktree(action: str, repo_root: Path, args: Dict[str, Any]) -> 
         rc, out = _run_git_cmd(repo_root, ["worktree", "remove", "--force", str(wt_p)])
         _run_git_cmd(repo_root, ["worktree", "prune"])
         return f"Removed worktree `{wt_p}`." if rc == 0 else f"error: {out}"
-    raw_br = str_arg(args, "branch") or f"feat/{_slugify_branch_part(str_arg(args, 'slug') or 'slice')}"
+    raw_br = str_arg(args, "branch", aliases=("branch_name", "target_branch")) or f"feat/{_slugify_branch_part(str_arg(args, 'slug') or 'slice')}"
     if raw_br.lower() in _PROTECTED_BRANCHES:
         return f"SAFETY GUARD REJECTED: create worktrees on a feature branch (`feat/...`), not `{raw_br}`."
     slug = re.sub(r"[^a-z0-9_-]+", "-", raw_br.lower()).strip("-")[:48]
-    wt_raw = str_arg(args, "worktree_path")
+    wt_raw = str_arg(args, "worktree_path", aliases=("path", "dir"))
     wt_dir = Path(wt_raw).resolve() if wt_raw else (repo_root.parent / ".worktrees" / repo_root.name / slug).resolve()
     if wt_dir.is_relative_to(settings.root.resolve()):
         return "SAFETY GUARD REJECTED: worktree_path must live outside Companion's installed `app/` directory."
@@ -262,15 +274,14 @@ def _handle_git_commit(repo_root: Path, args: Dict[str, Any]) -> str:
     cur_br = _current_branch(repo_root)
     allow_prot = bool_arg(args, "allow_protected_branch", False) and not is_in_agent_tool_turn()
     if cur_br.lower() in _PROTECTED_BRANCHES and not allow_prot:
-        return (
-            f"SAFETY GUARD REJECTED: direct commits onto protected branch `{cur_br}` are blocked. "
-            "Create/switch to a feature branch first via `git_manage(action='branch', branch='feat/<slug>')`."
-        )
-    msg = " ".join((str_arg(args, "message") or "").splitlines()).strip()
+        return f"SAFETY GUARD REJECTED: direct commits onto protected branch `{cur_br}` are blocked. Create/switch to a feature branch first via `git_manage(action='branch', branch='feat/<slug>')`."
+    msg = " ".join((str_arg(args, "message", aliases=("commit_message", "msg", "summary")) or "").splitlines()).strip()
     if not msg:
         return "error: commit `message` is required"
-    raw_paths = args.get("paths") if args.get("paths") is not None else args.get("files")
-    cand_rels: List[str] = [str(p).strip() for p in raw_paths if str(p).strip()] if isinstance(raw_paths, list) and raw_paths else []
+    raw_paths = next((args[k] for k in ("paths", "files", "file_paths") if args.get(k) is not None), None)
+    if isinstance(raw_paths, str) and raw_paths.strip():
+        raw_paths = json.loads(raw_paths) if raw_paths.strip().startswith("[") else [p.strip() for p in raw_paths.split(",") if p.strip()]
+    cand_rels: List[str] = [str(p).strip() for p in raw_paths if str(p).strip() and not is_ephemeral_cache_path(str(p))] if isinstance(raw_paths, list) and raw_paths else []
     if not cand_rels:
         rc_st, st_out = _run_git_cmd(repo_root, ["status", "--porcelain=v1"])
         if rc_st != 0:
@@ -279,7 +290,7 @@ def _handle_git_commit(repo_root: Path, args: Dict[str, Any]) -> str:
             m_porc = re.match(r"^[MADRCU?! ]{1,2}\s+(.+)$", ln)
             if m_porc:
                 entry = m_porc.group(1).split(" -> ")[-1].strip().strip('"')
-                if entry:
+                if entry and not is_ephemeral_cache_path(entry):
                     cand_rels.append(entry)
     if not cand_rels:
         return "Working tree is clean; nothing to commit."
@@ -345,8 +356,8 @@ def _handle_git_remote(action: str, repo_root: Path, args: Dict[str, Any]) -> st
 def tool_git_manage(args: Dict[str, Any]) -> str:
     """Execute safe local & Blind-Vault-authenticated Git/worktree operations governed by `delivery_policy`."""
     action = str_arg(args, "action", "status").lower()
-    raw_repo = str_arg(args, "repo_path")
-    repo_root = Path(raw_repo).resolve() if raw_repo else settings.active_project_root.resolve()
+    raw_repo = str_arg(args, "repo_path", aliases=("cwd", "repo", "workdir"))
+    repo_root = _resolve_repo_arg(raw_repo)
     mutating = action not in ("status", "diff", "log", "worktree_list")
     dir_err = _is_allowed_sdlc_repo_dir(repo_root, mutating=mutating)
     if dir_err:
@@ -361,8 +372,8 @@ def tool_git_manage(args: Dict[str, Any]) -> str:
         return f"Repo: `{repo_root}` | branch=`{br}` | delivery_policy=`{dp}`\n{st or '(clean)'}"
     if action == "diff":
         d_args = ["diff", "--cached"] if bool_arg(args, "staged", False) else ["diff"]
-        if str_arg(args, "path"):
-            d_args.extend(["--", str_arg(args, "path")])
+        if str_arg(args, "path", aliases=("file_path",)):
+            d_args.extend(["--", str_arg(args, "path", aliases=("file_path",))])
         rc, out = _run_git_cmd(repo_root, d_args)
         return (out[: settings.out_limit] or "(no diff)") if rc == 0 else f"error: {out}"
     if action == "log":
@@ -370,7 +381,8 @@ def tool_git_manage(args: Dict[str, Any]) -> str:
         rc, out = _run_git_cmd(repo_root, ["log", f"-n{lim}", "--oneline", "--decorate"])
         return (out or "(no commits)") if rc == 0 else f"error: {out}"
     if action == "branch":
-        br = str_arg(args, "branch")
+        raw_sl = str_arg(args, "slug", aliases=("name",))
+        br = str_arg(args, "branch", aliases=("branch_name", "target_branch")) or (raw_sl if "/" in raw_sl else (f"feat/{_slugify_branch_part(raw_sl)}" if raw_sl else ""))
         if not br:
             rc, out = _run_git_cmd(repo_root, ["branch", "--list"])
             return out if rc == 0 else f"error: {out}"
@@ -660,11 +672,11 @@ def tool_dev_preview(args: Dict[str, Any]) -> str:
     """Start, inspect logs, HTTP-probe, visually critique, or tear down isolated local `dev_preview` servers."""
     action = str_arg(args, "action", "status").lower()
     if action == "start":
-        cwd_str = str_arg(args, "cwd")
+        cwd_str = str_arg(args, "cwd", aliases=("repo_path", "workdir"))
         sid = int(getattr(_ACTIVE_TURN_PREVIEW_SCOPE, "sid", 0) or 0)
         res = preview_manager.start(
-            cwd=Path(cwd_str).resolve() if cwd_str else None, command=str_arg(args, "command"),
-            port=int_arg(args, "port", 0), health_path=str_arg(args, "health_path") or str_arg(args, "ready_path"),
+            cwd=_resolve_repo_arg(cwd_str) if cwd_str else None, command=str_arg(args, "command", aliases=("cmd",)),
+            port=int_arg(args, "port", 0), health_path=str_arg(args, "health_path", aliases=("ready_path", "path")),
             startup_timeout=float(int_arg(args, "timeout", 20)), turn_scope_id=sid,
         )
         return json.dumps(res) if res.get("ok") else f"error: {res.get('error')}"

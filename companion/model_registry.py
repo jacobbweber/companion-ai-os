@@ -12,13 +12,15 @@ import json
 import os
 import re
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion import memory_store as _ms_mod
 from companion.config import CAPABILITY_TIERS, MODEL_TIERS, TierConfig, is_in_agent_tool_turn, settings
-from companion.llm import discover_provider_models, format_model_tiers_status
+from companion.llm import chat, discover_provider_models, format_model_tiers_status, normalize_assistant_message
 from companion.llm_wire import VALID_DIALECTS, VALID_PRIVACY_MODES, VALID_REASONING_EFFORTS, is_local_or_lan_endpoint
 from companion.memory_store import MemoryStore, get_memory_store
+from companion.streaming import stream_event_context
 from companion.vault import get_vault_manager, normalize_secret_name
 
 __all__ = [
@@ -490,6 +492,78 @@ def _save_tier_route(params: Dict[str, Any], mem: MemoryStore) -> Dict[str, Any]
     return {**snap, "summary": f"Updated `{tier}` tier -> `{model}` via `{pid}` (ctx={ctx_win:,}, temp={temp:.2f}{f', effort={effort}' if effort else ''})."}
 
 
+def _calibrate_tier(params: Dict[str, Any], mem: MemoryStore) -> Dict[str, Any]:
+    """Run a non-destructive 2-step live streaming + tool-call compatibility probe against `tier`."""
+    tier = str(params.get("tier") or "fast").strip().lower()
+    if tier not in CAPABILITY_TIERS:
+        return {"ok": False, "error": f"Invalid tier `{tier}`. Valid: {', '.join(CAPABILITY_TIERS)}."}
+    _ensure_schema_and_seed(mem)
+    resolved_map, eff_priv = _get_cached_state(mem, settings.tiers)
+    cfg = resolved_map.get(tier, settings.resolve_tier(tier))
+    if eff_priv == "local_only" and not is_local_or_lan_endpoint(cfg.base_url):
+        msg = f"BLOCKED (`local_only` Privacy Lock prevents probing `{cfg.base_url}`)"
+        return {"ok": False, "tier": tier, "model": cfg.model, "base_url": cfg.base_url, "streaming_ok": False, "thinking_detected": False, "tool_call_ok": False, "latency_ms": 0.0, "ttft_ms": 0.0, "detail": msg, "error": msg, "summary": f"Tier `{tier}` (`{cfg.model}`): {msg}"}
+    ping_tool = [{"type": "function", "function": {"name": "calibration_ping", "description": "Read-only compatibility ping. Call immediately with echo='ok'.", "parameters": {"type": "object", "properties": {"echo": {"type": "string", "description": "Pass exact string 'ok'."}}, "required": ["echo"]}}}]
+    msgs: List[Dict[str, Any]] = [
+        {"role": "system", "content": "You are a compatibility probe. Immediately call `calibration_ping` with `{\"echo\": \"ok\"}`."},
+        {"role": "user", "content": "Invoke calibration_ping with echo='ok' now."},
+    ]
+    t0, first_mono, evts = time.perf_counter(), [], []
+
+    def _on_evt(ev: Dict[str, Any]) -> None:
+        evts.append(ev)
+        if not first_mono and ev.get("type") in ("thinking_delta", "text_delta", "orphan_think_closed"):
+            first_mono.append(time.perf_counter())
+
+    timeout_s = max(3, int(params.get("timeout") or 30))
+    call_kw = {"base_url": cfg.base_url, "model": cfg.model, "api_key": cfg.api_key, "temperature": 0.0, "http_timeout": timeout_s, "max_retries": 0, "dialect": cfg.dialect, "reasoning_effort": cfg.reasoning_effort}
+    streaming_ok, thinking_detected, tool_call_ok, warn_detail = False, False, False, ""
+    try:
+        with stream_event_context(_on_evt):
+            resp1 = chat(msgs, tools=ping_tool, tool_choice="auto", max_tokens=256, **call_kw)
+        msg1 = (resp1.get("choices") or [{}])[0].get("message") or {}
+        clean1, think1, tcalls = normalize_assistant_message(msg1)
+        streaming_ok = bool(evts or clean1 or think1 or tcalls)
+        thinking_detected = bool(think1) or any(e.get("type") in ("thinking_delta", "orphan_think_closed") for e in evts)
+        ping_tc = next((tc for tc in tcalls if (tc.get("function") or {}).get("name") == "calibration_ping"), None)
+        parsed_args = None
+        if ping_tc is not None:
+            raw_a = (ping_tc.get("function") or {}).get("arguments")
+            try:
+                parsed_args = json.loads(raw_a) if isinstance(raw_a, str) else raw_a
+            except Exception:
+                parsed_args = None
+        if isinstance(parsed_args, dict) and parsed_args:
+            step2_msgs = [*msgs, {"role": "assistant", "content": clean1 or "", "tool_calls": tcalls}, {"role": "tool", "tool_call_id": str(ping_tc.get("id") or "call_cal_1"), "name": "calibration_ping", "content": '{"ok": true, "echo": "ok"}'}]
+            with stream_event_context(_on_evt):
+                resp2 = chat(step2_msgs, tools=None, tool_choice="none", max_tokens=96, **call_kw)
+            _, think2, _ = normalize_assistant_message((resp2.get("choices") or [{}])[0].get("message") or {})
+            thinking_detected = thinking_detected or bool(think2) or any(e.get("type") in ("thinking_delta", "orphan_think_closed") for e in evts)
+            tool_call_ok = True
+        else:
+            warn_detail = "Model streamed text without invoking `calibration_ping` (verify tool-calling template)."
+    except Exception as exc:
+        err_s = str(exc)
+        if any(k in err_s.lower() for k in ("http 400", "tool", "template", "function")):
+            try:
+                with stream_event_context(_on_evt):
+                    fb = chat([{"role": "user", "content": "Reply with OK."}], tools=None, tool_choice="none", max_tokens=48, **call_kw)
+                c_fb, t_fb, _ = normalize_assistant_message((fb.get("choices") or [{}])[0].get("message") or {})
+                streaming_ok = bool(evts or c_fb or t_fb)
+                thinking_detected = bool(t_fb) or any(e.get("type") in ("thinking_delta", "orphan_think_closed") for e in evts)
+                warn_detail = f"Streaming OK, but endpoint rejected native tool calling ({err_s[:120]})."
+            except Exception as fb_exc:
+                err_s = str(fb_exc)
+        if not streaming_ok:
+            lat = round((time.perf_counter() - t0) * 1000.0, 1)
+            return {"ok": False, "tier": tier, "model": cfg.model, "base_url": cfg.base_url, "streaming_ok": False, "thinking_detected": False, "tool_call_ok": False, "latency_ms": lat, "ttft_ms": 0.0, "detail": err_s[:220], "error": err_s[:220], "summary": f"Tier `{tier}` (`{cfg.model}`) probe failed: {err_s[:160]}"}
+    lat_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+    ttft_ms = round((first_mono[0] - t0) * 1000.0, 1) if first_mono else lat_ms
+    ok = bool(streaming_ok and tool_call_ok)
+    detail = warn_detail or f"{'✓ Stream' if streaming_ok else '✗ Stream'} · {'✓ Tool Call' if tool_call_ok else '⚠ No Tool Call'} · {'✓ Reasoning' if thinking_detected else 'Direct'} · {lat_ms:.0f}ms (TTFT {ttft_ms:.0f}ms)"
+    return {"ok": ok, "tier": tier, "model": cfg.model, "base_url": cfg.base_url, "streaming_ok": streaming_ok, "thinking_detected": thinking_detected, "tool_call_ok": tool_call_ok, "latency_ms": lat_ms, "ttft_ms": ttft_ms, "detail": detail, "summary": f"Tier `{tier}` (`{cfg.model}`): {detail}"}
+
+
 def execute_model_registry_action(params: Optional[Dict[str, Any]] = None, actor: str = "user", store: Optional[MemoryStore] = None) -> Dict[str, Any]:
     """Execute Shared Core Action `models` across Web UI, CLI `/providers`, and internal tools."""
     p = dict(params or {})
@@ -520,6 +594,8 @@ def execute_model_registry_action(params: Optional[Dict[str, Any]] = None, actor
         return {**get_model_matrix_snapshot(mem), "summary": f"Removed provider `{pid}`."}
     if sub in ("test_provider", "discover_models", "discover"):
         return _discover_or_test_provider(p, mem)
+    if sub in ("calibrate_tier", "calibrate"):
+        return _calibrate_tier(p, mem)
     if sub in ("save_tier", "set_tier"):
         return _save_tier_route(p, mem)
     if sub == "reset_tier":
@@ -566,6 +642,8 @@ def parse_providers_slash(parts: List[str]) -> Dict[str, Any]:
     sub, rest = parts[0].lower(), parts[1:]
     if sub in ("check", "ping"):
         return {"subaction": "discover_models", "provider_id": rest[0]} if rest else {"subaction": "check_all"}
+    if sub == "calibrate":
+        return {"subaction": "calibrate_tier", "tier": rest[0] if rest else "fast"}
     if sub == "privacy" and rest:
         return {"subaction": "set_privacy", "privacy_mode": rest[0]}
     if sub == "add" and rest:

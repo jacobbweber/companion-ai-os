@@ -289,6 +289,8 @@ def _build_openai_compat_request(
         body["tools"], body["tool_choice"] = tools, tool_choice
     if stream:
         body["stream"] = True
+        if is_local_or_lan_endpoint(base_url) or "api.openai.com" in low_url or "openrouter.ai" in low_url:
+            body["stream_options"] = {"include_usage": True}
     headers: Dict[str, str] = {"Content-Type": "application/json", "User-Agent": "companion-os/3.3"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -683,8 +685,12 @@ def heal_http_400_request(dialect: str, url: str, body: Dict[str, Any], err_body
         mutated.pop("reasoning_effort", None)
         mutated.pop("reasoning", None)
         changed = True
+    if "stream_options" in low_err and "stream_options" in mutated:
+        mutated.pop("stream_options", None)
+        changed = True
     if not changed and mutated.get("stream") and _is_stream_error(low_err):
         mutated.pop("stream", None)
+        mutated.pop("stream_options", None)
         changed = True
     return (url, mutated) if changed else None
 

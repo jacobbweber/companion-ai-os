@@ -187,10 +187,7 @@ class ProjectGraphManager:
     @contextlib.contextmanager
     def project_workspace_scope(self, project_id: Optional[str] = None) -> Iterator[None]:
         """Bind `workspace_context(Path(workspace_path), project_id)` when a focused/target project has a bound repo directory."""
-        if _WORKSPACE_OVERRIDE.get() is not None:
-            yield
-            return
-        raw_pid = (project_id or self.store.get_user_profile().get("active_goal_project_id") or "").strip()
+        raw_pid = "" if _WORKSPACE_OVERRIDE.get() is not None else (project_id or self.store.get_user_profile().get("active_goal_project_id") or "").strip()
         if not raw_pid:
             yield
             return
@@ -213,7 +210,8 @@ class ProjectGraphManager:
         if not clean_title:
             raise ValueError("Project/Goal title is required.")
         base_slug = _slugify(slug or clean_title, "goal")
-        pid = (project_id or f"proj_{base_slug}_{uuid.uuid4().hex[:6]}").strip()
+        existing_p = None if (project_id or slug) else self.store._fetch_rows("SELECT project_id FROM projects WHERE LOWER(title) = LOWER(?) AND status = 'active' LIMIT 1", (clean_title,))
+        pid = (project_id or (str(existing_p[0][0]) if existing_p else f"proj_{base_slug}_{uuid.uuid4().hex[:6]}")).strip()
         tp = trigger_policy if isinstance(trigger_policy, TriggerPolicy) else TriggerPolicy.from_dict(trigger_policy)
         ws_id = (workspace_id or settings.get_workspace().project_id or SELF_PROJECT_ID).strip()
         ws_p = str(Path(workspace_path).resolve()) if (workspace_path or "").strip() else ""
@@ -358,6 +356,23 @@ class ProjectGraphManager:
             r["epic_id"] = r["milestone_id"]
         return rows
 
+    def _resolve_dep_ids(self, pid: str, raw_deps: Optional[List[Any]], exclude_id: str = "") -> List[str]:
+        if not raw_deps:
+            return []
+        existing = self.list_items(project_id=pid)
+        known_ids, out = {it["item_id"] for it in existing}, []
+        for raw in raw_deps:
+            d = str(raw or "").strip()
+            if not d or d == exclude_id:
+                continue
+            if d not in known_ids:
+                low_d = d.lower()
+                hit = next((it for it in existing if str(it["id"]) == d or it["title"].lower() == low_d or (d.startswith("wi_") and len(d) >= 9 and it["item_id"][:9] == d[:9]) or (not d.startswith("wi_") and len(low_d) >= 4 and low_d in it["title"].lower())), None)
+                d = hit["item_id"] if hit else d
+            if d != exclude_id and d not in out:
+                out.append(d)
+        return out
+
     def create_item(
         self, project_id: Optional[str], title: str, description: str = "", owner: str = "companion",
         stage_kind: str = "DELIVER_AND_VERIFY", status: str = "ready", priority: int = 3,
@@ -372,7 +387,10 @@ class ProjectGraphManager:
         pid = self.resolve_project_id(project_id)
         own = owner.strip().lower() if owner and owner.strip().lower() in VALID_ITEM_OWNERS else "companion"
         sk = stage_kind if stage_kind in VALID_STAGE_KINDS else "DELIVER_AND_VERIFY"
-        deps = [str(d).strip() for d in (depends_on or []) if str(d).strip()]
+        deps = self._resolve_dep_ids(pid, depends_on)
+        dup_rows = self.store._fetch_rows("SELECT item_id FROM work_items WHERE project_id = ? AND milestone_id = ? AND LOWER(title) = LOWER(?) AND status NOT IN ('done', 'completed', 'cancelled', 'archived') LIMIT 1", (pid, milestone_id, clean_title))
+        if dup_rows:
+            return self.update_item(str(dup_rows[0][0]), **({"depends_on": deps} if deps else {}), **({"description": description.strip()} if description.strip() else {}))
         iid = f"wi_{uuid.uuid4().hex[:10]}"
         with self.store._lock:
             self.store._ensure_project_record(pid)
@@ -415,7 +433,7 @@ class ProjectGraphManager:
         comp_at = cur.get("completed_at")
         if new_status in DONE_STATUSES and not comp_at:
             comp_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        deps = updates["depends_on"] if "depends_on" in updates and updates["depends_on"] is not None else cur["depends_on"]
+        deps = self._resolve_dep_ids(pid, updates["depends_on"], exclude_id=iid) if "depends_on" in updates and updates["depends_on"] is not None else cur["depends_on"]
         chk = updates["checklist"] if "checklist" in updates and updates["checklist"] is not None else cur["checklist"]
         tags = updates["tags"] if "tags" in updates and updates["tags"] is not None else cur["tags"]
         ver = updates["verification"] if "verification" in updates and updates["verification"] is not None else cur["verification"]

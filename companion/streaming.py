@@ -262,11 +262,11 @@ def stream_event_context(sink: Optional[StreamCallback]) -> Iterator[None]:
 
 
 class _ThinkTagStreamSplitter:
-    """Incremental state machine splitting `<think>...</think>` and prefix-orphan `</think>` from visible deltas."""
+    """Incremental state machine splitting `<think>...</think>`, `<tool_call>`, and `<function=...>` from visible deltas."""
 
     def __init__(self) -> None:
         self.in_think = False
-        self.in_tool_xml = False
+        self._tool_close_tag = ""
         self.saw_open_think = False
         self._emitted_pre_text: List[str] = []
         self._buf = ""
@@ -290,14 +290,14 @@ class _ThinkTagStreamSplitter:
     def _drain(self, final: bool) -> None:
         while self._buf:
             low = self._buf.lower()
-            if self.in_tool_xml:
-                end_tc = low.find("</tool_call>")
+            if self._tool_close_tag:
+                end_tc = low.find(self._tool_close_tag)
                 if end_tc == -1:
                     if final:
                         self._buf = ""
                     return
-                self._buf = self._buf[end_tc + len("</tool_call>") :]
-                self.in_tool_xml = False
+                self._buf = self._buf[end_tc + len(self._tool_close_tag) :]
+                self._tool_close_tag = ""
                 continue
             if not self.in_think:
                 orphan_end = low.find("</think>")
@@ -309,10 +309,16 @@ class _ThinkTagStreamSplitter:
                     emit_stream_event({"type": "orphan_think_closed", "thinking": pre_thought})
                     self._buf = self._buf[orphan_end + len("</think>") :]
                     continue
-                tc_idx = low.find("<tool_call>")
-                candidates = [i for i in (tc_idx, th_idx) if i != -1]
+                tc_idx, fn_idx = low.find("<tool_call>"), low.find("<function=")
+                orphan_tc = low.find("</tool_call>")
+                if orphan_tc != -1 and (tc_idx == -1 or orphan_tc < tc_idx) and (th_idx == -1 or orphan_tc < th_idx):
+                    if orphan_tc > 0:
+                        self._emit_visible(self._buf[:orphan_tc])
+                    self._buf = self._buf[orphan_tc + len("</tool_call>") :]
+                    continue
+                candidates = [i for i in (tc_idx, fn_idx, th_idx) if i != -1]
                 if not candidates:
-                    hold = 0 if final else min(len(self._buf), 11)
+                    hold = 0 if final else min(len(self._buf), 14)
                     safe_upto = len(self._buf) - hold if ("<" in self._buf[-hold:] and hold) else len(self._buf)
                     if safe_upto <= 0:
                         return
@@ -329,21 +335,27 @@ class _ThinkTagStreamSplitter:
                     self.in_think = True
                     self.saw_open_think = True
                     self._emitted_pre_text.clear()
-                else:
+                elif first == tc_idx:
                     self._buf = self._buf[first + len("<tool_call>") :]
-                    self.in_tool_xml = True
+                    self._tool_close_tag = "</tool_call>"
+                else:
+                    self._buf = self._buf[first + len("<function=") :]
+                    self._tool_close_tag = "</function>"
             else:
                 end_idx = low.find("</think>")
                 if end_idx == -1:
-                    tc_in_think = low.find("<tool_call>")
-                    if tc_in_think != -1:
-                        if tc_in_think > 0:
-                            emit_stream_event({"type": "thinking_delta", "delta": self._buf[:tc_in_think]})
-                        self._buf = self._buf[tc_in_think + len("<tool_call>") :]
+                    tc_in, fn_in = low.find("<tool_call>"), low.find("<function=")
+                    t_cands = [i for i in (tc_in, fn_in) if i != -1]
+                    if t_cands:
+                        t_first = min(t_cands)
+                        if t_first > 0:
+                            emit_stream_event({"type": "thinking_delta", "delta": self._buf[:t_first]})
+                        is_tc = t_first == tc_in
+                        self._buf = self._buf[t_first + len("<tool_call>" if is_tc else "<function=") :]
                         self.in_think = False
-                        self.in_tool_xml = True
+                        self._tool_close_tag = "</tool_call>" if is_tc else "</function>"
                         continue
-                    hold = 0 if final else min(len(self._buf), 11)
+                    hold = 0 if final else min(len(self._buf), 12)
                     safe_upto = len(self._buf) - hold if ("<" in self._buf[-hold:] and hold) else len(self._buf)
                     if safe_upto <= 0:
                         return
@@ -406,7 +418,7 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
         data = json.loads(raw)
         if has_stream_sink() and isinstance(data, dict) and data.get("choices"):
             msg = (data["choices"][0] or {}).get("message") or {}
-            reas = str(msg.get("reasoning_content") or msg.get("reasoning") or "")
+            reas = str(msg.get("reasoning_content") or msg.get("reasoning") or msg.get("thinking") or "")
             if reas:
                 emit_stream_event({"type": "thinking_delta", "delta": reas})
             splitter = _ThinkTagStreamSplitter()
@@ -448,7 +460,7 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
         if c0.get("finish_reason"):
             finish_reason = str(c0["finish_reason"])
         delta = c0.get("delta") if isinstance(c0.get("delta"), dict) else {}
-        r_piece = str(delta.get("reasoning_content") or delta.get("reasoning") or "")
+        r_piece = str(delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking") or "")
         if r_piece:
             reasoning_parts.append(r_piece)
             emit_stream_event({"type": "thinking_delta", "delta": r_piece})
@@ -508,6 +520,34 @@ def _normalize_parsed_tc_obj(parsed: Dict[str, Any], idx: int) -> Optional[Dict[
     return {"id": f"rescued_tc_{idx}", "type": "function", "function": {"name": name, "arguments": arg_str}}
 
 
+_PRESERVE_INDENT_PARAMS = frozenset({"old_str", "new_str", "old_string", "new_string", "old_text", "new_text", "content", "code", "body"})
+
+
+def _parse_xml_func_matches(xml_matches: List[re.Match[str]], base_idx: int) -> List[Dict[str, Any]]:
+    out_xml: List[Dict[str, Any]] = []
+    for offset, xml_m in enumerate(xml_matches):
+        fn_name = xml_m.group(1).strip()
+        args_dict: Dict[str, Any] = {}
+        for p_key, p_val in _XML_PARAM_RE.findall(xml_m.group(2)):
+            key_c = p_key.strip()
+            if key_c in _PRESERVE_INDENT_PARAMS:
+                args_dict[key_c] = re.sub(r"^\r?\n|\r?\n$", "", p_val)
+                continue
+            val_clean = p_val.strip()
+            if val_clean.startswith(("{", "[")):
+                with contextlib.suppress(Exception):
+                    args_dict[key_c] = json.loads(val_clean)
+                    continue
+            if val_clean.lower() in ("true", "false"):
+                args_dict[key_c] = val_clean.lower() == "true"
+                continue
+            if val_clean.lower() == "null":
+                continue
+            args_dict[key_c] = val_clean
+        out_xml.append({"id": f"rescued_tc_{base_idx + offset}", "type": "function", "function": {"name": fn_name, "arguments": json.dumps(args_dict)}})
+    return out_xml
+
+
 def _parse_tool_block_items(inner: str, base_idx: int) -> List[Dict[str, Any]]:
     """Parse one `<tool_call>` body in JSON object, JSON array (`[...]`), or Qwen XML (`<function=...>`) syntax."""
     body = inner.strip()
@@ -515,19 +555,7 @@ def _parse_tool_block_items(inner: str, base_idx: int) -> List[Dict[str, Any]]:
         body = re.sub(r"^```(?:json|xml)?\s*|\s*```$", "", body, flags=re.IGNORECASE).strip()
     xml_matches = list(_XML_FUNC_RE.finditer(body))
     if xml_matches:
-        out_xml: List[Dict[str, Any]] = []
-        for offset, xml_m in enumerate(xml_matches):
-            fn_name = xml_m.group(1).strip()
-            args_dict: Dict[str, Any] = {}
-            for p_key, p_val in _XML_PARAM_RE.findall(xml_m.group(2)):
-                val_clean = p_val.strip()
-                if val_clean.startswith(("{", "[")):
-                    with contextlib.suppress(Exception):
-                        args_dict[p_key] = json.loads(val_clean)
-                        continue
-                args_dict[p_key] = val_clean
-            out_xml.append({"id": f"rescued_tc_{base_idx + offset}", "type": "function", "function": {"name": fn_name, "arguments": json.dumps(args_dict)}})
-        return out_xml
+        return _parse_xml_func_matches(xml_matches, base_idx)
     try:
         parsed = json.loads(body)
     except Exception:
@@ -541,12 +569,22 @@ def _parse_tool_block_items(inner: str, base_idx: int) -> List[Dict[str, Any]]:
 
 
 def rescue_text_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Rescue `<tool_call>...</tool_call>` JSON/array/XML blocks emitted inside assistant text into OpenAI `tool_calls`."""
-    if not text or "<tool_call>" not in text.lower():
+    """Rescue `<tool_call>...</tool_call>` or bare `<function=...>...</function>` blocks into OpenAI `tool_calls`."""
+    if not text:
+        return text, []
+    low = text.lower()
+    if "<tool_call>" not in low and "<function=" not in low:
         return text, []
     rescued: List[Dict[str, Any]] = []
-    for match in _TOOL_CALL_TAG_RE.finditer(text):
-        rescued.extend(_parse_tool_block_items(match.group(1), len(rescued) + 1))
-    if not rescued:
-        return text, []
-    return _TOOL_CALL_TAG_RE.sub("", text).strip(), rescued
+    remaining = text
+    if "<tool_call>" in low:
+        for match in _TOOL_CALL_TAG_RE.finditer(remaining):
+            rescued.extend(_parse_tool_block_items(match.group(1), len(rescued) + 1))
+        if rescued:
+            remaining = _TOOL_CALL_TAG_RE.sub("", remaining).strip()
+    if "<function=" in remaining.lower():
+        bare_xml = list(_XML_FUNC_RE.finditer(remaining))
+        if bare_xml:
+            rescued.extend(_parse_xml_func_matches(bare_xml, len(rescued) + 1))
+            remaining = re.sub(r"</?tool_call>", "", _XML_FUNC_RE.sub("", remaining), flags=re.IGNORECASE).strip()
+    return (remaining, rescued) if rescued else (text, [])

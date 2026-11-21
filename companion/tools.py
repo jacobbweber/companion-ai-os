@@ -49,25 +49,32 @@ __all__ = [
 ]
 
 
+_WIKI_DIRS = ("01_inbox", "02_knowledge", "03_resources", "04_archive")
+
+
 def resolve(p: str, for_write: bool = False) -> Path:
-    """Resolve `p` against the active `WorkspaceContext` (mapping `data/...` to `effective_data_dir` on `self`)."""
+    """Resolve `p` against the active `WorkspaceContext` (mapping `data/...` & Wiki folders on `self`)."""
     cand = Path(p)
     if cand.is_absolute():
         return cand
-    ws = settings.get_workspace()
-    norm = p.replace("\\", "/").strip("/")
+    ws, norm = settings.get_workspace(), p.replace("\\", "/").strip("/")
+    if ws.is_self_project and (norm in _WIKI_DIRS or norm.startswith(tuple(f"{d}/" for d in _WIKI_DIRS))):
+        return settings.wiki_dir / norm
     if ws.is_self_project and (norm == "data" or norm.startswith("data/")):
-        sub = norm[5:] if norm.startswith("data/") else ""
-        return (settings.effective_data_dir / sub) if sub else settings.effective_data_dir
+        return (settings.effective_data_dir / norm[5:]) if norm.startswith("data/") and norm[5:] else settings.effective_data_dir
     if ws.is_self_project and (norm == "scratch" or norm.startswith("scratch/")):
-        sub = norm[8:] if norm.startswith("scratch/") else ""
-        return (settings.scratch_dir / sub) if sub else settings.scratch_dir
+        return (settings.scratch_dir / norm[8:]) if norm.startswith("scratch/") and norm[8:] else settings.scratch_dir
     if for_write and ws.is_self_project and not norm.startswith(("companion/", "surfaces/", "frontend/", "specs/", "skills/", "configs/", "memory/", "tests/", ".env", "secrets.env")) and norm not in ("README.md", "harness.py", ".gitignore", "Dockerfile", "docker-compose.yml"):
         return settings.scratch_dir / norm
-    if not for_write and not ws.is_self_project:
-        if (ws.project_root / p).exists():
-            return ws.project_root / p
-        if p.replace("\\", "/").startswith(("skills/", "specs/")) and (ws.self_root / p).exists():
+    if not ws.is_self_project:
+        rname = ws.project_root.name.lower()
+        if norm.lower() == rname and not (ws.project_root / p).exists():
+            return ws.project_root
+        if norm.lower().startswith(f"{rname}/") and not (ws.project_root / p).exists():
+            sub = norm[len(rname) + 1 :]
+            if sub and ((ws.project_root / sub).exists() or (for_write and (ws.project_root / sub).parent.exists())):
+                return ws.project_root / sub
+        if not for_write and not (ws.project_root / p).exists() and norm.startswith(("skills/", "specs/")) and (ws.self_root / p).exists():
             return ws.self_root / p
     return ws.project_root / p
 
@@ -90,7 +97,7 @@ _READ_MAX_BYTES = 40_000
 
 
 def tool_read_file(args: Dict[str, Any]) -> str:
-    path_str = str_arg(args, "path")
+    path_str = str_arg(args, "path", aliases=("file_path", "filepath", "file"))
     if not path_str:
         return "error: path is required"
     p = resolve(path_str, for_write=False)
@@ -109,9 +116,7 @@ def tool_read_file(args: Dict[str, Any]) -> str:
         if span is None:
             return f"error: symbol `{symbol}` not found in {p}. Available symbols: {', '.join(avail[:25]) or '(no top-level symbols)'}"
         s_ln, e_ln, kind = span
-        return f"# {p}  (symbol `{symbol}` [{kind}], lines {s_ln}-{e_ln} of {len(lines)})\n" + "\n".join(
-            f"{i:5d}|{lines[i - 1]}" for i in range(s_ln, min(e_ln, len(lines)) + 1)
-        )
+        return f"# {p}  (symbol `{symbol}` [{kind}], lines {s_ln}-{e_ln} of {len(lines)})\n" + "\n".join(f"{i:5d}|{lines[i - 1]}" for i in range(s_ln, min(e_ln, len(lines)) + 1))
     start = max(1, int_arg(args, "start_line", 1) or 1)
     req_end = int_arg(args, "end_line", 0) or len(lines)
     if start > min(len(lines), req_end):
@@ -132,10 +137,11 @@ def tool_read_file(args: Dict[str, Any]) -> str:
 
 
 def tool_write_file(args: Dict[str, Any]) -> str:
-    path_str = str_arg(args, "path")
-    if not path_str or args.get("content") is None:
+    path_str = str_arg(args, "path", aliases=("file_path", "filepath", "file"))
+    raw_c = next((args[k] for k in ("content", "text", "body") if args.get(k) is not None), None)
+    if not path_str or raw_c is None:
         return "error: path is required" if not path_str else "error: content is required"
-    p, norm_content = resolve(path_str, for_write=True), str(args.get("content", "")).replace("\r\n", "\n")
+    p, norm_content = resolve(path_str, for_write=True), str(raw_c).replace("\r\n", "\n")
     path_err = check_path_safety(p, write=True)
     if path_err:
         return path_err
@@ -149,7 +155,7 @@ def tool_write_file(args: Dict[str, Any]) -> str:
 
 
 def tool_edit_file(args: Dict[str, Any]) -> str:
-    path_str = str_arg(args, "path")
+    path_str = str_arg(args, "path", aliases=("file_path", "filepath", "file"))
     if not path_str:
         return "error: path is required"
     p = resolve(path_str, for_write=True)
@@ -158,7 +164,8 @@ def tool_edit_file(args: Dict[str, Any]) -> str:
         return path_err
     if not p.is_file():
         return f"error: file not found: {p}"
-    old_raw, new_raw = args.get("old_str"), args.get("new_str")
+    old_raw = next((args[k] for k in ("old_str", "old_string", "old_text", "target") if args.get(k) is not None), None)
+    new_raw = next((args[k] for k in ("new_str", "new_string", "new_text", "replacement") if args.get(k) is not None), None)
     if not isinstance(old_raw, str) or not old_raw or new_raw is None:
         return "error: old_str must be a non-empty string" if not isinstance(old_raw, str) or not old_raw else "error: new_str is required"
     target = get_execution_target()
@@ -201,7 +208,7 @@ def tool_edit_file(args: Dict[str, Any]) -> str:
 
 
 def tool_list_dir(args: Dict[str, Any]) -> str:
-    p = resolve(str_arg(args, "path", ".") or ".", for_write=False)
+    p = resolve(str_arg(args, "path", ".", aliases=("dir_path", "directory", "dir")) or ".", for_write=False)
     path_err = check_path_safety(p, write=False)
     if path_err:
         return path_err
@@ -215,10 +222,10 @@ _BINARY_EXTS = {".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3
 
 
 def tool_search(args: Dict[str, Any]) -> str:
-    pattern, file_glob = str_arg(args, "pattern"), str_arg(args, "file_glob").lower()
+    pattern, file_glob = str_arg(args, "pattern", aliases=("query", "search_term")), str_arg(args, "file_glob", aliases=("glob", "include")).lower()
     if not pattern:
         return "error: pattern is required"
-    base = resolve(str_arg(args, "path", ".") or ".", for_write=False)
+    base = resolve(str_arg(args, "path", ".", aliases=("dir_path", "directory")) or ".", for_write=False)
     path_err = check_path_safety(base, write=False)
     if path_err:
         return path_err
@@ -232,13 +239,7 @@ def tool_search(args: Dict[str, Any]) -> str:
         for root, dirs, fnames in os.walk(base):
             root_p = Path(root)
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and (in_static or not (d == "static" and root_p.name == "surfaces"))]
-            files.extend(
-                root_p / fn
-                for fn in fnames
-                if Path(fn).suffix.lower() not in _BINARY_EXTS
-                and fn.lower() not in (".env", "secrets.env")
-                and (not file_glob or fnmatch.fnmatch(fn.lower(), file_glob))
-            )
+            files.extend(root_p / fn for fn in fnames if Path(fn).suffix.lower() not in _BINARY_EXTS and fn.lower() not in (".env", "secrets.env") and (not file_glob or fnmatch.fnmatch(fn.lower(), file_glob)))
     elif not base.is_file():
         return f"error: path not found: {base}"
     target = get_execution_target()
@@ -258,7 +259,7 @@ def tool_search(args: Dict[str, Any]) -> str:
 
 def tool_run_python(args: Dict[str, Any]) -> str:
     """Execute Python code directly in the active `ExecutionTarget` with UTF-8 encoding."""
-    code = str(args.get("code") or "")
+    code = str(next((args[k] for k in ("code", "script", "python_code", "source") if args.get(k) is not None), "") or "")
     cmd_err = check_command_safety(code)
     if cmd_err:
         return cmd_err
@@ -271,7 +272,7 @@ _HEAD_TAIL_PIPE_RE = re.compile(r"\s*\|\s*(head|tail)(?:\s+-n\s*|\s+-)?(\d+)?\s*
 
 
 def tool_run_shell(args: Dict[str, Any]) -> str:
-    cmd = str(args.get("command") or "")
+    cmd = str(next((args[k] for k in ("command", "cmd", "shell_command") if args.get(k) is not None), "") or "")
     if not cmd.strip():
         return "error: empty command"
     cmd_err = check_command_safety(cmd)
@@ -383,7 +384,7 @@ def _validate_web_fetch_url(url: str) -> Optional[str]:
 
 
 def tool_web_fetch(args: Dict[str, Any]) -> str:
-    url = str_arg(args, "url")
+    url = str_arg(args, "url", aliases=("uri", "href"))
     url_err = _validate_web_fetch_url(url)
     if url_err:
         return url_err

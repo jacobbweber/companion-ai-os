@@ -22,7 +22,7 @@ __all__ = [
     "BUILTIN_TEMPLATES", "BUILTIN_TEMPLATE_MAP", "CANONICAL_FRONTMATTER_ORDER", "TemplateSpec",
     "as_slug_list", "canonicalize_ontology", "compute_body_metrics", "default_review_days", "extract_wikilinks",
     "get_template", "hydrate_note_meta", "list_templates", "load_tag_authority", "make_note_uid", "parse_frontmatter",
-    "recommend_templates", "register_authority_terms", "render_frontmatter", "save_template",
+    "recommend_templates", "register_authority_terms", "render_frontmatter", "save_template", "scaffold_foreground_body",
     "scrub_conversational_chatter", "seed_templates_and_authority", "sha16_bytes", "slugify_wiki", "validate_curated_note",
 ]
 
@@ -284,9 +284,21 @@ def _split_inline_array(inner: str) -> List[str]:
     return items
 
 
+_NUMBERED_LINE_RE = re.compile(r"^\s{0,5}\d+\|(.*)$")
+
+
+def _strip_read_file_numbering(text: str) -> str:
+    lines = (text or "").replace("\r\n", "\n").splitlines()
+    if lines and re.match(r"^#\s+.+\(lines\s+\d+-\d+\s+of\s+\d+\)\s*$", lines[0]):
+        lines = lines[1:]
+    if len(lines) >= 3 and all(_NUMBERED_LINE_RE.match(ln) for ln in lines[:3]):
+        return "\n".join(m.group(1) if (m := _NUMBERED_LINE_RE.match(ln)) else ln for ln in lines)
+    return (text or "").replace("\r\n", "\n")
+
+
 def parse_frontmatter(markdown_text: str) -> Tuple[Dict[str, Any], str]:
     """Parse rich YAML frontmatter (scalars, inline `[...]` lists, block `- item` lists) without mutating text."""
-    norm = (markdown_text or "").replace("\r\n", "\n")
+    norm = _strip_read_file_numbering(markdown_text)
     if not norm.startswith("---\n") or (end := norm.find("\n---\n", 4)) == -1:
         return {}, norm
     fm_raw, body = norm[4:end], norm[end + 5 :]
@@ -488,6 +500,29 @@ def recommend_templates(title: str, body: str, source: str = "") -> List[Dict[st
         if len(seen) >= 3:
             break
     return seen
+
+
+def scaffold_foreground_body(wiki_root: Path, tpl_slug: str, title: str, summary: str, body: str, rel: str) -> str:
+    """Auto-scaffold missing governed `required_sections` around raw user-pasted Markdown during foreground turns."""
+    if _PLACEHOLDER_RE.search(body or "") or "<title>" in (body or "").lower():
+        return body
+    t_res = get_template(wiki_root, tpl_slug) if tpl_slug and tpl_slug != "inbox-raw" else {"ok": False}
+    req_secs = list((t_res.get("template") or {}).get("required_sections") or []) if t_res.get("ok") else []
+    if not req_secs:
+        return body
+    headings_norm = [re.sub(r"[^a-z0-9]+", " ", h.lower()).strip() for h in _HEADING_RE.findall(body or "")]
+    missing = [s for s in req_secs if not any(re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip() in h for h in headings_norm if h)]
+    if not missing:
+        return body
+    core_b = re.sub(r"^\s*#\s+[^\n]+\n*", "", (body or "").strip()) or summary
+    if len(core_b) < 40:
+        core_b = f"{core_b}\n\nRecorded in `{rel}`."
+    if len(missing) == len(req_secs):
+        if len(req_secs) == 1:
+            return f"# {title}\n\n## {req_secs[0]}\n{core_b}\n"
+        tail = "".join(f"\n## {s}\nOperational context recorded in `{rel}`.\n" for s in req_secs[2:])
+        return f"# {title}\n\n## {req_secs[0]}\n{summary}\n\n## {req_secs[1]}\n{core_b}\n{tail}"
+    return (body or "").rstrip() + "\n" + "".join(f"\n## {s}\nOperational context recorded in `{rel}`.\n" for s in missing)
 
 
 def validate_curated_note(

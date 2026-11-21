@@ -390,20 +390,29 @@ def _sanitize_wire_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def normalize_assistant_message(msg_obj: Dict[str, Any]) -> Tuple[str, str, List[Dict[str, Any]]]:
-    """Normalize `msg_obj` in place: rescue `<tool_call>` (even inside unclosed `<think>`), strip `<think>`, and ensure unique IDs."""
+    """Normalize `msg_obj` in place: rescue `<tool_call>` / `<function=...>`, strip `<think>`, and ensure unique IDs."""
     raw_content = str(msg_obj.get("content") or "")
     raw_reasoning = str(msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or msg_obj.get("thinking") or "").strip()
     existing_tcalls = list(msg_obj.get("tool_calls") or [])
-    if not existing_tcalls and "<tool_call>" in raw_content.lower():
+    if not existing_tcalls and ("<tool_call>" in raw_content.lower() or "<function=" in raw_content.lower()):
         raw_content, rescued_tcalls = rescue_text_tool_calls(raw_content)
         if rescued_tcalls:
             existing_tcalls = rescued_tcalls
             if telemetry.active_trace_id:
-                telemetry.log("INFO", "llm", f"Rescued {len(rescued_tcalls)} text `<tool_call>` block(s) from assistant content.")
+                telemetry.log("INFO", "llm", f"Rescued {len(rescued_tcalls)} text tool call(s) from assistant content.")
+    if not existing_tcalls and ("<tool_call>" in raw_reasoning.lower() or "<function=" in raw_reasoning.lower()):
+        raw_reasoning, rescued_r_tcalls = rescue_text_tool_calls(raw_reasoning)
+        if rescued_r_tcalls:
+            existing_tcalls = rescued_r_tcalls
+            if telemetry.active_trace_id:
+                telemetry.log("INFO", "llm", f"Rescued {len(rescued_r_tcalls)} text tool call(s) from reasoning trace.")
 
     clean_content, tag_thinking = strip_thinking_tags(raw_content)
+    clean_content = re.sub(r"</?tool_call>", "", clean_content, flags=re.IGNORECASE).strip()
+    clean_reas, inner_reas = strip_thinking_tags(raw_reasoning)
+    eff_reas = "\n\n".join(x for x in (inner_reas, clean_reas) if x).strip()
     parts: List[str] = []
-    for chunk in (raw_reasoning, tag_thinking):
+    for chunk in (eff_reas, tag_thinking):
         if chunk and chunk not in parts:
             parts.append(chunk)
     combined_thinking = "\n\n".join(parts)

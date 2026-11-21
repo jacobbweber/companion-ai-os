@@ -18,7 +18,7 @@ from companion.telemetry import redact_secrets
 from companion.wiki_templates import (
     BUILTIN_TEMPLATE_MAP, as_slug_list, canonicalize_ontology, compute_body_metrics, default_review_days,
     extract_wikilinks, hydrate_note_meta, parse_frontmatter, recommend_templates, render_frontmatter,
-    scrub_conversational_chatter, seed_templates_and_authority, sha16_bytes, slugify_wiki, validate_curated_note,
+    scaffold_foreground_body, scrub_conversational_chatter, seed_templates_and_authority, sha16_bytes, slugify_wiki, validate_curated_note,
 )
 
 __all__ = ["WIKI_FOLDERS", "WikiEngine", "compute_note_staleness", "extract_wikilinks", "get_wiki_engine", "parse_frontmatter", "render_frontmatter"]
@@ -429,13 +429,7 @@ class WikiEngine:
                 eff_sum = f"{eff_title} — {first_ln}"[:220]
                 if len(eff_sum) < 24:
                     eff_sum = f"Curated reference note for {eff_title} in {eff_domain}."
-            if eff_tpl == "standard-note" and not template.strip() and not in_meta.get("template"):
-                low_b = in_body.lower()
-                if "## overview" not in low_b or "## key details" not in low_b:
-                    core_b = re.sub(r"^\s*#\s+[^\n]+\n*", "", in_body.strip()) or eff_sum
-                    if len(core_b) < 40:
-                        core_b = f"{core_b}\n\nRecorded in `{rel}`."
-                    in_body = f"# {eff_title}\n\n## Overview\n{eff_sum}\n\n## Key Details\n{core_b}\n"
+            in_body = scaffold_foreground_body(self.root, eff_tpl, eff_title, eff_sum, in_body, rel)
         raw_tags = tags if tags is not None else (in_meta["tags"] if "tags" in in_meta else old_meta.get("tags") or ([eff_domain] if is_fg else []))
         raw_ont = ontology if ontology is not None else (in_meta["ontology"] if "ontology" in in_meta else old_meta.get("ontology") or (["reference-knowledge"] if is_fg else []))
         merged_meta = hydrate_note_meta({**old_meta, **in_meta}, eff_title, in_body, eff_author, eff_status, eff_tpl, eff_domain, eff_topic, as_slug_list(raw_tags) or ([eff_domain] if is_fg else []), canonicalize_ontology(self.root, raw_ont) or (["reference-knowledge"] if is_fg else []), now_iso, summary=eff_sum)

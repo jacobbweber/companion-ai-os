@@ -14,9 +14,11 @@ Promote verified commits or release tags into a local packaged `app/` runtime di
 - Exercising `safe-deploy` verification and rollback readiness before production cutovers.
 
 ## Step-by-Step Procedure
-1. **Verify Target & Blind Vault Credentials**:
+1. **Live LAN Model Calibration (`scripts/live_model_calibration.py`)**:
+   - Before promoting a model/provider change, validate all 12 zero-mock LAN calibration scenarios against an isolated temporary `COMPANION_DATA_DIR` via `scripts/live_model_calibration.py` (or use `Settings -> Models & Tiers -> Calibrate` / `/providers calibrate <tier>` for a 10-second compatibility probe).
+2. **Verify Target & Blind Vault Credentials**:
    - Never hardcode hostnames, IPs, or SSH keys in skills or prompts. For remote hosts, inspect registered endpoints via `endpoint_manage(action="list")` and verify `credential_ref` via `vault_manage(action="check_secret")`.
-2. **Run the `safe-deploy` Deterministic DAG**:
+3. **Run the `safe-deploy` Deterministic DAG**:
    - Invoke `workflow_manage`:
      ```json
      {
@@ -28,9 +30,9 @@ Promote verified commits or release tags into a local packaged `app/` runtime di
        }
      }
      ```
-3. **Human Gate Approval (`deploy_approval_gate`)**:
+4. **Human Gate Approval (`deploy_approval_gate`)**:
    - `pre_deploy_snapshot` captures a clean backup of `target_app_dir` (and optional `data/` SQLite/Wiki snapshot) before pausing at `deploy_approval_gate` (`ApprovalQueue` `R3` gate in `balanced`/`strict` trust mode).
    - Once approved by the user, resume the DAG via `workflow_manage(action="resume_dag", run_id="...")`.
-4. **Post-Deploy Health + Doctor Gate & Automatic Rollback**:
+5. **Post-Deploy Health + Doctor Gate & Automatic Rollback**:
    - `verify_or_rollback` probes `/api/health` (`200 OK`) AND runs packaged `7/7` `System Doctor` (`tests/` absent).
    - If either check fails, `safe-deploy` automatically restores `target_app_dir` from `pre_deploy_snapshot` and verifies the restored runtime is healthy.

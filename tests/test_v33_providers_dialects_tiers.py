@@ -12,14 +12,16 @@ from unittest.mock import patch
 
 from companion.agent import handle_slash_command, run_agent_turn
 from companion.attachments import ingest_attachment, prepare_turn_attachments
-from companion.config import settings
+from companion.config import settings, workspace_context
 from companion.core_actions import execute_core_action
-from companion.intake import select_turn_step_tier
+from companion.intake import select_turn_step_tier, triage_turn
 from companion.llm import chat, discover_provider_models, format_model_tiers_status, normalize_assistant_message
 from companion.llm_wire import build_openai_resource_url, is_local_or_lan_endpoint, prepare_wire_request
 from companion.memory_store import MemoryStore, memory_store_context
+from companion.sdlc_tools import tool_git_manage
 from companion.semantic_memory import fetch_optional_embedding
-from companion.streaming import stream_event_context, wire_attachment_context
+from companion.streaming import ThinkTagStreamSplitter, stream_event_context, wire_attachment_context
+from companion.tools import dispatch
 from companion.vault import VaultManager
 
 
@@ -436,6 +438,165 @@ class TestModelRegistryBlindVaultAndPrivacyLock(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class TestLiveModelCalibrationAndWireRefinements(unittest.TestCase):
+    def test_vllm_reasoning_sse_bare_xml_rescue_and_calibrate_tier(self) -> None:
+        seen_bodies: List[Dict[str, Any]] = []
+
+        class CalibrateSSEHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                return
+
+            def do_POST(self) -> None:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8"))
+                seen_bodies.append(body)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.end_headers()
+                if "no-tools" in str(body.get("model") or ""):
+                    chunks = [{"choices": [{"delta": {"content": "Plain reply without tool call"}}]}]
+                elif body.get("tools"):
+                    chunks = [
+                        {"choices": [{"delta": {"role": "assistant", "reasoning": "Checking calibration_ping..."}}]},
+                        {"choices": [{"delta": {"tool_calls": [{"id": "call_cal_9", "index": 0, "type": "function", "function": {"name": "calibration_ping", "arguments": '{"echo": "ok"}'}}]}}]},
+                        {"choices": [], "usage": {"prompt_tokens": 42, "completion_tokens": 11, "total_tokens": 53}},
+                    ]
+                else:
+                    chunks = [{"choices": [{"delta": {"content": "Calibration verified."}}]}]
+                for c in chunks:
+                    self.wfile.write(f"data: {json.dumps(c)}\n\n".encode("utf-8"))
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        srv, local_url, _t = _start_mock_server(CalibrateSSEHandler)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                data_dir = Path(tmp) / "data"
+                store = MemoryStore(db_path=data_dir / "cal.db")
+                try:
+                    with patch.object(settings, "data_dir", data_dir), memory_store_context(store):
+                        execute_core_action("models", {"subaction": "save_provider", "id": "vllm-lan", "name": "vLLM LAN", "dialect": "openai_compat", "base_url": local_url, "max_concurrency": 4}, store=store, actor="web")
+                        execute_core_action("models", {"subaction": "save_tier", "tier": "fast", "provider_id": "vllm-lan", "model": "nemotron-3.5-lightning"}, store=store, actor="web")
+                        cal = execute_core_action("models", {"subaction": "calibrate_tier", "tier": "fast"}, store=store, actor="web")
+                        self.assertTrue(cal["ok"], cal)
+                        self.assertTrue(cal["streaming_ok"])
+                        self.assertTrue(cal["thinking_detected"])
+                        self.assertTrue(cal["tool_call_ok"])
+                        self.assertEqual(seen_bodies[0].get("stream_options"), {"include_usage": True})
+                        slash_cal = str(handle_slash_command("/providers calibrate fast", [], store=store))
+                        self.assertIn("Tool Call", slash_cal)
+
+                        # Model without tool-calling template returns actionable warning
+                        execute_core_action("models", {"subaction": "save_tier", "tier": "coding", "provider_id": "vllm-lan", "model": "no-tools-local"}, store=store, actor="web")
+                        cal_warn = execute_core_action("models", {"subaction": "calibrate_tier", "tier": "coding"}, store=store, actor="web")
+                        self.assertFalse(cal_warn["ok"])
+                        self.assertTrue(cal_warn["streaming_ok"])
+                        self.assertFalse(cal_warn["tool_call_ok"])
+
+                        # Privacy Lock blocks cloud calibrate_tier under local_only
+                        execute_core_action("models", {"subaction": "save_provider", "preset": "openai", "api_key_value": "sk-test"}, store=store, actor="web")
+                        execute_core_action("models", {"subaction": "save_tier", "tier": "reasoning", "provider_id": "openai", "model": "gpt-5"}, store=store, actor="web")
+                        execute_core_action("models", {"subaction": "set_privacy", "privacy_mode": "local_only"}, store=store, actor="web")
+                        cal_blocked = execute_core_action("models", {"subaction": "calibrate_tier", "tier": "reasoning"}, store=store, actor="web")
+                        self.assertFalse(cal_blocked["ok"])
+                        self.assertIn("Privacy Lock", cal_blocked["detail"])
+                finally:
+                    store.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # Bare `<function=...>` + orphan `</tool_call>` rescue & stream suppression with preserved indentation
+        raw_qwen_coder = (
+            "Let me patch discount.py:\n"
+            "<function=edit_file>\n<parameter=path>\ndiscount.py\n</parameter>\n"
+            "<parameter=old_str>\n    return subtotal + discount\n</parameter>\n"
+            "<parameter=new_str>\n    return subtotal - discount\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        emitted: List[str] = []
+        with stream_event_context(lambda ev: emitted.append(str(ev.get("delta") or "")) if ev.get("type") == "text_delta" else None):
+            sp = ThinkTagStreamSplitter()
+            for ch in (raw_qwen_coder[:30], raw_qwen_coder[30:95], raw_qwen_coder[95:]):
+                sp.feed(ch)
+            sp.flush()
+        joined_stream = "".join(emitted)
+        self.assertNotIn("<function=", joined_stream)
+        self.assertNotIn("</tool_call>", joined_stream)
+        clean_txt, _th, rescued = normalize_assistant_message({"role": "assistant", "content": raw_qwen_coder})
+        self.assertNotIn("</tool_call>", clean_txt)
+        self.assertEqual(len(rescued), 1)
+        parsed_edit = json.loads(rescued[0]["function"]["arguments"])
+        self.assertEqual(parsed_edit["old_str"], "    return subtotal + discount")
+        self.assertEqual(parsed_edit["new_str"], "    return subtotal - discount")
+        final_prose_clean, _, final_tcs = normalize_assistant_message({"role": "assistant", "content": "All tests pass and changes committed.\n</tool_call>"})
+        self.assertEqual(final_prose_clean, "All tests pass and changes committed.")
+        self.assertEqual(final_tcs, [])
+
+    def test_awaiting_approval_stop_notice_and_parameter_aliases(self) -> None:
+        import subprocess
+
+        # 1. Mixed `?` + board action routes to GUIDED_CHANGE (`fast`) rather than DEEP_CONSULT
+        mixed_q = "Please add a high-priority task card titled 'Audit NVMe SMART wear' to my board right now, and could you explain why NVMe wear matters for ZFS?"
+        dec = triage_turn(mixed_q)
+        self.assertEqual(dec.mode, "GUIDED_CHANGE")
+        self.assertEqual(dec.suggested_tier, "fast")
+
+        # 2. Parameter aliases, repo-name prefix stripping, blank-normalized edit_file, relative git_manage, and AWAITING_USER_APPROVAL stop
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            data_dir = base / "data"
+            repo = base / "sample_repo"
+            repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@local"], cwd=str(repo), check=True, capture_output=True)
+            (repo / "calc.py").write_text('"""Calc."""\n\n\ndef f(x: int) -> int:\n    return x + 1\n', encoding="utf-8", newline="\n")
+            subprocess.run(["git", "add", "."], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True)
+            store = MemoryStore(db_path=data_dir / "alias.db")
+            try:
+                with patch.object(settings, "data_dir", data_dir), memory_store_context(store), workspace_context(repo, "proj-sample"):
+                    r_out = dispatch("read_file", {"file_path": "sample_repo/calc.py"})
+                    self.assertIn("def f(x: int)", r_out)
+                    e_out = dispatch("edit_file", {"filepath": "sample_repo/calc.py", "old_string": '"""Calc."""\n\ndef f(x: int) -> int:\n    return x + 1', "new_string": '"""Calc."""\n\n\ndef f(x: int) -> int:\n    return x + 2'})
+                    self.assertIn("edited", e_out)
+                    b_out = tool_git_manage({"action": "branch", "repo_path": "sample_repo", "branch_name": "feat/alias-check"})
+                    self.assertIn("feat/alias-check", b_out)
+                    c_out = tool_git_manage({"action": "commit", "cwd": ".", "commit_message": "feat: test aliases", "files": "calc.py"})
+                    self.assertIn("Committed", c_out)
+
+                    # Idempotent create_project / create_item + title/prefix-typo depends_on resolution
+                    p_res = execute_core_action("agile", {"subaction": "create_project", "project_title": "Pipe", "kind": "software"}, actor="companion", store=store)
+                    p_res2 = execute_core_action("agile", {"subaction": "create_project", "project_title": "Pipe", "kind": "software"}, actor="companion", store=store)
+                    pid = p_res["project"]["project_id"]
+                    self.assertEqual(pid, p_res2["project"]["project_id"])
+                    i1a = execute_core_action("agile", {"subaction": "create_item", "project_id": pid, "card_title": "Define protobuf schema"}, actor="companion", store=store)["item"]
+                    i1b = execute_core_action("agile", {"subaction": "create_item", "project_id": pid, "card_title": "Define protobuf schema"}, actor="companion", store=store)["item"]
+                    self.assertEqual(i1a["item_id"], i1b["item_id"])
+                    typo_id = i1a["item_id"][:-1] + ("0" if i1a["item_id"][-1] != "0" else "1")
+                    i2 = execute_core_action("agile", {"subaction": "create_item", "project_id": pid, "card_title": "Batch ingester", "dependencies": json.dumps([typo_id])}, actor="companion", store=store)["item"]
+                    self.assertIn(i1a["item_id"], i2["depends_on"])
+
+                    # AWAITING_USER_APPROVAL post-tool stop notice in agent loop
+                    execute_core_action("wiki", {"subaction": "save", "path": "02_knowledge/homelab/fw.md", "title": "FW", "summary": "Canonical firewall ruleset.", "content": "# FW\n\n## Overview\nSSH.\n\n## Key Details\n22/tcp.\n"}, actor="user", store=store)
+                    step_idx = [0]
+
+                    def fake_apr_chat(messages: List[Dict[str, Any]], *_a: Any, **_kw: Any) -> Dict[str, Any]:
+                        step_idx[0] += 1
+                        if step_idx[0] == 1:
+                            return {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{"id": "tc_w1", "type": "function", "function": {"name": "wiki_manage", "arguments": json.dumps({"action": "save", "path": "02_knowledge/homelab/fw.md", "title": "FW", "content": "# FW\n\n## Overview\nAdd 8006.\n\n## Key Details\n8006/tcp.\n"})}}]}}]}
+                        tool_res = next(m["content"] for m in reversed(messages) if m.get("role") == "tool")
+                        assert "[ACTION QUEUED FOR USER APPROVAL" in tool_res
+                        return {"choices": [{"message": {"role": "assistant", "content": "Queued for your approval."}}]}
+
+                    msgs: List[Dict[str, Any]] = [{"role": "user", "content": "Update 02_knowledge/homelab/fw.md"}]
+                    reply = run_agent_turn(msgs, chat_fn=fake_apr_chat, store=store, verbose=False)
+                    self.assertEqual(reply, "Queued for your approval.")
+                    self.assertEqual(step_idx[0], 2)
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

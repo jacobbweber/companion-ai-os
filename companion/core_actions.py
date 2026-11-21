@@ -60,7 +60,14 @@ def _human_confirmed(p: Dict[str, Any], actor: str) -> bool:
 
 
 def _as_list(val: Any) -> Optional[List[str]]:
-    return None if val is None else ([str(x).strip() for x in val if str(x).strip()] if isinstance(val, list) else [s.strip() for s in str(val).split(",") if s.strip()])
+    if val is None:
+        return None
+    if isinstance(val, str) and val.strip().startswith("["):
+        try:
+            val = json.loads(val.strip())
+        except Exception:
+            pass
+    return [str(x).strip() for x in val if str(x).strip()] if isinstance(val, list) else [s.strip() for s in str(val).split(",") if s.strip()]
 
 
 def _act_trust(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
@@ -514,6 +521,8 @@ _EFFORT_MINS = {"quick": 15, "half_day": 180, "full_day": 360, "multi_day": 720}
 
 def _resolve_item_updates(p: Dict[str, Any]) -> Dict[str, Any]:
     upd = {k: v for k, v in p.items() if k not in ("subaction", "action", "item_id", "card_id")}
+    if "depends_on" in upd or p.get("dependencies") is not None or p.get("blocked_by") is not None:
+        upd["depends_on"] = _as_list(p.get("depends_on") if p.get("depends_on") is not None else (p.get("dependencies") or p.get("blocked_by")))
     if "estimate_minutes" not in upd and p.get("effort_size") in _EFFORT_MINS:
         upd["estimate_minutes"] = _EFFORT_MINS[str(p["effort_size"])]
     return upd
@@ -561,8 +570,8 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         tp_in = p.get("trigger_policy") if isinstance(p.get("trigger_policy"), dict) else None
         mpw = int(p.get("max_parallel_workers") or 2)
         proj = mgr.create_project(
-            title=str(p.get("title") or p.get("name") or "New Goal"), goal_summary=str(p.get("goal_summary") or p.get("description") or ""),
-            slug=str(p.get("slug") or "") or None, kind=str(p.get("kind") or "goal"), workspace_path=str(p.get("workspace_path") or ""),
+            title=str(p.get("title") or p.get("project_title") or p.get("name") or "New Goal"), goal_summary=str(p.get("goal_summary") or p.get("description") or ""),
+            slug=str(p.get("slug") or "") or None, kind=str(p.get("kind") or "goal"), workspace_path=str(p.get("workspace_path") or p.get("repo_path") or ""),
             delivery_policy=str(p.get("delivery_policy") or "local_only"), git_credential_ref=str(p.get("git_credential_ref") or ""),
             max_parallel_workers=mpw, test_command=str(p.get("test_command") or ""), preview_command=str(p.get("preview_command") or ""),
             trigger_policy=tp_in, project_id=pid or None,
@@ -581,8 +590,9 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         else:
             est = int(p["estimate_minutes"]) if p.get("estimate_minutes") is not None else _EFFORT_MINS.get(str(p.get("effort_size") or ""), 30)
             ver = p.get("verification") if isinstance(p.get("verification"), dict) else None
-            chk = p.get("checklist") if isinstance(p.get("checklist"), list) else None
-            it = mgr.create_item(project_id=pid or None, title=str(p.get("title") or ""), description=str(p.get("description") or ""), owner=str(p.get("owner") or "companion"), stage_kind=str(p.get("stage_kind") or "DELIVER_AND_VERIFY"), status=str(p.get("status") or p.get("column_key") or "ready"), priority=int(p.get("priority") or 3), depends_on=_as_list(p.get("depends_on")), milestone_id=str(p.get("milestone_id") or p.get("epic_id") or ""), timebox_id=str(p.get("timebox_id") or p.get("sprint_id") or ""), verification=ver, dag_name=str(p.get("dag_name") or ""), acceptance_criteria=str(p.get("acceptance_criteria") or ""), estimate_minutes=est, planned_date=str(p.get("planned_date") or ""), due_date=str(p.get("due_date") or ""), checklist=chk, tags=_as_list(p.get("tags")))
+            chk = _as_list(p.get("checklist")) if p.get("checklist") is not None else None
+            t_val = str(p.get("title") or p.get("card_title") or p.get("item_title") or p.get("name") or "")
+            it = mgr.create_item(project_id=pid or None, title=t_val, description=str(p.get("description") or ""), owner=str(p.get("owner") or "companion"), stage_kind=str(p.get("stage_kind") or "DELIVER_AND_VERIFY"), status=str(p.get("status") or p.get("column_key") or "ready"), priority=int(p.get("priority") or 3), depends_on=_as_list(p.get("depends_on") or p.get("dependencies") or p.get("blocked_by")), milestone_id=str(p.get("milestone_id") or p.get("epic_id") or ""), timebox_id=str(p.get("timebox_id") or p.get("sprint_id") or ""), verification=ver, dag_name=str(p.get("dag_name") or ""), acceptance_criteria=str(p.get("acceptance_criteria") or ""), estimate_minutes=est, planned_date=str(p.get("planned_date") or ""), due_date=str(p.get("due_date") or ""), checklist=chk, tags=_as_list(p.get("tags")))
         return {"ok": True, "card": it, "item": it, "summary": f"Saved work item `{it['item_id']}` (`{it['owner']}` | `{it['status']}`): {it['title']}"}
     if sub in ("move_card", "update_card", "update_item"):
         ref = str(p.get("item_id") or p.get("card_id") or "").strip()
@@ -597,7 +607,7 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         ok = mgr.delete_item(ref)
         return {"ok": ok, "item_id": ref, "summary": f"Deleted `{ref}`."}
     if sub in ("create_epic", "save_epic", "create_milestone"):
-        ms = mgr.create_milestone(pid or mgr.resolve_project_id(), str(p.get("title") or ""), description=str(p.get("description") or ""), stage_kind=str(p.get("stage_kind") or "DELIVER_AND_VERIFY"), target_date=str(p.get("target_date") or ""), milestone_id=str(p.get("epic_id") or p.get("milestone_id") or ""))
+        ms = mgr.create_milestone(pid or mgr.resolve_project_id(), str(p.get("title") or p.get("milestone_title") or p.get("name") or ""), description=str(p.get("description") or ""), stage_kind=str(p.get("stage_kind") or "DELIVER_AND_VERIFY"), target_date=str(p.get("target_date") or ""), milestone_id=str(p.get("epic_id") or p.get("milestone_id") or ""))
         return {"ok": True, "epic": ms, "milestone": ms, "summary": f"Saved milestone `{ms['title']}` (`{ms['milestone_id']}`)."}
     if sub in ("delete_epic", "delete_milestone"):
         mid = str(p.get("epic_id") or p.get("milestone_id") or "").strip()

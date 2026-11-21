@@ -281,12 +281,17 @@ def execute_calendar_action(p: Dict[str, Any], store: Optional[MemoryStore] = No
     """Unified CoreAction handler for `calendar` (`window`, `add_event`, `delete_event`, `list_events`)."""
     mgr = get_calendar_manager(store=store)
     sub = str(p.get("subaction") or p.get("action") or "window").strip().lower()
-    if sub in ("add_event", "save_event", "upsert_event", "schedule"):
+    if sub in ("add_event", "save_event", "upsert_event", "schedule", "create_event"):
+        raw_s = str(p.get("start_at") or p.get("start_time") or p.get("start") or p.get("date") or "").strip()
+        if len(raw_s) == 10 and p.get("time"):
+            raw_s = f"{raw_s}T{str(p['time']).strip()}"
         return mgr.upsert_event(
-            title=str(p.get("title") or ""), start_at=str(p.get("start_at") or p.get("date") or ""),
-            end_at=str(p.get("end_at") or ""), kind=str(p.get("kind") or "appointment"),
-            all_day=bool(p.get("all_day", False)), board_id=str(p.get("board_id") or ""),
-            card_id=str(p.get("card_id") or ""), notes=str(p.get("notes") or ""), event_id=str(p.get("event_id") or ""),
+            title=str(p.get("title") or p.get("event_title") or p.get("summary") or p.get("name") or ""),
+            start_at=raw_s, end_at=str(p.get("end_at") or p.get("end_time") or p.get("end") or ""),
+            kind=str(p.get("kind") or p.get("type") or "appointment"),
+            all_day=bool(p.get("all_day", False)), board_id=str(p.get("board_id") or p.get("project_id") or ""),
+            card_id=str(p.get("card_id") or p.get("item_id") or ""), notes=str(p.get("notes") or p.get("description") or ""),
+            event_id=str(p.get("event_id") or ""),
         )
     if sub == "delete_event":
         return mgr.delete_event(str(p.get("event_id") or ""))

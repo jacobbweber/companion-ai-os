@@ -419,6 +419,8 @@ class Settings:
         ws = self.build_workspace_context(project_root, project_id)
         with self._ws_lock:
             self._workspace = ws
+        if _WORKSPACE_OVERRIDE.get() is not None:
+            _WORKSPACE_OVERRIDE.set(ws)
         return ws
 
     def reset_workspace(self) -> WorkspaceContext:

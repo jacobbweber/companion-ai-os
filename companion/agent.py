@@ -124,6 +124,11 @@ def _execute_tool_calls(
         if tool_steps_out is not None:
             step_ok = not result.startswith(("error:", "exit=1", "SAFETY GUARD", "RISK GATE", "PHASE TOOL GATE", "Tool argument JSON"))
             tool_steps_out.append({"tool": name, "summary": summarize_tool_step(name, args or {}), "ok": step_ok, "duration_ms": round((time.perf_counter() - t_step0) * 1000.0, 1)})
+        if "AWAITING_USER_APPROVAL" in result or (result.startswith("RISK GATE REJECTED (R3)") and "`apr_" in result):
+            result = (
+                f"{result}\n\n[ACTION QUEUED FOR USER APPROVAL — Do NOT retry, bypass, or work around this action with other tools; "
+                "summarize the queued approval request calmly for the user and conclude your turn immediately.]"
+            )
         tc_id = tc.get("id")
         messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
         if log_to_conversations:
@@ -247,8 +252,8 @@ def _run_step_loop(
             if _SUBAGENT_DEPTH.get() > 0 and remaining == 1 and step >= 2:
                 break
             if step >= 1 and messages and messages[-1].get("role") == "tool":
-                notes = ([f"[PRIOR STEP WORKING SCRATCHPAD]\n{rolling_scratchpad}"] if rolling_scratchpad else []) + (
-                    [f"[ITERATION BUDGET NOTICE: Only {remaining} tool iteration(s) remain in this turn. Finish your current check and provide your clear final response.]"] if remaining in (1, 2, 4) else []
+                notes = ([f"[PRIOR STEP WORKING SCRATCHPAD] (Prior step context — the tool call above ALREADY executed; proceed to the next step without repeating it):\n{rolling_scratchpad}"] if rolling_scratchpad else []) + (
+                    [f"[ITERATION BUDGET NOTICE: Only {remaining} tool iteration(s) remain in this turn. Complete any required final step (such as git commit) and provide your clear final response.]"] if remaining in (1, 2) else []
                 )
                 if notes:
                     messages[-1]["content"] = str(messages[-1].get("content", "")) + "\n\n" + "\n\n".join(notes)
@@ -439,8 +444,8 @@ def run_subagent(
     worker_prompt = (
         f"[ISOLATED SUBAGENT WORKER TASK]\nGoal: {clean_goal}\n"
         f"Model Tier: `{tier_cfg.tier}` (`{tier_cfg.model}`) | Tool Budget: max {eff_iters} tool steps\nSkill Focus: `{clean_skill or 'general-worker'}`\n"
-        "Instructions: Execute the goal autonomously in this isolated context window. Keep file/tool exploration surgical (1-3 targeted reads) "
-        f"and return a concise, self-contained executive & technical summary.{skill_block}"
+        "Instructions: Execute the goal autonomously in this isolated context window. Keep file/tool exploration surgical (1-2 targeted reads), "
+        f"do not repeat completed tool calls, and return a concise (<200 words) self-contained summary.{skill_block}"
     )
     tag, parent_tid, t0 = f"subagent:{clean_skill or 'worker'}:{tier_cfg.tier}", telemetry.active_trace_id, time.perf_counter()
     depth_tok = _SUBAGENT_DEPTH.set(sub_depth + 1)

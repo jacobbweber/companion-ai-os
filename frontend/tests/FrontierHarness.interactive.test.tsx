@@ -101,9 +101,28 @@ mr.discover_provider_models = lambda *a, **kw: {
 
 def fake_chat(*args, **kwargs):
     from companion.streaming import emit_stream_event
+    tools = kwargs.get("tools") or (args[1] if len(args) > 1 else None)
+    model_name = str(kwargs.get("model") or "")
+    if tools and any((t.get("function") or {}).get("name") == "calibration_ping" for t in tools):
+        if "no-tools" in model_name:
+            emit_stream_event({"type": "text_delta", "delta": "Plain text without tool call."})
+            return {"choices": [{"message": {"role": "assistant", "content": "Plain text without tool call."}}]}
+        emit_stream_event({"type": "thinking_delta", "delta": "Calling calibration_ping..."})
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "Calling calibration_ping...",
+                    "tool_calls": [{"id": "call_cal_1", "type": "function", "function": {"name": "calibration_ping", "arguments": '{"echo": "ok"}'}}],
+                }
+            }]
+        }
     emit_stream_event({"type": "thinking_delta", "delta": "Checking request..."})
     emit_stream_event({"type": "text_delta", "delta": "Frontier reply verified."})
     return {"choices": [{"message": {"role": "assistant", "content": "Frontier reply verified."}}]}
+
+mr.chat = fake_chat
 
 srv, sess = create_web_server(host="127.0.0.1", port=0, store=store, chat_fn=fake_chat)
 ipc_out.write(json.dumps({"ready": True, "csrf_token": sess.csrf_token}) + "\\n")
@@ -542,6 +561,37 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
       probeBtn.click();
     });
     await flushUi(90);
+
+    const calFastBtn = container.querySelector('[data-testid="calibrate-tier-btn-fast"]') as HTMLButtonElement;
+    expect(calFastBtn).not.toBeNull();
+    await act(async () => {
+      calFastBtn.click();
+    });
+    await flushUi(110);
+    const calFastRes = container.querySelector('[data-testid="calibrate-tier-result-fast"]') as HTMLElement | null;
+    expect(calFastRes).not.toBeNull();
+    expect(calFastRes!.textContent).toContain('✓ Stream · ✓ Tool Call · ✓ Reasoning');
+
+    const cfgAudio = container.querySelector('[data-testid="configure-tier-audio"]') as HTMLButtonElement;
+    await act(async () => {
+      cfgAudio.click();
+    });
+    await flushUi(60);
+    const audioModelInput = container.querySelector('[data-testid="tier-model-audio"]') as HTMLInputElement;
+    await act(async () => {
+      audioModelInput.focus();
+      setInputValue(audioModelInput, 'no-tools-local');
+      audioModelInput.blur();
+    });
+    await flushUi(110);
+    const calAudioBtn = container.querySelector('[data-testid="calibrate-tier-btn-audio"]') as HTMLButtonElement;
+    await act(async () => {
+      calAudioBtn.click();
+    });
+    await flushUi(110);
+    const calAudioRes = container.querySelector('[data-testid="calibrate-tier-result-audio"]') as HTMLElement | null;
+    expect(calAudioRes).not.toBeNull();
+    expect(calAudioRes!.textContent).toContain('Tool-Call Template Warning');
 
     const cfgFast = container.querySelector('[data-testid="configure-tier-fast"]') as HTMLButtonElement;
     await act(async () => {

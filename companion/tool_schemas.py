@@ -60,7 +60,7 @@ TOOLS: List[Dict[str, Any]] = [
         "is_regex": _p("boolean", "Set true to treat `pattern` as a Python regular expression."),
         "file_glob": _p("string", "Optional filename glob filter such as `*.py`, `*.ts`, or `*.md`."),
     }, ["pattern"]),
-    _tool("run_python", "Execute Python 3 code directly in the active project root with UTF-8 output (preferred on Windows).", {
+    _tool("run_python", "Execute in-process Python 3 code directly with UTF-8 output (use `run_shell` for CLI commands like `unittest`/`pytest`/`git`; `subprocess.*` in `run_python` is R3-gated).", {
         "code": _p("string", "Valid Python 3 snippet to execute via `sys.executable -c`."),
     }, ["code"]),
     _tool("run_shell", "Execute a safe non-destructive shell command in the active project root.", {
@@ -493,8 +493,11 @@ def check_phase_tool_permission(tool_name: str, phase: Optional[str] = None, arg
     return None
 
 
-def str_arg(args: Dict[str, Any], key: str, default: str = "") -> str:
-    return default if args.get(key) is None else str(args.get(key)).strip()
+def str_arg(args: Dict[str, Any], key: str, default: str = "", aliases: Tuple[str, ...] = ()) -> str:
+    for k in (key, *aliases):
+        if args.get(k) is not None and str(args.get(k)).strip() != "":
+            return str(args.get(k)).strip()
+    return "" if args.get(key) == "" else default
 
 
 def int_arg(args: Dict[str, Any], key: str, default: int) -> int:

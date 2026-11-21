@@ -111,7 +111,7 @@ def tool_task_manage(args: Dict[str, Any]) -> str:
     """Create, update, and query tasks and engineering backlog items in SQLite."""
     action, store = str_arg(args, "action", "list_all").lower(), get_memory_store()
     if action == "add_task":
-        desc = str_arg(args, "description")
+        desc = str_arg(args, "description", aliases=("title", "task"))
         if not desc:
             return "error: description is required"
         tid = store.add_task(desc, priority=int_arg(args, "priority", 5), acceptance_criteria=str_arg(args, "acceptance_criteria") or None)
@@ -128,7 +128,7 @@ def tool_task_manage(args: Dict[str, Any]) -> str:
         tasks = store.get_all_tasks(status_filter=str_arg(args, "status") or None)
         return "\n".join(f"Task #{t['id']} [P{t['priority']} | {t['status']}]: {t['description']}" for t in tasks) if tasks else "No tasks."
     if action == "add_backlog":
-        desc = str_arg(args, "description")
+        desc = str_arg(args, "description", aliases=("title", "task"))
         if not desc:
             return "error: description is required"
         bid = store.add_backlog_item(
@@ -217,9 +217,14 @@ def _handle_skill_forge_action(action: str, args: Dict[str, Any]) -> str:
             )["summary"]
         )
     raw_sa = args.get("script_args") if args.get("script_args") is not None else args.get("args")
+    if isinstance(raw_sa, str) and raw_sa.strip().startswith("["):
+        try:
+            raw_sa = json.loads(raw_sa)
+        except Exception:
+            pass
     return run_skill_script(
-        skill_name=str_arg(args, "skill"),
-        script_name=str_arg(args, "script"),
+        skill_name=str_arg(args, "skill", aliases=("skill_name",)),
+        script_name=str_arg(args, "script", aliases=("script_name",)),
         script_args=[str(x) for x in raw_sa] if isinstance(raw_sa, list) else None,
     )
 
@@ -342,7 +347,7 @@ def tool_checkpoint_manage(args: Dict[str, Any]) -> str:
     """Create, list, or rollback workspace checkpoints or local Git save-points in the active project."""
     action, active_cp, target = str_arg(args, "action", "list").lower(), get_active_checkpoint_manager(), get_execution_target()
     if action == "create":
-        m = target.create_checkpoint(label=str_arg(args, "label", "manual") or "manual")
+        m = target.create_checkpoint(label=str_arg(args, "label", "manual", aliases=("message", "name")) or "manual")
         return f"Created workspace checkpoint `{m['checkpoint_id']}` ({m['file_count']} files)."
     if action == "list":
         cps = target.list_checkpoints()
@@ -354,7 +359,7 @@ def tool_checkpoint_manage(args: Dict[str, Any]) -> str:
         res = target.rollback_checkpoint(checkpoint_id=str_arg(args, "checkpoint_id") or None, force=bool_arg(args, "force", False))
         return f"Rolled back to `{res['checkpoint_id']}` ({res['restored_count']} files)." if res.get("restored") else f"error: {res.get('error')}"
     if action == "git_save":
-        res = active_cp.create_git_savepoint(message=str_arg(args, "label", "Manual save-point") or "Manual save-point", init_if_needed=bool_arg(args, "init_git", False))
+        res = active_cp.create_git_savepoint(message=str_arg(args, "label", "Manual save-point", aliases=("message", "name")) or "Manual save-point", init_if_needed=bool_arg(args, "init_git", False))
         return str(res.get("summary", ""))
     if action == "git_log":
         logs = active_cp.list_git_savepoints(limit=10)
@@ -472,7 +477,7 @@ class _DdgHtmlSearchParser(HTMLParser):
 
 def tool_web_search(args: Dict[str, Any]) -> str:
     """Search via configured SearXNG/JSON endpoint or DuckDuckGo HTML Lite (enforcing `local_only` privacy posture)."""
-    query = str_arg(args, "query")
+    query = str_arg(args, "query", aliases=("q", "pattern"))
     if not query:
         return "error: query is required"
     max_res = max(1, min(10, int_arg(args, "max_results", 5)))

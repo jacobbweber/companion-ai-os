@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { callAction } from '../api';
-import type { LlmProviderEntry, ModelMatrixSnapshot, TierRouteEntry } from '../types';
+import type { LlmProviderEntry, ModelMatrixSnapshot, TierCalibrationResult, TierRouteEntry } from '../types';
 
 interface SettingsModelsPanelProps {
   onRefreshStatus: () => Promise<void>;
@@ -16,6 +16,8 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
   const [showAddProvider, setShowAddProvider] = useState(false);
   const [expandedTier, setExpandedTier] = useState<string>('');
   const [showCompactionAdv, setShowCompactionAdv] = useState(false);
+  const [calibratingTier, setCalibratingTier] = useState<string>('');
+  const [tierCalibrations, setTierCalibrations] = useState<Record<string, TierCalibrationResult>>({});
 
   // Add Provider form (uncontrolled ref for API key — zero React state leakage)
   const [provId, setProvId] = useState('');
@@ -90,12 +92,21 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
   };
 
   const probeProvider = async (p: LlmProviderEntry) => {
-    const res = await callAction('models', {
-      subaction: 'discover_models',
-      provider_id: p.provider_id,
-    });
+    const res = await callAction('models', { subaction: 'discover_models', provider_id: p.provider_id });
     await loadMatrix();
     onToast(res.ok === false ? res.error || `Probe failed for ${p.label}.` : res.summary || `Probed ${p.label}.`);
+  };
+
+  const calibrateTier = async (tierName: string) => {
+    setCalibratingTier(tierName);
+    try {
+      const res = await callAction<TierCalibrationResult>('models', { subaction: 'calibrate_tier', tier: tierName });
+      const cal = res as unknown as TierCalibrationResult;
+      setTierCalibrations((prev) => ({ ...prev, [tierName]: cal }));
+      onToast(cal.summary || cal.error || `Calibrated ${tierName} tier.`);
+    } finally {
+      setCalibratingTier('');
+    }
   };
 
   const removeProvider = async (providerId: string) => {
@@ -286,6 +297,7 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
             ])
           );
           const listId = `models-datalist-${t.tier}`;
+          const cal = tierCalibrations[t.tier];
           return (
             <div key={t.tier} style={{ borderBottom: '1px solid var(--border-hairline)' }}>
               <div className="card-row" style={{ borderBottom: 'none' }}>
@@ -298,15 +310,41 @@ export const SettingsModelsPanel: React.FC<SettingsModelsPanelProps> = ({
                     {t.provider_id ? `${t.provider_id} / ` : ''}
                     {t.model} • {Math.round(t.context_window_tokens / 1024)}K ctx • temp {t.temperature}
                   </div>
+                  {cal && (
+                    <div style={{ marginTop: 6 }} data-testid={`calibrate-tier-result-${t.tier}`}>
+                      {cal.streaming_ok && cal.tool_call_ok ? (
+                        <span className="badge ok mono" title={`TTFT ${Math.round(cal.ttft_ms || 0)}ms`}>
+                          {`✓ Stream · ✓ Tool Call${cal.thinking_detected ? ' · ✓ Reasoning' : ''} · ${Math.round(cal.latency_ms || 0)}ms`}
+                        </span>
+                      ) : (
+                        <span className="badge warn">
+                          {cal.streaming_ok
+                            ? `✓ Stream · ⚠ Tool-Call Template Warning · ${Math.round(cal.latency_ms || 0)}ms — ${cal.detail}`
+                            : `✗ Probe Failed — ${cal.detail || cal.error || 'Endpoint unreachable'}`}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <button
-                  type="button"
-                  className="btn btn-ghost btn-sm"
-                  data-testid={`configure-tier-${t.tier}`}
-                  onClick={() => setExpandedTier(isOpen ? '' : t.tier)}
-                >
-                  {isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />} Configure
-                </button>
+                <div style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    data-testid={`calibrate-tier-btn-${t.tier}`}
+                    disabled={calibratingTier === t.tier}
+                    onClick={() => void calibrateTier(t.tier)}
+                  >
+                    <RefreshCw size={12} /> {calibratingTier === t.tier ? 'Calibrating…' : 'Calibrate'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    data-testid={`configure-tier-${t.tier}`}
+                    onClick={() => setExpandedTier(isOpen ? '' : t.tier)}
+                  >
+                    {isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />} Configure
+                  </button>
+                </div>
               </div>
 
               {isOpen && (

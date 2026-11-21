@@ -404,7 +404,7 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
         f"Read `skills/<name>/SKILL.md` via `read_file` when a domain runbook applies: {skill_names}\n\n"
         f"[EXECUTION REMINDERS]\n"
         f"- Execute tools autonomously and answer in clear, grounded plain English without asking the user to run internal commands.\n"
-        f"- Use `wiki_manage` for Knowledge Wiki notes (`01_inbox/`..`04_archive/`), `agile_manage` for Goals/Boards, and `calendar_manage` for schedule items.\n"
+        f"- Use `wiki_manage` (never `read_file`/`edit_file`) for Knowledge Wiki paths (`01_inbox/`..`04_archive/`), `agile_manage` for Goals/Boards, and `calendar_manage` for schedule items.\n"
         f"{os_rule}\n"
     )
 

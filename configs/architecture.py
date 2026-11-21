@@ -238,7 +238,7 @@ CORE_COMPONENTS: List[ComponentSpec] = [
         layer=ArchitectureLayer.DOMAIN,
         module_path="companion/model_registry.py",
         description="12-preset local/frontier LLM provider registry, Zero-Reveal Blind Vault API key binding, hot-reload 8-slot capability tier matrix, and LAN privacy lock",
-        dependencies=["Configuration & .env Loader", "Multi-Dialect LLM Wire Translators", "LLM HTTP Client", "Persistent Memory, ADR & Autonomy Store", "Zero-Reveal Blind Credential Vault & Snapshot Backups"],
+        dependencies=["Configuration & .env Loader", "Live SSE & Stream Event Bus", "Multi-Dialect LLM Wire Translators", "LLM HTTP Client", "Persistent Memory, ADR & Autonomy Store", "Zero-Reveal Blind Credential Vault & Snapshot Backups"],
     ),
     # Crossbar: Deterministic Workflow Graph Layer
     ComponentSpec(

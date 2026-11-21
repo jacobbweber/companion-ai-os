@@ -17,9 +17,9 @@ Execute production-grade software engineering inside any external Git repository
 1. **Orient & Inspect Repo Rules**:
    - Check `<repo_sdlc_context>` in `<turn_context>` for discovered `.agents/rules/*.md`, `AGENTS.md`, `CLAUDE.md`, active branch, and detected stack (`pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`).
    - Confirm the project's `delivery_policy` (`local_only` default | `ask_me` | `remote_branch_pr`). Never push or open a PR when `delivery_policy == "local_only"`.
-2. **Isolate on a Feature Branch or Worktree**:
+2. **Isolate on a Feature Branch**:
    - Use `git_manage(action="status")` to inspect working tree cleanliness.
-   - Create a descriptive branch (`feat/<slug>` or `fix/<slug>`) via `git_manage(action="branch", branch="feat/...")`, OR create an isolated sibling worktree via `git_manage(action="worktree_add", branch="feat/...", worktree_path="../wt-<slug>")` when parallel work is active.
+   - For single-repo tasks, switch the repository in place to a descriptive feature branch (`feat/<slug>` or `fix/<slug>`) via `git_manage(action="branch", branch="feat/...")`. Reserve `git_manage(action="worktree_add", ...)` for multi-worker parallel slices.
    - Never commit directly onto `main` or `master`.
 3. **Test-First Implementation**:
    - Read target files (`read_file`, `search`) and write or update automated tests covering the target behavior.

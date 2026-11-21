@@ -90,7 +90,10 @@ _ADVANCE_VERBS = frozenset({"advance", "continue", "proceed", "resume", "tackle"
 _GOAL_NOUNS = frozenset({"goal", "slice", "milestone", "project", "work"})
 _PERSONAL_ASSISTANT_NOUNS = frozenset({
     "course", "courses", "flashcard", "flashcards", "study", "quiz", "calendar", "appointment",
-    "reminder", "task", "tasks", "card", "cards", "board", "milestone", "milestones", "note", "notes", "inbox",
+    "reminder", "task", "tasks", "card", "cards", "board", "milestone", "milestones", "note", "notes", "inbox", "wiki", "event", "events",
+})
+_PERSONAL_ACTION_VERBS = frozenset({
+    "add", "create", "save", "schedule", "capture", "curate", "log", "move", "update", "delete", "remove",
 })
 
 
@@ -309,6 +312,9 @@ def triage_turn(
 
     if readiness.status == "NEEDS_ALIGNMENT" and (readiness.risk_tier == ActionRiskTier.R3_HIGH_IMPACT_MUTATION or has_mutation):
         return TriageDecision("GUIDED_CHANGE", "reasoning", "high-impact or underspecified goal routed to Blueprint alignment", readiness.status, readiness.reasons, needs_blueprint=True, route="GOAL_ALIGN_PLAN", risk_tier=risk_code)
+    has_personal_write = bool((word_set & _PERSONAL_ACTION_VERBS) and (word_set & _PERSONAL_ASSISTANT_NOUNS)) and not bool(word_set & consult_cues)
+    if has_personal_write and readiness.status == "READY" and not multi_deliverable:
+        return TriageDecision("GUIDED_CHANGE", "fast", "personal board/calendar/wiki action", readiness.status, readiness.reasons, route="DIRECT_TURN", risk_tier=risk_code)
     if (is_question or (not has_mutation and bool(word_set & consult_cues))) and not multi_deliverable:
         is_deep = len(words_list) >= 14 or bool(word_set & consult_cues)
         return TriageDecision("DEEP_CONSULT" if is_deep else "CHAT_DIRECT", "reasoning" if is_deep else "fast", "analytical consultation" if is_deep else "direct question", readiness.status, readiness.reasons, route="DIRECT_TURN", risk_tier=risk_code)
