@@ -50,7 +50,7 @@ if ($ExistingPids.Count -gt 0 -and $StopExisting) {
     $ExistingPids = @()
 }
 
-$Flag = if ($Mode -eq "tray") { "--locked --tray --no-browser --host 127.0.0.1 --port $Port" } else { "--locked --web --host 127.0.0.1 --port $Port" }
+$Flag = if ($Mode -eq "tray") { "--immutable --tray --no-browser --host 127.0.0.1 --port $Port" } else { "--immutable --web --host 127.0.0.1 --port $Port" }
 $ArgsStr = "`"$RepoRoot\harness.py`" --data-dir `"$DataDir`" $Flag"
 
 $Action = New-ScheduledTaskAction -Execute $PythonExe -Argument $ArgsStr -WorkingDirectory $RepoRoot

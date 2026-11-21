@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Builds a self-contained Windows Desktop Installer (`dist\CompanionSetup-v3.5.0.exe`).
+Builds a self-contained Windows Desktop Installer (`dist\CompanionSetup-v4.0.0.exe`).
 Downloads the official Python 3.12 Windows Embeddable Runtime (zero pip packages needed!),
 stages the clean Companion app tree + silent Win32 tray launchers, and compiles `companion.iss`
 if Inno Setup 6 (`ISCC.exe`) is installed.
@@ -50,7 +50,7 @@ Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 appDir = fso.GetParentFolderName(WScript.ScriptFullName)
 dataDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Companion\data")
-cmd = """" & appDir & "\runtime\pythonw.exe"" """ & appDir & "\harness.py"" --data-dir """ & dataDir & """ --locked --tray"
+cmd = """" & appDir & "\runtime\pythonw.exe"" """ & appDir & "\harness.py"" --data-dir """ & dataDir & """ --immutable --tray"
 sh.Run cmd, 0, False
 '@
 Set-Content -Path (Join-Path $StageDir "launch-companion.vbs") -Value $VbsInteractive -Encoding ASCII
@@ -69,8 +69,8 @@ $IsccCandidates = @(
 if ($IsccCandidates.Count -gt 0) {
     $Iscc = $IsccCandidates[0]
     & $Iscc (Join-Path $PSScriptRoot "companion.iss")
-    Write-Host "Built installer: $RepoRoot\dist\CompanionSetup-v3.5.0.exe" -ForegroundColor Green
+    Write-Host "Built installer: $RepoRoot\dist\CompanionSetup-v4.0.0.exe" -ForegroundColor Green
 } else {
     Write-Host "Portable bundle staged at: $StageDir" -ForegroundColor Yellow
-    Write-Host "Install Inno Setup 6 (https://jrsoftware.org/isinfo.php) and re-run this script to compile CompanionSetup-v3.5.0.exe."
+    Write-Host "Install Inno Setup 6 (https://jrsoftware.org/isinfo.php) and re-run this script to compile CompanionSetup-v4.0.0.exe."
 }

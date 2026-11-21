@@ -12,7 +12,7 @@ Built on a zero-dependency Python 3.12 standard library A-Frame Architecture (47
 import os
 import sys
 
-__version__ = "3.5.0"
+__version__ = "4.0.0"
 
 
 def ensure_utf8_streams() -> None:

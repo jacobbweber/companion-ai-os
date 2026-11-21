@@ -1,9 +1,9 @@
 {
   "name": "companion-web-studio",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
   "type": "module",
-  "description": "Companion AI OS 3.0 — Multi-Studio Matte Brutalist Sci-Fi Web Interface (Ring-1 Build -> surfaces/static/ Ring-0 Runtime)",
+  "description": "Companion AI OS 4.0 — Progressive-Disclosure Multi-Studio Web Interface & Parallel Worktree Studio (Ring-1 Build -> surfaces/static/ Ring-0 Runtime)",
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",

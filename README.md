@@ -55,7 +55,7 @@ Companion strictly separates **application code** from **your personal runtime d
 ## Deployment Options
 
 ### Option 1: Docker Compose (Recommended for Home Servers / NAS)
-Runs as a non-root container with an immutable application core (`COMPANION_IMMUTABLE_CORE=1`) and all user state persisted cleanly in `./companion-data`:
+Runs as a non-root container with an immutable application core (`COMPANION_IMMUTABLE_APP=1`) and all user state persisted cleanly in `./companion-data`:
 
 ```bash
 docker compose up -d
@@ -75,7 +75,7 @@ docker compose up -d
   # Remove anytime (preserves your user data):
   powershell -ExecutionPolicy Bypass -File deploy\windows\uninstall-startup-service.ps1
   ```
-- **Build a standalone `CompanionSetup-v3.5.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
+- **Build a standalone `CompanionSetup-v4.0.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
   ```powershell
   powershell -ExecutionPolicy Bypass -File deploy\windows\build-installer.ps1
   ```
