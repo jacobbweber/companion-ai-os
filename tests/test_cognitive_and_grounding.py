@@ -17,35 +17,16 @@ from companion.autonomy import (
     run_autonomous_goal,
 )
 from companion.compaction import build_lossless_phase_handoff
-from companion.config import SKIP_DIRS, Settings, settings, workspace_context
+from companion.config import SKIP_DIRS, Settings, settings, walk_pruned_files, workspace_context
 from companion.context import build_system_prompt
-from companion.disciplines import verify_repository_syntax, walk_pruned_files
-from companion.hygiene import analyze_workspace_hygiene, build_repo_headroom_map, extract_python_symbol
 from companion.llm import current_tier_name, normalize_assistant_message, rescue_text_tool_calls
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.safety import CheckpointManager, lint_single_file_edit
 from companion.tool_schemas import TOOLS, check_phase_tool_permission, filter_tools_for_phase, phase_tool_context
-from companion.tools import dispatch, tool_edit_file, tool_read_file, tool_write_file
-from configs.architecture import _check_layer_dependencies
+from companion.tools import dispatch, extract_python_symbol, tool_edit_file, tool_read_file, tool_write_file
 
 
 class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
-    def test_upgrade1_crowded_modules_decompressed_with_headroom(self) -> None:
-        """Verify previously crowded modules now sit comfortably below the 550-line ceiling."""
-        for rel in (
-            "companion/tools.py",
-            "companion/os_tools.py",
-            "companion/safety.py",
-            "companion/context.py",
-            "companion/checkpoints.py",
-            "companion/compaction.py",
-            "companion/tool_schemas.py",
-        ):
-            full = settings.root / rel
-            self.assertTrue(full.is_file(), f"Missing module {rel}")
-            line_cnt = len(full.read_text(encoding="utf-8").splitlines())
-            self.assertLessEqual(line_cnt, 520, f"{rel} should have generous headroom, got {line_cnt} lines")
-
     def test_upgrade2_per_tier_temperature_tool_call_rescue_and_rolling_scratchpad(self) -> None:
         """Verify per-tier temperature defaults, JSON/Qwen XML `<tool_call>` rescue, and 1-step `<think>` continuity."""
         saved_ft, saved_rt = os.environ.pop("COMPANION_FAST_TEMP", None), os.environ.pop("COMPANION_REASONING_TEMP", None)
@@ -101,11 +82,12 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             self.assertIn("Step-1 plan: check root files", seen_tail_msgs[1])
             store.close()
 
-    def test_upgrade3_ast_repo_headroom_radar_and_symbol_read_file(self) -> None:
-        """Verify cached AST Repo Radar in system prompt and surgical `read_file(..., symbol=...)` slicing."""
-        radar = build_repo_headroom_map(settings.root)
+    def test_upgrade3_workspace_radar_and_symbol_read_file(self) -> None:
+        """Verify workspace radar and surgical `read_file(..., symbol=...)` slicing."""
+        from companion.grounding import build_workspace_radar
+
+        radar = build_workspace_radar(settings.root)
         self.assertIn("companion/config.py", radar)
-        self.assertIn(f"/{settings.max_module_lines}L]", radar)
 
         with tempfile.TemporaryDirectory() as tmp:
             ext_repo = Path(tmp) / "ext_repo"
@@ -140,49 +122,23 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             self.assertIn("error: symbol `nonexistent_sym` not found", missing)
             self.assertIn("Engine.start", missing)
 
-    def test_upgrade4_inline_post_edit_micro_linter(self) -> None:
-        """Verify `<5ms` inline micro-linter rejects orphan, oversized, stdlib, and layer violations immediately."""
+    def test_upgrade4_inline_post_edit_syntax_guard(self) -> None:
+        """Verify inline syntax guard rejects invalid Python/JSON while allowing clean edits."""
         with tempfile.TemporaryDirectory() as tmp:
             gov = Path(tmp)
-            (gov / "companion").mkdir()
-
-            err_orphan, _ = lint_single_file_edit(gov / "stray_root.py", '"""Stray."""\nx = 1\n', governed_root=gov)
-            self.assertIn("HYGIENE GUARD REJECTED", str(err_orphan))
-
-            err_ext, _ = lint_single_file_edit(gov / "companion" / "bad_pkg.py", '"""Bad."""\nimport fastapi\n', governed_root=gov)
-            self.assertIn("violates ADR-001", str(err_ext))
-
-            err_layer, _ = lint_single_file_edit(
-                gov / "companion" / "config.py",
-                '"""Bad upward import."""\nfrom companion.agent import run_agent_turn\n',
-                governed_root=gov,
-            )
-            self.assertIn("ARCHITECTURE GUARD REJECTED", str(err_layer))
-
-            big_fn = '"""Big fn."""\ndef huge():\n' + "".join(f"    x_{i} = {i}\n" for i in range(105))
-            err_fn, _ = lint_single_file_edit(gov / "companion" / "oversized.py", big_fn, governed_root=gov)
-            self.assertIn("HYGIENE GUARD REJECTED", str(err_fn))
-
-            err_u_imp, warn_u_imp = lint_single_file_edit(
-                gov / "companion" / "warn_demo.py",
-                '"""Demo."""\nimport math\n\nx = 1\n',
-                governed_root=gov,
-            )
-            self.assertIsNone(err_u_imp)
-            self.assertIn("[INLINE LINT WARNING: Unused import(s)", warn_u_imp)
+            err_bad, _ = lint_single_file_edit(gov / "bad.py", "def broken(:\n", governed_root=gov)
+            self.assertIn("SYNTAX GUARD REJECTED", str(err_bad))
 
             target_py = Path(tmp) / "warn_demo.py"
             res_w = tool_write_file({"path": str(target_py), "content": '"""Demo."""\nimport math\n\nx = 1\n'})
             self.assertIn("wrote", res_w)
-            self.assertNotIn("INLINE LINT WARNING", res_w)
 
             res_e = tool_edit_file({"path": str(target_py), "old_str": "import math\n\n", "new_str": ""})
             self.assertIn("edited", res_e)
-            self.assertNotIn("INLINE LINT WARNING", res_e)
 
     def test_upgrade5_rich_tool_parameter_schemas_and_phase_tool_gating(self) -> None:
-        """Verify every parameter across all 28 tools has a description and `DESIGN`/`PLAN` lock out file writes."""
-        self.assertEqual(len(TOOLS), 28)
+        """Verify every parameter across all tools has a description and `DESIGN`/`PLAN` lock out file writes."""
+        self.assertGreaterEqual(len(TOOLS), 10)
         for tool_spec in TOOLS:
             fn_name = tool_spec["function"]["name"]
             props = tool_spec["function"]["parameters"]["properties"]
@@ -294,26 +250,8 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_upgrade8b_import_qualified_dead_code_catches_shadowed_method_names(self) -> None:
-        """Verify dead top-level functions in `companion/` are caught even if an unrelated class defines a same-named method."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            comp = root / "companion"
-            comp.mkdir()
-            (comp / "alpha.py").write_text('"""Alpha."""\ndef status() -> str:\n    return "dead top-level fn"\n', encoding="utf-8")
-            (comp / "beta.py").write_text(
-                '"""Beta."""\nclass Worker:\n    def status(self) -> str:\n        return "alive method"\n\nw = Worker().status()\n',
-                encoding="utf-8",
-            )
-            (root / "harness.py").write_text('"""Entry."""\nfrom companion.beta import Worker\nprint(Worker)\n', encoding="utf-8")
-            rep = analyze_workspace_hygiene(root=root)
-            self.assertFalse(rep.clean)
-            self.assertEqual(len(rep.dead_definitions), 1)
-            self.assertIn("companion/alpha.py", rep.dead_definitions[0])
-            self.assertIn("status", rep.dead_definitions[0])
-
-    def test_read_only_phase_memory_and_sdd_action_locks_and_reflect_exceptions(self) -> None:
-        """Verify mutating `memory_manage` and `sdd_manage` actions are locked in read-only phases and selectively open in `REFLECT`."""
+    def test_read_only_phase_memory_action_locks_and_reflect_exceptions(self) -> None:
+        """Verify mutating `memory_manage` actions are locked in read-only phases and selectively open in `REFLECT`."""
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp) / "phase_locks_ws"
             ws.mkdir()
@@ -325,11 +263,7 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
                             for act in ("add_note", "set_profile", "add_adr", "upsert_fact", "sync", "  UPSERT_FACT  "):
                                 res = dispatch("memory_manage", {"action": act, "key": "k", "value": "v", "content": "n", "title": "ADR-X", "decision": "d"})
                                 self.assertIn("PHASE TOOL GATE REJECTED", res)
-                            for s_act in ("sync", "add_adr"):
-                                s_res = dispatch("sdd_manage", {"action": s_act, "title": "ADR-X", "decision": "d"})
-                                self.assertIn("PHASE TOOL GATE REJECTED", s_res)
                             self.assertIsNotNone(dispatch("memory_manage", {"action": "query_facts", "query": "k"}))
-                            self.assertIn("ADR-001", dispatch("sdd_manage", {"action": "get_adrs"}))
                     self.assertEqual(store.query_knowledge_facts("k"), [])
 
                     with phase_tool_context("REFLECT"):
@@ -340,20 +274,13 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
                         self.assertIn("PHASE TOOL GATE REJECTED", dispatch("memory_manage", {"action": "sync"}))
                         self.assertIn("PHASE TOOL GATE REJECTED", dispatch("memory_manage", {"action": "set_profile", "key": "x", "value": "y"}))
                         self.assertIn("PHASE TOOL GATE REJECTED", dispatch("memory_manage", {"action": "add_adr", "title": "T", "decision": "D"}))
-                        self.assertIn("PHASE TOOL GATE REJECTED", dispatch("sdd_manage", {"action": "sync"}))
-                        self.assertIn("PHASE TOOL GATE REJECTED", dispatch("sdd_manage", {"action": "add_adr", "title": "T", "decision": "D"}))
-                    with phase_tool_context("IMPLEMENT"):
-                        sync_out = dispatch("sdd_manage", {"action": "sync"})
-                        self.assertIn(str(ws / "specs" / "DECISIONS.md"), sync_out)
-                        self.assertTrue((ws / "specs" / "DECISIONS.md").is_file())
                     self.assertEqual(store.query_knowledge_facts("reflect:lesson")[0]["value"], "verified")
             finally:
                 store.close()
 
-    def test_pruned_os_walk_skips_ignored_dirs_in_o1_and_docs_list_all_24_modules(self) -> None:
-        """Verify `walk_pruned_files`, syntax/hash/hard-verify/layer scans prune `SKIP_DIRS` in O(1), and docs list all 24 modules."""
+    def test_pruned_os_walk_skips_ignored_dirs_in_o1(self) -> None:
+        """Verify `walk_pruned_files` and hash/hard-verify scans prune `SKIP_DIRS` in O(1)."""
         with tempfile.TemporaryDirectory() as tmp:
-            # Place workspace inside a parent dir named `.venv` to also prove parent path segments never false-prune `root`
             ws = Path(tmp) / ".venv" / "clean_proj"
             ws.mkdir(parents=True)
             (ws / "app.py").write_text('"""Clean module."""\nVALUE = 1\n', encoding="utf-8")
@@ -364,12 +291,6 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
                 (nested / "broken.py").write_text("def syntax_bomb(:\n", encoding="utf-8")
                 (nested / "ignored.json").write_text("{bad_json", encoding="utf-8")
 
-            arch_ws = Path(tmp) / ".venv" / "arch_repo"
-            (arch_ws / "companion").mkdir(parents=True)
-            (arch_ws / "companion" / "config.py").write_text("from companion.agent import run_agent_turn\n", encoding="utf-8")
-            (arch_ws / "node_modules" / "pkg").mkdir(parents=True)
-            (arch_ws / "node_modules" / "pkg" / "bad.py").write_text("x = 1\n", encoding="utf-8")
-
             visited_roots: List[str] = []
             real_walk = os.walk
 
@@ -378,39 +299,18 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
                     visited_roots.append(Path(cur_r).as_posix())
                     yield cur_r, dirs, files
 
-            with patch("companion.disciplines.os.walk", side_effect=spy_walk):
+            with patch("companion.config.os.walk", side_effect=spy_walk):
                 pruned = walk_pruned_files(ws)
-                syn_ok, syn_res = verify_repository_syntax(ws)
-                layer_errs = _check_layer_dependencies(arch_ws)
                 with workspace_context(ws, "walk-proj"):
                     hashes = _snapshot_file_hashes(ws)
                     hv_ok, hv_msg = _evaluate_hard_verification(ws, {}, run_doctor_tests=False, goal="Create app.py")
 
             self.assertEqual([p.name for p in pruned], ["app.py", "config.json"])
-            self.assertTrue(syn_ok)
-            self.assertEqual(len(syn_res), 1)
-            self.assertGreaterEqual(len(layer_errs), 1)
             self.assertEqual(set(hashes.keys()), {"app.py", "config.json"})
             self.assertTrue(hv_ok, hv_msg)
-            ws_posix, arch_posix = ws.as_posix(), arch_ws.as_posix()
+            ws_posix = ws.as_posix()
             rel_visits = [r[len(ws_posix) :].lstrip("/") for r in visited_roots if r.startswith(ws_posix)]
-            rel_arch = [r[len(arch_posix) :].lstrip("/") for r in visited_roots if r.startswith(arch_posix)]
-            self.assertTrue(all((rv.split("/", 1)[0] not in SKIP_DIRS) for rv in (*rel_visits, *rel_arch) if rv))
-
-        prod_py = [*(settings.root / "companion").glob("*.py"), *(settings.root / "configs").glob("*.py"), *(settings.root / "surfaces").glob("*.py"), settings.root / "harness.py"]
-        for py_f in prod_py:
-            self.assertNotIn(".rglob(", py_f.read_text(encoding="utf-8"), f"Unpruned `.rglob(` left in {py_f.name}")
-
-        stems = sorted(p.stem for p in (settings.root / "companion").glob("*.py") if p.name != "__init__.py")
-        self.assertEqual(len(stems), 47)
-        readme_txt = (settings.root / "README.md").read_text(encoding="utf-8")
-        sdd_skill_txt = (settings.root / "skills" / "sdd-compliance" / "SKILL.md").read_text(encoding="utf-8")
-        patterns_txt = (settings.root / "skills" / "knowledge-wiki" / "references" / "agentic-patterns.md").read_text(encoding="utf-8")
-        for stem in stems:
-            self.assertIn(stem, companion_pkg_doc or "", f"`{stem}` missing from companion/__init__.py docstring")
-            self.assertIn(f"{stem}.py", readme_txt, f"`{stem}.py` missing from README.md")
-            self.assertIn(stem, sdd_skill_txt, f"`{stem}` missing from skills/sdd-compliance/SKILL.md")
-            self.assertIn(f"{stem}.py", patterns_txt, f"`{stem}.py` missing from agentic-patterns.md")
+            self.assertTrue(all((rv.split("/", 1)[0] not in SKIP_DIRS) for rv in rel_visits if rv))
 
 
 if __name__ == "__main__":

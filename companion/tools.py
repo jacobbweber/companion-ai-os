@@ -1,5 +1,6 @@
 """Comprehensive, Self-Guarded Tool Registry (A-Frame Application Layer, 28 tools)."""
 
+import ast
 import fnmatch
 import json
 import os
@@ -11,21 +12,19 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue
+from companion.archive_and_approvals import ActionRiskTier, classify_action_risk, get_approval_queue
 from companion.config import SKIP_DIRS, agent_tool_turn_context, is_in_agent_tool_turn, settings
-from companion.disciplines import ActionRiskTier, classify_action_risk
 from companion.grounding import get_execution_target
 from companion.harvest_tools import (
     tool_agile_manage, tool_calendar_manage, tool_education_manage, tool_endpoint_manage,
     tool_job_manage, tool_mcp_manage, tool_routine_manage, tool_vault_manage, tool_wiki_manage,
 )
-from companion.hygiene import extract_python_symbol
 from companion.llm_wire import check_url_ssrf, urlopen_safe
 from companion.mcp_hub import get_mcp_hub
 from companion.memory_store import get_memory_store
 from companion.os_tools import (
     summarize_tool_step, tool_checkpoint_manage, tool_memory_manage, tool_project_manage,
-    tool_sdd_manage, tool_system_doctor, tool_task_manage, tool_telemetry_manage, tool_web_search, tool_workflow_manage,
+    tool_system_doctor, tool_task_manage, tool_telemetry_manage, tool_web_search, tool_workflow_manage,
 )
 from companion.safety import (
     check_command_safety, check_path_safety, lint_single_file_edit,
@@ -41,12 +40,48 @@ from companion.tool_schemas import (
 
 __all__ = [
     "PHASE_ALLOWED_TOOLS", "TOOLS", "TOOL_IMPLS", "check_phase_tool_permission", "current_workflow_phase", "dispatch",
-    "filter_tools_for_phase", "phase_tool_context", "r3_approval_context", "resolve", "tool_agile_manage", "tool_calendar_manage",
-    "tool_checkpoint_manage", "tool_dev_preview", "tool_edit_file", "tool_education_manage", "tool_endpoint_manage",
-    "tool_git_manage", "tool_job_manage", "tool_list_dir", "tool_mcp_manage", "tool_memory_manage", "tool_project_manage", "tool_read_file",
-    "tool_routine_manage", "tool_run_python", "tool_run_shell", "tool_sdd_manage", "tool_search", "tool_system_doctor",
-    "tool_task_manage", "tool_telemetry_manage", "tool_vault_manage", "tool_web_fetch", "tool_web_search", "tool_wiki_manage", "tool_workflow_manage", "tool_write_file",
+    "extract_python_symbol", "filter_tools_for_phase", "phase_tool_context", "r3_approval_context", "resolve",
+    "tool_agile_manage", "tool_calendar_manage", "tool_checkpoint_manage", "tool_dev_preview", "tool_edit_file",
+    "tool_education_manage", "tool_endpoint_manage", "tool_git_manage", "tool_job_manage", "tool_list_dir",
+    "tool_mcp_manage", "tool_memory_manage", "tool_project_manage", "tool_read_file", "tool_routine_manage",
+    "tool_run_python", "tool_run_shell", "tool_search", "tool_system_doctor", "tool_task_manage",
+    "tool_telemetry_manage", "tool_vault_manage", "tool_web_fetch", "tool_web_search", "tool_wiki_manage",
+    "tool_workflow_manage", "tool_write_file",
 ]
+
+
+def extract_python_symbol(source: str, symbol: str, rel_path: str = "<file>") -> Tuple[Optional[Tuple[int, int, str]], List[str]]:
+    """Locate a Python `class`, `def`, or `Class.method` AST span `(start_line, end_line, kind)`."""
+    target = (symbol or "").strip()
+    try:
+        tree = ast.parse(source, filename=rel_path)
+    except SyntaxError:
+        return None, []
+    available: List[str] = []
+    exact_match: Optional[Tuple[int, int, str]] = None
+    fallback_match: Optional[Tuple[int, int, str]] = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            available.append(node.name)
+            if node.name == target and exact_match is None:
+                start = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+                exact_match = (start, getattr(node, "end_lineno", node.lineno), "function")
+        elif isinstance(node, ast.ClassDef):
+            available.append(node.name)
+            if node.name == target and exact_match is None:
+                start = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+                exact_match = (start, getattr(node, "end_lineno", node.lineno), "class")
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    qual = f"{node.name}.{sub.name}"
+                    available.append(qual)
+                    start = sub.decorator_list[0].lineno if sub.decorator_list else sub.lineno
+                    end = getattr(sub, "end_lineno", sub.lineno)
+                    if target == qual and exact_match is None:
+                        exact_match = (start, end, "method")
+                    elif sub.name == target and fallback_match is None:
+                        fallback_match = (start, end, f"method `{qual}`")
+    return (exact_match or fallback_match), available
 
 
 _WIKI_DIRS = ("01_inbox", "02_knowledge", "03_resources", "04_archive")
@@ -417,7 +452,7 @@ TOOL_IMPLS: Dict[str, Callable[[Dict[str, Any]], str]] = {
     "list_dir": tool_list_dir, "search": tool_search, "run_python": tool_run_python,
     "run_shell": tool_run_shell, "web_fetch": tool_web_fetch, "web_search": tool_web_search, "memory_manage": tool_memory_manage,
     "task_manage": tool_task_manage, "workflow_manage": tool_workflow_manage, "checkpoint_manage": tool_checkpoint_manage,
-    "sdd_manage": tool_sdd_manage, "project_manage": tool_project_manage,
+    "project_manage": tool_project_manage,
     "system_doctor": tool_system_doctor, "telemetry_manage": tool_telemetry_manage,
     "job_manage": tool_job_manage, "wiki_manage": tool_wiki_manage, "vault_manage": tool_vault_manage,
     "endpoint_manage": tool_endpoint_manage, "mcp_manage": tool_mcp_manage, "routine_manage": tool_routine_manage,

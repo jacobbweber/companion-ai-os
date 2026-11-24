@@ -1,10 +1,8 @@
 """
-Self-Preservation, Workspace Path Locks, Inline Micro-Linter & 7-Stage System Doctor
-(A-Frame Domain Layer).
+Workspace Path/Command Safety Guards, Indent-Shifted Edit Recovery, LoopGuard & Runtime Health Doctor.
 
-Guarantees that Companion can self-iterate and build external projects without losing itself,
-violating `ADR-007` project boundaries, leaking internal linters onto user repos, exposing
-Blind Vault secrets to subprocesses, or getting trapped in repetitive tool loops.
+Guarantees mechanical WorkspaceContext path confinement, blocks destructive shell/SQL/secret-exfil
+patterns, detects infinite tool loops, and verifies runtime health without repo self-policing bloat.
 """
 
 import ast
@@ -22,23 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.checkpoints import CheckpointManager, checkpoint_manager, get_active_checkpoint_manager
-from companion.config import settings
-from companion.disciplines import (
-    FORBIDDEN_EXTERNAL_IMPORTS,
-    analyze_python_source,
-    check_module_layer_imports,
-    find_non_abstract_stubs,
-    iter_ast_import_targets,
-    validate_embedded_scripts,
-    verify_repository_syntax,
-)
-from companion.hygiene import (
-    ALLOWED_ROOT_FILES,
-    ALLOWED_TOP_DIRS,
-    analyze_workspace_hygiene,
-    find_semicolon_chains,
-    find_unused_imports_in_source,
-)
+from companion.config import settings, walk_pruned_files
 
 __all__ = [
     "CheckpointManager", "LoopGuard", "check_command_safety", "check_path_safety",
@@ -77,7 +59,7 @@ def check_command_safety(command: str) -> Optional[str]:
         return None
     for rx, reason in _DESTRUCTIVE_CMD_PATTERNS:
         if rx.search(cmd):
-            return f"SAFETY GUARD REJECTED command: blocked {reason}.\nCommand was NOT executed. Use safe, scoped project operations or `checkpoint_manage`."
+            return f"SAFETY GUARD REJECTED command: blocked {reason}.\nCommand was NOT executed. Use safe, scoped project operations."
     protected = {-1, 0, 1, os.getpid(), *([os.getppid()] if os.getppid() > 0 else [])}
     for m in re.finditer(r"\bkill\b(?P<rest>[^\n;&|]+)", cmd, re.I):
         args_part = re.sub(r"^(?:\s+(?:-[sSnN]\s+\S+|--signal(?:=|\s+)\S+|-[a-zA-Z0-9]+))?(?:\s+--)?", "", m.group("rest"))
@@ -104,7 +86,7 @@ def normalize_windows_shell_command(command: str) -> Tuple[str, bool]:
 
 
 def check_path_safety(path: Path, write: bool = False, allowed_roots: Optional[List[Path]] = None) -> Optional[str]:
-    """Enforce mechanical WorkspaceContext path confinement (`ADR-007`) and protect core/sensitive files."""
+    """Enforce mechanical WorkspaceContext path confinement and protect core/sensitive files."""
     try:
         resolved = path.resolve()
     except Exception as exc:
@@ -116,21 +98,23 @@ def check_path_safety(path: Path, write: bool = False, allowed_roots: Optional[L
     else:
         ws = settings.get_workspace()
         if ws.is_self_project:
-            roots = [ws.self_root, *([settings.data_dir.resolve()] if settings.data_dir else []), tmp_root]
+            roots = [ws.self_root, settings.effective_data_dir.resolve(), *([settings.data_dir.resolve()] if settings.data_dir else []), tmp_root]
         elif write:
-            if resolved.is_relative_to(ws.self_root) and not resolved.is_relative_to(ws.project_root):
+            if resolved.is_relative_to(ws.self_root) and not resolved.is_relative_to(ws.project_root) and not resolved.is_relative_to(settings.effective_data_dir.resolve()):
                 return (
-                    f"SAFETY GUARD REJECTED path: Companion's installed `app/` runtime (`{ws.self_root}`) is permanently IMMUTABLE / READ-ONLY (`ADR-007` / `ADR-019`) "
+                    f"SAFETY GUARD REJECTED path: Companion's installed `app/` runtime (`{ws.self_root}`) is permanently IMMUTABLE / READ-ONLY "
                     f"while working on external project `{ws.project_id}` (`{ws.project_root}`)."
                 )
-            roots = [ws.project_root, tmp_root]
+            roots = [ws.project_root, settings.domains_dir.resolve(), settings.scratch_dir.resolve(), tmp_root]
         else:
-            roots = [ws.project_root, settings.effective_data_dir.resolve(), (ws.self_root / "skills").resolve(), (ws.self_root / "specs").resolve(), tmp_root]
+            roots = [ws.project_root, settings.effective_data_dir.resolve(), (ws.self_root / "skills").resolve(), tmp_root]
 
     if not any(resolved.is_relative_to(r) for r in roots):
         return f"SAFETY GUARD REJECTED path: `{resolved}` is outside the active WorkspaceContext root (`{roots[0]}`). Cross-directory traversal is blocked."
     parts_lower = [pt.lower() for pt in resolved.parts]
     fname_lower = resolved.name.lower()
+    if ".agents" in parts_lower and write:
+        return f"SAFETY GUARD REJECTED path: `.agents/` builder directory (`{resolved}`) is off-limits to runtime tool writes."
     if ".ssh" in parts_lower or ".ssh_tmp" in parts_lower or fname_lower.startswith((".comp_ssh_", ".secrets_")):
         return f"SAFETY GUARD REJECTED path: access to SSH/Vault temporary credentials (`{resolved}`) is blocked."
     is_env_secret = (
@@ -160,133 +144,42 @@ def check_path_safety(path: Path, write: bool = False, allowed_roots: Optional[L
                 data_roots.append((ws_chk.self_root / "data").resolve())
             if not any(resolved.is_relative_to(dr) for dr in data_roots):
                 return (
-                    f"SAFETY GUARD REJECTED path: Companion's installed `app/` runtime (`{ws_chk.self_root}`) is permanently IMMUTABLE (`ADR-019`). "
-                    "Write inside `data/` (`data/scratch/`) or focus an external Project clone (`workspace_path`)."
+                    f"SAFETY GUARD REJECTED path: Companion's installed `app/` runtime (`{ws_chk.self_root}`) is permanently IMMUTABLE. "
+                    "Write inside `data/` (`data/domains/`, `data/scratch/`, `data/skills/`) or focus an external Project clone (`workspace_path`)."
                 )
     return None
 
 
 def validate_python_syntax(source: str, filename: str = "<string>") -> Tuple[bool, Optional[str]]:
     """Validate that Python source code parses and compiles without SyntaxError."""
-    res = analyze_python_source(source, filename=filename)
-    return res.valid_syntax, res.syntax_error
-
-
-def _check_python_governed_rules(tree: ast.Module, lines: List[str], rel: str) -> Optional[str]:
-    """Enforce orphan-path, line-budget, ADR-001 stdlib, and A-Frame layer rules on Companion source edits."""
-    parts = rel.split("/")
-    if len(parts) == 1 and parts[0] not in ALLOWED_ROOT_FILES:
-        return f"HYGIENE GUARD REJECTED `{rel}`: root `.py` file not allowed (place inside {sorted(ALLOWED_TOP_DIRS)})."
-    if len(parts) > 1 and parts[0] not in ALLOWED_TOP_DIRS:
-        return f"HYGIENE GUARD REJECTED `{rel}`: top-level folder `{parts[0]}` not in {sorted(ALLOWED_TOP_DIRS)}."
-    if len(lines) > settings.max_module_lines:
-        return f"HYGIENE GUARD REJECTED `{rel}`: module is {len(lines)} lines (> budget {settings.max_module_lines}). Extract a cohesive helper module instead."
-    fn_cap = settings.max_function_lines
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            fn_len = getattr(node, "end_lineno", node.lineno) - node.lineno + 1
-            if fn_len > fn_cap:
-                return f"HYGIENE GUARD REJECTED `{rel}:{node.lineno}`: `{node.name}()` is {fn_len} lines (> budget {fn_cap}). Extract a helper."
-            if node.args.args and node.args.args[0].arg in ("self", "cls"):
-                return f"HYGIENE GUARD REJECTED `{rel}:{node.lineno}`: `{node.name}({node.args.args[0].arg})` is mis-indented at module top-level."
-        elif isinstance(node, ast.ClassDef):
-            for sub in node.body:
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    fn_len = getattr(sub, "end_lineno", sub.lineno) - sub.lineno + 1
-                    if fn_len > fn_cap:
-                        return f"HYGIENE GUARD REJECTED `{rel}:{sub.lineno}`: `{node.name}.{sub.name}()` is {fn_len} lines (> budget {fn_cap})."
-
-    if parts[0] not in ("tests", "skills", "data"):
-        semi = find_semicolon_chains(tree, rel)
-        if semi:
-            return f"HYGIENE GUARD REJECTED `{semi[0]}`: write one statement per line (do not chain statements with `;`)."
-        ring0_local = {"companion", "surfaces", "configs", "memory", "harness", "tests", "__future__", "msvcrt", "winreg", "winsound", "_winapi"}
-        stdlib_lower = {m.lower() for m in getattr(sys, "stdlib_module_names", ())}
-        for target, lineno in iter_ast_import_targets(tree):
-            top_pkg = target.split(".")[0].lower()
-            if top_pkg in FORBIDDEN_EXTERNAL_IMPORTS or (stdlib_lower and top_pkg not in stdlib_lower and top_pkg not in ring0_local):
-                return f"HYGIENE GUARD REJECTED `{rel}:{lineno}`: third-party import `{top_pkg}` violates ADR-001 stdlib-only rule in Ring-0 core."
-        layer_errs = check_module_layer_imports(tree, rel)
-        if layer_errs:
-            src_mod, src_layer, tgt_mod, tgt_layer, _line = layer_errs[0]
-            return f"ARCHITECTURE GUARD REJECTED `{rel}`: upward layer import `{src_mod}` ({src_layer.value}) -> `{tgt_mod}` ({tgt_layer.value})."
-    return None
-
-
-def _looks_like_skill_pack_member(resolved: Path) -> bool:
-    parts = [pt.lower() for pt in resolved.parts]
-    if "skills" not in parts:
-        return False
-    idx = max(i for i, pt in enumerate(parts) if pt == "skills")
-    tail = parts[idx + 1 :]
-    return (len(tail) == 2 and resolved.name == "SKILL.md") or (len(tail) >= 3 and tail[1] in ("dags", "scripts", "references"))
+    try:
+        tree = ast.parse(source, filename=filename)
+        compile(tree, filename=filename, mode="exec")
+        return True, None
+    except SyntaxError as exc:
+        return False, f"SyntaxError at line {exc.lineno}, col {exc.offset}: {exc.msg}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def lint_single_file_edit(
     path: Path, content: str, op_name: str = "write_file", governed_root: Optional[Path] = None,
 ) -> Tuple[Optional[str], str]:
-    """Run `<5ms` inline post-edit micro-linting; scope Companion-internal rules strictly to `companion-self`."""
-    from companion.sdd import validate_skill_or_recipe_path
-
+    """Validate syntax on `.py` and `.json` file edits without imposing Companion-repo policing on user files."""
+    _ = governed_root
     resolved = path.resolve()
-    gov_root = (governed_root or settings.root).resolve()
-    explicit_gov = governed_root is not None and gov_root != settings.root.resolve()
-    eff_data, gov_data = settings.effective_data_dir.resolve(), (gov_root / "data").resolve()
-    is_companion_self_repo = (
-        (gov_root / "companion").is_dir()
-        and ((gov_root / "specs" / "ARCHITECTURE.md").is_file() or explicit_gov)
-        and resolved.is_relative_to(gov_root)
-        and not resolved.is_relative_to(eff_data)
-        and not resolved.is_relative_to(gov_data)
-        and ".companion_backups" not in resolved.parts
-    )
-    is_skill_pack = (
-        (is_companion_self_repo and resolved.is_relative_to((gov_root / "skills").resolve()))
-        or resolved.is_relative_to(settings.user_skills_dir.resolve())
-        or resolved.is_relative_to((gov_data / "skills").resolve())
-        or (settings.get_workspace().is_self_project and resolved.is_relative_to(Path(tempfile.gettempdir()).resolve()) and _looks_like_skill_pack_member(resolved))
-    )
-    if is_skill_pack:
-        skill_err = validate_skill_or_recipe_path(resolved, content)
-        if skill_err:
-            return skill_err, ""
-
-    rel = str(resolved.relative_to(gov_root)).replace("\\", "/") if resolved.is_relative_to(gov_root) else resolved.name
-    warnings: List[str] = []
     sfx = resolved.suffix.lower()
-
     if sfx == ".py":
         valid, syn_err = validate_python_syntax(content, filename=str(resolved))
         if not valid:
             verb_note = "File was NOT modified. Fix syntax and retry." if op_name == "write_file" else "Edit was NOT applied. Adjust new_str and retry."
             return f"SYNTAX GUARD REJECTED {op_name} on {path}:\n  {syn_err}\n{verb_note}", ""
-        if is_companion_self_repo:
-            tree = ast.parse(content, filename=rel)
-            lines = content.splitlines()
-            gov_err = _check_python_governed_rules(tree, lines, rel)
-            if gov_err:
-                return f"{gov_err}\nOperation was NOT applied.", ""
-            unused = find_unused_imports_in_source(tree, rel)
-            if unused:
-                warnings.append(f"Unused import(s): {'; '.join(unused)} — remove before finishing so System Doctor Stage 5 passes.")
-            if len(lines) >= int(settings.max_module_lines * 0.9):
-                warnings.append(f"Module headroom low: {len(lines)}/{settings.max_module_lines} lines.")
-            long_lines = [idx for idx, ln in enumerate(lines, 1) if len(ln) > 160 and not ln.lstrip().startswith(("#", '"', "'"))]
-            if long_lines:
-                warnings.append(f"{len(long_lines)} code line(s) exceed 160 chars (e.g. L{long_lines[0]}) — wrap long expressions cleanly.")
-
-    if sfx in {".js", ".mjs", ".cjs", ".html", ".htm"}:
-        js_err = validate_embedded_scripts(content, rel, check_pythonisms=is_companion_self_repo)
-        if js_err:
-            return f"SYNTAX GUARD REJECTED {op_name} on {path}:\n  {js_err}\nOperation was NOT applied.", ""
-
-    if is_companion_self_repo and sfx in {".py", ".html", ".js"} and not rel.startswith(("tests/", "skills/", "data/")) and rel not in ("companion/safety.py", "companion/disciplines.py"):
-        for _ln, label in find_non_abstract_stubs(content, suffix=sfx):
-            warnings.append(f"Detected {label} in `{rel}` — replace stubs with complete working logic before verification.")
-            break
-
-    warn_str = ("\n[INLINE LINT WARNING: " + " | ".join(warnings) + "]") if warnings else ""
-    return None, warn_str
+    elif sfx == ".json":
+        try:
+            json.loads(content)
+        except Exception as exc:
+            return f"SYNTAX GUARD REJECTED {op_name} on {path}: Invalid JSON ({exc}).", ""
+    return None, ""
 
 
 def _try_blank_normalized_replace(t_lines: List[str], o_lines: List[str], n_lines: List[str]) -> Optional[str]:
@@ -364,13 +257,13 @@ class LoopGuard:
         return f"{name}:{canonical}"
 
     def check_before_call(self, name: str, args: Dict[str, Any]) -> Optional[str]:
-        if name == "run_shell" and _KILL_FAMILY_RE.search(str(args.get("command") or "")):
+        if name in ("run_shell", "run_command") and _KILL_FAMILY_RE.search(str(args.get("command") or "")):
             self.family_counts["process_kill"] += 1
             if self.family_counts["process_kill"] > 2:
                 self.consecutive_errors = max(self.consecutive_errors, self.max_consecutive_errors)
                 return (
-                    "LOOP GUARD INTERVENTION: Repeated process-kill attempts detected in this turn — a supervisor (`systemctl --user`, `systemctl`, Docker, or parent daemon) is likely respawning the process. "
-                    "Escalating to `reasoning`: inspect `systemctl --user list-units`, `systemctl status <pid>`, or `docker ps` instead of killing respawned PIDs."
+                    "LOOP GUARD INTERVENTION: Repeated process-kill attempts detected in this turn — a supervisor daemon is likely respawning the process. "
+                    "Inspect `systemctl status <pid>` or `docker ps` instead of killing respawned PIDs."
                 )
         sig = self._signature(name, args)
         self.call_counts[sig] += 1
@@ -379,21 +272,21 @@ class LoopGuard:
         if self.consecutive_identical > self.max_identical_calls or self.call_counts[sig] > self.max_identical_calls + 1:
             return (
                 f"LOOP GUARD INTERVENTION: You have called `{name}` with identical arguments {self.call_counts[sig]} times in this turn. "
-                "Repeating the exact same call will not produce a different outcome. Adjust parameters or answer with current findings."
+                "Adjust parameters or answer with current findings."
             )
         return None
 
     def record_result(self, name: str, result: str) -> Optional[str]:
         is_err = result.startswith((
             "error:", "error in ", "Tool argument JSON parse error", "SYNTAX GUARD REJECTED", "SAFETY GUARD REJECTED",
-            "HYGIENE GUARD REJECTED", "ARCHITECTURE GUARD REJECTED", "PHASE TOOL GATE REJECTED", "RISK GATE REJECTED",
-            "SKILL FORGE REJECTED", "WIKI AUTHOR GUARD REJECTED", "PRIVILEGE GUARD REJECTED",
+            "PHASE TOOL GATE REJECTED", "RISK GATE REJECTED", "SKILL FORGE REJECTED", "WIKI AUTHOR GUARD REJECTED",
+            "PRIVILEGE GUARD REJECTED",
         )) or bool(re.match(r"^exit=(?!0\b)-?\d+\n", result))
         self.consecutive_errors = (self.consecutive_errors + 1) if is_err else 0
         if self.consecutive_errors >= self.max_consecutive_errors:
             return (
                 f"\n[SELF-RECOVERY HINT: {self.consecutive_errors} consecutive tool errors detected. "
-                "Pause and apply the OODA Loop (`skills/ooda-troubleshooting/SKILL.md`): inspect root cause before retrying.]"
+                "Pause and inspect the root cause before retrying.]"
             )
         if self.consecutive_errors == 1 and _SCHEMA_TYPO_RE.search(result):
             return f"\n[Parameter hint for `{name}`: check parameter names/types against the tool schema and retry cleanly.]"
@@ -425,60 +318,85 @@ def run_unit_tests(root: Optional[Path] = None, timeout: int = 90, pattern: str 
 
 
 def _inspect_doctor_db(target_root: Path) -> Tuple[str, int, Dict[str, str]]:
-    """Inspect SQLite ADRs & profile read-only when DB exists so `run_system_doctor` never mutates live `data/`."""
+    """Inspect SQLite profile read-only when DB exists so `run_system_doctor` never mutates live `data/`."""
     db_file = settings.db_path if target_root == settings.root.resolve() else (target_root / "data" / "conversations.db")
     if db_file.is_file():
         with contextlib.suppress(Exception), contextlib.closing(sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True)) as ro_conn:
-            adr_cnt = int(ro_conn.execute("SELECT COUNT(*) FROM architecture_decisions").fetchone()[0])
             prof = dict(ro_conn.execute("SELECT key, value FROM user_profile").fetchall())
-            if adr_cnt > 0 and prof:
-                return db_file.name, adr_cnt, prof
+            ok_chk = ro_conn.execute("PRAGMA quick_check").fetchone()
+            if prof and ok_chk and ok_chk[0] == "ok":
+                return db_file.name, len(prof), prof
     from companion.memory_store import MemoryStore
 
     mem = MemoryStore(db_path=db_file)
     try:
-        return mem.db_path.name, len(mem.get_adrs()), mem.get_user_profile()
+        prof = mem.get_user_profile()
+        return mem.db_path.name, len(prof), prof
     finally:
         mem.close()
 
 
 def run_system_doctor(root: Optional[Path] = None, run_tests: bool = True) -> Dict[str, Any]:
-    """Run comprehensive 7-stage self-diagnostics across Companion AI OS."""
+    """Run 7-stage operational Runtime Health Doctor (zero repo self-policing or builder contamination)."""
     target_root = (root or settings.root).resolve()
     checks: List[Dict[str, Any]] = []
+
     cfg_issues = settings.validate()
     checks.append({"check": "1. Configuration & .env", "passed": len(cfg_issues) == 0, "details": "Settings valid" if not cfg_issues else "; ".join(cfg_issues)})
 
-    syntax_ok, syntax_results = verify_repository_syntax(target_root)
-    bad_files = [f"{r.path}: {r.syntax_error}" for r in syntax_results if not r.valid_syntax]
-    checks.append({"check": "2. Python AST & Syntax Integrity", "passed": syntax_ok, "details": f"All {len(syntax_results)} Python files compiled cleanly." if syntax_ok else f"Syntax errors: {'; '.join(bad_files)}"})
-
-    from configs.architecture import verify_architecture
-
-    arch_res = verify_architecture(target_root)
+    py_files = [p for p in walk_pruned_files(target_root) if p.suffix.lower() == ".py" and ".agents" not in p.parts]
+    bad_syntax: List[str] = []
+    for pf in py_files:
+        ok_syn, syn_err = validate_python_syntax(pf.read_text(encoding="utf-8", errors="replace"), filename=str(pf))
+        if not ok_syn:
+            bad_syntax.append(f"{pf.relative_to(target_root)}: {syn_err}")
     checks.append({
-        "check": "3. A-Frame Architecture Boundaries", "passed": bool(arch_res.get("valid")),
-        "details": f"All {arch_res.get('component_count')} core architectural components verified." if arch_res.get("valid") else f"Issues: missing={arch_res.get('missing_components')}, violations={arch_res.get('layer_violations')}",
+        "check": "2. Runtime Python Syntax Integrity",
+        "passed": len(bad_syntax) == 0,
+        "details": f"All {len(py_files)} runtime Python files compiled cleanly." if not bad_syntax else f"Syntax errors: {'; '.join(bad_syntax[:5])}",
     })
 
-    from companion.sdd import verify_sdd
-
-    sdd_rep = verify_sdd(target_root)
+    static_dir = target_root / "surfaces" / "static"
+    required_static = ("index.html", "styles.css", "app.js")
+    missing_static = [fn for fn in required_static if not (static_dir / fn).is_file()] if (target_root / "surfaces").is_dir() else []
     checks.append({
-        "check": "4. Living Spec-Driven Development (SDD) Sync", "passed": sdd_rep.valid,
-        "details": f"4/4 canonical specs synced, {len(sdd_rep.contract_ids)} subsystem contracts, {sdd_rep.active_adr_count} active ADRs." if sdd_rep.valid else sdd_rep.format_summary(),
+        "check": "3. Web Surface Static Bundle",
+        "passed": len(missing_static) == 0,
+        "details": "Compiled Web UI assets (`index.html`, `styles.css`, `app.js`) verified." if not missing_static else f"Missing static assets: {missing_static}",
     })
 
-    hygiene_rep = analyze_workspace_hygiene(target_root)
+    skills_dir = target_root / "skills"
+    leaked_builder = [d.name for d in (skills_dir.iterdir() if skills_dir.is_dir() else ()) if d.is_dir() and d.name in {"anti-sprawl-gate", "product-intent-dogfood", "sdd-compliance", "web-surface-dev", "release-readiness", "devops-ops"}]
     checks.append({
-        "check": "5. Codebase Hygiene, Dead-Code & Simplicity", "passed": hygiene_rep.clean,
-        "details": f"Zero dead code, zero unused imports, all {hygiene_rep.scanned_files} files within simplicity budgets." if hygiene_rep.clean else hygiene_rep.format_summary(),
+        "check": "4. Runtime Skills & Builder Boundary",
+        "passed": len(leaked_builder) == 0,
+        "details": "Clean runtime boundary (zero `.agents` builder skills leaked into `skills/`)." if not leaked_builder else f"Builder skill leak in `skills/`: {leaked_builder}",
     })
 
-    db_name, adr_cnt, profile = _inspect_doctor_db(target_root)
+    domains_root = settings.domains_dir
+    bad_domain_dbs: List[str] = []
+    domain_db_count = 0
+    if domains_root.is_dir():
+        for db_p in domains_root.rglob("*.db"):
+            domain_db_count += 1
+            try:
+                with contextlib.closing(sqlite3.connect(f"file:{db_p.as_posix()}?mode=ro", uri=True)) as dconn:
+                    qc = dconn.execute("PRAGMA quick_check").fetchone()
+                    if not qc or qc[0] != "ok":
+                        bad_domain_dbs.append(db_p.name)
+            except Exception as exc:
+                bad_domain_dbs.append(f"{db_p.name} ({exc})")
     checks.append({
-        "check": "6. SQLite Memory, ADRs & Autonomy Store", "passed": adr_cnt > 0 and len(profile) > 0,
-        "details": f"DB healthy ({db_name}): {adr_cnt} ADRs, {len(profile)} profile keys, background_autonomy={profile.get('background_autonomy', 'off')}, immutable_app={settings.immutable_app}.",
+        "check": "5. Domain Capability Pack SQLite Isolation",
+        "passed": len(bad_domain_dbs) == 0,
+        "details": f"{domain_db_count} domain SQLite DB(s) healthy." if not bad_domain_dbs else f"Corrupt domain DB(s): {bad_domain_dbs}",
+    })
+
+    db_name, prof_cnt, profile = _inspect_doctor_db(target_root)
+    checks.append({
+        "check": "6. Core SQLite WAL Store & Blind Vault",
+        "passed": prof_cnt > 0,
+        "details": f"DB healthy ({db_name}): {prof_cnt} profile keys, background_autonomy={profile.get('background_autonomy', 'off')}.",
     })
 
     if run_tests:
@@ -492,6 +410,6 @@ def run_system_doctor(root: Optional[Path] = None, run_tests: bool = True) -> Di
             checks.append({"check": "7. Automated Unit Test Suite", "passed": bool(test_res["passed"]), "details": details_str})
 
     all_passed = all(c["passed"] for c in checks)
-    lines = [f"=== Companion System Doctor: {'HEALTHY (PASS)' if all_passed else 'ISSUES DETECTED (FAIL)'} ==="]
+    lines = [f"=== Companion Runtime Doctor: {'HEALTHY (PASS)' if all_passed else 'ISSUES DETECTED (FAIL)'} ==="]
     lines.extend(f"[{'PASS' if c['passed'] else 'FAIL'}] {c['check']}: {c['details']}" for c in checks)
-    return {"healthy": all_passed, "checks": checks, "summary": "\n".join(lines)}
+    return {"healthy": all_passed, "checks": checks, "stages": checks, "summary": "\n".join(lines)}

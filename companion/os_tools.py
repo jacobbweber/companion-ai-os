@@ -20,11 +20,9 @@ from companion.config import settings
 from companion.context import manage_active_project
 from companion.dag_runtime import resume_dag_run
 from companion.grounding import get_execution_target, get_knowledge_port
-from companion.hygiene import analyze_workspace_hygiene
 from companion.llm_wire import is_local_or_lan_endpoint, urlopen_safe
 from companion.memory_store import get_memory_store
 from companion.safety import check_path_safety, get_active_checkpoint_manager, run_system_doctor
-from companion.sdd import CANONICAL_SPEC_FILES, sync_decisions_md, verify_sdd
 from companion.skill_forge import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
 from companion.telemetry import telemetry
 from companion.tool_schemas import bool_arg, current_workflow_phase, int_arg, str_arg
@@ -57,8 +55,7 @@ def tool_memory_manage(args: Dict[str, Any]) -> str:
             consequences=str_arg(args, "consequences", "Clean modular evolution") or "Clean modular evolution",
         )
         store.sync_memory_md()
-        sync_decisions_md(root=settings.active_project_root, store=store)
-        return f"Recorded ADR #{aid} ('{title}') and synced MEMORY.md & specs/DECISIONS.md."
+        return f"Recorded ADR #{aid} ('{title}') and synced MEMORY.md."
     if action == "get_adrs":
         adrs = store.get_adrs()
         return "\n".join(f"#{a['id']} {a['title']} [{a['status']}]: {a['decision']}" for a in adrs) if adrs else "No ADRs."
@@ -101,9 +98,7 @@ def tool_memory_manage(args: Dict[str, Any]) -> str:
         return "\n".join(f"[{ts} {role}]: {c[:300]}" for role, c, ts in reversed(msgs)) if msgs else "No messages."
     if action == "sync":
         md_path = store.sync_memory_md()
-        if settings.get_workspace().is_self_project:
-            return f"Synchronized SQLite memory to {md_path} (`specs/DECISIONS.md` inside installed `app/` remains immutable)."
-        return f"Synchronized SQLite memory to {md_path} and {sync_decisions_md(root=settings.active_project_root, store=store)}."
+        return f"Synchronized SQLite memory to {md_path}."
     return f"error: unknown memory_manage action '{action}'."
 
 
@@ -365,30 +360,6 @@ def tool_checkpoint_manage(args: Dict[str, Any]) -> str:
         logs = active_cp.list_git_savepoints(limit=10)
         return "\n".join(f"- `{e['commit']}` ({e['date']}): {e['subject']}" for e in logs) if logs else "No Git commits found in active workspace."
     return f"error: unknown checkpoint_manage action '{action}'."
-
-
-def tool_sdd_manage(args: Dict[str, Any]) -> str:
-    """Verify Spec-Driven Development alignment, AST Dead-Code Hygiene, or read/sync specs."""
-    action = str_arg(args, "action", "verify").lower()
-    if action in ("verify", "status"):
-        return f"{verify_sdd().format_summary()}\n\n{analyze_workspace_hygiene().format_summary()}"
-    if action == "sync":
-        if settings.get_workspace().is_self_project:
-            return "SAFETY GUARD REJECTED: `sdd_manage(action='sync')` writes `specs/DECISIONS.md` and Companion's installed `app/` runtime is permanently immutable. Focus an external Project clone (`workspace_path`) instead."
-        store = get_memory_store()
-        return f"Synchronized & compacted ADRs to {sync_decisions_md(root=settings.active_project_root, store=store)} and memory to {store.sync_memory_md()}."
-    if action in ("add_adr", "get_adrs"):
-        return tool_memory_manage(args)
-    if action == "read_spec":
-        name = f"{(str_arg(args, 'spec_name', 'CONTRACTS.md') or 'CONTRACTS.md').upper().removesuffix('.MD')}.md"
-        if name not in CANONICAL_SPEC_FILES:
-            return f"error: spec_name must be one of {CANONICAL_SPEC_FILES}"
-        p = settings.specs_dir / name
-        if not p.is_file():
-            return f"error: file not found: {p}"
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-        return f"# {p}  (lines 1-{len(lines)} of {len(lines)})\n" + "\n".join(f"{i:5d}|{ln}" for i, ln in enumerate(lines, 1))
-    return f"error: unknown sdd_manage action '{action}'. Valid: verify, status, sync, read_spec, add_adr, get_adrs"
 
 
 def tool_project_manage(args: Dict[str, Any]) -> str:

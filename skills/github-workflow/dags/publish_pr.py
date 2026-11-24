@@ -40,7 +40,7 @@ def _step_verify_policy(ctx: Dict[str, Any]) -> Dict[str, Any]:
     if not head or head in ("main", "master"):
         raise RuntimeError(f"Feature branch required (`head={head!r}`); direct `main`/`master` PR publish is blocked.")
     pg = get_project_graph(store=get_memory_store())
-    pid = str(params.get("project_id") or settings.workspace.project_id or "").strip()
+    pid = str(params.get("project_id") or settings.get_workspace().project_id or "").strip()
     proj = pg.get_project(pid) if pid else None
     policy = str((proj or {}).get("delivery_policy") or params.get("delivery_policy") or "local_only")
     if policy == "local_only":

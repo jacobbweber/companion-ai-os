@@ -19,13 +19,13 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-VLLM_URL = os.environ.get("COMPANION_CAL_VLLM_URL", "http://192.168.1.218:8006")
-VLLM_MODEL = os.environ.get("COMPANION_CAL_VLLM_MODEL", "nemotron-3.5-lightning")
-OLLAMA_URL = os.environ.get("COMPANION_CAL_OLLAMA_URL", "http://192.168.1.29:11434")
+VLLM_URL = os.environ.get("COMPANION_CAL_VLLM_URL", os.environ.get("COMPANION_BASE_URL", "http://127.0.0.1:8006"))
+VLLM_MODEL = os.environ.get("COMPANION_CAL_VLLM_MODEL", os.environ.get("COMPANION_MODEL", "nemotron-3.5-lightning"))
+OLLAMA_URL = os.environ.get("COMPANION_CAL_OLLAMA_URL", "http://127.0.0.1:11434")
 REASONING_MODEL = os.environ.get("COMPANION_CAL_REASONING_MODEL", "qwen3.8:latest")
 CODER_MODEL = os.environ.get("COMPANION_CAL_CODER_MODEL", "qwen3-coder:latest")
 

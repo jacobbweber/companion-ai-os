@@ -10,20 +10,18 @@ from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import patch
 
+from companion.archive_and_approvals import ActionRiskTier, classify_action_risk
 from companion.autonomy import _execute_implement_tasks, run_autonomous_goal
 from companion.blueprint import handle_blueprint_conversation_turn, is_pure_blueprint_question
 from companion.checkpoints import CheckpointManager
 from companion.compaction import build_lossless_phase_handoff, extract_key_tokens
 from companion.config import workspace_context
-from companion.disciplines import ActionRiskTier, classify_action_risk, verify_repository_syntax
 from companion.grounding import LocalKnowledgeAdapter
-from companion.hygiene import analyze_workspace_hygiene
 from companion.intake import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.safety import lint_single_file_edit
-from companion.sdd import parse_pep723_dependencies, validate_skill_or_recipe_path
 from companion.semantic_memory import cosine_f32_bytes, pack_f32_vector
-from companion.skill_forge import build_skill_script_command
+from companion.skill_forge import build_skill_script_command, parse_pep723_dependencies
 from companion.streaming import emit_stream_event, read_completion_or_sse_stream, stream_event_context
 from companion.telemetry import TelemetryEngine
 from companion.tools import tool_read_file, tool_search, tool_web_fetch
@@ -209,19 +207,6 @@ class TestV24Evolution(unittest.TestCase):
             self.assertEqual(guarded.read_text(encoding="utf-8"), "CLEAN = 1\n")
             self.assertFalse(rogue.exists())
 
-            # Hygiene catches unused private methods & dead functions in `surfaces/`
-            hyg_root = Path(tmp) / "hyg"
-            (hyg_root / "companion").mkdir(parents=True)
-            (hyg_root / "surfaces").mkdir(parents=True)
-            (hyg_root / "companion" / "svc.py").write_text(
-                '"""Svc."""\nclass Worker:\n    def run(self) -> int:\n        return 1\n    def _dead_helper(self) -> int:\n        return 2\n\n_w = Worker().run()\n',
-                encoding="utf-8",
-            )
-            (hyg_root / "surfaces" / "ui.py").write_text('"""UI."""\ndef unused_surface_fn() -> int:\n    return 5\n', encoding="utf-8")
-            rep = analyze_workspace_hygiene(hyg_root)
-            self.assertTrue(any("_dead_helper" in d for d in rep.dead_definitions))
-            self.assertTrue(any("unused_surface_fn" in d for d in rep.dead_definitions))
-
             # Telemetry retention pruning
             tel = TelemetryEngine(db_path=Path(tmp) / "prune.db")
             try:
@@ -267,32 +252,9 @@ class TestV24Evolution(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "companion").mkdir()
             skill_py = root / "skills" / "scraper-pack" / "scripts" / "fetch_page.py"
             skill_py.parent.mkdir(parents=True)
             skill_py.write_text(pep_script, encoding="utf-8")
-
-            # Declared PEP 723 imports pass skill validation
-            self.assertIsNone(validate_skill_or_recipe_path(skill_py, pep_script))
-
-            # Undeclared third-party import (`pandas`) in the same PEP 723 script is still rejected!
-            bad_pep = pep_script + "import pandas\nprint(pandas)\n"
-            err_undeclared = validate_skill_or_recipe_path(skill_py, bad_pep)
-            self.assertIn("Undeclared third-party import", str(err_undeclared))
-
-            # Ring-0 `companion/` module rejects third-party imports (including non-list packages like `pandas`) EVEN IF `# /// script` is added!
-            ring0_err, _ = lint_single_file_edit(root / "companion" / "brain.py", pep_script, governed_root=root)
-            self.assertIn("ADR-001 stdlib-only rule", str(ring0_err))
-            ring0_pandas_err, _ = lint_single_file_edit(root / "companion" / "df.py", '"""DF."""\nimport pandas\nprint(pandas)\n', governed_root=root)
-            self.assertIn("ADR-001 stdlib-only rule", str(ring0_pandas_err))
-
-            # Standalone `surfaces/static/*.js` syntax errors are caught by `verify_repository_syntax`
-            bad_js = root / "surfaces" / "static" / "broken.js"
-            bad_js.parent.mkdir(parents=True)
-            bad_js.write_text("const s = txt[0:5];\n", encoding="utf-8")
-            syn_ok, _ = verify_repository_syntax(root)
-            self.assertFalse(syn_ok)
-            bad_js.unlink()
 
             # Command builder uses `uv run` when `uv` is present, clear message when missing, and `sys.executable` for stdlib
             with patch("companion.skill_forge.shutil.which", return_value="C:/Tools/uv.exe"):

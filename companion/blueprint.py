@@ -17,7 +17,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from companion.autonomy import resolve_goal_engines, run_autonomous_goal, run_phase_turn
 from companion.compaction import build_lossless_phase_handoff
 from companion.config import settings
-from companion.disciplines import resolve_workspace_contract
 from companion.grounding import get_knowledge_port
 from companion.llm import chat, model_gate
 from companion.memory_store import MemoryStore, get_memory_store
@@ -159,14 +158,13 @@ def _revise_existing_blueprint(
     alignment_notes = [*list(meta.get("alignment_notes") or []), feedback]
     combined_feedback = "; ".join(alignment_notes)
     _, target_root, _, wf = resolve_goal_engines(mem, cp_mgr, root)
-    contract = resolve_workspace_contract(target_root, is_self_project=settings.get_workspace().is_self_project and target_root == settings.root.resolve())
 
     for t in mem.get_all_tasks(status_filter="pending"):
         if t.get("workflow_id") == wf_id:
             mem.update_task(int(t["id"]), status="cancelled", verification_result="Superseded by Blueprint revision")
 
     half = max(4, max_phase_iters // 2)
-    rule_hint = "100% Python stdlib per ADR-001" if contract.enforce_stdlib_only else "clean modular design & explicit verification"
+    rule_hint = "clean modular design & explicit verification"
     with model_gate.foreground_turn():
         mem.update_workflow_state(wf_id, str(active.get("current_state") or "PLAN"), "DESIGN", f"Revising Blueprint design per feedback: {feedback[:80]}", status="active")
         design_raw = run_phase_turn(

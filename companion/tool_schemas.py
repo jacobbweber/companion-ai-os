@@ -135,14 +135,6 @@ TOOLS: List[Dict[str, Any]] = [
         "label": _p("string", "Descriptive label when creating a checkpoint or commit message for `git_save`."),
         "checkpoint_id": _p("string", "Checkpoint ID to restore on `rollback` (defaults to latest)."),
     }, ["action"]),
-    _tool("sdd_manage", "Verify 4-File Canonical SDD & import-qualified Dead-Code Hygiene, or read/sync specs and ADRs.", {
-        "action": _p("string", "SDD operation.", enum=["verify", "status", "sync", "read_spec", "add_adr", "get_adrs"]),
-        "spec_name": _p("string", "Canonical spec file for `read_spec`.", enum=["PRODUCT.md", "ARCHITECTURE.md", "CONTRACTS.md", "DECISIONS.md"]),
-        "title": _p("string", "ADR title when `action='add_adr'` (e.g., `ADR-014: ...`)."),
-        "context": _p("string", "Architectural context or problem statement for `add_adr`."),
-        "decision": _p("string", "Core architectural decision text when `action='add_adr'`."),
-        "consequences": _p("string", "Expected tradeoffs and verification outcomes for `add_adr`."),
-    }, ["action"]),
     _tool("telemetry_manage", "Inspect KPIs, Waterfall execution traces, and structured application logs (`DEBUG`, `INFO`, `WARN`, `ERROR`).", {
         "action": _p("string", "Telemetry query or log action.", enum=["kpis", "waterfall", "recent_traces", "logs", "log_event", "prune"]),
         "trace_id": _p("string", "Specific trace ID to inspect for `waterfall`."),
@@ -151,11 +143,11 @@ TOOLS: List[Dict[str, Any]] = [
         "message": _p("string", "Log message text when `action='log_event'`."),
         "limit": _p("integer", "Maximum trace or log entries to display."),
     }, ["action"]),
-    _tool("project_manage", "Manage multi-project `WorkspaceContext` (`ADR-007`): inspect, list, initialize/switch external projects (locking Companion core read-only), or return to `self`.", {
+    _tool("project_manage", "Manage multi-project `WorkspaceContext`: inspect, list, initialize/switch external projects (locking Companion core read-only), or return to `self`.", {
         "action": _p("string", "Workspace management action.", enum=["status", "list", "init", "switch", "self"]),
         "target": _p("string", "Project name or folder path for `init` or `switch` (created outside Companion core)."),
     }, ["action"]),
-    _tool("system_doctor", "Run 7-stage system health diagnostics (config, AST syntax, A-Frame layers, SDD sync, import-qualified dead-code hygiene, SQLite, unit tests).", {
+    _tool("system_doctor", "Run 7-stage runtime health diagnostics (config, syntax, static bundle, skill boundary, domain DBs, SQLite WAL store, unit tests).", {
         "run_tests": _p("boolean", "Whether to run Stage 7 automated unit tests (default true)."),
     }, []),
     _tool("job_manage", "Dispatch, inspect, cancel, or resume Forever-Chat background jobs so long tasks never clutter active chat.", {
@@ -355,11 +347,11 @@ TOOLS: List[Dict[str, Any]] = [
 ALL_TOOL_NAMES: FrozenSet[str] = frozenset(t["function"]["name"] for t in TOOLS)
 _READ_ORIENT_TOOLS: Tuple[str, ...] = (
     "read_file", "list_dir", "search", "web_fetch", "web_search", "memory_manage", "task_manage",
-    "workflow_manage", "checkpoint_manage", "sdd_manage", "telemetry_manage", "project_manage",
+    "workflow_manage", "checkpoint_manage", "telemetry_manage", "project_manage",
     "system_doctor", "job_manage", "wiki_manage", "vault_manage", "endpoint_manage", "mcp_manage",
     "routine_manage", "agile_manage", "calendar_manage", "education_manage", "git_manage", "dev_preview",
 )
-_REPO_INTERNAL_TOOLS: FrozenSet[str] = frozenset({"sdd_manage", "checkpoint_manage", "task_manage", "system_doctor", "git_manage", "dev_preview"})
+_REPO_INTERNAL_TOOLS: FrozenSet[str] = frozenset({"checkpoint_manage", "task_manage", "system_doctor", "git_manage", "dev_preview"})
 _CODE_MARKERS: FrozenSet[str] = frozenset({".git", "pyproject.toml", "package.json", "cargo.toml", "go.mod", "makefile", "requirements.txt"})
 _CODE_EXTS: FrozenSet[str] = frozenset({".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".cs", ".csproj", ".sln", ".java", ".c", ".cpp", ".sh", ".ps1"})
 
@@ -411,15 +403,13 @@ def _workspace_hidden_tools(eff_phase: str) -> FrozenSet[str]:
     if ws.is_self_project:
         return frozenset() if eff_phase else _REPO_INTERNAL_TOOLS
     root = ws.project_root
-    if (root / "companion").is_dir() and (root / "specs" / "ARCHITECTURE.md").is_file():
-        return frozenset()
     if eff_phase or any((root / m).exists() for m in _CODE_MARKERS):
-        return frozenset({"sdd_manage", "system_doctor"})
+        return frozenset({"system_doctor"})
     try:
         for cur, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             if any(Path(fn).suffix.lower() in _CODE_EXTS or fn.lower() in _CODE_MARKERS for fn in files):
-                return frozenset({"sdd_manage", "system_doctor"})
+                return frozenset({"system_doctor"})
             if Path(cur) != root:
                 dirs[:] = []
     except OSError:
@@ -445,7 +435,6 @@ def filter_tools_for_phase(phase: Optional[str] = None) -> List[Dict[str, Any]]:
 _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "checkpoint_manage": frozenset({"rollback", "git_save"}),
     "memory_manage": frozenset({"add_note", "set_profile", "add_adr", "upsert_fact", "sync"}),
-    "sdd_manage": frozenset({"sync", "add_adr"}),
     "workflow_manage": frozenset({"start", "transition", "abort", "complete", "recover", "autonomy", "blueprint", "approve", "run_dag", "resume_dag", "run_recipe", "bootstrap_skill", "run_script"}),
     "job_manage": frozenset({"dispatch", "cancel", "resume"}),
     "wiki_manage": frozenset({"capture_inbox", "save", "curate", "graduate", "commit_curation", "revert_curation", "save_template", "create_proxy_note", "deep_curate_job", "consolidate_ontology", "verify_note", "stage_turn", "trash", "restore", "export_chat"}),

@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.config import settings
-from companion.disciplines import ActionRiskTier, analyze_python_source
+from companion.archive_and_approvals import ActionRiskTier
+from companion.safety import validate_python_syntax
 from companion.grounding import get_execution_target
 from companion.safety import check_command_safety
 
@@ -271,8 +272,8 @@ def _validate_structured_file(path: Path, raw_text: Optional[str] = None) -> Opt
         txt = raw_text
     ext = path.suffix.lower()
     if ext == ".py":
-        res = analyze_python_source(txt, filename=str(path))
-        return None if res.valid_syntax else f"Python SyntaxError in `{path.name}`: {res.syntax_error}"
+        ok_syn, syn_err = validate_python_syntax(txt, filename=str(path))
+        return None if ok_syn else f"Python SyntaxError in `{path.name}`: {syn_err}"
     if ext == ".json":
         try:
             json.loads(txt)

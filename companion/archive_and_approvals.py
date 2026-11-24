@@ -19,7 +19,8 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from enum import Enum
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 from companion.config import is_in_agent_tool_turn
 from companion.memory_store import MemoryStore, get_memory_store, parse_time_window
@@ -27,11 +28,85 @@ from companion.semantic_memory import hybrid_rrf_rank
 from companion.telemetry import redact_secrets
 
 __all__ = [
-    "TRUST_MODES", "ApprovalQueue", "archive_aged_conversations", "compute_approval_fingerprint", "consume_session_nudges",
-    "current_session_id", "delete_prompt_template", "dismiss_session_nudges", "enqueue_session_nudge", "format_forever_search_results",
-    "get_approval_queue", "get_prompt_template", "get_trust_mode", "list_prompt_templates", "peek_session_nudges",
+    "ActionRiskTier", "TRUST_MODES", "ApprovalQueue", "archive_aged_conversations", "classify_action_risk",
+    "compute_approval_fingerprint", "consume_session_nudges", "current_session_id", "delete_prompt_template",
+    "dismiss_session_nudges", "enqueue_session_nudge", "format_forever_search_results", "get_approval_queue",
+    "get_prompt_template", "get_trust_mode", "list_prompt_templates", "peek_session_nudges",
     "render_prompt_template", "save_prompt_template", "search_forever_history", "session_id_context", "set_trust_mode",
 ]
+
+
+class ActionRiskTier(str, Enum):
+    """Domain-neutral action risk classification (`R0`..`R3`) enforced at tool & workflow execution boundaries."""
+
+    R0_READ_ONLY = "R0"
+    R1_LOCAL_REVERSIBLE = "R1"
+    R2_CAPABILITY_PROMOTION = "R2"
+    R3_HIGH_IMPACT_MUTATION = "R3"
+
+
+_R3_SHELL_RE = re.compile(
+    r"(?:\b(?:ssh|scp|sftp|rsync)\s+\S+|\bgit\s+push\b|\b(?:npm|twine|cargo)\s+publish\b|"
+    r"\b(?:curl|wget)\b[^\n]*(?:\b(?:-X|--request)\s*(?:POST|PUT|DELETE|PATCH)\b|(?:\s|^)(?:-d|--data|--data-raw|--data-binary|--json|-F|--form)\b)|"
+    r"\bInvoke-(?:RestMethod|WebRequest)\b[^\n]*(?:-Method\s+(?:Post|Put|Delete|Patch)\b|-Body\b)|"
+    r"\b(?:kill|pkill|killall|taskkill|Stop-Process)\b|"
+    r"\bsystemctl\b(?!\s+(?:--[a-z0-9=-]+\s+|-[a-zA-Z]+\s+)*(?:status|list-(?:units|unit-files|timers|sockets|dependencies)|is-(?:active|enabled|failed|system-running)|show|cat|help)\b)|"
+    r"\b(?:schtasks|reg\s+(?:add|delete)|netsh|sc\s+(?:create|delete|config))\b)",
+    re.I,
+)
+_R3_PYTHON_RE = re.compile(
+    r"(?:\bsmtplib\.SMTP\b|\bftplib\.FTP\b|"
+    r"\bos\.(?:system|popen|kill|killpg)\b|"
+    r"\bshutil\.rmtree\s*\(\s*['\"](?:/|[A-Za-z]:\\|\.\.))",
+)
+_R0_ACTIONS: Dict[str, FrozenSet[str]] = {
+    "checkpoint_manage": frozenset({"", "list", "git_log"}),
+    "memory_manage": frozenset({"get_notes", "get_adrs", "get_profile", "search", "search_history", "recent_history", "query_facts", "read_fact"}),
+    "task_manage": frozenset({"list_tasks", "list_backlog", "list_all"}),
+    "project_manage": frozenset({"", "status", "current", "list"}),
+    "job_manage": frozenset({"", "list", "status"}),
+    "wiki_manage": frozenset({"", "list", "tree", "read", "search", "graph", "diff", "list_stale", "list_trash", "list_templates", "read_template", "tag_authority", "inspect_graduation", "validate_curation", "curation_history"}),
+    "vault_manage": frozenset({"", "list", "check_secret", "list_missing", "audit"}),
+    "endpoint_manage": frozenset({"", "list", "test", "inspect_host", "ssh_read_file"}),
+    "mcp_manage": frozenset({"", "list", "discover", "list_partners", "handshake_partner", "check_partner_job"}),
+    "routine_manage": frozenset({"", "list", "autonomy_status", "morning", "list_approvals", "prompt_list"}),
+    "agile_manage": frozenset({"", "board_view", "list_items", "roadmap", "list_boards", "list_epics", "list_sprints", "capacity"}),
+    "git_manage": frozenset({"", "status", "diff", "log", "worktree_list"}),
+    "dev_preview": frozenset({"", "status", "list", "logs", "http_probe"}),
+}
+
+
+def classify_action_risk(tool_name: str, args: Optional[Dict[str, Any]] = None) -> ActionRiskTier:
+    """Classify `(tool_name, args)` into `R0`..`R3` without domain-specific hardcoding."""
+    payload, action = args or {}, str((args or {}).get("action") or (args or {}).get("subaction") or "").strip().lower()
+    if tool_name in ("read_file", "list_dir", "search", "web_fetch", "web_search", "system_doctor"):
+        return ActionRiskTier.R0_READ_ONLY
+    if tool_name == "telemetry_manage":
+        return ActionRiskTier.R0_READ_ONLY if action != "log_event" else ActionRiskTier.R1_LOCAL_REVERSIBLE
+    if tool_name == "workflow_manage":
+        return ActionRiskTier.R0_READ_ONLY if action in ("", "status", "list_dags", "list_recipes", "http_smoke", "check_skill") else (ActionRiskTier.R2_CAPABILITY_PROMOTION if action == "bootstrap_skill" else ActionRiskTier.R1_LOCAL_REVERSIBLE)
+    if tool_name == "endpoint_manage":
+        if action in ("ssh_exec", "winrm_exec", "propose", "register", "remove"):
+            return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+        if action == "api_request" and str(payload.get("method") or "GET").strip().upper() not in ("GET", "HEAD"):
+            return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+    if tool_name == "mcp_manage" and action in ("call_tool", "delegate_partner", "propose_server", "register_server", "register", "remove", "register_partner", "remove_partner"):
+        return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+    if tool_name == "mcp_manage" and action == "harvest_skill":
+        return ActionRiskTier.R2_CAPABILITY_PROMOTION
+    if tool_name in ("run_shell", "run_command") and _R3_SHELL_RE.search(str(payload.get("command") or "")):
+        return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+    if tool_name == "run_python":
+        py_code = str(payload.get("code") or "")
+        if _R3_SHELL_RE.search(py_code) or _R3_PYTHON_RE.search(py_code):
+            return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
+    if tool_name in ("write_file", "edit_file") and (str(payload.get("path") or "").replace("\\", "/").startswith("skills/") or "/skills/" in str(payload.get("path") or "").replace("\\", "/")):
+        return ActionRiskTier.R2_CAPABILITY_PROMOTION
+    if tool_name == "project_manage" and not action and any(str(payload.get(k) or "").strip() for k in ("target", "path", "name")):
+        return ActionRiskTier.R1_LOCAL_REVERSIBLE
+    if tool_name in _R0_ACTIONS and action in _R0_ACTIONS[tool_name]:
+        return ActionRiskTier.R0_READ_ONLY
+    return ActionRiskTier.R1_LOCAL_REVERSIBLE
 
 _ACTIVE_SESSION_ID: ContextVar[str] = ContextVar("companion_active_session_id", default="main")
 

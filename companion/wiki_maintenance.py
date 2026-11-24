@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from companion.archive_and_approvals import get_approval_queue
 from companion.attachments import MAX_ATTACHMENT_BYTES, inspect_image_bytes
-from companion.disciplines import walk_pruned_files
+from companion.config import walk_pruned_files
 from companion.telemetry import redact_secrets
 from companion.wiki_curation import propose_ai_graduation
 from companion.wiki_engine import WIKI_FOLDERS, WikiEngine, compute_note_staleness

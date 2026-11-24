@@ -21,10 +21,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from companion.checkpoints import CheckpointManager, get_active_checkpoint_manager, get_self_checkpoint_manager
-from companion.config import SELF_PROJECT_ID, SKIP_DIRS, settings
-from companion.disciplines import GENERAL_TRACKED_EXTENSIONS, analyze_python_source
-from companion.hygiene import build_repo_headroom_map
+from companion.config import GENERAL_TRACKED_EXTENSIONS, SELF_PROJECT_ID, SKIP_DIRS, settings, walk_pruned_files
 from companion.memory_store import MemoryStore, get_memory_store
+from companion.safety import validate_python_syntax
 from companion.semantic_memory import expand_semantic_terms, semantic_similarity
 from companion.streaming import check_cancelled, get_active_cancel_scope
 from companion.vault import get_vault_manager
@@ -401,24 +400,18 @@ def build_epistemic_grounding(
 
 
 def build_workspace_radar(root: Optional[Path] = None, max_files: int = 30) -> str:
-    """Render Python AST line-budget radar plus a domain-neutral inventory of non-Python workspace files."""
+    """Render a domain-neutral inventory of workspace files."""
     target_root = (root or settings.active_project_root).resolve()
-    py_radar = build_repo_headroom_map(target_root, max_files=max_files)
-    if (target_root / "companion").is_dir() and "(No Python modules" not in py_radar:
-        return py_radar
-    other_files = [
+    files = [
         str(p.relative_to(target_root)).replace("\\", "/")
-        for p in _walk_workspace_files(target_root)
-        if p.suffix.lower() in GENERAL_TRACKED_EXTENSIONS and p.suffix.lower() != ".py"
+        for p in walk_pruned_files(target_root)
+        if p.suffix.lower() in GENERAL_TRACKED_EXTENSIONS
     ]
-    if "(No Python modules" in py_radar and other_files:
-        shown = ", ".join(f"`{f}`" for f in other_files[:18])
-        more = f" (+{len(other_files) - 18} more)" if len(other_files) > 18 else ""
-        return f"  Workspace Artifacts ({len(other_files)} non-Python file(s)): {shown}{more}"
-    if other_files:
-        shown = ", ".join(f"`{f}`" for f in other_files[:10])
-        return f"{py_radar}\n  Non-Python Artifacts ({len(other_files)}): {shown}"
-    return py_radar
+    if not files:
+        return "  (Empty workspace)"
+    shown = ", ".join(f"`{f}`" for f in files[:max_files])
+    more = f" (+{len(files) - max_files} more)" if len(files) > max_files else ""
+    return f"  Workspace Files ({len(files)}): {shown}{more}"
 
 
 class ExecutionTarget(Protocol):
@@ -570,9 +563,9 @@ class LocalWorkspaceTarget:
     def run_python_code(self, code: str, timeout: Optional[int] = None) -> str:
         if not (code or "").strip():
             return "error: empty Python code"
-        syn = analyze_python_source(code, filename="<run_python>")
-        if not syn.valid_syntax:
-            return f"error: Python syntax error in code: {syn.syntax_error}"
+        ok_syn, syn_err = validate_python_syntax(code, filename="<run_python>")
+        if not ok_syn:
+            return f"error: Python syntax error in code: {syn_err}"
         rc, stdout, stderr, guard_err = self.exec_command([sys.executable, "-c", code], shell=False, timeout=timeout)
         if rc == -1 and guard_err:
             return f"error: Python execution {guard_err}"

@@ -195,8 +195,8 @@ def _extract_pdf_stdlib_fallback(raw: bytes) -> str:
 
 
 def _extract_pdf(pdf_path: Path, raw: bytes) -> Tuple[str, str]:
-    """Extract PDF text via Ring-1 `scripts/extract_pdf.py` (`uv run --script` / `pypdf`), falling back to stdlib stream scan."""
-    script = (settings.root / "skills" / "web-surface-dev" / "scripts" / "extract_pdf.py").resolve()
+    """Extract PDF text via first-class runtime `companion/scripts/extract_pdf.py` (`uv run --script` / `pypdf`), falling back to stdlib stream scan."""
+    script = (settings.root / "companion" / "scripts" / "extract_pdf.py").resolve()
     if script.is_file():
         uv_bin = shutil.which("uv")
         cmds = (

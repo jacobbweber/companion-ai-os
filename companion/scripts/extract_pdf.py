@@ -2,10 +2,10 @@
 # dependencies = ["pypdf"]
 # ///
 """
-Ring-1 PDF Text Extractor (`skills/web-surface-dev/scripts/extract_pdf.py`).
+First-Class Runtime PDF Text Extractor (`companion/scripts/extract_pdf.py`).
 
 Extracts page-indexed UTF-8 text from `.pdf` attachments using `pypdf` in an isolated
-subprocess so Ring-0 (`companion/attachments.py`) stays 100% Python stdlib (`ADR-001`).
+subprocess so `companion/attachments.py` stays 100% Python stdlib.
 """
 
 import io

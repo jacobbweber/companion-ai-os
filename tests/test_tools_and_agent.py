@@ -118,8 +118,8 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         from companion.context import compact_messages_if_needed
         from companion.tools import dispatch
 
-        spec_out = dispatch("sdd_manage", {"action": "read_spec", "spec_name": "PRODUCT.md", "title": None})
-        self.assertIn("Companion AI OS", spec_out)
+        doc_out = dispatch("memory_manage", {"action": "get_adrs", "title": None})
+        self.assertIn("ADR-001", doc_out)
 
         head_out = tool_run_shell({"command": "python -c \"for i in range(5): print(i)\" | head -2", "cwd": None})
         self.assertIn("exit=0", head_out)
@@ -288,8 +288,9 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         skills = discover_skills()
         names = {s["name"] for s in skills}
         self.assertIn("proactive-checkin", names)
-        self.assertIn("sdd-compliance", names)
-        self.assertIn("engineering-workflow", names)
+        self.assertNotIn("sdd-compliance", names)
+        self.assertNotIn("anti-sprawl-gate", names)
+        self.assertNotIn("web-surface-dev", names)
         self.assertIn("skill-creator", names)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,7 +351,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
             try:
                 summary = run_subagent(
                     goal="Audit all skills",
-                    skill_name="sdd-compliance",
+                    skill_name="deep-thinking",
                     max_iters=4,
                     chat_fn=fake_worker_chat,
                     store=store,
@@ -360,12 +361,12 @@ class TestToolsAndAgentLoop(unittest.TestCase):
                 # Parent message list must still have only 1 message (zero worker tool bloat!)
                 self.assertEqual(len(parent_msgs), 1)
                 # Pre-loaded Tier-2 SKILL.md must be injected into the worker prompt
-                self.assertTrue(any("PRE-LOADED TIER-2 SKILL RUNBOOK (`skills/sdd-compliance/SKILL.md`)" in p for p in captured_prompts))
+                self.assertTrue(any("PRE-LOADED TIER-2 SKILL RUNBOOK (`skills/deep-thinking/SKILL.md`)" in p for p in captured_prompts))
                 # Parent trace ID must be restored!
                 self.assertEqual(telemetry.active_trace_id, parent_tid)
                 wf_text = telemetry.format_waterfall(parent_tid)
-                self.assertIn("subagent_call:subagent:sdd-compliance", wf_text)
-                self.assertIn("ADR-001", dispatch("sdd_manage", {"action": "get_adrs"}))
+                self.assertIn("subagent_call:subagent:deep-thinking", wf_text)
+                self.assertIn("ADR-001", dispatch("memory_manage", {"action": "get_adrs"}))
             finally:
                 telemetry.end_trace(parent_tid, status="ok")
                 telemetry.db_path, telemetry.conn = old_db, old_conn
@@ -563,8 +564,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         self.assertIsNone(lg.record_result("run_python", "error: syntax failure 1"))
         hint = lg.record_result("run_python", "error: syntax failure 2")
         self.assertIsNotNone(hint)
-        self.assertIn("OODA Loop", str(hint))
-        self.assertIn("ooda-troubleshooting", str(hint))
+        self.assertIn("SELF-RECOVERY HINT", str(hint))
 
     def test_frontier_core_parsers_wire_and_bounded_read(self) -> None:
         """Verify CORE-4, CORE-5, CORE-8: prefix-orphan </think>, unclosed <think> tool rescue, parallel deltas, strict JSON args, & bounded read_file."""

@@ -12,11 +12,10 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from companion.archive_and_approvals import ApprovalQueue, peek_session_nudges, set_trust_mode
+from companion.archive_and_approvals import ActionRiskTier, ApprovalQueue, classify_action_risk, peek_session_nudges, set_trust_mode
 from companion.background_jobs import BackgroundJobManager
 from companion.config import agent_tool_turn_context, settings
 from companion.core_actions import execute_core_action
-from companion.disciplines import ActionRiskTier, classify_action_risk
 from companion.endpoints import EndpointManager
 from companion.llm import ModelGate
 from companion.llm_wire import urlopen_safe

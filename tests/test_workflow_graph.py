@@ -143,7 +143,8 @@ class TestWorkflowGraph(unittest.TestCase):
         self.assertEqual(run_res["final_output"]["verdict"], "healthy")
 
         builtin_names = {d["name"] for d in discover_dags()}
-        self.assertTrue({"deep-analysis", "ooda-diagnose", "full-audit"}.issubset(builtin_names))
+        self.assertTrue({"pre-commit-verify", "publish-pr"}.issubset(builtin_names))
+        self.assertNotIn("full-audit", builtin_names)
 
     def test_manual_transition_during_active_dag_returns_clean_result(self) -> None:
         self.store.create_workflow_run(

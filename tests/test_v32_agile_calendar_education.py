@@ -266,7 +266,6 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
             # Scoped repo-internal tools: hidden in daily OS mode, exposed when focused on an external repo workspace
             with workspace_context(settings.root, "companion-self"):
                 daily_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
-                self.assertNotIn("sdd_manage", daily_names)
                 self.assertNotIn("system_doctor", daily_names)
                 self.assertNotIn("git_manage", daily_names)
                 self.assertNotIn("dev_preview", daily_names)
@@ -276,14 +275,6 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
                 dev_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
                 self.assertIn("git_manage", dev_names)
                 self.assertIn("dev_preview", dev_names)
-                self.assertNotIn("sdd_manage", dev_names)
-            (ext_ws / "companion").mkdir(parents=True, exist_ok=True)
-            (ext_ws / "specs").mkdir(parents=True, exist_ok=True)
-            (ext_ws / "specs" / "ARCHITECTURE.md").write_text("# architecture\n", encoding="utf-8")
-            with workspace_context(ext_ws, "ext-companion-clone"):
-                comp_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
-                self.assertIn("sdd_manage", comp_names)
-                self.assertIn("system_doctor", comp_names)
 
 
 if __name__ == "__main__":

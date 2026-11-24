@@ -21,12 +21,11 @@ import sys
 import tempfile
 import tomllib
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from companion.checkpoints import CheckpointManager, checkpoint_manager
 from companion.config import SELF_PROJECT_ID, settings
 from companion.dag_runtime import discover_dags, execute_dag_by_name, get_dag_run, list_dag_runs, resume_dag_run, self_test_dag
-from companion.disciplines import iter_ast_import_targets
 from companion.grounding import (
     discover_skills,
     get_execution_target,
@@ -34,17 +33,8 @@ from companion.grounding import (
     invalidate_skills_cache,
     rank_relevant_skills,
 )
-from companion.hygiene import find_unused_imports_in_source
 from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
 from companion.safety import validate_python_syntax
-from companion.sdd import (
-    check_wiki_author_guard,
-    is_undeclared_skill_import,
-    parse_pep723_dependencies,
-    validate_dag_python_source,
-    validate_skill_markdown,
-    verify_skills_directory,
-)
 from companion.telemetry import redact_secrets, telemetry
 from companion.vault import get_vault_manager
 
@@ -53,11 +43,90 @@ __all__ = [
     "check_make_vs_borrow",
     "distill_workflow_reflection",
     "execute_customizations_action",
+    "parse_pep723_dependencies",
     "run_skill_script",
     "stage_and_promote_skill",
+    "validate_skill_markdown",
 ]
 
 _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_PEP723_BLOCK_RE = re.compile(r"(?m)^# /// script\s*\n((?:^#(?: .*)?\n)*)^# ///\s*$")
+_DEP_NAME_RE = re.compile(r"^([A-Za-z0-9_.-]+)")
+_PYPI_IMPORT_ALIASES: Dict[str, str] = {
+    "beautifulsoup4": "bs4", "pillow": "pil", "pyyaml": "yaml", "scikit-learn": "sklearn", "opencv-python": "cv2",
+}
+
+
+def validate_skill_markdown(content: str, expected_name: Optional[str] = None) -> Optional[str]:
+    """Validate a `skills/<name>/SKILL.md` file's YAML frontmatter and basic structure."""
+    norm = content.replace("\r\n", "\n").strip()
+    if not norm.startswith("---\n"):
+        return "SKILL.md must start with YAML frontmatter delimited by `---`."
+    end_idx = norm.find("\n---", 4)
+    if end_idx == -1:
+        return "SKILL.md is missing closing `---` for YAML frontmatter."
+    fm_block = norm[4:end_idx]
+    meta: Dict[str, str] = {}
+    cur_key = ""
+    for line in fm_block.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if (line.startswith(" ") or line.startswith("\t")) and cur_key:
+            item = s[1:].strip().strip("'\"") if s.startswith("-") else s.strip("'\"")
+            meta[cur_key] = f"{meta[cur_key]}, {item}" if (meta[cur_key] and s.startswith("-")) else f"{meta[cur_key]} {item}".strip()
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            cur_key = k.strip().lower()
+            val = v.strip().strip("'\"")
+            meta[cur_key] = "" if val in (">", "|", ">-", "|-") else val
+    name = meta.get("name", "")
+    if not name or not _KEBAB_RE.match(name):
+        return f"SKILL.md frontmatter `name` must be kebab-case (`[a-z0-9-]+`), got `{name}`."
+    if expected_name and _KEBAB_RE.match(expected_name) and name != expected_name:
+        return f"SKILL.md frontmatter `name: {name}` does not match folder name `{expected_name}`."
+    if len(meta.get("description", "")) < 10:
+        return "SKILL.md frontmatter must include a concise `description` (>= 10 chars)."
+    return None
+
+
+def parse_pep723_dependencies(source: str) -> Tuple[List[str], Set[str], Optional[str]]:
+    """Parse PEP 723 `# /// script` metadata, returning `(raw_deps, allowed_import_roots, error)`."""
+    match = _PEP723_BLOCK_RE.search((source or "").replace("\r\n", "\n"))
+    if not match:
+        return [], set(), None
+    uncommented = "\n".join(line[2:] if line.startswith("# ") else line[1:] for line in match.group(1).splitlines())
+    try:
+        meta = tomllib.loads(uncommented)
+    except Exception as exc:
+        return [], set(), f"Invalid PEP 723 `# /// script` TOML metadata: {exc}"
+    deps = meta.get("dependencies", [])
+    if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+        return [], set(), "PEP 723 `dependencies` must be a list of package requirement strings."
+    raw_deps: List[str] = []
+    allowed_imports: Set[str] = set()
+    for req in deps:
+        clean_req = req.strip()
+        if not clean_req:
+            continue
+        raw_deps.append(clean_req)
+        m = _DEP_NAME_RE.match(clean_req)
+        if m:
+            pkg = m.group(1).lower()
+            norm = pkg.replace("-", "_").replace(".", "_")
+            allowed_imports.update({pkg, norm})
+            if pkg in _PYPI_IMPORT_ALIASES:
+                allowed_imports.add(_PYPI_IMPORT_ALIASES[pkg])
+    return raw_deps, allowed_imports, None
+
+
+def _check_wiki_author_guard(md_path: Path) -> Optional[str]:
+    if not md_path.is_file():
+        return None
+    head = md_path.read_text(encoding="utf-8", errors="replace")[:600]
+    if re.search(r"(?im)^author\s*:\s*['\"]?user['\"]?\s*$", head):
+        return f"WIKI AUTHOR GUARD REJECTED: `{md_path.name}` has `author: user` and cannot be overwritten automatically."
+    return None
 
 
 def check_make_vs_borrow(capability_query: str, root: Optional[Path] = None) -> Dict[str, Any]:
@@ -76,38 +145,15 @@ def check_make_vs_borrow(capability_query: str, root: Optional[Path] = None) -> 
 
 
 def _lint_staged_python(fname: str, code: str, kind: str) -> Optional[str]:
-    """Enforce syntax, ADR-001 Ring-1 PEP 723 rules, line budgets, and zero unused imports on staged `.py` assets."""
+    """Enforce syntax, PEP 723 metadata validity, and `--self-test` CLI entrypoint on staged `.py` assets."""
     valid, syn_err = validate_python_syntax(code, filename=fname)
     if not valid:
         return f"{kind} `{fname}` SyntaxError: {syn_err}"
-    _raw_deps, allowed_imports, pep_err = parse_pep723_dependencies(code)
+    _raw_deps, _allowed_imports, pep_err = parse_pep723_dependencies(code)
     if pep_err:
         return f"{kind} `{fname}` {pep_err}"
-    lines = code.splitlines()
-    if len(lines) > settings.max_module_lines:
-        return f"{kind} `{fname}` exceeds module budget ({len(lines)} > {settings.max_module_lines} lines)."
-    tree = ast.parse(code, filename=fname)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            fn_len = getattr(node, "end_lineno", node.lineno) - node.lineno + 1
-            if fn_len > settings.max_function_lines:
-                return f"{kind} `{fname}` function `{node.name}()` exceeds {settings.max_function_lines} lines ({fn_len}L)."
-    for target, lineno in iter_ast_import_targets(tree):
-        top_pkg = target.split(".")[0].lower()
-        if is_undeclared_skill_import(top_pkg, allowed_imports):
-            return (
-                f"{kind} `{fname}:{lineno}` imports undeclared third-party package `{top_pkg}` "
-                "(declare in PEP 723 `# /// script` `dependencies = [...]` or use Python stdlib)."
-            )
-    unused = find_unused_imports_in_source(tree, f"{kind.lower()}s/{fname}")
-    if unused:
-        return f"{kind} `{fname}` has unused import(s): {'; '.join(unused)}"
     if kind == "Script" and "--self-test" not in code:
         return f"Script `{fname}` must implement a `--self-test` CLI entrypoint."
-    if kind == "DAG":
-        dag_err = validate_dag_python_source(code, filename=fname)
-        if dag_err:
-            return f"DAG `{fname}`: {dag_err}"
     return None
 
 
@@ -246,7 +292,7 @@ def stage_and_promote_skill(
             msg = f"SKILL FORGE REJECTED: `skills/{clean_name}` already exists (pass `overwrite=True` to update)."
             return {"promoted": False, "error": msg, "summary": msg}
         for existing_md in sorted(dest_dir.glob("references/*.md")):
-            guard_err = check_wiki_author_guard(existing_md)
+            guard_err = _check_wiki_author_guard(existing_md)
             if guard_err:
                 return {"promoted": False, "error": guard_err, "summary": guard_err}
 
@@ -261,11 +307,6 @@ def stage_and_promote_skill(
         pop_err, staged_dags, staged_scripts = _populate_staged_skill_dir(stage_skill, skill_md, references, dags, scripts)
         if pop_err:
             return {"promoted": False, "error": pop_err, "summary": pop_err}
-
-        dir_issues = verify_skills_directory(stage_root)
-        if dir_issues:
-            msg = f"SKILL FORGE REJECTED (structure check): {'; '.join(dir_issues)}"
-            return {"promoted": False, "error": msg, "summary": msg}
 
         if self_test and (staged_dags or staged_scripts):
             test_err = _run_staged_self_tests(staged_dags, staged_scripts, Path(tmp) / "self_test_sandbox")

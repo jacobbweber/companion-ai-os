@@ -256,38 +256,11 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
                 st = json.loads(tool_dev_preview({"action": "list"}))
                 self.assertEqual(st["previews"], [])
 
-    def test_safe_deploy_dag_human_gate_and_simulated_failure_rollback(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            base = Path(tmp)
-            src_v1, src_v2, target_app = base / "src_v1", base / "src_v2", base / "runtime" / "app"
-            for d, tag in ((src_v1, "v1-good"), (src_v2, "v2-bad")):
-                (d / "companion").mkdir(parents=True)
-                (d / "harness.py").write_text(f"RELEASE = {tag!r}\n", encoding="utf-8")
-            (target_app / "companion").mkdir(parents=True)
-            (target_app / "harness.py").write_text("RELEASE = 'v1-good'\n", encoding="utf-8")
-
-            with contextlib.closing(MemoryStore(db_path=base / "deploy.db")) as store:
-                set_trust_mode("balanced", store=store)
-                with memory_store_context(store):
-                    paused = execute_dag_by_name(
-                        "safe-deploy",
-                        params={
-                            "source_repo": str(src_v2),
-                            "target_app_dir": str(target_app),
-                            "backup_dir": str(base / "backups"),
-                            "simulate_health_failure": True,
-                            "run_doctor": False,
-                            "snapshot_data_store": False,
-                        },
-                        store=store,
-                    )
-                    self.assertEqual(paused["status"], "waiting_approval")
-                    ApprovalQueue(store=store).resolve(paused["approval_id"], "approve", actor="user")
-                    resumed = resume_dag_run(paused["run_id"], store=store)
-                    self.assertEqual(resumed["status"], "completed")
-                    ver_node = resumed["nodes"]["verify_or_rollback"]
-                    self.assertTrue(ver_node["rolled_back"])
-                    self.assertIn("v1-good", (target_app / "harness.py").read_text(encoding="utf-8"))
+    def test_safe_deploy_ops_builder_script_and_rollback(self) -> None:
+        script = Path(__file__).resolve().parent.parent / ".agents" / "skills" / "devops-ops" / "scripts" / "safe_deploy_ops.py"
+        proc = subprocess.run([sys.executable, "-B", str(script), "--self-test"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+        self.assertIn("pass", proc.stdout.lower())
 
     def test_builtin_idle_routines_web_watcher_nudges_and_reload_endpoint(self) -> None:
         builtin_ids = {r["routine_id"] for r in BUILTIN_IDLE_ROUTINES}
@@ -369,7 +342,7 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
 
                     dag_out = dispatch("workflow_manage", {"action": "run_dag", "dag_name": "pre-commit-verify", "params": {"repo_path": str(repo)}})
                     self.assertIn("pre-commit-verify", dag_out.lower())
-                    scr_out = dispatch("workflow_manage", {"action": "run_script", "skill": "devops-ops", "script": "safe_deploy_ops.py", "args": ["--self-test"]})
+                    scr_out = dispatch("workflow_manage", {"action": "run_script", "skill": "remote-endpoints", "script": "endpoint_probe.py", "args": ["--self-test"]})
                     self.assertIn("pass", scr_out.lower())
 
                     with agent_tool_turn_context():

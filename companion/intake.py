@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.config import settings
 from companion.dag_runtime import discover_dags
-from companion.disciplines import ActionRiskTier
+from companion.archive_and_approvals import ActionRiskTier
 from companion.grounding import EpistemicGrounding, build_epistemic_grounding
 from companion.memory_store import MemoryStore, has_memory_store_override
 from companion.project_graph import get_project_graph

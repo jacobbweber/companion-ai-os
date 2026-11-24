@@ -18,7 +18,6 @@ from companion.blueprint import (
 )
 from companion.compaction import classify_task_autoskip, format_task_carry_forward
 from companion.config import SELF_PROJECT_ID, TierConfig, settings, workspace_context
-from companion.eval_harness import run_live_flight_eval
 from companion.memory_store import MemoryStore
 from companion.safety import CheckpointManager
 from surfaces import create_web_server, dispatch_raw_http, render_web_index_html
@@ -199,13 +198,6 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
                 srv.server_close()
                 store.close()
 
-    def test_live_flight_eval_harness_runs_all_three_flights_in_isolated_workspace(self) -> None:
-        """Verify `run_live_flight_eval` executes all 3 flights cleanly and restores `companion-self`."""
-        res = run_live_flight_eval(suite="full", chat_fn=_scripted_flight_model, check_endpoints=False, verbose=False)
-        self.assertTrue(res["passed"], res["summary"])
-        self.assertEqual(len(res["flights"]), 3)
-        self.assertEqual(settings.get_workspace().project_id, SELF_PROJECT_ID)
-
     def test_carry_forward_autoskip_coding_tier_and_git_savepoint(self) -> None:
         """Verify Carry-Forward ledger, 0-LLM auto-skip on trailing test task, `coding` tier routing, and Git save-points."""
         prev_coding = settings.tiers["coding"]
@@ -244,10 +236,6 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
                         self.assertIn("Initial verified build", str(slash_log))
                 finally:
                     slash_store.close()
-
-        cmp_res = run_live_flight_eval(suite="compare", chat_fn=_scripted_flight_model, check_endpoints=False, verbose=False)
-        self.assertTrue(cmp_res["passed"], cmp_res["summary"])
-        self.assertGreaterEqual(cmp_res["candidates"][0]["auto_skipped_tasks"], 1)
 
     def test_autonomous_goal_injects_carry_forward_and_autoskips_trailing_verify(self) -> None:
         """Verify `_execute_implement_tasks` injects `[WORK ALREADY COMPLETED]` on Task #2 and skips pure-verify Task #3."""

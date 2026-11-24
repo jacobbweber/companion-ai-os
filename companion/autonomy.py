@@ -19,18 +19,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.compaction import build_lossless_phase_handoff, classify_task_autoskip, format_task_carry_forward
-from companion.config import settings
+from companion.config import GENERAL_TRACKED_EXTENSIONS, settings, walk_pruned_files
 from companion.dag_runtime import execute_dag_by_name
-from companion.disciplines import (
-    FORBIDDEN_EXTERNAL_IMPORTS as FORBIDDEN_STDLIB_VIOLATION_IMPORTS,
-    find_non_abstract_stubs, iter_ast_import_targets, resolve_workspace_contract, verify_repository_syntax, walk_pruned_files,
-)
 from companion.intake import PHASE_TIERS, IntentDecision, classify_turn_intent, resolve_workflow_phase_tier, run_http_smoke_probe
 from companion.llm import chat, model_gate, tier_context
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
-from companion.safety import CheckpointManager, get_active_checkpoint_manager, run_system_doctor, run_unit_tests
-from companion.sdd import sync_decisions_md
+from companion.safety import CheckpointManager, get_active_checkpoint_manager, run_system_doctor, run_unit_tests, validate_python_syntax
 from companion.skill_forge import distill_workflow_reflection
 from companion.streaming import emit_stream_event
 from companion.telemetry import telemetry
@@ -47,9 +42,8 @@ __all__ = [
 def _snapshot_file_hashes(root: Path) -> Dict[str, str]:
     """Capture SHA-256 hashes of tracked workspace files under `root` to detect workflow mutations."""
     hashes: Dict[str, str] = {}
-    tracked_exts = resolve_workspace_contract(root).tracked_extensions
     for item in walk_pruned_files(root):
-        if item.suffix.lower() in tracked_exts:
+        if item.suffix.lower() in GENERAL_TRACKED_EXTENSIONS:
             rel = str(item.relative_to(root)).replace("\\", "/")
             try:
                 hashes[rel] = hashlib.sha256(item.read_bytes()).hexdigest()
@@ -65,9 +59,8 @@ def _changed_paths_since(root: Path, baseline: Dict[str, str]) -> List[Path]:
 
 
 def scan_placeholder_violations(paths: List[Path], root: Optional[Path] = None) -> List[str]:
-    """Scan modified production files for stubs, syntax errors, and (when governed) ADR-001 imports."""
+    """Scan modified Python files for syntax errors."""
     target_root = (root or settings.active_project_root).resolve()
-    contract = resolve_workspace_contract(target_root, is_self_project=settings.get_workspace().is_self_project)
     violations: List[str] = []
     for path in paths:
         if not path.is_file():
@@ -76,24 +69,10 @@ def scan_placeholder_violations(paths: List[Path], root: Optional[Path] = None) 
             rel = str(path.resolve().relative_to(target_root)).replace("\\", "/")
         except ValueError:
             rel = path.name
-        top = rel.split("/", 1)[0]
-        if top in ("tests", "skills", ".companion_backups") or rel in ("companion/autonomy.py", "companion/safety.py", "companion/disciplines.py"):
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if contract.enforce_stdlib_only and path.suffix.lower() in {".py", ".html", ".js"}:
-            for lineno, label in find_non_abstract_stubs(text, suffix=path.suffix.lower()):
-                violations.append(f"{rel}:{lineno} contains {label}")
         if path.suffix.lower() == ".py":
-            try:
-                tree = ast.parse(text, filename=rel)
-            except SyntaxError as exc:
-                violations.append(f"{rel}:{exc.lineno} SyntaxError: {exc.msg}")
-                continue
-            if contract.enforce_stdlib_only:
-                for target, lineno in iter_ast_import_targets(tree):
-                    mod_name = target.split(".")[0]
-                    if mod_name.lower() in FORBIDDEN_STDLIB_VIOLATION_IMPORTS:
-                        violations.append(f"{rel}:{lineno} imports external package `{mod_name}` (violates ADR-001 stdlib-only invariant)")
+            ok_syn, syn_err = validate_python_syntax(path.read_text(encoding="utf-8", errors="replace"), filename=rel)
+            if not ok_syn:
+                violations.append(f"{rel}: {syn_err}")
     return violations
 
 
@@ -128,17 +107,13 @@ def run_phase_turn(
 
 
 def _verify_task_completion(root: Path, changed_paths: List[Path], run_doctor_tests: bool) -> Tuple[bool, str]:
-    """Per-task micro-gate: verify AST/structured syntax, zero stubs, and newly modified test files."""
-    syntax_ok, syn_results = verify_repository_syntax(root)
-    if not syntax_ok:
-        bad = [f"{r.path}: {r.syntax_error}" for r in syn_results if not r.valid_syntax]
-        return False, f"SyntaxError in {', '.join(bad[:3])}"
+    """Per-task micro-gate: verify structured syntax and newly modified test files."""
+    stubs = scan_placeholder_violations(changed_paths, root=root)
+    if stubs:
+        return False, f"Syntax violation: {'; '.join(stubs[:3])}"
     struct_ok, struct_msg = evaluate_step_verification(VerificationSpec("assertion"), root, "ok", changed_paths)
     if not struct_ok:
         return False, struct_msg
-    stubs = scan_placeholder_violations(changed_paths, root=root)
-    if stubs:
-        return False, f"Stub/Contract violation: {'; '.join(stubs[:3])}"
     if run_doctor_tests:
         for p in changed_paths:
             if p.name.startswith("test_") and p.suffix.lower() == ".py" and p.is_file():
@@ -155,7 +130,7 @@ def _evaluate_hard_verification(
     goal: str = "",
     goal_plan: Optional[GoalPlan] = None,
 ) -> Tuple[bool, str]:
-    """Run deterministic contract scan + workspace gate (`system_doctor` on Companion core; evidence & tests externally)."""
+    """Run deterministic contract scan + workspace gate."""
     changed = _changed_paths_since(root, baseline_hashes)
     stub_issues = scan_placeholder_violations(changed, root=root)
     struct_ok, struct_msg = evaluate_step_verification(VerificationSpec("assertion"), root, "ok", changed)
@@ -172,24 +147,20 @@ def _evaluate_hard_verification(
             elif st.status != "completed":
                 stub_issues.append(f"Step `{st.step_id}` ({st.title}) incomplete (`{st.status}`): {st.evidence or 'step did not pass verification'}")
 
-    contract = resolve_workspace_contract(root, is_self_project=settings.get_workspace().is_self_project)
-    if contract.enforce_sdd_and_doctor:
-        doc = run_system_doctor(root=root, run_tests=run_doctor_tests)
-        doc_ok, doc_summary = bool(doc.get("healthy")), str(doc.get("summary", ""))
-    else:
-        all_files = [p for p in walk_pruned_files(root) if p.name != ".gitignore"]
-        has_src = len(all_files) > 0
-        has_py = any(p.suffix.lower() == ".py" for p in all_files)
-        syn_ok, _ = verify_repository_syntax(root)
-        t_res = run_unit_tests(root=root) if run_doctor_tests else {"passed": True, "ran": 1, "output": "Tests skipped."}
-        low_goal = goal.lower()
-        needs_tests = run_doctor_tests and ("test" in low_goal) and (has_py or any(k in low_goal for k in ("unittest", "unit test", "test_", "pytest")))
-        tests_ok = bool(t_res.get("passed")) and (not needs_tests or int(t_res.get("ran", 0)) >= 1)
-        doc_ok = (has_src or not run_doctor_tests) and syn_ok and tests_ok
-        extra = "" if has_src else "\nFAIL: Zero source files or artifacts created in external workspace — write the requested files with `write_file`."
-        if needs_tests and int(t_res.get("ran", 0)) == 0:
-            extra += "\nFAIL: Goal requires unit tests, but 0 unit tests were found/executed in `tests/`."
-        doc_summary = f"External Workspace Gate (`{root}`): artifacts={'PASS' if has_src else 'FAIL'}, syntax={'PASS' if syn_ok else 'FAIL'}, tests={'PASS' if tests_ok else 'FAIL'}\n{t_res.get('output', '')}{extra}"
+    all_files = [p for p in walk_pruned_files(root) if p.name != ".gitignore"]
+    has_src = len(all_files) > 0
+    has_py = any(p.suffix.lower() == ".py" for p in all_files)
+    py_errs = scan_placeholder_violations([p for p in all_files if p.suffix.lower() == ".py"], root=root)
+    syn_ok = len(py_errs) == 0
+    t_res = run_unit_tests(root=root) if run_doctor_tests else {"passed": True, "ran": 1, "output": "Tests skipped."}
+    low_goal = goal.lower()
+    needs_tests = run_doctor_tests and ("test" in low_goal) and (has_py or any(k in low_goal for k in ("unittest", "unit test", "test_", "pytest")))
+    tests_ok = bool(t_res.get("passed")) and (not needs_tests or int(t_res.get("ran", 0)) >= 1)
+    doc_ok = (has_src or not run_doctor_tests) and syn_ok and tests_ok
+    extra = "" if has_src else "\nFAIL: Zero source files or artifacts created in workspace — write the requested files with `write_file`."
+    if needs_tests and int(t_res.get("ran", 0)) == 0:
+        extra += "\nFAIL: Goal requires unit tests, but 0 unit tests were found/executed in `tests/`."
+    doc_summary = f"Workspace Gate (`{root}`): artifacts={'PASS' if has_src else 'FAIL'}, syntax={'PASS' if syn_ok else 'FAIL'}, tests={'PASS' if tests_ok else 'FAIL'}\n{t_res.get('output', '')}{extra}"
     passed = (len(stub_issues) == 0) and doc_ok
     parts = (["Verification / Contract Violations:\n" + "\n".join(f"  - {v}" for v in stub_issues)] if stub_issues else []) + [doc_summary]
     return passed, "\n\n".join(parts)
@@ -234,10 +205,9 @@ def _execute_single_dag_step(
     pre_hashes = _snapshot_file_hashes(target_root)
     carry_block = format_task_carry_forward(target_root, built_rels, notes)
     fast_notice = "\n[FAST-PATH NOTICE: Target file(s) for this task already exist on disk from a prior step — inspect briefly and conclude if satisfied.]" if already_built else ""
-    contract = resolve_workspace_contract(target_root, is_self_project=settings.get_workspace().is_self_project)
     impl_prompt = (
         f"Overall Goal: {goal}\n\n{carry_block}Lossless Architecture Design Handoff:\n{design_handoff}\n\n"
-        f"Lossless Plan Handoff:\n{plan_handoff}\n\nExecute Task #{tid}: {step.title}{fast_notice}\n{contract.impl_rules_prompt}"
+        f"Lossless Plan Handoff:\n{plan_handoff}\n\nExecute Task #{tid}: {step.title}{fast_notice}"
     )
     out = run_phase_turn("IMPLEMENT", impl_prompt, min(max_phase_iters, 4) if already_built else max_phase_iters, chat_fn, mem, verbose)
     if not pinned_root and settings.active_project_root.resolve() != target_root:
@@ -390,7 +360,6 @@ def _finalize_autonomous_goal(
         mem.update_task(int(ip_task["id"]), status="completed", verification_result=f"Verified by Workflow #{wf_id} final verification gate")
     distill_workflow_reflection(clean_goal, wf_id, _changed_paths_since(target_root, baseline_hashes), target_root, mem)
     if target_root == settings.root.resolve():
-        sync_decisions_md(store=mem, root=target_root)
         mem.sync_memory_md()
     git_res = eff_cp.create_git_savepoint(f"Complete Workflow #{wf_id}: {clean_goal[:72]}", init_if_needed=False) if auto_git_commit else {}
     git_line = f"\nGit Save-Point: {git_res['summary']}" if git_res.get("summary") else ""
@@ -412,11 +381,10 @@ def _run_planning_phases(
 ) -> Tuple[str, str, str]:
     """Execute or reuse lossless `DISCOVER -> DESIGN -> PLAN` handoffs and build `GoalPlan` DAG."""
     half = max(4, max_phase_iters // 2)
-    contract = resolve_workspace_contract(target_root, is_self_project=settings.get_workspace().is_self_project)
     disc = str(meta.get("discovery_handoff") or "")
     if not disc:
         _ensure_wf_state(wf, mem, "DISCOVER", "Autonomous DISCOVER phase started")
-        raw = run_phase_turn("DISCOVER", f"Goal: {clean_goal}\nInspect relevant workspace files, configs, specs, and tests. Do NOT edit files; return a grounded impact summary with exact file paths.", half, chat_fn, mem, verbose)
+        raw = run_phase_turn("DISCOVER", f"Goal: {clean_goal}\nInspect relevant workspace files, configs, and tests. Do NOT edit files; return a grounded impact summary with exact file paths.", half, chat_fn, mem, verbose)
         disc = build_lossless_phase_handoff("DISCOVER", raw, max_chars=5000)
         if wf_id is not None:
             mem.update_workflow_metadata(wf_id, {"discovery_handoff": disc})
@@ -424,7 +392,7 @@ def _run_planning_phases(
     design = str(meta.get("design_handoff") or "")
     if not design:
         _ensure_wf_state(wf, mem, "DESIGN", "Discovery complete; entering reasoning DESIGN phase")
-        rule_hint = "100% Python stdlib per ADR-001, <=550L/module, <=100L/fn, SDD sync" if contract.enforce_sdd_and_doctor else "clean modular design, explicit verification evidence"
+        rule_hint = "clean modular design, explicit verification evidence"
         raw = run_phase_turn("DESIGN", f"Goal: {clean_goal}\nLossless Discovery Findings:\n{disc}\n\nKeep internal <think> reasoning brief (<200 words). Produce a concise technical design (<400 words; {rule_hint}) directly from the Discovery Findings.", 1, chat_fn, mem, verbose)
         design = build_lossless_phase_handoff("DESIGN", raw, max_chars=5000)
         if wf_id is not None:

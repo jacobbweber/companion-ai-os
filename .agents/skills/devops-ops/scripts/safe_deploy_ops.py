@@ -26,7 +26,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -36,7 +36,7 @@ from companion.vault import create_snapshot_backup  # noqa: E402
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 PACKAGED_APP_ITEMS = (
     "harness.py", "README.md", ".gitignore", ".env.example", "Dockerfile", "docker-compose.yml",
-    ".agents", "companion", "surfaces", "configs", "memory", "specs", "skills", "deploy",
+    "companion", "surfaces", "skills", "deploy",
 )
 _IGNORE_PATTERNS = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".pytest_cache", "node_modules", ".git")
 _PROTECTED_TARGET_ENTRIES = {"data", ".env", "secrets.env"}

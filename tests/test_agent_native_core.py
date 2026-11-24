@@ -41,8 +41,7 @@ from companion.routines import (
     get_routine_manager,
 )
 from companion.safety import lint_single_file_edit
-from companion.sdd import validate_skill_markdown
-from companion.skill_forge import run_skill_script, stage_and_promote_skill
+from companion.skill_forge import run_skill_script, stage_and_promote_skill, validate_skill_markdown
 from companion.tools import resolve
 from companion.trigger_policy import (
     TriggerPolicy,
@@ -243,11 +242,9 @@ class TestPhase2CodeControlledDAGRuntimeAndForge(unittest.TestCase):
     def test_all_builtin_skill_dags_pass_self_test_and_forge_promotes_dags(self) -> None:
         discovered = discover_dags(root=settings.root)
         names = {d["name"] for d in discovered}
-        expected = {
-            "deep-analysis", "deliver-feature", "full-audit",
-            "ooda-diagnose", "release-check", "verify-feature",
-        }
+        expected = {"pre-commit-verify", "publish-pr"}
         self.assertTrue(expected.issubset(names), f"Missing built-in DAGs: {expected - names}")
+        self.assertFalse({"full-audit", "release-check", "safe-deploy"} & names)
         for d in discovered:
             if d["name"] in expected:
                 st = self_test_dag(Path(d["path"]))
@@ -364,9 +361,9 @@ class TestPhase4CognitiveTriageGate(unittest.TestCase):
             d_chat = triage_turn("Hey, how are you doing today?", store=store, root=settings.root)
             self.assertEqual(d_chat.route, "DIRECT_TURN")
 
-            d_dag = triage_turn("Please run the `full-audit` DAG on the repository now", store=store, root=settings.root)
+            d_dag = triage_turn("Please run the `pre-commit-verify` DAG on the repository now", store=store, root=settings.root)
             self.assertEqual(d_dag.route, "EXECUTE_VERIFIED_DAG")
-            self.assertEqual(d_dag.matched_dag, "full-audit")
+            self.assertEqual(d_dag.matched_dag, "pre-commit-verify")
 
             d_adv = triage_turn("Continue advancing our active goal slice", store=store, root=settings.root)
             self.assertEqual(d_adv.route, "ADVANCE_ACTIVE_GOAL")
@@ -486,10 +483,10 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
             self.assertEqual(td.route, "DIRECT_TURN")
 
             picked = match_verified_dag(
-                "Run the `sdd-verify` or `full-audit` DAG check? Wait: run the `release-check` DAG.",
+                "Run the `publish-pr` check? Wait: run the `pre-commit-verify` DAG.",
                 root=settings.root,
             )
-            self.assertEqual(picked, "release-check")
+            self.assertEqual(picked, "pre-commit-verify")
 
     def test_dag_spec_dict_coercion_kwarg_fn_and_summary_output(self) -> None:
         dag = DAGSpec(

@@ -18,16 +18,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from companion.config import settings
+from companion.config import settings, walk_pruned_files
 from companion.dag_runtime import (
     DAGRuntimeBindings,
     discover_dags,
     execute_dag_by_name,
     register_dag_runtime_bindings,
 )
-from companion.disciplines import DISCIPLINES, DisciplineSpec, verify_repository_syntax
 from companion.memory_store import MemoryStore, get_memory_store
-from companion.safety import CheckpointManager, get_active_checkpoint_manager, run_unit_tests
+from companion.safety import CheckpointManager, get_active_checkpoint_manager, run_unit_tests, validate_python_syntax
 from companion.workflow_dag import ExecutorBindings, is_node_output_passed as _is_node_output_passed
 
 __all__ = [
@@ -156,22 +155,21 @@ class WorkflowEngine:
         cp_id = self.cp_manager.create_checkpoint(label=f"wf_{workflow_type}")["checkpoint_id"] if create_initial_checkpoint else ""
         wf_id = self.store.create_workflow_run(workflow_type=workflow_type, goal=goal, initial_state=initial_state.value, acceptance_criteria=acceptance_criteria, checkpoint_id=cp_id, metadata={"template": workflow_type, "verified": False})
         self.store.sync_memory_md()
-        disc = DISCIPLINES.get(initial_state.value)
-        return TransitionResult(True, wf_id, WorkflowState.IDLE.value, initial_state.value, f"Workflow #{wf_id} ({workflow_type}) started in state `{initial_state.value}`.{f' Active Discipline: {disc.name} — {disc.purpose}' if disc else ''}", checkpoint_id=cp_id or None)
+        return TransitionResult(True, wf_id, WorkflowState.IDLE.value, initial_state.value, f"Workflow #{wf_id} ({workflow_type}) started in state `{initial_state.value}`.", checkpoint_id=cp_id or None)
 
     def _run_verification_gate(self) -> Tuple[bool, str]:
-        syntax_ok, syntax_results = verify_repository_syntax(self.root)
-        bad_syntax = [f"{r.path}: {r.syntax_error}" for r in syntax_results if not r.valid_syntax]
-        if not syntax_ok:
+        py_files = [p for p in walk_pruned_files(self.root) if p.suffix.lower() == ".py"]
+        bad_syntax = [f"{p.name}: {err}" for p in py_files if not (res := validate_python_syntax(p.read_text(encoding="utf-8", errors="replace"), str(p)))[0] and (err := res[1])]
+        if bad_syntax:
             return False, f"Syntax gate failed on {len(bad_syntax)} file(s): {'; '.join(bad_syntax)}"
         test_res = run_unit_tests(self.root)
         if not test_res["passed"]:
             return False, f"Unit test gate failed (exit={test_res.get('returncode')}):\n{test_res.get('output', '')}"
-        return True, f"Verification passed ({len(syntax_results)} Python file(s) checked; tests passed)."
+        return True, f"Verification passed ({len(py_files)} Python file(s) checked; tests passed)."
 
     def _format_discipline_guidance(self, state_val: str) -> str:
-        disc: Optional[DisciplineSpec] = DISCIPLINES.get(state_val)
-        return "" if not disc else f"\nActive Discipline [{disc.name}]: {disc.purpose}\nChecklist:\n" + "\n".join(f"  - {item}" for item in disc.checklist) + f"\nRequired Deliverable: {disc.deliverable}"
+        _ = state_val
+        return ""
 
     def transition(
         self,
@@ -255,7 +253,6 @@ class WorkflowEngine:
         if curr == WorkflowState.RECOVER:
             graph_parts.append("**[RECOVER]**")
         allowed = [s.value for s in ALLOWED_TRANSITIONS.get(curr, ())]
-        disc = DISCIPLINES.get(curr.value)
         lines = [
             f"Active Workflow #{wf_id} (`{wf_type}`): {active['goal']}",
             f"  Graph Progress: {' -> '.join(graph_parts)}",
@@ -265,9 +262,6 @@ class WorkflowEngine:
             lines.append(f"  Acceptance Criteria: {active['acceptance_criteria']}")
         if active.get("checkpoint_id"):
             lines.append(f"  Safety Checkpoint  : `{active['checkpoint_id']}`")
-        if disc:
-            lines.append(f"  Active Discipline  : {disc.name} — {disc.purpose}")
-            lines.append(f"  Phase Deliverable  : {disc.deliverable}")
         return "\n".join(lines)
 
     def discover_dags(self) -> List[Dict[str, Any]]:

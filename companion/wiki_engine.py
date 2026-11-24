@@ -10,8 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.archive_and_approvals import get_approval_queue, get_trust_mode
-from companion.config import get_execution_origin, settings
-from companion.disciplines import walk_pruned_files
+from companion.config import get_execution_origin, settings, walk_pruned_files
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.semantic_memory import hybrid_rrf_rank
 from companion.telemetry import redact_secrets

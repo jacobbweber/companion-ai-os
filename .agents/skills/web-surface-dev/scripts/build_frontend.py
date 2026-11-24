@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 FRONTEND_DIR = REPO_ROOT / "frontend"
 STATIC_DIR = REPO_ROOT / "surfaces" / "static"
 

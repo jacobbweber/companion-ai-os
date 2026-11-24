@@ -25,8 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.archive_and_approvals import get_approval_queue
-from companion.config import is_in_agent_tool_turn, parse_env_file, settings
-from companion.disciplines import walk_pruned_files
+from companion.config import is_in_agent_tool_turn, parse_env_file, settings, walk_pruned_files
 from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
 from companion.telemetry import notify_db_closed, redact_secrets, secret_redactor
 

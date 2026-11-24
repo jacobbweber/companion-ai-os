@@ -6,6 +6,7 @@ Companion-touched files in a Copy-on-Write ledger so `rollback_checkpoint` never
 and guards read-only trees via an O(1)-RAM `(mtime_ns, size)` stat cache.
 """
 
+import ast
 import contextlib
 import hashlib
 import json
@@ -17,8 +18,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from companion.config import SELF_PROJECT_ID, SKIP_DIRS, settings, slugify_project_id
-from companion.disciplines import GENERAL_TRACKED_EXTENSIONS, analyze_python_file
+from companion.config import GENERAL_TRACKED_EXTENSIONS, SELF_PROJECT_ID, SKIP_DIRS, settings, slugify_project_id
+
+
+def _check_py_file_syntax(path: Path) -> Tuple[bool, Optional[str]]:
+    try:
+        src = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(src, filename=str(path))
+        compile(tree, filename=str(path), mode="exec")
+        return True, None
+    except SyntaxError as exc:
+        return False, f"SyntaxError L{exc.lineno}: {exc.msg}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -300,10 +312,10 @@ class CheckpointManager:
             resolved = item.resolve()
             if item.suffix.lower() != ".py" or (resolved in pre_snapshot and pre_snapshot[resolved] == item.read_text(encoding="utf-8", errors="replace")):
                 continue
-            res = analyze_python_file(resolved)
-            if not res.valid_syntax:
+            ok_syn, syn_err = _check_py_file_syntax(resolved)
+            if not ok_syn:
                 resolved.write_text(pre_snapshot[resolved], encoding="utf-8") if resolved in pre_snapshot else resolved.unlink(missing_ok=True)
-                healed.append(f"{resolved.name} ({res.syntax_error})")
+                healed.append(f"{resolved.name} ({syn_err})")
         return f"SYNTAX GUARD REJECTED subprocess file modification: {', '.join(healed)}. Corrupted Python file(s) were automatically restored. Use `edit_file` or `write_file` instead." if healed else None
 
     def snapshot_py_stats(self) -> Dict[Path, Tuple[int, int, str]]:
@@ -328,11 +340,11 @@ class CheckpointManager:
             prev = pre_stats.get(resolved)
             if prev is not None and prev[0] == st.st_mtime_ns and prev[1] == st.st_size:
                 continue
-            res = analyze_python_file(resolved)
-            if not res.valid_syntax:
+            ok_syn, syn_err = _check_py_file_syntax(resolved)
+            if not ok_syn:
                 orig = self._read_blob(prev[2]) if prev is not None else None
                 resolved.write_bytes(orig) if orig is not None else resolved.unlink(missing_ok=True)
-                healed.append(f"{resolved.name} ({res.syntax_error})")
+                healed.append(f"{resolved.name} ({syn_err})")
         return f"SYNTAX GUARD REJECTED subprocess file modification: {', '.join(healed)}. Corrupted Python file(s) were automatically restored. Use `edit_file` or `write_file` instead." if healed else None
 
     def _iter_git_guard_files(self) -> List[Path]:

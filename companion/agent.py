@@ -29,8 +29,6 @@ from companion.context import (
 from companion.core_actions import HARVEST_SLASH_VERBS, handle_harvest_slash
 from companion.dag_runtime import register_dag_runtime_bindings
 from companion.education_engine import get_education_engine
-from companion.eval_harness import run_live_flight_eval
-from companion.hygiene import analyze_workspace_hygiene
 from companion.intake import select_turn_step_tier, triage_turn
 from companion.llm import chat, current_tier_name, normalize_assistant_message, recover_empty_synthesis, tier_context
 from companion.mcp_hub import get_mcp_hub
@@ -39,7 +37,6 @@ from companion.os_tools import summarize_tool_step
 from companion.project_graph import get_project_graph
 from companion.routines import execute_autonomy_mode_action, format_morning_briefing
 from companion.safety import LoopGuard, run_system_doctor
-from companion.sdd import verify_sdd
 from companion.sdlc_tools import preview_turn_cleanup_scope
 from companion.streaming import check_cancelled, clean_subagent_wire_context, emit_stream_event, turn_context_scope
 from companion.telemetry import telemetry
@@ -638,17 +635,8 @@ def handle_slash_command(cmd_str: str, messages: List[Dict[str, Any]], store: Op
         return str(create_or_revise_blueprint(arg or "status", chat_fn=chat_fn, store=mem)["summary"])
     if verb == "approve":
         return str(approve_blueprint_and_build(chat_fn=chat_fn, store=mem)["summary"])
-    if verb == "eval":
-        return str(run_live_flight_eval(suite=arg or "full", chat_fn=chat_fn)["summary"])
     if verb == "goal":
         return "Usage: `/goal <feature or engineering objective>` (or `/goal resume`)" if not arg else str(run_autonomous_goal(arg, chat_fn=chat_fn, store=mem)["summary"])
-    if verb in ("specs", "sdd"):
-        sub = arg.split()[0].lower() if arg else "verify"
-        if sub == "sync":
-            return dispatch("sdd_manage", {"action": "sync"})
-        return dispatch("sdd_manage", {"action": "read_spec", "spec_name": sub}) if (sub.upper().endswith(".MD") or sub.upper() in ("PRODUCT", "ARCHITECTURE", "CONTRACTS", "DECISIONS")) else verify_sdd().format_summary()
-    if verb == "hygiene":
-        return analyze_workspace_hygiene().format_summary()
     if verb in ("skills", "skill"):
         return format_skills_catalog(skill_name=arg or None)
     if verb in ("subagent", "worker"):

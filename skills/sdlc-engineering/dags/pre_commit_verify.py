@@ -26,8 +26,9 @@ from companion.sdlc_tools import check_git_stage_safety  # noqa: E402
 
 
 def _resolve_repo(ctx: Dict[str, Any]) -> Path:
-    raw = str(ctx.get("params", {}).get("repo_root") or "").strip()
-    return Path(raw).resolve() if raw else settings.workspace.project_root.resolve()
+    params = ctx.get("params", {})
+    raw = str(params.get("repo_root") or params.get("repo_path") or "").strip()
+    return Path(raw).resolve() if raw else settings.get_workspace().project_root.resolve()
 
 
 def _step_stage_safety(ctx: Dict[str, Any]) -> Dict[str, Any]:

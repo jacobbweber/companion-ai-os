@@ -1,92 +1,24 @@
-"""Unit tests for Living Canonical SDD, AST Dead-Code Hygiene, and Unified Idle Routines."""
+"""Unit tests for Background Idle Routines, Skill Validation & Packaged Runtime Doctor."""
 
 import contextlib
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-from companion.disciplines import resolve_workspace_contract
+from companion.config import settings
 from companion.grounding import LocalKnowledgeAdapter, discover_skills
-from companion.hygiene import analyze_workspace_hygiene
 from companion.memory_store import MemoryStore, memory_store_context
+from companion.project_graph import ProjectGraphManager
 from companion.routines import format_morning_briefing, get_routine_manager
-from companion.sdd import (
-    MAX_ACTIVE_ADRS,
-    sync_decisions_md,
-    validate_dag_python_source,
-    validate_skill_markdown,
-    verify_sdd,
-    verify_skills_directory,
-)
-from companion.skill_forge import run_skill_script, stage_and_promote_skill
+from companion.safety import run_system_doctor
+from companion.skill_forge import run_skill_script, stage_and_promote_skill, validate_skill_markdown
+from companion.telemetry import notify_db_closed
 from companion.tools import dispatch
 
 
-class TestSDDHygieneAndIdleRoutines(unittest.TestCase):
-    def test_live_workspace_passes_sdd_verification(self) -> None:
-        rep = verify_sdd()
-        self.assertTrue(rep.valid, f"SDD verification failed:\n{rep.format_summary()}")
-        self.assertEqual(len(rep.present_spec_files), 4)
-        self.assertEqual(len(rep.sprawl_files), 0)
-        self.assertEqual(len(rep.undocumented_modules), 0)
-
-    def test_sdd_detects_spec_sprawl_and_undocumented_module(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            specs_dir = root / "specs"
-            specs_dir.mkdir()
-            for fname in ("PRODUCT.md", "ARCHITECTURE.md", "CONTRACTS.md", "DECISIONS.md"):
-                (specs_dir / fname).write_text("## SPEC-01: Test\nOwned Modules:\nInvariants:\nVerification Tests:\n", encoding="utf-8")
-            (specs_dir / "001_extra_sprawl.md").write_text("sprawl", encoding="utf-8")
-            comp_dir = root / "companion"
-            comp_dir.mkdir()
-            (comp_dir / "mystery.py").write_text('"""Mystery."""\nx = 1\n', encoding="utf-8")
-
-            with contextlib.closing(MemoryStore(db_path=root / "memory" / "test.db")) as store:
-                rep = verify_sdd(root=root, store=store)
-                self.assertFalse(rep.valid)
-                self.assertIn("001_extra_sprawl.md", rep.sprawl_files)
-                self.assertIn("companion/mystery.py", rep.undocumented_modules)
-
-    def test_adr_compaction_keeps_active_adrs_within_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            with contextlib.closing(MemoryStore(db_path=root / "memory" / "test.db")) as store:
-                for i in range(20):
-                    store.add_adr(
-                        title=f"ADR-1{i:02d}: Decision {i}",
-                        context="Ctx",
-                        decision="Dec",
-                        consequences="Cons",
-                        status="accepted",
-                    )
-                dec_path = sync_decisions_md(store=store, root=root)
-                text = dec_path.read_text(encoding="utf-8")
-                self.assertIn("Historical / Superseded Decisions (Compacted)", text)
-                self.assertEqual(text.count("### ADR-"), MAX_ACTIVE_ADRS)
-
-    def test_live_workspace_passes_ast_hygiene_and_dead_code_check(self) -> None:
-        rep = analyze_workspace_hygiene()
-        self.assertTrue(rep.clean, f"Workspace hygiene check failed:\n{rep.format_summary()}")
-
-    def test_hygiene_scanner_detects_unused_imports_and_dead_functions(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            comp = root / "companion"
-            comp.mkdir()
-            (comp / "sample.py").write_text(
-                '"""Sample."""\nfrom math import sqrt\n\nclass Box:\n    sqrt = 1\n\ndef unused_recursive(n):\n    return unused_recursive(n - 1)\n\ndef misindented_method(self):\n    return Box().sqrt\n',
-                encoding="utf-8",
-            )
-            rep = analyze_workspace_hygiene(root=root)
-            self.assertFalse(rep.clean)
-            self.assertEqual(len(rep.unused_imports), 1)
-            self.assertIn("sqrt", rep.unused_imports[0])
-            self.assertEqual(len(rep.dead_definitions), 2)
-            self.assertTrue(any("unused_recursive" in d for d in rep.dead_definitions))
-            self.assertTrue(any("misindented_method(self)" in d for d in rep.dead_definitions))
-
+class TestRoutinesSkillsAndRuntimeDoctor(unittest.TestCase):
     def test_background_autonomy_routines_and_morning_briefing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -115,68 +47,21 @@ class TestSDDHygieneAndIdleRoutines(unittest.TestCase):
                     out = dispatch("routine_manage", {"action": "autonomy_status"})
                     self.assertIn("ON", out)
 
-    def test_skill_and_dag_linter_and_write_guards(self) -> None:
-        valid_md = (
-            "---\nname: demo-skill\ndescription: A valid demo skill for testing.\n"
-            "required_tools: [read_file]\n---\n\n# Demo\n## When to Use This Skill\nTest.\n"
-            "## Step-by-Step Procedure\n1. Run.\n"
-        )
-        self.assertIsNone(validate_skill_markdown(valid_md, expected_name="demo-skill"))
-        self.assertIsNotNone(validate_skill_markdown(valid_md, expected_name="other-name"))
-        self.assertIsNotNone(validate_skill_markdown("# Missing frontmatter\n"))
-
-        valid_dag_src = (
-            '"""Demo DAG."""\nfrom companion.dag_runtime import DAGNode, DAGSpec\n'
-            "DAG = DAGSpec(name='demo-flow', description='Valid deterministic demo DAG', nodes=[DAGNode('n1', fn=lambda _c: {})])\n"
-        )
-        self.assertIsNone(validate_dag_python_source(valid_dag_src, filename="demo_flow.py"))
-        self.assertIsNotNone(validate_dag_python_source("x = 1\n", filename="bad_dag.py"))
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bad_skill_path = root / "skills" / "demo-skill" / "SKILL.md"
-            res1 = dispatch("write_file", {"path": str(bad_skill_path), "content": "# No frontmatter"})
-            self.assertIn("SKILL LINTER REJECTED", res1)
-            self.assertFalse(bad_skill_path.exists())
-
-            bad_dag_path = root / "skills" / "demo-skill" / "dags" / "demo_flow.py"
-            res2 = dispatch("write_file", {"path": str(bad_dag_path), "content": "x = 1\n"})
-            self.assertIn("SKILL LINTER REJECTED", res2)
-            self.assertFalse(bad_dag_path.exists())
-
-            ref_md = valid_md + "\nSee `references/missing_doc.md`.\n"
-            res3 = dispatch("write_file", {"path": str(bad_skill_path), "content": ref_md})
-            self.assertIn("wrote", res3)
-            issues = verify_skills_directory(root=root)
-            self.assertTrue(any("missing_doc.md" in i for i in issues), f"Expected missing_doc.md issue in {issues}")
-
-            user_wiki = root / "skills" / "knowledge-wiki" / "references" / "user-guide.md"
-            user_content = "---\ntitle: User Guide\nauthor: user\n---\n\n# Protected Note\n"
-            self.assertIn("wrote", dispatch("write_file", {"path": str(user_wiki), "content": user_content}))
-            blocked_w = dispatch("write_file", {"path": str(user_wiki), "content": "# Overwritten\n"})
-            self.assertIn("WIKI AUTHOR GUARD REJECTED", blocked_w)
-            blocked_e = dispatch("edit_file", {"path": str(user_wiki), "old_str": "# Protected Note", "new_str": "# Changed"})
-            self.assertIn("WIKI AUTHOR GUARD REJECTED", blocked_e)
-            self.assertEqual(user_wiki.read_text(encoding="utf-8"), user_content)
-
-    def test_skill_forge_path_traversal_author_guard_and_script_write_guards(self) -> None:
+    def test_skill_forge_path_traversal_author_guard_and_knowledge_adapter(self) -> None:
         valid_md = (
             "---\nname: safe-pack\ndescription: Safe pack for guard tests.\n"
             "required_tools: [read_file]\n---\n\n# Safe Pack\n## When to Use This Skill\nTest.\n"
             "## Step-by-Step Procedure\n1. Run.\n"
         )
+        self.assertIsNone(validate_skill_markdown(valid_md, expected_name="safe-pack"))
+        self.assertIsNotNone(validate_skill_markdown(valid_md, expected_name="other-name"))
+        self.assertIsNotNone(validate_skill_markdown("# Missing frontmatter\n"))
+
         good_script = '"""Check."""\nimport sys\nif "--self-test" in sys.argv:\n    sys.exit(0)\nprint("ok")\n'
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.assertIn("invalid skill name", run_skill_script("../../outside", "evil", root=root))
             self.assertIn("invalid skill name", run_skill_script("bad/slash", "evil", root=root))
-
-            sc_target = root / "skills" / "safe-pack" / "scripts" / "check.py"
-            r_noself = dispatch("write_file", {"path": str(sc_target), "content": '"""No self test."""\nprint(1)\n'})
-            self.assertIn("SKILL LINTER REJECTED", r_noself)
-            r_ext = dispatch("write_file", {"path": str(sc_target), "content": '"""Ext."""\nimport requests\n# --self-test\nprint(requests)\n'})
-            self.assertIn("SKILL LINTER REJECTED", r_ext)
-            self.assertFalse(sc_target.exists())
 
             p1 = stage_and_promote_skill("safe-pack", valid_md, scripts={"check.py": good_script}, root=root)
             self.assertTrue(p1["promoted"], p1["summary"])
@@ -198,13 +83,6 @@ class TestSDDHygieneAndIdleRoutines(unittest.TestCase):
             self.assertFalse(p_noself["promoted"])
             self.assertIn("--self-test", p_noself["summary"])
 
-            ext_ui = root / "ext_3d_app"
-            (ext_ui / "surfaces").mkdir(parents=True)
-            (ext_ui / "companion").mkdir(parents=True)
-            ext_contract = resolve_workspace_contract(ext_ui, is_self_project=False)
-            self.assertEqual(ext_contract.contract_id, "general-workspace")
-            self.assertFalse(ext_contract.enforce_stdlib_only)
-
             with contextlib.closing(MemoryStore(db_path=root / "mem.db")) as st:
                 docs_dir = root / "refs"
                 docs_dir.mkdir()
@@ -222,13 +100,6 @@ class TestSDDHygieneAndIdleRoutines(unittest.TestCase):
                     self.assertIn("http://127.0.0.1:9000", dispatch("memory_manage", {"action": "query_facts", "key": "cfg:endpoint"}))
 
     def test_safe4_project_workspace_path_and_packaged_app_doctor_without_tests(self) -> None:
-        """Verify SAFE-4: ProjectGraph `workspace_path` scope binding and 7/7 System Doctor on packaged `app/` without `tests/`."""
-        import shutil
-
-        from companion.config import settings
-        from companion.project_graph import ProjectGraphManager
-        from companion.safety import run_system_doctor
-
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             code_repo = base / "repo_alpha"
@@ -252,7 +123,7 @@ class TestSDDHygieneAndIdleRoutines(unittest.TestCase):
             staged_app = base / "packaged_app"
             staged_app.mkdir()
             shutil.copy2(settings.root / "harness.py", staged_app / "harness.py")
-            for dirname in ("companion", "surfaces", "configs", "memory", "specs", "skills", "deploy"):
+            for dirname in ("companion", "surfaces", "skills", "deploy"):
                 src_d = settings.root / dirname
                 if src_d.is_dir():
                     shutil.copytree(src_d, staged_app / dirname, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -261,7 +132,6 @@ class TestSDDHygieneAndIdleRoutines(unittest.TestCase):
             self.assertTrue(doc["healthy"], doc["summary"])
             self.assertEqual(len(doc["checks"]), 7)
             self.assertTrue(all(c["passed"] for c in doc["checks"]))
-            from companion.telemetry import notify_db_closed
             notify_db_closed(staged_app / "data" / "conversations.db")
 
 
