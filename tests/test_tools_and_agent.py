@@ -152,7 +152,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         from companion.config import settings
         from companion.context import execute_identity_action, is_identity_bootstrapped, manage_companion_tone, run_first_boot_onboarding
         from companion.context import discover_skills
-        from companion.skill_forge import stage_and_promote_skill
+        from companion.workflows import stage_and_promote_skill
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)

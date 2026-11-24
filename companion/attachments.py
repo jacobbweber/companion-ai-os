@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from companion.config import settings
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.vault import get_vault_manager
-from companion.wiki_engine import get_wiki_engine
+from companion.wiki import get_wiki_engine
 
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB per file
 MAX_UNCOMPRESSED_STREAM_BYTES = 32 * 1024 * 1024  # 32 MB zip/zlib bomb cap

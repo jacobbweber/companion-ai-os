@@ -1722,7 +1722,7 @@ def tool_delegate_subagent(args: Dict[str, Any]) -> str:
 
 
 def _handle_skill_forge_action(action: str, args: Dict[str, Any]) -> str:
-    from companion.skill_forge import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
+    from companion.workflows import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
 
     if action == "check_skill":
         q = str_arg(args, "goal") or str_arg(args, "skill")

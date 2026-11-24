@@ -23,13 +23,13 @@ from companion.routines import (
     execute_autonomy_mode_action,
     get_routine_manager,
 )
-from companion.skill_forge import execute_customizations_action
+from companion.workflows import execute_customizations_action
 from companion.tools import r3_approval_context
 from companion.vault import create_snapshot_backup, get_vault_manager, list_snapshot_backups, restore_snapshot_backup
 from companion.wiki_curation import commit_curation_plan, inspect_graduation, list_curation_history, revert_curation, validate_curation_plan
-from companion.wiki_engine import get_wiki_engine
-from companion.wiki_maintenance import execute_wiki_maintenance_subaction
-from companion.wiki_templates import get_template, list_templates, load_tag_authority, save_template, slugify_wiki
+from companion.wiki import get_wiki_engine
+from companion.wiki import execute_wiki_maintenance_subaction
+from companion.wiki import get_template, list_templates, load_tag_authority, save_template, slugify_wiki
 from companion.worktree_runner import execute_agile_worktree_subaction
 
 __all__ = ["CORE_ACTIONS", "HARVEST_SLASH_VERBS", "ActionSpec", "execute_core_action", "handle_harvest_slash", "list_core_actions"]

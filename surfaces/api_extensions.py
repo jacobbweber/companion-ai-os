@@ -40,8 +40,8 @@ from companion.project_graph import get_project_graph
 from companion.routines import IdleAutonomyWatcher, describe_operating_quadrant
 from companion.streaming import wire_attachment_context
 from companion.telemetry import TelemetryEngine, read_ro_rows, telemetry
-from companion.wiki_engine import get_wiki_engine
-from companion.wiki_maintenance import read_wiki_asset_raw
+from companion.wiki import get_wiki_engine
+from companion.wiki import read_wiki_asset_raw
 from companion.agent import WorkflowEngine
 
 __all__ = [

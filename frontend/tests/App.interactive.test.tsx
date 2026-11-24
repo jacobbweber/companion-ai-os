@@ -20,7 +20,7 @@ os.environ["COMPANION_SECRETS_FILE"] = str(tmp_dir / "secrets.env")
 sys.path.insert(0, str(repo_root))
 
 import companion.memory_store as ms
-import companion.background_jobs as bj
+import companion.jobs as bj
 import companion.core_actions as ca
 from companion.core_actions import execute_core_action
 from companion.endpoints import get_endpoint_manager

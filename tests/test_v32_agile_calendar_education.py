@@ -27,10 +27,10 @@ from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
 from companion.routines import get_routine_manager
-from companion.skill_forge import run_skill_script
+from companion.workflows import run_skill_script
 from companion.tools import check_phase_tool_permission, filter_tools_for_phase
 from companion.tools import tool_search, tool_web_search
-from companion.wiki_templates import list_templates
+from companion.wiki import list_templates
 from surfaces.api_extensions import enrich_web_status
 
 
@@ -191,6 +191,34 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
         edu = get_education_engine(store=self.store)
         cr = edu.upsert_course(title="Go Concurrency", domain="systems", modules=["Goroutines", "Channels"])
         edu.upsert_study_items(cr["course_id"], [{"prompt": "What buffered channel op blocks?", "answer": "Send when buffer is full."}])
+        gen_res = edu.generate_study_items(
+            course_id=cr["course_id"],
+            item_kind="quiz",
+            count=2,
+            chat_fn=lambda *_a, **_kw: {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"items":[{"prompt":"When does an unbuffered channel send complete?","answer":"When a receiver is ready","choices":["Immediately","When a receiver is ready","On close","Never"],"explanation":"Rendezvous synchronization.","topic":"Channels"}]}',
+                    }
+                }]
+            },
+        )
+        self.assertTrue(gen_res["ok"], gen_res)
+        self.assertGreaterEqual(gen_res["count"], 1)
+        ai_course = edu.upsert_course(
+            title="French Mother Sauces",
+            chat_fn=lambda *_a, **_kw: {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"domain":"cooking","goal_summary":"Master the five classical French mother sauces.","modules":[{"slug":"roux","title":"Roux Ratios & Starch","objective":"Cook white, blond, and brown roux."},{"slug":"bechamel","title":"Bechamel & Veloute","objective":"Emulsify dairy and stock bases."}]}',
+                    }
+                }]
+            },
+        )
+        self.assertEqual(ai_course["course"]["total_modules"], 2)
+        self.assertEqual(ai_course["course"]["domain"], "cooking")
         with memory_store_context(self.store):
             tool_out = tool_education_manage({"action": "flashcard_deck", "course_id": cr["course_id"]})
         self.assertIn("```companion-flashcards", tool_out)

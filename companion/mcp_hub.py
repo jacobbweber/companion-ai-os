@@ -10,9 +10,9 @@ from companion.jobs import get_job_manager
 from companion.config import is_in_agent_tool_turn, settings
 from companion.llm_wire import check_url_ssrf, urlopen_safe
 from companion.memory_store import MemoryStore, get_memory_store
-from companion.skill_forge import stage_and_promote_skill
+from companion.workflows import stage_and_promote_skill
 from companion.vault import get_vault_manager, normalize_secret_name
-from companion.wiki_engine import get_wiki_engine
+from companion.wiki import get_wiki_engine
 
 __all__ = ["HOSTED_MCP_SAFE_TOOLS", "MCPHub", "build_local_peer_identity", "format_connected_partners_hud", "get_mcp_hub", "harvest_mcp_capability_pack"]
 

@@ -20,7 +20,7 @@ from companion.core_actions import execute_core_action, list_core_actions
 from companion.context import build_epistemic_grounding
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.tools import dispatch
-from companion.wiki_engine import WikiEngine
+from companion.wiki import WikiEngine
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 

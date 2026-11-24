@@ -23,7 +23,7 @@ from companion.jobs import get_job_manager
 from companion.llm import chat, model_gate
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.vault import create_snapshot_backup
-from companion.wiki_engine import get_wiki_engine
+from companion.wiki import get_wiki_engine
 from companion.workflows import execute_dag_by_name
 
 __all__ = [

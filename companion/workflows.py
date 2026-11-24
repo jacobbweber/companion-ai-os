@@ -16,28 +16,32 @@ Replaces arbitrary Python-lambda `DAGSpec` files (`dag_runtime.py` + `workflow_d
 5. `GoalPlan`, `GoalStep`, and `VerificationSpec` verification contracts.
 """
 
+import ast
 import concurrent.futures
 import contextlib
 import contextvars
 import inspect
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from companion.approvals import ActionRiskTier, get_approval_queue
-from companion.config import settings
-from companion.context import invalidate_skills_cache
-from companion.memory_store import MemoryStore, get_memory_store
-from companion.telemetry import telemetry
+from companion.config import SELF_PROJECT_ID, settings
+from companion.context import discover_skills, get_knowledge_port, invalidate_skills_cache, rank_relevant_skills
+from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
+from companion.telemetry import redact_secrets, telemetry
 from companion.tools import check_command_safety, get_execution_target, validate_python_syntax
+from companion.vault import CheckpointManager, checkpoint_manager, get_vault_manager
 
 VALID_WORKFLOW_NODE_TYPES = (
     "llm_step",
@@ -67,14 +71,18 @@ __all__ = [
     "WorkflowNode",
     "WorkflowSpec",
     "build_goal_plan_from_tasks",
+    "build_skill_script_command",
+    "check_make_vs_borrow",
     "dag_node",
     "discover_dags",
     "discover_skill_domain_validators",
     "discover_workflows",
+    "distill_workflow_reflection",
     "dry_run_dag",
     "dry_run_workflow",
     "ensure_domain_pack",
     "evaluate_step_verification",
+    "execute_customizations_action",
     "execute_dag_by_name",
     "execute_dag_spec",
     "execute_workflow_by_name",
@@ -83,11 +91,15 @@ __all__ = [
     "is_node_output_passed",
     "list_dag_runs",
     "load_workflow_spec_from_file",
+    "parse_pep723_dependencies",
     "register_dag_runtime_bindings",
     "register_domain_validator",
     "resume_dag_run",
     "resume_workflow_run",
+    "run_skill_script",
     "self_test_dag",
+    "stage_and_promote_skill",
+    "validate_skill_markdown",
     "validate_typed_payload",
 ]
 
@@ -1431,3 +1443,458 @@ def build_goal_plan_from_tasks(goal: str, pending_tasks: List[Tuple[int, str, st
         steps.append(GoalStep(step_id=sid, title=desc, depends_on=[prev_id] if prev_id else [], risk_tier=risk, verification=v_spec, task_id=int(tid)))
         prev_id = sid
     return GoalPlan(goal=goal, steps=steps)
+
+
+# ---------------------------------------------------------------------------
+# 6. Skill & Capability Pack Forge, Safe Script Runner & Customizations Bus
+# ---------------------------------------------------------------------------
+_PEP723_BLOCK_RE = re.compile(r"(?m)^# /// script\s*\n((?:^#(?: .*)?\n)*)^# ///\s*$")
+_DEP_NAME_RE = re.compile(r"^([A-Za-z0-9_.-]+)")
+_PYPI_IMPORT_ALIASES: Dict[str, str] = {
+    "beautifulsoup4": "bs4", "pillow": "pil", "pyyaml": "yaml", "scikit-learn": "sklearn", "opencv-python": "cv2",
+}
+
+
+def validate_skill_markdown(content: str, expected_name: Optional[str] = None) -> Optional[str]:
+    """Validate a `skills/<name>/SKILL.md` file's YAML frontmatter and basic structure."""
+    norm = content.replace("\r\n", "\n").strip()
+    if not norm.startswith("---\n"):
+        return "SKILL.md must start with YAML frontmatter delimited by `---`."
+    end_idx = norm.find("\n---", 4)
+    if end_idx == -1:
+        return "SKILL.md is missing closing `---` for YAML frontmatter."
+    fm_block = norm[4:end_idx]
+    meta: Dict[str, str] = {}
+    cur_key = ""
+    for line in fm_block.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if (line.startswith(" ") or line.startswith("\t")) and cur_key:
+            item = s[1:].strip().strip("'\"") if s.startswith("-") else s.strip("'\"")
+            meta[cur_key] = f"{meta[cur_key]}, {item}" if (meta[cur_key] and s.startswith("-")) else f"{meta[cur_key]} {item}".strip()
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            cur_key = k.strip().lower()
+            val = v.strip().strip("'\"")
+            meta[cur_key] = "" if val in (">", "|", ">-", "|-") else val
+    name = meta.get("name", "")
+    if not name or not _KEBAB_RE.match(name):
+        return f"SKILL.md frontmatter `name` must be kebab-case (`[a-z0-9-]+`), got `{name}`."
+    if expected_name and _KEBAB_RE.match(expected_name) and name != expected_name:
+        return f"SKILL.md frontmatter `name: {name}` does not match folder name `{expected_name}`."
+    if len(meta.get("description", "")) < 10:
+        return "SKILL.md frontmatter must include a concise `description` (>= 10 chars)."
+    return None
+
+
+def parse_pep723_dependencies(source: str) -> Tuple[List[str], Set[str], Optional[str]]:
+    """Parse PEP 723 `# /// script` metadata, returning `(raw_deps, allowed_import_roots, error)`."""
+    match = _PEP723_BLOCK_RE.search((source or "").replace("\r\n", "\n"))
+    if not match:
+        return [], set(), None
+    uncommented = "\n".join(line[2:] if line.startswith("# ") else line[1:] for line in match.group(1).splitlines())
+    try:
+        meta = tomllib.loads(uncommented)
+    except Exception as exc:
+        return [], set(), f"Invalid PEP 723 `# /// script` TOML metadata: {exc}"
+    deps = meta.get("dependencies", [])
+    if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+        return [], set(), "PEP 723 `dependencies` must be a list of package requirement strings."
+    raw_deps: List[str] = []
+    allowed_imports: Set[str] = set()
+    for req in deps:
+        clean_req = req.strip()
+        if not clean_req:
+            continue
+        raw_deps.append(clean_req)
+        m = _DEP_NAME_RE.match(clean_req)
+        if m:
+            pkg = m.group(1).lower()
+            norm = pkg.replace("-", "_").replace(".", "_")
+            allowed_imports.update({pkg, norm})
+            if pkg in _PYPI_IMPORT_ALIASES:
+                allowed_imports.add(_PYPI_IMPORT_ALIASES[pkg])
+    return raw_deps, allowed_imports, None
+
+
+def _check_wiki_author_guard(md_path: Path) -> Optional[str]:
+    if not md_path.is_file():
+        return None
+    head = md_path.read_text(encoding="utf-8", errors="replace")[:600]
+    if re.search(r"(?im)^author\s*:\s*['\"]?user['\"]?\s*$", head):
+        return f"WIKI AUTHOR GUARD REJECTED: `{md_path.name}` has `author: user` and cannot be overwritten automatically."
+    return None
+
+
+def check_make_vs_borrow(capability_query: str, root: Optional[Path] = None) -> Dict[str, Any]:
+    """Check existing `skills/` and `KnowledgePort` before forging a new procedural capability."""
+    target_root = (root or settings.root).resolve()
+    skills = discover_skills(target_root)
+    matched_skills = rank_relevant_skills(capability_query, skills, top_k=3)
+    known_facts = get_knowledge_port().search(capability_query, limit=4)
+    rec = "BORROW" if matched_skills else "FORGE"
+    s_names = [s["name"] for s in matched_skills]
+    summary = (
+        f"Make-vs-Borrow Check: `{rec}` — existing relevant skills: {s_names or 'none'}; "
+        f"grounded facts: {[f.key for f in known_facts] or 'none'}."
+    )
+    return {"recommendation": rec, "existing_skills": matched_skills, "known_facts": [f.key for f in known_facts], "summary": summary}
+
+
+def _lint_staged_python(fname: str, code: str, kind: str) -> Optional[str]:
+    valid, syn_err = validate_python_syntax(code, filename=fname)
+    if not valid:
+        return f"{kind} `{fname}` SyntaxError: {syn_err}"
+    _raw_deps, _allowed_imports, pep_err = parse_pep723_dependencies(code)
+    if pep_err:
+        return f"{kind} `{fname}` {pep_err}"
+    if kind == "Script" and "--self-test" not in code:
+        return f"Script `{fname}` must implement a `--self-test` CLI entrypoint."
+    return None
+
+
+def build_skill_script_command(
+    sc_path: Path,
+    extra_args: List[str],
+    source: Optional[str] = None,
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Resolve `sys.executable` for pure-stdlib scripts or isolated `uv run` for PEP 723 skill scripts."""
+    code = source if source is not None else sc_path.read_text(encoding="utf-8", errors="replace")
+    raw_deps, _allowed, pep_err = parse_pep723_dependencies(code)
+    if pep_err:
+        return None, pep_err
+    if not raw_deps:
+        return [sys.executable, str(sc_path), *extra_args], None
+    uv_bin = shutil.which("uv")
+    if not uv_bin:
+        return None, (
+            f"PEP 723 skill script `{sc_path.name}` declares isolated packages {raw_deps}, "
+            "which requires `uv` on PATH (`winget install astral-sh.uv`). Core Python remains untouched."
+        )
+    return [uv_bin, "run", "--quiet", str(sc_path), *extra_args], None
+
+
+def _populate_staged_skill_dir(
+    stage_skill: Path,
+    skill_md: str,
+    references: Optional[Dict[str, str]],
+    dags: Optional[Dict[str, Any]],
+    scripts: Optional[Dict[str, str]],
+) -> Tuple[Optional[str], List[Path], List[Path]]:
+    stage_skill.mkdir(parents=True, exist_ok=True)
+    (stage_skill / "SKILL.md").write_text((skill_md or "").replace("\r\n", "\n"), encoding="utf-8", newline="\n")
+
+    for fname, content in (references or {}).items():
+        clean_f = Path(fname).name
+        if not clean_f.endswith(".md"):
+            return f"SKILL FORGE REJECTED: reference `{fname}` must end with `.md`.", [], []
+        ref_d = stage_skill / "references"
+        ref_d.mkdir(exist_ok=True)
+        (ref_d / clean_f).write_text(str(content).replace("\r\n", "\n"), encoding="utf-8", newline="\n")
+
+    staged_scripts: List[Path] = []
+    for fname, content in (scripts or {}).items():
+        clean_f = Path(fname).name
+        if not clean_f.endswith(".py"):
+            return f"SKILL FORGE REJECTED: script `{fname}` must end with `.py`.", [], []
+        norm_code = str(content).replace("\r\n", "\n")
+        lint_err = _lint_staged_python(clean_f, norm_code, "Script")
+        if lint_err:
+            return f"SKILL FORGE REJECTED (`scripts/{clean_f}`): {lint_err}", [], []
+        sc_d = stage_skill / "scripts"
+        sc_d.mkdir(exist_ok=True)
+        sc_path = sc_d / clean_f
+        sc_path.write_text(norm_code, encoding="utf-8", newline="\n")
+        staged_scripts.append(sc_path)
+
+    staged_dags: List[Path] = []
+    for fname, content in (dags or {}).items():
+        clean_f = Path(fname).name
+        if clean_f.endswith(".py"):
+            return (
+                f"SKILL FORGE REJECTED (`{clean_f}`): Python-lambda `.py` DAG files are retired. "
+                "Author a declarative JSON workflow (`<name>.workflow.json`) using `run_script`, `call_tool`, `llm_step`, `mcp_step`, or `human_gate`.",
+                [],
+                [],
+            )
+        stem = clean_f.removesuffix(".workflow.json").removesuffix(".json")
+        out_name = f"{stem}.workflow.json"
+        try:
+            wf_obj = dict(content) if isinstance(content, dict) else json.loads(str(content))
+            wf_spec = WorkflowSpec.from_dict(wf_obj)
+            val_err = wf_spec.validate()
+        except Exception as exc:
+            return f"SKILL FORGE REJECTED (`workflows/{out_name}`): invalid declarative workflow JSON ({exc}).", [], []
+        if val_err:
+            return f"SKILL FORGE REJECTED (`workflows/{out_name}`): {val_err}", [], []
+        wf_d = stage_skill / "workflows"
+        wf_d.mkdir(exist_ok=True)
+        wf_p = wf_d / out_name
+        wf_p.write_text(json.dumps(wf_obj, indent=2) + "\n", encoding="utf-8", newline="\n")
+        staged_dags.append(wf_p)
+    return None, staged_dags, staged_scripts
+
+
+def _run_staged_self_tests(staged_dags: List[Path], staged_scripts: List[Path], sandbox_dir: Path) -> Optional[str]:
+    for dag_path in staged_dags:
+        dag_res = self_test_dag(dag_path)
+        if not dag_res.get("ok"):
+            return f"SKILL FORGE REJECTED (`workflows/{dag_path.name}`): {dag_res.get('error', 'self-test failed')}"
+    sandbox_dir.mkdir(parents=True, exist_ok=True)
+    for sc_path in staged_scripts:
+        cmd, cmd_err = build_skill_script_command(sc_path, ["--self-test"])
+        if cmd_err or cmd is None:
+            return f"SKILL FORGE REJECTED (`{sc_path.name}`): {cmd_err}"
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(sandbox_dir), stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45,
+            )
+        except Exception as exc:
+            return f"SKILL FORGE REJECTED (`{sc_path.name} --self-test` crashed/timed out): {exc}"
+        if proc.returncode != 0:
+            out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[:260]
+            return f"SKILL FORGE REJECTED (`{sc_path.name} --self-test` exited {proc.returncode}): {out}"
+    return None
+
+
+def stage_and_promote_skill(
+    name: str,
+    skill_md: str,
+    scripts: Optional[Dict[str, str]] = None,
+    dags: Optional[Dict[str, Any]] = None,
+    references: Optional[Dict[str, str]] = None,
+    self_test: bool = True,
+    overwrite: bool = False,
+    root: Optional[Path] = None,
+    scope: str = "core",
+    workflows: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Stage, lint, `--self-test`, checkpoint, and atomically promote a Capability Pack (`R2`)."""
+    clean_name = (name or "").strip().lower()
+    if not clean_name or not _KEBAB_RE.match(clean_name):
+        msg = f"SKILL FORGE REJECTED: skill name `{name}` must be kebab-case (`[a-z0-9-]+`)."
+        return {"promoted": False, "error": msg, "summary": msg}
+
+    eff_workflows = {**(dags or {}), **(workflows or {})}
+    eff_scope = (scope or "core").strip().lower()
+    target_root = (root or settings.root).resolve()
+    is_user_scope = eff_scope == "user"
+    if not is_user_scope and target_root == settings.root.resolve():
+        msg = (
+            "SAFETY GUARD REJECTED: Companion's installed `app/` (`skills/`) is permanently IMMUTABLE (`ADR-019`). "
+            "Pass `scope='user'` to save an update-safe skill inside `data/skills/`, or promote into an external Project clone (`workspace_path`)."
+        )
+        return {"promoted": False, "error": msg, "summary": msg}
+    skills_parent = (settings.user_skills_dir if root is None else (target_root / "data" / "skills")) if is_user_scope else (target_root / "skills")
+    dest_dir = skills_parent.resolve() / clean_name
+    if dest_dir.exists():
+        if not overwrite:
+            msg = f"SKILL FORGE REJECTED: `skills/{clean_name}` already exists (pass `overwrite=True` to update)."
+            return {"promoted": False, "error": msg, "summary": msg}
+        for existing_md in sorted(dest_dir.glob("references/*.md")):
+            guard_err = _check_wiki_author_guard(existing_md)
+            if guard_err:
+                return {"promoted": False, "error": guard_err, "summary": guard_err}
+
+    md_err = validate_skill_markdown(skill_md or "", expected_name=clean_name)
+    if md_err:
+        msg = f"SKILL FORGE REJECTED (`SKILL.md`): {md_err}"
+        return {"promoted": False, "error": msg, "summary": msg}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stage_root = Path(tmp) / "stage_repo"
+        stage_skill = stage_root / "skills" / clean_name
+        pop_err, staged_dags, staged_scripts = _populate_staged_skill_dir(stage_skill, skill_md, references, eff_workflows, scripts)
+        if pop_err:
+            return {"promoted": False, "error": pop_err, "summary": pop_err}
+
+        if self_test and (staged_dags or staged_scripts):
+            test_err = _run_staged_self_tests(staged_dags, staged_scripts, Path(tmp) / "self_test_sandbox")
+            if test_err:
+                return {"promoted": False, "error": test_err, "summary": test_err}
+
+        cp = {"checkpoint_id": "user_data_skill"} if is_user_scope else (checkpoint_manager if target_root == settings.root.resolve() else CheckpointManager(root=target_root, store=False)).create_checkpoint(label=f"skill_forge_{clean_name}")
+        dest_dir.parent.mkdir(parents=True, exist_ok=True)
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        shutil.copytree(stage_skill, dest_dir)
+        invalidate_skills_cache()
+
+    rel_lbl = f"{'data/skills' if is_user_scope else 'skills'}/{clean_name}"
+    if root is None or target_root == settings.root.resolve():
+        if "unittest" not in sys.modules or has_memory_store_override():
+            get_knowledge_port().propose_update(
+                key=f"skill:{clean_name}",
+                value=f"Promoted verified skill `{rel_lbl}/SKILL.md` (scripts={list((scripts or {}).keys())}, workflows={list(eff_workflows.keys())}).",
+                project_id="global",
+                source="skill_forge",
+                confidence=1.0,
+            )
+    telemetry.log("INFO", "workflows", f"Promoted verified skill `{rel_lbl}` (cp={cp['checkpoint_id']})")
+    summary = (
+        f"Promoted verified skill `{rel_lbl}/` (checkpoint `{cp['checkpoint_id']}`; "
+        f"scripts={len(scripts or {})}, workflows={len(eff_workflows)}, references={len(references or {})})."
+    )
+    return {"promoted": True, "skill": clean_name, "scope": "user" if is_user_scope else "core", "path": str(dest_dir), "checkpoint_id": cp["checkpoint_id"], "summary": summary}
+
+
+def run_skill_script(
+    skill_name: str,
+    script_name: str,
+    script_args: Optional[List[str]] = None,
+    root: Optional[Path] = None,
+    timeout: int = 30,
+) -> str:
+    """Execute a promoted `skills/<skill>/scripts/<script>.py` or `data/domains/<pack>/scripts/<script>.py`."""
+    s_clean = (skill_name or "").strip().lower()
+    f_clean = Path((script_name or "").strip()).name
+    if not s_clean or not f_clean:
+        return "error: skill and script name are required for run_script"
+    if not _KEBAB_RE.match(s_clean):
+        return f"error: invalid skill name '{s_clean}' (must be kebab-case)"
+    if not f_clean.endswith(".py"):
+        f_clean += ".py"
+    base_root = (root or settings.root).resolve()
+    cand_roots = (
+        [settings.domains_dir.resolve(), settings.user_skills_dir.resolve(), (base_root / "skills").resolve()]
+        if root is None or base_root == settings.root.resolve()
+        else [(base_root / "data" / "domains").resolve(), (base_root / "data" / "skills").resolve(), (base_root / "skills").resolve()]
+    )
+    sc_path = next(
+        (
+            (sr / s_clean / "scripts" / f_clean).resolve()
+            for sr in cand_roots
+            if (sr / s_clean / "scripts" / f_clean).resolve().is_relative_to(sr)
+            and (sr / s_clean / "scripts" / f_clean).is_file()
+        ),
+        None,
+    )
+    if sc_path is None:
+        return f"error: skill script not found: `skills/{s_clean}/scripts/{f_clean}`"
+
+    cmd, cmd_err = build_skill_script_command(sc_path, [str(a) for a in (script_args or [])])
+    if cmd_err or cmd is None:
+        return f"error: {cmd_err}"
+    rc, stdout, stderr, guard_err = get_execution_target().exec_command(cmd, shell=False, timeout=timeout)
+    if rc == -1 and guard_err:
+        return f"error: skill script `{s_clean}/{f_clean}` {guard_err}"
+    if guard_err:
+        return f"exit=1\n{redact_secrets(guard_err)}"
+    raw_out = (stdout + (("\n[stderr]\n" + stderr) if stderr else "")).strip() or "(no output)"
+    out = redact_secrets(raw_out)
+    if "unittest" not in sys.modules or has_memory_store_override():
+        out = get_vault_manager().scrub_output(out)
+    return f"exit={rc}\n{out[: settings.out_limit] + chr(10) + '... [truncated]' if len(out) > settings.out_limit else out}"
+
+
+def _summarize_artifact_structure(path: Path) -> Optional[str]:
+    suf = path.suffix.lower()
+    if suf not in (".json", ".toml", ".py"):
+        return None
+    try:
+        txt = path.read_text(encoding="utf-8", errors="replace")
+        if suf == ".json":
+            obj = json.loads(txt)
+            return f"JSON keys={list(obj.keys())[:10]}" if isinstance(obj, dict) else f"JSON {type(obj).__name__}"
+        if suf == ".toml":
+            obj = tomllib.loads(txt)
+            return f"TOML sections={list(obj.keys())[:10]}"
+        tree = ast.parse(txt, filename=path.name)
+        syms = [n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        return f"Python symbols={syms[:10]}" if syms else f"Python module ({len(txt.splitlines())}L)"
+    except Exception:
+        return None
+
+
+def distill_workflow_reflection(
+    goal: str,
+    wf_id: Optional[int],
+    changed_paths: List[Path],
+    target_root: Path,
+    store: MemoryStore,
+) -> Dict[str, Any]:
+    """Persist verified deliverable facts into `KnowledgePort` post-verification."""
+    rels: List[str] = []
+    artifact_facts: List[Tuple[str, str]] = []
+    for p in changed_paths:
+        if p.is_file():
+            try:
+                rel = str(p.resolve().relative_to(target_root.resolve())).replace("\\", "/")
+            except ValueError:
+                rel = p.name
+            rels.append(rel)
+            if len(artifact_facts) < 5:
+                struct = _summarize_artifact_structure(p)
+                if struct:
+                    artifact_facts.append((f"artifact:{rel}", f"Verified artifact `{rel}` ({struct})."))
+    pid = SELF_PROJECT_ID if target_root.resolve() == settings.root.resolve() else settings.get_workspace().project_id
+    port = get_knowledge_port(store=store)
+    key = f"workflow:{wf_id or 'latest'}:deliverables"
+    val = f"Goal `{goal[:100]}` verified" + (f" -> artifacts: {', '.join(rels[:10])}" if rels else " (zero file mutations needed).")
+    port.propose_update(key=key, value=val, project_id=pid, source="reflect", confidence=1.0)
+    for a_key, a_val in artifact_facts:
+        port.propose_update(key=a_key, value=a_val, project_id=pid, source="reflect", confidence=0.95)
+    return {"fact_key": key, "artifacts_recorded": rels[:10], "artifact_facts": [k for k, _ in artifact_facts]}
+
+
+def execute_customizations_action(p: Dict[str, Any], _actor: str = "user", store: Optional[MemoryStore] = None) -> Dict[str, Any]:
+    """CoreAction handler for Customizations (`skills/`, `data/skills/`, `data/domains/`, declarative `workflows`, and `dag_runs`)."""
+    mem = store or get_memory_store()
+    sub = str(p.get("subaction") or p.get("action") or "list").strip().lower()
+    if sub in ("read_skill", "inspect_skill"):
+        s_clean = str(p.get("skill") or p.get("name") or "").strip().lower()
+        req_asset = str(p.get("asset") or "").strip().lstrip("/\\").replace("\\", "/")
+        roots = [settings.domains_dir.resolve(), settings.user_skills_dir.resolve(), (settings.root / "skills").resolve()]
+        sdir = next(
+            (
+                (r / s_clean).resolve()
+                for r in roots
+                if s_clean
+                and ((r / s_clean / "SKILL.md").is_file() or (r / s_clean / "CONTEXT.md").is_file())
+                and (r / s_clean).resolve().is_relative_to(r)
+            ),
+            None,
+        )
+        if sdir is None:
+            return {"ok": False, "error": f"Skill or Domain Capability Pack `{s_clean}` not found."}
+        entry_doc = "SKILL.md" if (sdir / "SKILL.md").is_file() else "CONTEXT.md"
+        asset = req_asset if req_asset and (sdir / req_asset).is_file() else entry_doc
+        target = (sdir / asset).resolve()
+        if not target.is_relative_to(sdir) or not target.is_file():
+            return {"ok": False, "error": f"Asset `{req_asset or asset}` not found inside `{s_clean}`."}
+        files = [
+            entry_doc,
+            *[
+                f"{sub_d}/{f.name}"
+                for sub_d in ("references", "workflows", "dags", "scripts", "01_inbox", "02_records", "03_reports")
+                if (sdir / sub_d).is_dir()
+                for f in sorted((sdir / sub_d).iterdir())
+                if f.is_file() and f.suffix.lower() in (".md", ".py", ".json", ".sql", ".csv", ".txt")
+            ],
+        ]
+        return {
+            "ok": True, "skill": s_clean, "asset": asset, "files": files,
+            "content": target.read_text(encoding="utf-8", errors="replace"),
+            "summary": f"Loaded `{s_clean}/{asset}`.",
+        }
+    if sub == "get_dag_run":
+        rec = get_dag_run(str(p.get("run_id") or ""), store=mem)
+        return {"ok": rec is not None, "dag_run": rec, "run": rec, "node_runs": (rec or {}).get("node_runs", []), "error": "" if rec else "Workflow run not found."}
+    if sub in ("run_dag", "resume_dag"):
+        from companion.agent import ensure_dag_runtime_bound
+
+        ensure_dag_runtime_bound()
+        if sub == "resume_dag":
+            return resume_dag_run(str(p.get("run_id") or ""), store=mem)
+        raw_params = p.get("params")
+        params = raw_params if isinstance(raw_params, dict) else (json.loads(raw_params) if isinstance(raw_params, str) and raw_params.strip().startswith("{") else {})
+        return execute_dag_by_name(str(p.get("dag") or p.get("dag_name") or ""), params=params, store=mem)
+    skills = discover_skills(settings.root)
+    dags = discover_dags(settings.root)
+    runs = list_dag_runs(store=mem, limit=int(p.get("limit") or 20))
+    return {
+        "ok": True, "skills": skills, "dags": dags, "dag_runs": runs,
+        "summary": f"Customizations: {len(skills)} Capability Pack(s), {len(dags)} Declarative Workflow(s), {len(runs)} recent run(s).",
+    }

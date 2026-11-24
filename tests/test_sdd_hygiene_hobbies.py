@@ -13,7 +13,7 @@ from companion.memory_store import MemoryStore, memory_store_context
 from companion.project_graph import ProjectGraphManager
 from companion.routines import format_morning_briefing, get_routine_manager
 from companion.tools import run_system_doctor
-from companion.skill_forge import run_skill_script, stage_and_promote_skill, validate_skill_markdown
+from companion.workflows import run_skill_script, stage_and_promote_skill, validate_skill_markdown
 from companion.telemetry import notify_db_closed
 from companion.tools import dispatch
 

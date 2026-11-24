@@ -181,7 +181,7 @@ class LocalKnowledgeAdapter:
                 if len(entries) >= limit:
                     return entries
         if tokens and len(entries) < limit:
-            from companion.wiki_engine import get_wiki_engine
+            from companion.wiki import get_wiki_engine
 
             for wn in get_wiki_engine(store=self.store).search_notes(q_clean, limit=limit - len(entries)):
                 wkey = f"wiki:{wn['rel_path']}"
@@ -206,7 +206,7 @@ class LocalKnowledgeAdapter:
         if not k:
             return None
         if k.startswith("wiki:"):
-            from companion.wiki_engine import get_wiki_engine
+            from companion.wiki import get_wiki_engine
 
             wn = get_wiki_engine(store=self.store).read_note(k[5:])
             return KnowledgeEntry(f"wiki:{wn['path']}", wn["title"], wn["body"][:240], f"wiki:{wn['author']}", 0.92, wn["raw"]) if wn.get("ok") else None

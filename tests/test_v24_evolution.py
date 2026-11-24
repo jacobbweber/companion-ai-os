@@ -21,7 +21,7 @@ from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.tools import lint_single_file_edit
 from companion.memory_store import cosine_f32_bytes, pack_f32_vector
-from companion.skill_forge import build_skill_script_command, parse_pep723_dependencies
+from companion.workflows import build_skill_script_command, parse_pep723_dependencies
 from companion.streaming import emit_stream_event, read_completion_or_sse_stream, stream_event_context
 from companion.telemetry import TelemetryEngine
 from companion.tools import tool_read_file, tool_search, tool_web_fetch
@@ -257,11 +257,11 @@ class TestV24Evolution(unittest.TestCase):
             skill_py.write_text(pep_script, encoding="utf-8")
 
             # Command builder uses `uv run` when `uv` is present, clear message when missing, and `sys.executable` for stdlib
-            with patch("companion.skill_forge.shutil.which", return_value="C:/Tools/uv.exe"):
+            with patch("companion.workflows.shutil.which", return_value="C:/Tools/uv.exe"):
                 cmd_uv, uv_err = build_skill_script_command(skill_py, ["--self-test"], pep_script)
                 self.assertIsNone(uv_err)
                 self.assertEqual(cmd_uv[:3], ["C:/Tools/uv.exe", "run", "--quiet"])
-            with patch("companion.skill_forge.shutil.which", return_value=None):
+            with patch("companion.workflows.shutil.which", return_value=None):
                 _, missing_err = build_skill_script_command(skill_py, ["--self-test"], pep_script)
                 self.assertIn("requires `uv` on PATH", str(missing_err))
             stdlib_py = root / "skills" / "scraper-pack" / "scripts" / "pure.py"

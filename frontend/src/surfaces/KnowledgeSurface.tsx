@@ -88,6 +88,8 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
   const [editBody, setEditBody] = useState('');
   const [diff, setDiff] = useState<WikiDiffPayload | null>(null);
   const [graduatingPath, setGraduatingPath] = useState('');
+  const [freshAudit, setFreshAudit] = useState<{ path: string; summary: string; flagged: string[] } | null>(null);
+  const [verifyingFresh, setVerifyingFresh] = useState(false);
   const [graph, setGraph] = useState<MindMapGraph | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -161,6 +163,7 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
     }
     setDiff(null);
     setGraduatingPath('');
+    setFreshAudit(null);
     setEditing(false);
     setSelectedAsset(null);
     if (switchMobile) setMobilePane('reading');
@@ -536,17 +539,32 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                           type="button"
                           className="btn btn-sm"
                           data-testid="wiki-verify-fresh-btn"
-                          title="Verify freshness cadence"
+                          title="Run AI claim & freshness audit"
+                          disabled={verifyingFresh}
                           onClick={async () => {
-                            const r = await callAction('wiki', {
+                            setVerifyingFresh(true);
+                            const r = await callAction<{
+                              audit_summary?: string;
+                              flagged_claims?: string[];
+                              summary?: string;
+                              error?: string;
+                            }>('wiki', {
                               subaction: 'verify_note',
                               path: selectedNote.path,
                             });
+                            setVerifyingFresh(false);
                             await Promise.all([openNote(selectedNote.path, false, true), loadTreeAndFacets(false)]);
+                            if (r.ok && (r.audit_summary || (r.flagged_claims && r.flagged_claims.length > 0))) {
+                              setFreshAudit({
+                                path: selectedNote.path,
+                                summary: r.audit_summary || r.summary || 'Verified note freshness.',
+                                flagged: r.flagged_claims || [],
+                              });
+                            }
                             onToast(r.ok === false ? r.error || 'Could not verify note.' : r.summary || 'Verified note freshness.');
                           }}
                         >
-                          <CheckCircle2 size={12} /> Verify Fresh
+                          <CheckCircle2 size={12} /> {verifyingFresh ? 'Auditing...' : 'Verify Fresh'}
                         </button>
                       )}
                       <button type="button" className="btn btn-sm" onClick={() => void inspectNoteDiff()}>
@@ -587,6 +605,35 @@ export const KnowledgeSurface: React.FC<KnowledgeSurfaceProps> = ({
                         onToast(msg);
                       }}
                     />
+                  )}
+
+                  {freshAudit && freshAudit.path === selectedNote.path && (
+                    <div
+                      data-testid="wiki-freshness-audit-banner"
+                      style={{
+                        marginBottom: 14,
+                        padding: '9px 12px',
+                        borderRadius: 'var(--radius-sm)',
+                        background: 'var(--bg-elevated)',
+                        border: `1px solid ${freshAudit.flagged.length > 0 ? 'var(--status-warn)' : 'var(--border-hairline)'}`,
+                        fontSize: 12.5,
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                        <strong>AI Freshness Audit</strong>
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setFreshAudit(null)}>
+                          Dismiss
+                        </button>
+                      </div>
+                      <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>{freshAudit.summary}</div>
+                      {freshAudit.flagged.length > 0 && (
+                        <ul style={{ margin: '6px 0 0 18px', padding: 0, color: 'var(--status-warn)' }}>
+                          {freshAudit.flagged.map((fc, i) => (
+                            <li key={i}>{fc}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
                   )}
 
                   {diff && (

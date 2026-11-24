@@ -25,7 +25,7 @@ from companion.agent import assess_turn_readiness, select_turn_step_tier
 from companion.llm import current_tier_name
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.tools import CheckpointManager
-from companion.skill_forge import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
+from companion.workflows import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
 from companion.tools import check_phase_tool_permission, phase_tool_context
 from companion.tools import dispatch
 from companion.workflows import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks, evaluate_step_verification

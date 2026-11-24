@@ -34,7 +34,7 @@ from companion.streaming import (
 )
 from companion.telemetry import redact_secrets, trace_scope
 from companion.tools import ALL_TOOL_NAMES, TOOLS, phase_tool_context
-from companion.wiki_engine import get_wiki_engine
+from companion.wiki import get_wiki_engine
 
 __all__ = [
     "JOB_STATUSES",

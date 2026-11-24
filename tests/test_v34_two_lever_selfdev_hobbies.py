@@ -38,7 +38,7 @@ from companion.sdlc_tools import (
     tool_dev_preview,
     tool_git_manage,
 )
-from companion.skill_forge import stage_and_promote_skill
+from companion.workflows import stage_and_promote_skill
 from companion.tools import phase_tool_context
 from companion.tools import dispatch
 from companion.vault import VaultManager

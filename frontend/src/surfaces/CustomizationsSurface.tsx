@@ -165,8 +165,8 @@ export const CustomizationsSurface: React.FC<CustomizationsSurfaceProps> = ({
                 <div className="card-row-info">
                   <div className="card-row-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span>{sk.name}</span>
-                    <span className={`badge ${sk.scope === 'user' ? 'accent' : ''}`}>
-                      {sk.scope === 'user' ? 'User Forged' : 'Core'}
+                    <span className={`badge ${sk.scope === 'user' || sk.scope === 'domain' ? 'accent' : ''}`}>
+                      {sk.scope === 'domain' ? 'Domain Pack' : sk.scope === 'user' ? 'User Forged' : 'Core'}
                     </span>
                     {sk.dags && <span className="badge ok">DAG: {sk.dags}</span>}
                   </div>

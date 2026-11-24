@@ -31,7 +31,7 @@ from companion.routines import (
     get_routine_manager,
 )
 from companion.tools import lint_single_file_edit
-from companion.skill_forge import run_skill_script, stage_and_promote_skill, validate_skill_markdown
+from companion.workflows import run_skill_script, stage_and_promote_skill, validate_skill_markdown
 from companion.tools import resolve
 from companion.routines import TriggerPolicy, evaluate_trigger_eligibility, is_within_allowed_window, matches_cron_5field, register_trigger_precheck
 from companion.workflows import VerificationSpec, evaluate_step_verification, register_domain_validator

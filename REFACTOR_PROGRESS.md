@@ -28,11 +28,11 @@
   - [x] Consolidate `jobs.py` (from `background_jobs.py` with full runtime skill/pack context) and `routines.py` (absorbing `trigger_policy.py`).
   - [x] Run tests & commit Phase 3 checkpoint on `refactor/frontier-standard-harness`.
 
-- [ ] **Phase 4: Eliminate All Hollow Verbs in `Knowledge` & `Study` Studios**
-  - [ ] Consolidate `wiki.py` (`wiki_engine.py` + `wiki_templates.py` + `wiki_maintenance.py`) and `wiki_curation.py` (absorbing `skill_forge.py` staging validator).
-  - [ ] Upgrade `propose_graduation` to synthesize both metadata AND complete structured Markdown prose via real LLM (zero `"Operational context recorded in..."` fake boilerplate, zero silent `"fallback"` green badges), enable `MERGE_AND_REFINE` overlap absorption in `WikiGraduateModal.tsx`, upgrade Chat `"Save to Wiki"` (`stage_turn`) with `user_prompt` + real `fast` LLM synthesis, and make `Verify Fresh` perform a real LLM claim/freshness audit (plus optional `Mark Reviewed` stamp) while keeping staleness age math deterministic.
-  - [ ] Upgrade `education_engine.py` + `KnowledgeStudyView.tsx`: `+ Add Course` generates a real multi-module syllabus via LLM; add 1-click `Generate Flashcards` & `Generate Quiz` (`education.generate_items`) with schema validation; upgrade `curate_study_note` to synthesize real prose study notes while keeping SM-2 interval math & stage FSM deterministic.
-  - [ ] Build frontend (`npm --prefix frontend test` & `npm --prefix frontend run build`), run backend tests, & commit Phase 4 checkpoint.
+- [x] **Phase 4: Eliminate All Hollow Verbs in `Knowledge` & `Study` Studios**
+  - [x] Consolidate `wiki.py` (`wiki_engine.py` + `wiki_templates.py` + `wiki_maintenance.py`) and absorb `skill_forge.py` into `workflows.py`.
+  - [x] Upgrade `propose_graduation` to synthesize both metadata AND complete structured Markdown prose via real LLM (zero `"Operational context recorded in..."` fake boilerplate, zero silent `"fallback"` green badges), enable `MERGE_AND_REFINE` overlap absorption in `WikiGraduateModal.tsx`, upgrade Chat `"Save to Wiki"` (`stage_turn`) with `user_prompt` + real `fast` LLM synthesis, and make `Verify Fresh` perform a real LLM claim/freshness audit (plus optional `quick_stamp`) while keeping staleness age math deterministic.
+  - [x] Upgrade `education_engine.py` + `KnowledgeStudyView.tsx`: `+ Add Course` generates a real multi-module syllabus via LLM; add 1-click `Generate Flashcards` & `Generate Quiz` (`education.generate_items`) with schema validation; upgrade `curate_study_note` to synthesize real prose study notes while keeping SM-2 interval math & stage FSM deterministic.
+  - [x] Build frontend (`npm --prefix frontend test` & `npm --prefix frontend run build`), run backend tests, & commit Phase 4 checkpoint.
 
 - [ ] **Phase 5: Eliminate All Hollow Verbs in `Board & Goals`, `Automations` & `Customizations`**
   - [ ] Consolidate `projects.py` (`project_graph.py`) and `worktrees.py` (`worktree_runner.py` + `sdlc_tools.py` + `github_pr_ci.py`).

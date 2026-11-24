@@ -16,7 +16,7 @@ from companion.llm import _sanitize_wire_messages, current_tier_name
 from companion.memory_store import MemoryStore
 from companion.streaming import wire_attachment_context
 from companion.vault import get_vault_manager
-from companion.wiki_engine import get_wiki_engine
+from companion.wiki import get_wiki_engine
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 

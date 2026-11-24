@@ -65,7 +65,7 @@ from companion.mcp_hub import get_mcp_hub
 from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override, memory_store_context
 from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
 from companion.sdlc_tools import preview_turn_cleanup_scope
-from companion.skill_forge import distill_workflow_reflection
+from companion.workflows import distill_workflow_reflection
 from companion.streaming import (
     check_cancelled,
     clean_subagent_wire_context,

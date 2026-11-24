@@ -28,7 +28,7 @@ from companion.sdlc_tools import check_git_stage_safety
 from companion.tools import dispatch, filter_tools_for_phase, phase_tool_context
 from companion.routines import evaluate_trigger_eligibility, TriggerPolicy
 from companion.vault import VaultManager, create_snapshot_backup, restore_snapshot_backup
-from companion.wiki_engine import WikiEngine
+from companion.wiki import WikiEngine
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 
