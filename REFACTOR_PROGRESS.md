@@ -34,11 +34,11 @@
   - [x] Upgrade `education_engine.py` + `KnowledgeStudyView.tsx`: `+ Add Course` generates a real multi-module syllabus via LLM; add 1-click `Generate Flashcards` & `Generate Quiz` (`education.generate_items`) with schema validation; upgrade `curate_study_note` to synthesize real prose study notes while keeping SM-2 interval math & stage FSM deterministic.
   - [x] Build frontend (`npm --prefix frontend test` & `npm --prefix frontend run build`), run backend tests, & commit Phase 4 checkpoint.
 
-- [ ] **Phase 5: Eliminate All Hollow Verbs in `Board & Goals`, `Automations` & `Customizations`**
-  - [ ] Consolidate `projects.py` (`project_graph.py`) and `worktrees.py` (`worktree_runner.py` + `sdlc_tools.py` + `github_pr_ci.py`).
-  - [ ] Upgrade `Slice 15m Unblocker` (`WorkItemInspector.tsx` -> `agile.slice_unblocker`) and `Seed 4 DIKW Stages` / Milestone Breakdown (`BoardGoalsSurface.tsx` -> `agile.seed_dikw` / `plan_milestones`) to use real LLM domain-aware decomposition + deterministic SQLite persistence.
-  - [ ] Consolidate `integrations.py` (`endpoints.py` + `mcp_hub.py` with persistent `stdio` MCP client & real LLM MCP `Harvest Pack` generating `SKILL.md` + `*.workflow.json`), update `core_actions.py`, and upgrade `/checkin` to synthesize a real LLM priority coaching brief over deterministic state.
-  - [ ] Build frontend (`npm --prefix frontend test` & `npm --prefix frontend run build`), run backend tests, & commit Phase 5 checkpoint.
+- [x] **Phase 5: Eliminate All Hollow Verbs in `Board & Goals`, `Automations` & `Customizations`**
+  - [x] Consolidate `projects.py` (`project_graph.py`) and `worktrees.py` (`worktree_runner.py` + `sdlc_tools.py` + native GitHub PR client).
+  - [x] Upgrade `Slice 15m Unblocker` (`WorkItemInspector.tsx` -> `agile.slice_unblocker`) and `Seed 4 DIKW Stages` / Milestone Breakdown (`BoardGoalsSurface.tsx` -> `agile.seed_dikw`) to use real LLM domain-aware decomposition + deterministic SQLite persistence.
+  - [x] Consolidate `integrations.py` (`endpoints.py` + `mcp_hub.py` with persistent `stdio` MCP client & real LLM MCP `Harvest Pack` generating `SKILL.md` + `*.workflow.json`), update `core_actions.py`, and upgrade `/checkin` to synthesize a real LLM priority coaching brief over deterministic state.
+  - [x] Build frontend (`npm --prefix frontend test` & `npm --prefix frontend run build`), run backend tests, & commit Phase 5 checkpoint.
 
 - [ ] **Phase 6: Comprehensive Test Suite Alignment & Static UI Build Verification**
   - [ ] Align `tests/` suite with the lean ~25-module architecture; verify 100% of 18 HTTP/SSE routes, 18 `callAction` domains, declarative workflows, attachment `storage_path` handoff, domain SQLite packs, and LLM-validated verbs.

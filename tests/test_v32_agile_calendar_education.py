@@ -25,7 +25,7 @@ from companion.context import discover_skills, rank_relevant_skills
 from companion.tools import tool_agile_manage, tool_education_manage
 from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
+from companion.projects import get_project_graph, sync_workflow_to_project_graph
 from companion.routines import get_routine_manager
 from companion.workflows import run_skill_script
 from companion.tools import check_phase_tool_permission, filter_tools_for_phase
@@ -259,6 +259,37 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
             self.assertTrue(ub["ok"])
             self.assertEqual(ub["unblocker"]["estimate_minutes"], 15)
             self.assertEqual(get_project_graph(self.store).get_item(cid)["status"], "blocked")
+
+            patio = get_project_graph(self.store).create_project(title="Backyard Patio Refresh", goal_summary="Level pavers and add string lights")
+            seeded_ms = get_project_graph(self.store).seed_dikw_goal_milestones(
+                patio["project_id"],
+                chat_fn=lambda *_a, **_kw: {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"stages":{"OBSERVE_DATA":{"title":"1. Measure Patio Footprint & Slope","description":"Check drainage","starter_item":{"title":"Measure 12x16 patio perimeter","owner":"human"}},"CURATE_DIKW":{"title":"2. Compare Paver Materials & Budget","description":"Cost sheet","starter_item":{"title":"Price gravel base and pavers","owner":"companion"}},"FORGE_CAPABILITY":{"title":"3. Rent Compactor & Stage Base","description":"Prep tools","starter_item":{"title":"Reserve plate compactor","owner":"human"}},"DELIVER_AND_VERIFY":{"title":"4. Lay Pavers & Hang String Lights","description":"Final build","starter_item":{"title":"Sweep polymeric sand and test lights","owner":"human"}}}}',
+                        }
+                    }]
+                },
+            )
+            self.assertEqual(len(seeded_ms), 4)
+            patio_ms = get_project_graph(self.store).list_milestones(patio["project_id"])
+            self.assertIn("Measure Patio Footprint", patio_ms[0]["title"])
+            patio_items = get_project_graph(self.store).list_items(project_id=patio["project_id"])
+            self.assertEqual(len(patio_items), 4)
+            ai_ub = get_project_graph(self.store).slice_unblocker(
+                patio_items[0]["item_id"],
+                chat_fn=lambda *_a, **_kw: {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"title":"Grab 25ft tape measure and sketch corners","description":"Quick 10-minute yard measurement.","owner":"human","checklist":["Find tape measure","Measure length","Measure width"]}',
+                        }
+                    }]
+                },
+            )
+            self.assertEqual(ai_ub["title"], "Grab 25ft tape measure and sketch corners")
+            self.assertEqual(len(ai_ub["checklist"]), 3)
             self.assertEqual(len(execute_core_action("agile", {"subaction": "list_items", "project_id": pid}, store=self.store)["items"]), 2)
             self.assertTrue(execute_core_action("agile", {"subaction": "delete_epic", "epic_id": mid}, store=self.store)["ok"])
             bad_sub = execute_core_action("agile", {"subaction": "nonexistent_subaction"}, store=self.store)

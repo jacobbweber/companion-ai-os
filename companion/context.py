@@ -528,7 +528,7 @@ def _load_known_projects(mem: MemoryStore) -> Dict[str, str]:
 
 
 def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known: Dict[str, str]) -> None:
-    from companion.project_graph import get_project_graph
+    from companion.projects import get_project_graph
 
     pg = get_project_graph(store=mem)
     if pid != SELF_PROJECT_ID:
@@ -815,8 +815,8 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
         else f"External Workspace (`{ws.project_id}` -> `{ws.project_root}`; `data/domains/` & `data/scratch/` also accessible)"
     )
     from companion.education_engine import format_education_hud
-    from companion.mcp_hub import format_connected_partners_hud
-    from companion.project_graph import format_project_graph_hud
+    from companion.integrations import format_connected_partners_hud
+    from companion.projects import format_project_graph_hud
 
     trust_mode, partners_hud = get_trust_mode(store=mem), format_connected_partners_hud(store=mem)
     partners_section = f"\n{partners_hud}\n" if partners_hud else ""
@@ -887,8 +887,8 @@ def build_turn_context(
     if pending_tasks:
         lines.append("focus_tasks: " + "; ".join(f"#{tid}({st}) {desc[:60]}" for tid, desc, st, _ in pending_tasks))
     if not ws.is_self_project and ws.project_root.is_dir():
-        from companion.project_graph import get_project_graph
-        from companion.sdlc_tools import discover_repo_sdlc_context
+        from companion.projects import get_project_graph
+        from companion.worktrees import discover_repo_sdlc_context
 
         proj_rec = get_project_graph(mem).get_project()
         if sdlc_ctx := discover_repo_sdlc_context(ws.project_root, project=proj_rec):

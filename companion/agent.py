@@ -18,7 +18,9 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -61,10 +63,10 @@ from companion.context import (
 from companion.workflows import DAGRuntimeBindings, discover_dags, execute_dag_by_name, register_dag_runtime_bindings, resume_dag_run
 from companion.education_engine import get_education_engine
 from companion.llm import chat, current_tier_name, model_gate, normalize_assistant_message, recover_empty_synthesis, tier_context
-from companion.mcp_hub import get_mcp_hub
+from companion.integrations import get_mcp_hub
 from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override, memory_store_context
-from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
-from companion.sdlc_tools import preview_turn_cleanup_scope
+from companion.projects import get_project_graph, sync_workflow_to_project_graph
+from companion.worktrees import preview_turn_cleanup_scope
 from companion.workflows import distill_workflow_reflection
 from companion.streaming import (
     check_cancelled,
@@ -1949,11 +1951,12 @@ def check_in(store: Optional[MemoryStore] = None, chat_fn: Optional[Callable[...
         f"Pending Tasks   : {len(mem.get_pending_tasks()[:6])} active | Pending Backlog: {len(mem.get_backlog(status='pending')[:6])}\n"
         f"Recent Notes    : {len(mem.get_system_notes(limit=5))} notes saved"
     )
-    if chat_fn is not None:
+    if chat_fn is not None or ("unittest" not in sys.modules and os.environ.get("COMPANION_TEST_MODE") != "1"):
+        llm_call = chat_fn or chat
         try:
             ready = [it["title"] for it in get_project_graph(store=mem).next_ready_companion_items(limit=4)]
             with tier_context("fast"):
-                resp = chat_fn([
+                resp = llm_call([
                     {"role": "system", "content": "Write a 2-sentence prioritized next-action coaching note grounded strictly in the user's state snapshot."},
                     {"role": "user", "content": f"{base}\nReady items: {ready}"},
                 ], None, "none")
@@ -2108,7 +2111,7 @@ def handle_slash_command(
 
         return format_morning_briefing(store=mem, mark_seen=True)
     if verb in ("checkin", "check-in"):
-        return check_in(store=mem, chat_fn=chat_fn if not interactive else None)
+        return check_in(store=mem, chat_fn=chat_fn)
     if verb in ("telemetry", "kpis", "metrics"):
         return telemetry.format_kpi_dashboard()
     if verb in ("traces", "waterfall", "trace"):

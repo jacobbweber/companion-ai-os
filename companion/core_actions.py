@@ -14,11 +14,11 @@ from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, wor
 from companion.context import execute_identity_action
 from companion.workflows import resume_dag_run
 from companion.education_engine import execute_education_action
-from companion.endpoints import get_endpoint_manager
-from companion.mcp_hub import format_connected_partners_hud, get_mcp_hub, harvest_mcp_capability_pack
+from companion.integrations import get_endpoint_manager
+from companion.integrations import format_connected_partners_hud, get_mcp_hub, harvest_mcp_capability_pack
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
 from companion.model_registry import execute_model_registry_action
-from companion.project_graph import get_project_graph
+from companion.projects import get_project_graph
 from companion.routines import (
     execute_autonomy_mode_action,
     get_routine_manager,
@@ -30,7 +30,7 @@ from companion.wiki_curation import commit_curation_plan, inspect_graduation, li
 from companion.wiki import get_wiki_engine
 from companion.wiki import execute_wiki_maintenance_subaction
 from companion.wiki import get_template, list_templates, load_tag_authority, save_template, slugify_wiki
-from companion.worktree_runner import execute_agile_worktree_subaction
+from companion.worktrees import execute_agile_worktree_subaction
 
 __all__ = ["CORE_ACTIONS", "HARVEST_SLASH_VERBS", "ActionSpec", "execute_core_action", "handle_harvest_slash", "list_core_actions"]
 
@@ -162,7 +162,7 @@ def _apply_approved_request(req: Dict[str, Any], mem: MemoryStore, skip_dag_resu
         return _exec_out(get_routine_manager(store=mem).create_or_update_routine(routine_id=str(payload["routine_id"]), schedule_expr=str(payload.get("schedule") or ""), target_kind=str(payload.get("target_kind") or ""), title=str(payload.get("title") or ""), target_name=str(payload.get("target_name") or ""), inputs=payload.get("inputs") if isinstance(payload.get("inputs"), dict) else None, trigger_policy=payload.get("trigger_policy") if isinstance(payload.get("trigger_policy"), dict) else None, enabled=True, catch_up=_as_bool(payload.get("catch_up")), actor="user", confirmed=True))
     if cat == "git_push" and payload.get("repo_path"):
         from pathlib import Path
-        from companion.sdlc_tools import tool_git_manage
+        from companion.worktrees import tool_git_manage
 
         rp = Path(str(payload["repo_path"]))
         with memory_store_context(mem), workspace_context(rp, str(payload.get("project_id") or rp.name)):

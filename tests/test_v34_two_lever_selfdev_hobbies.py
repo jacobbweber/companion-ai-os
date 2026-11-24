@@ -23,7 +23,7 @@ from companion.core_actions import execute_core_action
 from companion.workflows import execute_dag_by_name, resume_dag_run
 from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.project_graph import get_project_graph
+from companion.projects import get_project_graph
 from companion.routines import (
     BUILTIN_IDLE_ROUTINES,
     IdleAutonomyWatcher,
@@ -31,7 +31,7 @@ from companion.routines import (
     get_routine_manager,
 )
 from companion.tools import check_path_safety
-from companion.sdlc_tools import (
+from companion.worktrees import (
     PreviewProcessManager,
     discover_repo_sdlc_context,
     preview_turn_cleanup_scope,
@@ -215,7 +215,7 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
                         captured_askpass.append(out_pw.stdout.strip())
                         return 0, vm.scrub_output(f"To https://github.com/acme/demo.git (auth={tok})\n * [new branch] feat/widget -> feat/widget")
 
-                    with patch.dict(os.environ, {"COMPANION_SECRETS_FILE": str(base / "secrets.env")}, clear=False), patch("companion.sdlc_tools._run_git_cmd", side_effect=_fake_git_push):
+                    with patch.dict(os.environ, {"COMPANION_SECRETS_FILE": str(base / "secrets.env")}, clear=False), patch("companion.worktrees._run_git_cmd", side_effect=_fake_git_push):
                         p_ok = tool_git_manage({"action": "push", "remote": "origin", "branch": "feat/widget"})
                     self.assertEqual(captured_askpass, [tok])
                     self.assertNotIn(tok, p_ok)
@@ -239,7 +239,7 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
                 encoding="utf-8",
             )
             mgr = PreviewProcessManager()
-            with patch("companion.sdlc_tools.preview_manager", mgr), workspace_context(repo, "web-app"):
+            with patch("companion.worktrees.preview_manager", mgr), workspace_context(repo, "web-app"):
                 with preview_turn_cleanup_scope():
                     cmd = f'"{sys.executable}" srv.py {{port}}'
                     started = json.loads(tool_dev_preview({"action": "start", "command": cmd, "ready_path": "/"}))

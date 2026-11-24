@@ -16,7 +16,7 @@ from companion.approvals import ActionRiskTier, ApprovalQueue, classify_action_r
 from companion.jobs import BackgroundJobManager
 from companion.config import agent_tool_turn_context, settings
 from companion.core_actions import execute_core_action
-from companion.endpoints import EndpointManager
+from companion.integrations import EndpointManager
 from companion.llm import ModelGate
 from companion.llm_wire import urlopen_safe
 from companion.memory_store import MemoryStore

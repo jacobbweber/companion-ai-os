@@ -945,7 +945,7 @@ def filter_tools_for_phase(phase: Optional[str] = None) -> List[Dict[str, Any]]:
     base = [t for t in TOOLS if t["function"]["name"] not in hidden and (not allowed or t["function"]["name"] in allowed)]
     if not allowed or eff in ("IMPLEMENT", "RECOVER"):
         try:
-            from companion.mcp_hub import get_mcp_hub
+            from companion.integrations import get_mcp_hub
 
             base.extend(get_mcp_hub().list_approved_openai_tools())
         except Exception:
@@ -1699,7 +1699,7 @@ def tool_education_manage(args: Dict[str, Any]) -> str:
 def tool_delegate_subagent(args: Dict[str, Any]) -> str:
     """Spawn a single isolated subagent worker or parallel worktree subagents."""
     if isinstance(args.get("tasks"), list) and args.get("tasks"):
-        from companion.worktree_runner import format_parallel_subagents_tool
+        from companion.worktrees import format_parallel_subagents_tool
 
         return format_parallel_subagents_tool(args)
     goal = str_arg(args, "goal")
@@ -1966,13 +1966,13 @@ def tool_ops_manage(args: Dict[str, Any]) -> str:
 
 
 def tool_git_manage(args: Dict[str, Any]) -> str:
-    from companion.sdlc_tools import tool_git_manage as _impl
+    from companion.worktrees import tool_git_manage as _impl
 
     return _impl(args)
 
 
 def tool_dev_preview(args: Dict[str, Any]) -> str:
-    from companion.sdlc_tools import tool_dev_preview as _impl
+    from companion.worktrees import tool_dev_preview as _impl
 
     return _impl(args)
 
@@ -2198,7 +2198,7 @@ def _resolve_mcp_tool(name: str) -> Optional[Callable[[Dict[str, Any]], str]]:
     _, srv_id, mcp_tool = name.split("__", 2)
 
     def _call(a: Dict[str, Any]) -> str:
-        from companion.mcp_hub import get_mcp_hub
+        from companion.integrations import get_mcp_hub
 
         r = get_mcp_hub().call_mcp_tool(srv_id, mcp_tool, arguments=a if isinstance(a, dict) else {}, actor="companion")
         if r.get("awaiting_approval"):

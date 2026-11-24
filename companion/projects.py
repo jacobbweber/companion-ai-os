@@ -12,13 +12,16 @@ domain-blind execution graph (`Projects/Goals -> Milestones -> Work Items`):
 
 import contextlib
 import json
+import os
 import re
+import sys
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 from companion.config import SELF_PROJECT_ID, _WORKSPACE_OVERRIDE, settings, workspace_context
+from companion.llm import chat, normalize_assistant_message, tier_context
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.routines import TriggerPolicy, evaluate_trigger_eligibility, register_trigger_precheck
 from companion.vault import normalize_secret_name
@@ -52,6 +55,22 @@ _ITEM_COLS = [
 def _slugify(text: str, fallback: str = "project") -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (text or "").strip().lower()).strip("-")
     return s[:48] or fallback
+
+
+def _extract_project_json(raw_text: str) -> Dict[str, Any]:
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.DOTALL | re.IGNORECASE).strip()
+    if "</think>" in cleaned.lower():
+        cleaned = re.split(r"</think>", cleaned, flags=re.IGNORECASE)[-1].strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+    s, e = cleaned.find("{"), cleaned.rfind("}")
+    if s != -1 and e > s:
+        try:
+            obj = json.loads(cleaned[s : e + 1])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return {}
 
 
 def _norm_column_key(status: str, item_kind: str = "task") -> str:
@@ -313,35 +332,144 @@ class ProjectGraphManager:
             self.store.conn.commit()
         return bool(cur.rowcount)
 
-    def slice_unblocker(self, item_ref: Union[str, int], title: str = "", description: str = "", owner: str = "companion") -> Dict[str, Any]:
-        """Create a 15-minute `ready` unblocker step linked to `item_ref`."""
+    def slice_unblocker(
+        self,
+        item_ref: Union[str, int],
+        title: str = "",
+        description: str = "",
+        owner: str = "",
+        chat_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Create a concrete 15-minute `ready` unblocker step via LLM decomposition (when `title` omitted) + deterministic SQLite link."""
         parent = self.get_item(item_ref)
-        step_title = (title or "").strip() or f"15m Unblocker: {parent['title'][:72]}"
+        proj = self.get_project(parent["project_id"])
+        step_title = (title or "").strip()
+        step_desc = (description or "").strip()
+        step_owner = (owner or "").strip().lower()
+        step_checklist: List[str] = []
+
+        should_ai = (
+            not step_title
+            and (chat_fn is not None or ("unittest" not in sys.modules and os.environ.get("COMPANION_TEST_MODE") != "1"))
+        )
+        if should_ai:
+            llm_call = chat_fn or chat
+            sys_msg = (
+                "You are Companion's Personal Agile Unblocker Coach.\n"
+                "Decompose a stuck/large task into the single smallest concrete <=15-minute physical or cognitive first action that breaks inertia.\n"
+                "Make it domain-authentic (household, DIY, cooking, finances, or coding — NEVER generic '15m Unblocker: ...' repetition).\n"
+                'Respond ONLY with JSON: {"title":"...","description":"1-2 sentences","owner":"human"|"companion","checklist":["step 1","step 2","step 3"]}'
+            )
+            usr_msg = (
+                f"Project: {proj['title']} ({proj.get('goal_summary') or proj.get('kind')})\n"
+                f"Blocked/Target Card: {parent['title']}\nDetails: {parent.get('description') or '(none)'}\n"
+                f"Current Owner: {parent['owner']}"
+            )
+            try:
+                with tier_context("fast"):
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=500) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_project_json(txt) or _extract_project_json(thk)
+                if str(parsed.get("title") or "").strip():
+                    step_title = str(parsed["title"]).strip()[:120]
+                if not step_desc and str(parsed.get("description") or "").strip():
+                    step_desc = str(parsed["description"]).strip()[:400]
+                cand_own = str(parsed.get("owner") or "").strip().lower()
+                if not step_owner and cand_own in VALID_ITEM_OWNERS:
+                    step_owner = cand_own
+                if isinstance(parsed.get("checklist"), list):
+                    step_checklist = [str(c).strip() for c in parsed["checklist"] if str(c).strip()][:5]
+            except Exception:
+                pass
+
+        eff_title = step_title or f"15m Unblocker: {parent['title'][:72]}"
+        eff_desc = step_desc or f"First 15-minute unblocking slice for `{parent['item_id']}` ({parent['title']})."
+        eff_owner = step_owner if step_owner in VALID_ITEM_OWNERS else (parent["owner"] or "human")
         unblocker = self.create_item(
-            project_id=parent["project_id"], title=step_title,
-            description=(description or f"First 15-minute unblocking slice for `{parent['item_id']}` ({parent['title']}).").strip(),
-            owner=owner or parent["owner"], stage_kind=parent["stage_kind"], status="ready",
-            priority=max(1, int(parent["priority"]) - 1), milestone_id=parent["milestone_id"],
-            timebox_id=parent["timebox_id"], estimate_minutes=15, tags=["unblocker", parent["item_id"]],
+            project_id=parent["project_id"],
+            title=eff_title,
+            description=eff_desc,
+            owner=eff_owner,
+            stage_kind=parent["stage_kind"],
+            status="ready",
+            priority=max(1, int(parent["priority"]) - 1),
+            milestone_id=parent["milestone_id"],
+            timebox_id=parent["timebox_id"],
+            estimate_minutes=15,
+            checklist=step_checklist or None,
+            tags=["unblocker", parent["item_id"]],
         )
         new_deps = list(dict.fromkeys([unblocker["item_id"], *parent["depends_on"]]))
         self.update_item(parent["item_id"], depends_on=new_deps)
         return unblocker
 
-    def seed_dikw_goal_milestones(self, project_id: str) -> Dict[str, str]:
-        """Ensure the 4 DIKW/Capability prerequisite milestones exist for a broad Goal project."""
+    def seed_dikw_goal_milestones(
+        self,
+        project_id: str,
+        chat_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+    ) -> Dict[str, str]:
+        """Generate 4 domain-authentic DIKW milestones (+ starter items when live LLM is available) for `project_id`."""
         pid = self.resolve_project_id(project_id)
+        proj = self.get_project(pid)
         existing = {m["stage_kind"]: m["milestone_id"] for m in self.list_milestones(pid)}
         titles = {
             "OBSERVE_DATA": "1. Observe & Gather Grounding Data",
             "CURATE_DIKW": "2. Synthesize & Curate DIKW Wiki Context",
-            "FORGE_CAPABILITY": "3. Forge & Self-Test Capabilities / DAGs",
-            "DELIVER_AND_VERIFY": "4. Deliver, Verify & Checkpoint Outcomes",
+            "FORGE_CAPABILITY": "3. Prepare Tools, Materials & Capabilities",
+            "DELIVER_AND_VERIFY": "4. Deliver, Verify & Complete Outcomes",
         }
+        descriptions: Dict[str, str] = {}
+        starter_tasks: Dict[str, Dict[str, Any]] = {}
+
+        missing_stages = [sk for sk in VALID_STAGE_KINDS if sk not in existing]
+        should_ai = bool(missing_stages) and (
+            chat_fn is not None or ("unittest" not in sys.modules and os.environ.get("COMPANION_TEST_MODE") != "1")
+        )
+        if should_ai:
+            llm_call = chat_fn or chat
+            sys_msg = (
+                "You are Companion's Goal & Milestone Planner.\n"
+                "Tailor 4 progressive milestones (`OBSERVE_DATA`, `CURATE_DIKW`, `FORGE_CAPABILITY`, `DELIVER_AND_VERIFY`) "
+                "specifically to the user's goal domain (e.g. DIY patio refresh, cooking, fitness, household budget, or software — NEVER use software/DAG jargon for non-software goals!).\n"
+                "For each stage, provide a specific milestone `title`, `description`, and 1 concrete `starter_item` (`title`, `owner`: `human` or `companion`).\n"
+                'Respond ONLY with JSON: {"stages":{"OBSERVE_DATA":{"title":"1. ...","description":"...","starter_item":{"title":"...","owner":"human"}},"CURATE_DIKW":{...},"FORGE_CAPABILITY":{...},"DELIVER_AND_VERIFY":{...}}}'
+            )
+            usr_msg = f"Project Title: {proj['title']}\nGoal Summary: {proj.get('goal_summary') or '(general goal)'}\nKind: {proj.get('kind')}"
+            try:
+                with tier_context("fast"):
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=900) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_project_json(txt) or _extract_project_json(thk)
+                stages_obj = parsed.get("stages") if isinstance(parsed.get("stages"), dict) else parsed
+                if isinstance(stages_obj, dict):
+                    for sk in VALID_STAGE_KINDS:
+                        entry = stages_obj.get(sk)
+                        if isinstance(entry, dict) and str(entry.get("title") or "").strip():
+                            titles[sk] = str(entry["title"]).strip()[:120]
+                            descriptions[sk] = str(entry.get("description") or "").strip()[:260]
+                            if isinstance(entry.get("starter_item"), dict) and str(entry["starter_item"].get("title") or "").strip():
+                                starter_tasks[sk] = entry["starter_item"]
+            except Exception:
+                pass
+
+        prev_item_id = ""
         for idx, sk in enumerate(VALID_STAGE_KINDS):
             if sk not in existing:
-                ms = self.create_milestone(pid, titles[sk], stage_kind=sk, sort_order=idx * 10)
+                ms = self.create_milestone(pid, titles[sk], description=descriptions.get(sk, ""), stage_kind=sk, sort_order=idx * 10)
                 existing[sk] = ms["milestone_id"]
+                if sk in starter_tasks:
+                    st_spec = starter_tasks[sk]
+                    st_own = str(st_spec.get("owner") or "companion").strip().lower()
+                    created_it = self.create_item(
+                        project_id=pid,
+                        title=str(st_spec["title"]).strip()[:120],
+                        description=str(st_spec.get("description") or descriptions.get(sk, "")).strip()[:280],
+                        owner=st_own if st_own in VALID_ITEM_OWNERS else "companion",
+                        stage_kind=sk,
+                        milestone_id=ms["milestone_id"],
+                        depends_on=[prev_item_id] if prev_item_id else None,
+                    )
+                    prev_item_id = created_it["item_id"]
         return existing
 
     def list_milestones(self, project_id: Optional[str] = None) -> List[Dict[str, Any]]:

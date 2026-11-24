@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from companion.approvals import archive_aged_conversations, enqueue_session_nudge, get_approval_queue
 from companion.config import execution_origin_context, settings
-from companion.endpoints import get_endpoint_manager
+from companion.integrations import get_endpoint_manager
 from companion.jobs import get_job_manager
 from companion.llm import chat, model_gate
 from companion.memory_store import MemoryStore, get_memory_store
@@ -853,7 +853,7 @@ class IdleAutonomyWatcher:
                 res = rm.run_routine_now(chosen["routine_id"], run_in_background=False, now=eff_now, chat_fn=self.chat_fn)
             return {"ok": bool(res.get("ok")), "action": "idle_routine", "routine_id": chosen["routine_id"], "result": res}
 
-        from companion.project_graph import get_project_graph
+        from companion.projects import get_project_graph
         from companion.agent import run_autonomous_goal_slice
         idle_goals = get_project_graph(self.store).eligible_idle_goal_projects(idle_seconds=eff_idle, now_utc=eff_now, now_local=now_local)
         if idle_goals:

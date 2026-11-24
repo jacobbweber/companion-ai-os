@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from companion.config import settings  # noqa: E402
-from companion.sdlc_tools import check_git_stage_safety  # noqa: E402
+from companion.worktrees import check_git_stage_safety  # noqa: E402
 
 
 def _read_stdin_payload() -> Dict[str, Any]:

@@ -33,10 +33,10 @@ from companion.config import settings
 from companion.core_actions import execute_core_action, list_core_actions
 from companion.education_engine import get_education_engine
 from companion.llm import active_swap_status
-from companion.mcp_hub import get_mcp_hub
+from companion.integrations import get_mcp_hub
 from companion.memory_store import MemoryStore
 from companion.model_registry import get_model_matrix_snapshot
-from companion.project_graph import get_project_graph
+from companion.projects import get_project_graph
 from companion.routines import IdleAutonomyWatcher, describe_operating_quadrant
 from companion.streaming import wire_attachment_context
 from companion.telemetry import TelemetryEngine, read_ro_rows, telemetry

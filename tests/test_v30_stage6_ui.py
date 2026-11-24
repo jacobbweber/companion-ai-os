@@ -232,7 +232,7 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
         """Verify persistent CSRF, proxy HTTPS cookie, coalesced cursor SSE, meta_json hydration, and Turn 2+ doc excerpt."""
         import base64
         from companion.attachments import ingest_attachment
-        from companion.project_graph import get_project_graph
+        from companion.projects import get_project_graph
         from surfaces.api_extensions import record_coalesced_job_event
         from surfaces.web_server import verify_lan_client_auth
 

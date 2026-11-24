@@ -363,7 +363,7 @@ class BackgroundJobManager:
         deadline = time.monotonic() + float(job.get("timeout_sec") or 600)
         is_live_db = mem.db_path.resolve() == settings.db_path.resolve()
         eff_prio = "foreground" if str(job.get("starter") or "") in ("worktree", "board_worktree") else "background"
-        from companion.project_graph import get_project_graph
+        from companion.projects import get_project_graph
 
         st, raw_out, meta_err = "failed", "", ""
         try:

@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from companion.education_engine import get_education_engine
 from companion.memory_store import MemoryStore, get_memory_store
-from companion.project_graph import get_project_graph
+from companion.projects import get_project_graph
 from companion.routines import compute_next_run_utc, get_routine_manager
 
 __all__ = [

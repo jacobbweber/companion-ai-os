@@ -23,8 +23,8 @@ import companion.memory_store as ms
 import companion.jobs as bj
 import companion.core_actions as ca
 from companion.core_actions import execute_core_action
-from companion.endpoints import get_endpoint_manager
-from companion.project_graph import get_project_graph
+from companion.integrations import get_endpoint_manager
+from companion.projects import get_project_graph
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 store = ms.MemoryStore(db_path=tmp_dir / "data" / "companion.db")
