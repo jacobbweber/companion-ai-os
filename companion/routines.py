@@ -13,8 +13,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from companion.archive_and_approvals import archive_aged_conversations, enqueue_session_nudge, get_approval_queue
-from companion.autonomy import run_autonomous_goal_slice
+from companion.approvals import archive_aged_conversations, enqueue_session_nudge, get_approval_queue
+from companion.agent import run_autonomous_goal_slice
 from companion.background_jobs import get_job_manager
 from companion.config import execution_origin_context
 from companion.dag_runtime import execute_dag_by_name

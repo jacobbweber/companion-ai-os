@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion import __version__
-from companion.archive_and_approvals import get_approval_queue, get_trust_mode
+from companion.approvals import get_approval_queue, get_trust_mode
 from companion.background_jobs import get_job_manager
 from companion.config import is_in_agent_tool_turn, settings
 from companion.llm_wire import check_url_ssrf, urlopen_safe

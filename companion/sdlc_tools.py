@@ -16,15 +16,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterator, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue
+from companion.approvals import get_approval_queue
 from companion.attachments import ingest_attachment, inspect_image_bytes
 from companion.config import is_in_agent_tool_turn, settings
 from companion.llm import chat, normalize_assistant_message, tier_context
 from companion.memory_store import get_memory_store
 from companion.project_graph import get_project_graph
-from companion.safety import check_command_safety, check_path_safety
+from companion.tools import check_command_safety, check_path_safety
 from companion.streaming import get_active_cancel_scope, wire_attachment_context
-from companion.tool_schemas import bool_arg, int_arg, str_arg
+from companion.tools import bool_arg, int_arg, str_arg
 from companion.vault import _lock_windows_owner_dacl, get_vault_manager
 
 __all__ = [

@@ -138,7 +138,7 @@ for _boot_attempt in range(2):
         from companion.llm import chat, model_gate
         from companion.memory_store import get_memory_store
         from companion.routines import IdleAutonomyWatcher, reconcile_startup_missed_runs
-        from companion.safety import checkpoint_manager, run_system_doctor
+        from companion.tools import checkpoint_manager, run_system_doctor
         from companion.tools import (
             TOOL_IMPLS, TOOLS, dispatch, resolve,
             tool_agile_manage, tool_calendar_manage, tool_checkpoint_manage, tool_dev_preview, tool_edit_file,
@@ -148,7 +148,7 @@ for _boot_attempt in range(2):
             tool_search, tool_system_doctor, tool_task_manage, tool_telemetry_manage,
             tool_vault_manage, tool_web_fetch, tool_web_search, tool_wiki_manage, tool_workflow_manage, tool_write_file,
         )
-        from companion.workflow_graph import workflow_engine
+        from companion.agent import workflow_engine
 
         break
     except Exception as _boot_exc:

@@ -24,7 +24,7 @@ from companion.config import settings
 from companion.core_actions import execute_core_action
 from companion.llm import ModelGate
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.os_tools import summarize_tool_step
+from companion.tools import summarize_tool_step
 from companion.project_graph import get_project_graph
 from companion.streaming import CancelScope, cancel_scope_context, check_cancelled, stream_event_context
 from companion.vault import get_vault_manager

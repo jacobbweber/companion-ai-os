@@ -10,21 +10,213 @@ Universal Project & Goal Graph (`projects`, `milestones`, `project_timeboxes`, `
 import contextlib
 import contextvars
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
 import threading
+import urllib.request
 import uuid
 import weakref
+from array import array
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from companion import __version__
 from companion.config import SELF_PROJECT_ID, is_in_agent_tool_turn, settings
-from companion.semantic_memory import hybrid_rrf_rank
+from companion.llm_wire import build_openai_resource_url, is_local_or_lan_endpoint, urlopen_safe
 from companion.telemetry import get_db_writer_lock, notify_db_closed, redact_secrets, sqlite_write_tx, telemetry_db_context
+
+
+_WORD_RE = re.compile(r"[a-zA-Z0-9_]{2,}")
+_STOP_WORDS_SEM = frozenset({
+    "a", "about", "all", "also", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by",
+    "can", "did", "do", "does", "for", "from", "get", "had", "has", "have", "how", "i", "if", "in",
+    "into", "is", "it", "its", "just", "me", "my", "no", "not", "of", "on", "or", "our", "out", "so",
+    "some", "than", "that", "the", "their", "them", "then", "there", "these", "they", "this", "to",
+    "up", "us", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will", "with",
+    "would", "you", "your",
+})
+
+
+def _stem_word(word: str) -> str:
+    """Lightweight deterministic domain-neutral English stemmer (zero IT/homelab cluster bias)."""
+    w = word.lower().strip("_")
+    if len(w) <= 3:
+        return w
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+    for suf in ("ization", "ational", "fulness", "ousness", "iveness", "ication"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            return w[: -len(suf)]
+    for suf in ("ing", "tion", "sion", "ment", "ness", "able", "ible", "ally", "edly"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            base = w[: -len(suf)]
+            return base[:-1] if len(base) >= 4 and base[-1] == base[-2] else base
+    for suf in ("ed", "es", "er", "or", "ly", "al", "ic", "ou", "s"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3 and not w.endswith(("ss", "us", "is")):
+            return w[: -len(suf)]
+    return w
+
+
+def _tokenize_stems(text: str) -> List[str]:
+    out: List[str] = []
+    for tok in _WORD_RE.findall((text or "").lower()):
+        for part in tok.split("_"):
+            if len(part) >= 2 and part not in _STOP_WORDS_SEM:
+                out.append(_stem_word(part))
+    return out
+
+
+_GENERAL_SYNONYMS: Tuple[Tuple[str, ...], ...] = (
+    ("gpu", "vram", "graphics", "cuda", "accelerator"),
+    ("pause", "delay", "latency", "slow", "swap", "transition", "unload", "reload"),
+    ("recipe", "cook", "meal", "dish", "ingredient", "kitchen"),
+    ("budget", "expense", "receipt", "spend", "cost", "finance", "invoice"),
+    ("appointment", "calendar", "schedule", "meeting", "event", "reminder"),
+    ("study", "course", "flashcard", "quiz", "review", "learn"),
+)
+
+
+def expand_semantic_terms(query: str) -> Set[str]:
+    """Return stemmed query terms plus lightweight multi-domain English synonyms for offline recall."""
+    base = set(_tokenize_stems(query))
+    expanded = set(base)
+    for grp in _GENERAL_SYNONYMS:
+        stemmed_grp = {_stem_word(w) for w in grp}
+        if base & stemmed_grp:
+            expanded.update(stemmed_grp)
+    return expanded
+
+
+def _sparse_embed(text: str) -> Dict[str, float]:
+    """Build an L2-normalized sparse feature vector over stems, synonym clusters, bigrams, and char 4-grams."""
+    stems = _tokenize_stems(text)
+    if not stems:
+        return {}
+    weights: Dict[str, float] = {}
+    stem_set = set(stems)
+    for c_idx, grp in enumerate(_GENERAL_SYNONYMS):
+        if stem_set & {_stem_word(w) for w in grp}:
+            weights[f"c:{c_idx}"] = 1.6
+    for idx, st in enumerate(stems):
+        weights[f"w:{st}"] = weights.get(f"w:{st}", 0.0) + 2.0
+        if idx + 1 < len(stems):
+            bg = f"b:{st}_{stems[idx + 1]}"
+            weights[bg] = weights.get(bg, 0.0) + 1.4
+        if len(st) >= 4:
+            for g_i in range(min(len(st) - 3, 6)):
+                gm = f"g:{st[g_i : g_i + 4]}"
+                weights[gm] = weights.get(gm, 0.0) + 0.45
+    dampened = {k: (1.0 + math.log(v)) if v > 1.0 else v for k, v in weights.items()}
+    d_norm = math.sqrt(sum(v * v for v in dampened.values())) or 1.0
+    return {k: v / d_norm for k, v in dampened.items()}
+
+
+def semantic_similarity(text_a: str, text_b: str) -> float:
+    va, vb = _sparse_embed(text_a), _sparse_embed(text_b)
+    if not va or not vb:
+        return 0.0
+    if len(va) > len(vb):
+        va, vb = vb, va
+    return max(0.0, min(1.0, sum(val * vb.get(k, 0.0) for k, val in va.items())))
+
+
+def hybrid_rrf_rank(
+    query: str,
+    candidates: Sequence[Tuple[Any, str]],
+    lexical_ids: Iterable[Any] = (),
+    limit: int = 20,
+    min_semantic_score: float = 0.13,
+    rrf_k: int = 60,
+) -> List[Any]:
+    """Fuse lexical (BM25/FTS5) rank order with stem/n-gram cosine similarity via Reciprocal Rank Fusion."""
+    q_stems = _tokenize_stems(query)
+    q_vec = _sparse_embed(query)
+    lex_list = list(lexical_ids)
+    lex_rank = {doc_id: rank for rank, doc_id in enumerate(lex_list, 1)}
+
+    sem_scored: List[Tuple[float, Any]] = []
+    if q_vec:
+        for doc_id, text in candidates:
+            d_vec = _sparse_embed(text)
+            if not d_vec:
+                continue
+            sim = sum(val * d_vec.get(k, 0.0) for k, val in q_vec.items())
+            if doc_id in lex_rank:
+                sem_scored.append((sim, doc_id))
+            elif not lex_rank and sim >= min_semantic_score:
+                sem_scored.append((sim, doc_id))
+            elif lex_rank and sim >= 0.25 and bool(q_stems) and all(f"w:{st}" in d_vec for st in q_stems):
+                sem_scored.append((sim, doc_id))
+    sem_scored.sort(key=lambda item: item[0], reverse=True)
+    sem_rank = {doc_id: (rank, sim) for rank, (sim, doc_id) in enumerate(sem_scored, 1)}
+
+    all_ids: List[Any] = []
+    seen: Set[Any] = set()
+    for did in (*lex_list, *(did for _, did in sem_scored)):
+        if did not in seen:
+            seen.add(did)
+            all_ids.append(did)
+
+    fused: List[Tuple[float, Any]] = []
+    for did in all_ids:
+        score = 0.0
+        if did in lex_rank:
+            score += 1.0 / (rrf_k + lex_rank[did])
+        if did in sem_rank:
+            s_rk, sim = sem_rank[did]
+            score += (1.15 * (0.5 + sim)) / (rrf_k + s_rk)
+        fused.append((score, did))
+    fused.sort(key=lambda item: item[0], reverse=True)
+    return [did for _, did in fused[: max(1, limit)]]
+
+
+def pack_f32_vector(vec: Sequence[float]) -> bytes:
+    norm = math.sqrt(sum(float(x) * float(x) for x in vec)) or 1.0
+    return array("f", (float(x) / norm for x in vec)).tobytes()
+
+
+def cosine_f32_bytes(blob_a: bytes, blob_b: bytes) -> float:
+    if not blob_a or not blob_b or len(blob_a) != len(blob_b) or len(blob_a) % 4 != 0:
+        return 0.0
+    va, vb = array("f"), array("f")
+    va.frombytes(blob_a)
+    vb.frombytes(blob_b)
+    return float(sum(a * b for a, b in zip(va, vb)))
+
+
+def fetch_optional_embedding(text: str, timeout: float = 3.0) -> Optional[bytes]:
+    """Fetch dense embeddings when a dedicated `embedding` tier is configured (respecting Privacy Lock)."""
+    emb_cfg = settings.resolve_tier("embedding")
+    if emb_cfg.is_dedicated and emb_cfg.model and emb_cfg.base_url:
+        base, model, api_key, dialect = emb_cfg.base_url.rstrip("/"), emb_cfg.model, emb_cfg.api_key, emb_cfg.dialect
+    else:
+        model, base, api_key, dialect = (settings.embedding_model or "").strip(), (settings.embedding_base_url or "").strip().rstrip("/"), settings.api_key, "openai_compat"
+    if not model or not base or base == settings.base_url.rstrip("/"):
+        return None
+    if settings.effective_privacy_mode() == "local_only" and not is_local_or_lan_endpoint(base):
+        return None
+    try:
+        if dialect == "gemini_native":
+            g_base = base if base.lower().endswith(("/v1beta", "/v1alpha", "/v1")) else f"{base}/v1beta"
+            m_id = model.removeprefix("models/")
+            payload = json.dumps({"model": f"models/{m_id}", "content": {"parts": [{"text": (text or "")[:4000]}]}}).encode("utf-8")
+            hdrs = {"Content-Type": "application/json", **({"x-goog-api-key": api_key} if api_key else {})}
+            with urlopen_safe(urllib.request.Request(f"{g_base}/models/{m_id}:embedContent", data=payload, headers=hdrs, method="POST"), timeout=timeout, allow_private_lan=True, allow_redirects=False) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            emb = (data.get("embedding") or {}).get("values")
+        else:
+            payload = json.dumps({"model": model, "input": (text or "")[:4000]}).encode("utf-8")
+            hdrs = {"Content-Type": "application/json", **({"Authorization": f"Bearer {api_key}"} if api_key else {})}
+            with urlopen_safe(urllib.request.Request(build_openai_resource_url(base, "embeddings"), data=payload, headers=hdrs, method="POST"), timeout=timeout, allow_private_lan=True, allow_redirects=False) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            emb = ((data.get("data") or [{}])[0]).get("embedding")
+        return pack_f32_vector(emb) if isinstance(emb, list) and emb else None
+    except Exception:
+        return None
 
 
 def parse_time_window(window: str, now: Optional[datetime] = None) -> Optional[Tuple[str, str]]:

@@ -296,7 +296,7 @@ def scenario_05_plan_first_approve_execute() -> Dict[str, Any]:
     from companion.config import settings
     from companion.llm import chat
     from companion.project_graph import get_project_graph
-    from companion.safety import run_unit_tests
+    from companion.tools import run_unit_tests
     from companion.streaming import stream_event_context
     from surfaces.web_server import CompanionWebSession
 
@@ -330,7 +330,7 @@ def _run_scenario_06_candidate(provider_id: str, model_name: str) -> Dict[str, A
     from companion.config import settings
     from companion.llm import chat
     from companion.project_graph import get_project_graph
-    from companion.safety import run_unit_tests
+    from companion.tools import run_unit_tests
     from companion.sdlc_tools import _current_branch, _run_git_cmd
     from companion.streaming import stream_event_context
     from surfaces.web_server import CompanionWebSession
@@ -385,7 +385,7 @@ def scenario_07_parallel_vllm_worktrees() -> Dict[str, Any]:
     from companion.background_jobs import BackgroundJobManager
     from companion.llm import chat
     from companion.project_graph import get_project_graph
-    from companion.safety import run_unit_tests
+    from companion.tools import run_unit_tests
     from companion.worktree_runner import dispatch_parallel_ready_items, merge_worktree_into_base
 
     with IsolatedEnvContext(coding_provider="vllm-spark", coding_model=VLLM_MODEL, mode="coding") as ctx:
@@ -500,7 +500,7 @@ def scenario_09_dev_preview_browser_dogfood() -> Dict[str, Any]:
 
 
 def scenario_10_graceful_awaiting_approval_stop() -> Dict[str, Any]:
-    from companion.archive_and_approvals import get_approval_queue
+    from companion.approvals import get_approval_queue
     from companion.core_actions import execute_core_action
     from companion.llm import chat
     from companion.streaming import stream_event_context

@@ -19,10 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue, get_trust_mode
+from companion.approvals import get_approval_queue, get_trust_mode
 from companion.config import get_execution_origin
 from companion.llm import chat, normalize_assistant_message, tier_context
-from companion.semantic_memory import semantic_similarity
+from companion.memory_store import semantic_similarity
 from companion.telemetry import redact_secrets
 from companion.wiki_engine import WikiEngine
 from companion.wiki_templates import (

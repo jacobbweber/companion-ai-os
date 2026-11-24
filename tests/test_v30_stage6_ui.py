@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from companion.archive_and_approvals import enqueue_session_nudge
+from companion.approvals import enqueue_session_nudge
 from companion.memory_store import MemoryStore
 from surfaces.web_assets import read_static_asset, render_web_index_html
 from surfaces.web_server import CompanionHTTPServer, create_web_server, dispatch_raw_http

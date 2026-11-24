@@ -14,7 +14,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from companion.archive_and_approvals import get_approval_queue
+from companion.approvals import get_approval_queue
 from companion.config import settings
 from companion.core_actions import execute_core_action
 from companion.dag_runtime import (
@@ -30,17 +30,17 @@ from companion.dag_runtime import (
     self_test_dag,
 )
 from companion.endpoints import get_endpoint_manager
-from companion.intake import match_verified_dag, triage_turn
+from companion.agent import match_verified_dag, triage_turn
 from companion.mcp_hub import get_mcp_hub, harvest_mcp_capability_pack
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.os_tools import _dict_arg
+from companion.tools import _dict_arg
 from companion.project_graph import get_project_graph
 from companion.routines import (
     IdleAutonomyWatcher,
     format_morning_briefing,
     get_routine_manager,
 )
-from companion.safety import lint_single_file_edit
+from companion.tools import lint_single_file_edit
 from companion.skill_forge import run_skill_script, stage_and_promote_skill, validate_skill_markdown
 from companion.tools import resolve
 from companion.trigger_policy import (
@@ -568,7 +568,7 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
 
     def test_project_focus_bridge_personal_triage_and_flashcard_fence_guard(self) -> None:
         from companion.agent import _extract_turn_widget_fence
-        from companion.intake import assess_turn_readiness, triage_turn
+        from companion.agent import assess_turn_readiness, triage_turn
         from companion.project_graph import format_project_graph_hud
 
         with tempfile.TemporaryDirectory() as tmp, contextlib.closing(MemoryStore(db_path=Path(tmp) / "focus.db")) as store:

@@ -10,23 +10,23 @@ from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import patch
 
-from companion.archive_and_approvals import ActionRiskTier, classify_action_risk
-from companion.autonomy import _execute_implement_tasks, run_autonomous_goal
-from companion.blueprint import handle_blueprint_conversation_turn, is_pure_blueprint_question
-from companion.checkpoints import CheckpointManager
-from companion.compaction import build_lossless_phase_handoff, extract_key_tokens
+from companion.approvals import ActionRiskTier, classify_action_risk
+from companion.agent import _execute_implement_tasks, run_autonomous_goal
+from companion.agent import handle_blueprint_conversation_turn, is_pure_blueprint_question
+from companion.vault import CheckpointManager
+from companion.context import build_lossless_phase_handoff, extract_key_tokens
 from companion.config import workspace_context
-from companion.grounding import LocalKnowledgeAdapter
-from companion.intake import classify_turn_intent
+from companion.context import LocalKnowledgeAdapter
+from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.safety import lint_single_file_edit
-from companion.semantic_memory import cosine_f32_bytes, pack_f32_vector
+from companion.tools import lint_single_file_edit
+from companion.memory_store import cosine_f32_bytes, pack_f32_vector
 from companion.skill_forge import build_skill_script_command, parse_pep723_dependencies
 from companion.streaming import emit_stream_event, read_completion_or_sse_stream, stream_event_context
 from companion.telemetry import TelemetryEngine
 from companion.tools import tool_read_file, tool_search, tool_web_fetch
 from companion.workflow_dag import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks
-from companion.workflow_graph import WorkflowEngine
+from companion.agent import WorkflowEngine
 from surfaces.web_assets import read_static_asset, render_web_index_html
 from surfaces.web_server import CompanionHTTPServer, CompanionWebSession, dispatch_raw_http
 

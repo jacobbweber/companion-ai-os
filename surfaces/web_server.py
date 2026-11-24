@@ -9,14 +9,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.agent import handle_slash_command, run_agent_turn
-from companion.autonomy import run_autonomous_goal
-from companion.blueprint import create_or_revise_blueprint, is_awaiting_blueprint_approval
+from companion.agent import run_autonomous_goal
+from companion.agent import create_or_revise_blueprint, is_awaiting_blueprint_approval
 from companion.config import settings
 from companion.context import build_system_prompt, manage_active_project, manage_companion_tone, manage_model_tier
 from companion.llm import chat, model_gate
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
 from companion.project_graph import get_project_graph
-from companion.safety import run_system_doctor
+from companion.tools import run_system_doctor
 from companion.streaming import CancelScope, cancel_scope_context, get_active_cancel_scope, stream_event_context
 from companion.telemetry import notify_db_closed, read_ro_rows, telemetry
 from surfaces.api_extensions import (

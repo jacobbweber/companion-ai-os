@@ -8,18 +8,12 @@ from typing import Any, Callable, Dict, List
 from unittest.mock import patch
 
 from companion.agent import handle_slash_command, run_agent_turn, run_subagent
-from companion.autonomy import resolve_workflow_phase_tier, run_autonomous_goal, run_phase_turn
-from companion.blueprint import (
-    approve_blueprint_and_build,
-    classify_blueprint_reply,
-    create_or_revise_blueprint,
-    format_blueprint_card,
-    is_awaiting_blueprint_approval,
-)
-from companion.compaction import classify_task_autoskip, format_task_carry_forward
+from companion.agent import resolve_workflow_phase_tier, run_autonomous_goal, run_phase_turn
+from companion.agent import approve_blueprint_and_build, classify_blueprint_reply, create_or_revise_blueprint, format_blueprint_card, is_awaiting_blueprint_approval
+from companion.context import classify_task_autoskip, format_task_carry_forward
 from companion.config import SELF_PROJECT_ID, TierConfig, settings, workspace_context
 from companion.memory_store import MemoryStore
-from companion.safety import CheckpointManager
+from companion.tools import CheckpointManager
 from surfaces import create_web_server, dispatch_raw_http, render_web_index_html
 
 
@@ -158,7 +152,7 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
                     self.assertIn("Revised Blueprint Ready for Your Review", bp2["summary"])
                     self.assertNotIn("DISCOVER", phases_seen[4:])
 
-                    with patch("companion.autonomy.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
+                    with patch("companion.agent.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
                         reply = run_agent_turn([{"role": "user", "content": "Looks great, go ahead and build it!"}], chat_fn=fake_bp_chat, store=store, verbose=False)
                     self.assertIn("Autonomous Goal Execution: COMPLETE", reply)
                     self.assertTrue((ws_root / "greeter.py").is_file())
@@ -188,7 +182,7 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
                     _, st_raw = dispatch_raw_http(srv, method="GET", path="/api/status")
                     self.assertTrue(json.loads(st_raw)["awaiting_approval"])
 
-                    with patch("companion.autonomy.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
+                    with patch("companion.agent.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
                         code2, raw2 = dispatch_raw_http(srv, method="POST", path="/api/chat", body=json.dumps({"message": "/approve", "async": False}).encode("utf-8"), headers=csrf_hdrs)
                     self.assertEqual(code2, 200)
                     self.assertIn("COMPLETE", json.loads(raw2)["response"])
@@ -346,7 +340,7 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
 
         from companion.memory_store import memory_store_context
         from companion.workflow_dag import GoalPlan, GoalStep, VerificationSpec
-        from companion.workflow_graph import WorkflowEngine
+        from companion.agent import WorkflowEngine
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

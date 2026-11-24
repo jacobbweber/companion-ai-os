@@ -21,7 +21,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from companion.archive_and_approvals import enqueue_session_nudge
+from companion.approvals import enqueue_session_nudge
 from companion.config import execution_origin_context, settings, workspace_context
 from companion.llm import chat, model_gate, tier_context
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
@@ -34,7 +34,7 @@ from companion.streaming import (
     wire_attachment_context,
 )
 from companion.telemetry import redact_secrets, trace_scope
-from companion.tool_schemas import TOOLS, phase_tool_context
+from companion.tools import ALL_TOOL_NAMES, TOOLS, phase_tool_context
 from companion.wiki_engine import get_wiki_engine
 
 __all__ = [
@@ -100,7 +100,7 @@ _JOBS_LOCK = threading.RLock()
 def resolve_paired_worker_tools(requested: Optional[List[str]] = None) -> List[str]:
     """Ensure every worker receives complementary read/inspect tools alongside any action tool (never `job_manage`)."""
     base = [str(t).strip() for t in (requested or list(_DEFAULT_WORKER_TOOLS)) if str(t).strip()]
-    known = {t["function"]["name"] for t in TOOLS}
+    known = set(ALL_TOOL_NAMES)
     expanded: List[str] = []
     for name in base:
         if name == "job_manage":

@@ -12,13 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 from companion.agent import handle_slash_command
-from companion.archive_and_approvals import (
-    ApprovalQueue,
-    consume_session_nudges,
-    enqueue_session_nudge,
-    peek_session_nudges,
-    set_trust_mode,
-)
+from companion.approvals import ApprovalQueue, consume_session_nudges, enqueue_session_nudge, peek_session_nudges, set_trust_mode
 from companion.config import (
     Settings,
     agent_tool_turn_context,
@@ -27,7 +21,7 @@ from companion.config import (
 )
 from companion.core_actions import execute_core_action
 from companion.dag_runtime import execute_dag_by_name, resume_dag_run
-from companion.intake import classify_turn_intent
+from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.project_graph import get_project_graph
 from companion.routines import (
@@ -36,7 +30,7 @@ from companion.routines import (
     describe_operating_quadrant,
     get_routine_manager,
 )
-from companion.safety import check_path_safety
+from companion.tools import check_path_safety
 from companion.sdlc_tools import (
     PreviewProcessManager,
     discover_repo_sdlc_context,
@@ -45,7 +39,7 @@ from companion.sdlc_tools import (
     tool_git_manage,
 )
 from companion.skill_forge import stage_and_promote_skill
-from companion.tool_schemas import phase_tool_context
+from companion.tools import phase_tool_context
 from companion.tools import dispatch
 from companion.vault import VaultManager
 from surfaces.api_extensions import register_service_reload_handler

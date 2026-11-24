@@ -14,7 +14,7 @@ from companion.memory_store import MemoryStore, get_memory_store, memory_store_c
 from companion.project_graph import get_project_graph
 from companion.sdlc_tools import _current_branch, _run_git_cmd, check_git_stage_safety, discover_repo_sdlc_context, is_ephemeral_cache_path, preview_manager, tool_git_manage
 from companion.streaming import CancelScope, cancel_scope_context, check_cancelled, get_active_cancel_scope, get_active_stream_sink
-from companion.tool_schemas import int_arg
+from companion.tools import int_arg
 
 __all__ = [
     "WORKTREE_CODE_TOOLS", "collect_worktree_deliverable_receipt", "discard_worktree", "dispatch_parallel_ready_items",

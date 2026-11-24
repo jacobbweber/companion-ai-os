@@ -21,14 +21,14 @@ from companion.config import settings, workspace_context
 from companion.context import build_system_prompt
 from companion.core_actions import execute_core_action, handle_harvest_slash
 from companion.education_engine import get_education_engine
-from companion.grounding import discover_skills, rank_relevant_skills
-from companion.harvest_tools import tool_agile_manage, tool_education_manage
-from companion.intake import classify_turn_intent
+from companion.context import discover_skills, rank_relevant_skills
+from companion.tools import tool_agile_manage, tool_education_manage
+from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
 from companion.routines import get_routine_manager
 from companion.skill_forge import run_skill_script
-from companion.tool_schemas import check_phase_tool_permission, filter_tools_for_phase
+from companion.tools import check_phase_tool_permission, filter_tools_for_phase
 from companion.tools import tool_search, tool_web_search
 from companion.wiki_templates import list_templates
 from surfaces.api_extensions import enrich_web_status
@@ -252,13 +252,13 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
                 self.assertNotIn("notes.md", s_py)
 
             # web_search privacy lock + HTML Lite parsing
-            with unittest.mock.patch("companion.os_tools.settings.effective_privacy_mode", return_value="local_only"), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
+            with unittest.mock.patch("companion.tools.settings.effective_privacy_mode", return_value="local_only"), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
                 self.assertIn("PRIVACY LOCK", tool_web_search({"query": "Ubuntu GDM black screen"}))
             fake_html = b'<html><body><a class="result__a" href="https://example.com/gdm">Fix GDM Black Screen</a><a class="result__snippet">Restart gdm service.</a></body></html>'
             fake_resp = unittest.mock.MagicMock()
             fake_resp.read.return_value = fake_html
             fake_resp.__enter__.return_value = fake_resp
-            with unittest.mock.patch("companion.os_tools.settings.effective_privacy_mode", return_value="hybrid"), unittest.mock.patch("companion.os_tools.urlopen_safe", return_value=fake_resp), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
+            with unittest.mock.patch("companion.tools.settings.effective_privacy_mode", return_value="hybrid"), unittest.mock.patch("companion.tools.urlopen_safe", return_value=fake_resp), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
                 ws_out = tool_web_search({"query": "Ubuntu GDM", "max_results": 3})
             self.assertIn("Fix GDM Black Screen", ws_out)
             self.assertIn("https://example.com/gdm", ws_out)

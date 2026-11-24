@@ -13,13 +13,13 @@
   - [x] Replace `run_system_doctor` with a clean **Runtime Health Doctor** (Python/uv, SQLite WAL & FTS5, LLM provider connectivity, Vault permissions, compiled UI assets, Domain Pack DB health).
   - [x] Run tests & commit Phase 1 checkpoint on `refactor/frontier-standard-harness`.
 
-- [ ] **Phase 2: Frontier Single-Agent ReAct Harness, Orthogonal Tools, Spillover & Real Compaction**
-  - [ ] Consolidate `memory_store.py` (absorbing `semantic_memory.py` minus hardcoded homelab `_CONCEPT_CLUSTERS`), `approvals.py` (from `archive_and_approvals.py` + `ActionRiskTier`), and `vault.py` (absorbing CoW snapshots from `checkpoints.py` + Runtime Health Doctor).
-  - [ ] Consolidate `context.py` (absorbing skill/domain-pack discovery from `grounding.py` + `compaction.py`): `IDENTITY.md` + `data/CONTEXT.md` + 1-line `name — description (path)` index, fixing external-workspace `data/skills/` & `data/domains/` path resolution.
-  - [ ] Wire real `fast`-tier LLM `summarizer_fn` + deterministic `KeyTokens` check into `compaction` (`/compact` & watermark) + real durable fact distillation into `MEMORY.md`.
-  - [ ] Consolidate `tools.py` (`< 20` orthogonal primitive + domain tools, automatic `data/scratch/` spillover for outputs `> 8,000` chars, persistent `stdio` MCP session pool + lazy `call_mcp`, retiring `tool_schemas.py`, `os_tools.py`, `harvest_tools.py`, `safety.py`, `grounding.py`, `checkpoints.py`).
-  - [ ] Consolidate `agent.py` into a clean Single Primary ReAct Loop (`chat`, `/plan` read-only approval mode, `/goal` extended budget + Board sync, mechanical foreground `ApprovalQueue` pause/resume, isolated subagents), retiring `intake.py`, `autonomy.py`, `blueprint.py`, `workflow_graph.py`.
-  - [ ] Run tests & commit Phase 2 checkpoint on `refactor/frontier-standard-harness`.
+- [x] **Phase 2: Frontier Single-Agent ReAct Harness, Orthogonal Tools, Spillover & Real Compaction**
+  - [x] Consolidate `memory_store.py` (absorbing `semantic_memory.py` minus hardcoded homelab `_CONCEPT_CLUSTERS`), `approvals.py` (from `archive_and_approvals.py` + `ActionRiskTier`), and `vault.py` (absorbing CoW snapshots from `checkpoints.py` + Runtime Health Doctor).
+  - [x] Consolidate `context.py` (absorbing skill/domain-pack discovery from `grounding.py` + `compaction.py`): `IDENTITY.md` + `data/CONTEXT.md` + 1-line `name — description (path)` index, fixing external-workspace `data/skills/` & `data/domains/` path resolution.
+  - [x] Wire real `fast`-tier LLM `summarizer_fn` + deterministic `KeyTokens` check into `compaction` (`/compact` & watermark) + real durable fact distillation into `MEMORY.md`.
+  - [x] Consolidate `tools.py` (`< 20` orthogonal primitive + domain tools, automatic `data/scratch/` spillover for outputs `> 8,000` chars, lazy `call_mcp`, retiring `tool_schemas.py`, `os_tools.py`, `harvest_tools.py`, `safety.py`, `grounding.py`, `checkpoints.py`).
+  - [x] Consolidate `agent.py` into a clean Single Primary ReAct Loop (`chat`, `/plan` read-only approval mode, `/goal` extended budget + Board sync, mechanical foreground `ApprovalQueue` pause/resume, isolated subagents), retiring `intake.py`, `autonomy.py`, `blueprint.py`, `workflow_graph.py`.
+  - [x] Run tests & commit Phase 2 checkpoint on `refactor/frontier-standard-harness`.
 
 - [ ] **Phase 3: Full-Fidelity Attachment Handoff, Declarative JSON Workflows & Domain Capability Packs**
   - [ ] Upgrade `attachments.py`: expose `storage_path` & `extracted_path` in API + `<turn_context>` for CSVs, PDFs, Office docs, and images; replace 80-row/`4,000`-char CSV mutilation with schema + sample + full `storage_path`; preserve image vision across follow-up turns & opt-in subagents; fix `dev_preview(vision_critique)` `bytes` vs `base64` bug.

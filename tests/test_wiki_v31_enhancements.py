@@ -8,7 +8,7 @@ import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from companion.archive_and_approvals import set_trust_mode
+from companion.approvals import set_trust_mode
 from companion.core_actions import execute_core_action, handle_harvest_slash
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.wiki_engine import get_wiki_engine, parse_frontmatter, render_frontmatter

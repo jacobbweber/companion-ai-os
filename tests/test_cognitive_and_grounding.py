@@ -9,20 +9,14 @@ from unittest.mock import patch
 
 from companion import __doc__ as companion_pkg_doc
 from companion.agent import handle_slash_command, run_agent_turn
-from companion.autonomy import (
-    IntentDecision,
-    _evaluate_hard_verification,
-    _snapshot_file_hashes,
-    classify_turn_intent,
-    run_autonomous_goal,
-)
-from companion.compaction import build_lossless_phase_handoff
+from companion.agent import IntentDecision, _evaluate_hard_verification, _snapshot_file_hashes, classify_turn_intent, run_autonomous_goal
+from companion.context import build_lossless_phase_handoff
 from companion.config import SKIP_DIRS, Settings, settings, walk_pruned_files, workspace_context
 from companion.context import build_system_prompt
 from companion.llm import current_tier_name, normalize_assistant_message, rescue_text_tool_calls
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.safety import CheckpointManager, lint_single_file_edit
-from companion.tool_schemas import TOOLS, check_phase_tool_permission, filter_tools_for_phase, phase_tool_context
+from companion.tools import CheckpointManager, lint_single_file_edit
+from companion.tools import TOOLS, check_phase_tool_permission, filter_tools_for_phase, phase_tool_context
 from companion.tools import dispatch, extract_python_symbol, tool_edit_file, tool_read_file, tool_write_file
 
 
@@ -84,7 +78,7 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
 
     def test_upgrade3_workspace_radar_and_symbol_read_file(self) -> None:
         """Verify workspace radar and surgical `read_file(..., symbol=...)` slicing."""
-        from companion.grounding import build_workspace_radar
+        from companion.context import build_workspace_radar
 
         radar = build_workspace_radar(settings.root)
         self.assertIn("companion/config.py", radar)
@@ -97,10 +91,10 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
             try:
                 with workspace_context(settings.root, "companion-self"):
                     runtime_p = build_system_prompt(store=store)
-                    self.assertNotIn("[CODEBASE AST & LINE-BUDGET RADAR", runtime_p)
+                    self.assertNotIn("[ACTIVE WORKSPACE FILES", runtime_p)
                 with workspace_context(ext_repo, "ext-repo"):
                     sys_p = build_system_prompt(store=store)
-                    self.assertIn("[CODEBASE AST & LINE-BUDGET RADAR", sys_p)
+                    self.assertIn("[ACTIVE WORKSPACE FILES", sys_p)
             finally:
                 store.close()
 
@@ -232,7 +226,7 @@ class TestCognitiveAndGroundingUpgrades(unittest.TestCase):
                     phases_called.append(str(messages[-1]["content"])[:55])
                     return {"choices": [{"message": {"role": "assistant", "content": "Implemented widget cleanly."}}]}
 
-                with patch("companion.autonomy.run_system_doctor", return_value={"healthy": True, "checks": [], "summary": "PASS"}):
+                with patch("companion.agent.run_system_doctor", return_value={"healthy": True, "checks": [], "summary": "PASS"}):
                     res = run_autonomous_goal(
                         goal="resume",
                         chat_fn=fake_resume_chat,

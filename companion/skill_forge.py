@@ -23,18 +23,13 @@ import tomllib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from companion.checkpoints import CheckpointManager, checkpoint_manager
+from companion.vault import CheckpointManager, checkpoint_manager
 from companion.config import SELF_PROJECT_ID, settings
 from companion.dag_runtime import discover_dags, execute_dag_by_name, get_dag_run, list_dag_runs, resume_dag_run, self_test_dag
-from companion.grounding import (
-    discover_skills,
-    get_execution_target,
-    get_knowledge_port,
-    invalidate_skills_cache,
-    rank_relevant_skills,
-)
+from companion.context import discover_skills, get_knowledge_port, invalidate_skills_cache, rank_relevant_skills
+from companion.tools import get_execution_target
 from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
-from companion.safety import validate_python_syntax
+from companion.tools import validate_python_syntax
 from companion.telemetry import redact_secrets, telemetry
 from companion.vault import get_vault_manager
 

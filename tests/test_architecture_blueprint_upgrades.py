@@ -13,25 +13,23 @@ from typing import Any, Dict, List
 from unittest.mock import patch
 
 from companion.agent import run_agent_turn
-from companion.autonomy import run_autonomous_goal
-from companion.blueprint import approve_blueprint_and_build, create_or_revise_blueprint, is_awaiting_blueprint_approval
-from companion.archive_and_approvals import ActionRiskTier, classify_action_risk
-from companion.compaction import compact_messages_if_needed
+from companion.agent import run_autonomous_goal
+from companion.agent import approve_blueprint_and_build, create_or_revise_blueprint, is_awaiting_blueprint_approval
+from companion.approvals import ActionRiskTier, classify_action_risk
+from companion.context import compact_messages_if_needed
 from companion.config import SELF_PROJECT_ID, settings, workspace_context
 from companion.context import build_system_prompt
-from companion.grounding import (
-    KnowledgeEntry, LocalWorkspaceTarget, build_epistemic_grounding, build_workspace_radar,
-    get_knowledge_port, register_execution_target, register_knowledge_adapter,
-)
-from companion.intake import assess_turn_readiness, select_turn_step_tier
+from companion.context import KnowledgeEntry, build_epistemic_grounding, build_workspace_radar, get_knowledge_port, register_knowledge_adapter
+from companion.tools import LocalWorkspaceTarget, register_execution_target
+from companion.agent import assess_turn_readiness, select_turn_step_tier
 from companion.llm import current_tier_name
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.safety import CheckpointManager
+from companion.tools import CheckpointManager
 from companion.skill_forge import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
-from companion.tool_schemas import check_phase_tool_permission, phase_tool_context
+from companion.tools import check_phase_tool_permission, phase_tool_context
 from companion.tools import dispatch
 from companion.workflow_dag import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks, evaluate_step_verification
-from companion.workflow_graph import WorkflowEngine
+from companion.agent import WorkflowEngine
 from surfaces.web_server import CompanionWebSession
 
 

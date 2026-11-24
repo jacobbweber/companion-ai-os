@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from companion.archive_and_approvals import get_approval_queue
+from companion.approvals import get_approval_queue
 from companion.config import settings
 from companion.memory_store import MemoryStore, get_memory_store
 from companion.telemetry import telemetry

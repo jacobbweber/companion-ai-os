@@ -11,7 +11,7 @@ import zlib
 from pathlib import Path
 
 from companion.attachments import ingest_attachment, prepare_turn_attachments
-from companion.intake import classify_turn_intent, select_turn_step_tier
+from companion.agent import classify_turn_intent, select_turn_step_tier
 from companion.llm import _sanitize_wire_messages, current_tier_name
 from companion.memory_store import MemoryStore
 from companion.streaming import wire_attachment_context

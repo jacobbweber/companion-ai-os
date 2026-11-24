@@ -12,9 +12,9 @@ from companion.dag_runtime import (
     execute_dag_by_name,
     execute_dag_spec,
 )
-from companion.grounding import LocalWorkspaceTarget, register_execution_target
+from companion.tools import LocalWorkspaceTarget, register_execution_target
 from companion.memory_store import MemoryStore
-from companion.safety import CheckpointManager
+from companion.tools import CheckpointManager
 from companion.workflow_dag import (
     GoalPlan,
     GoalStep,
@@ -22,7 +22,7 @@ from companion.workflow_dag import (
     evaluate_step_verification,
     is_node_output_passed,
 )
-from companion.workflow_graph import WorkflowEngine, WorkflowState
+from companion.agent import WorkflowEngine, WorkflowState
 
 
 class TestWorkflowGraph(unittest.TestCase):

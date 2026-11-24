@@ -7,11 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from companion.archive_and_approvals import (
-    TRUST_MODES, archive_aged_conversations, current_session_id, delete_prompt_template, dismiss_session_nudges,
-    format_forever_search_results, get_approval_queue, get_trust_mode, list_prompt_templates, render_prompt_template,
-    save_prompt_template, search_forever_history, set_trust_mode,
-)
+from companion.approvals import TRUST_MODES, archive_aged_conversations, current_session_id, delete_prompt_template, dismiss_session_nudges, format_forever_search_results, get_approval_queue, get_trust_mode, list_prompt_templates, render_prompt_template, save_prompt_template, search_forever_history, set_trust_mode
 from companion.background_jobs import get_job_manager
 from companion.calendar_engine import execute_calendar_action
 from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, workspace_context
@@ -28,7 +24,7 @@ from companion.routines import (
     get_routine_manager,
 )
 from companion.skill_forge import execute_customizations_action
-from companion.tool_schemas import r3_approval_context
+from companion.tools import r3_approval_context
 from companion.vault import create_snapshot_backup, get_vault_manager, list_snapshot_backups, restore_snapshot_backup
 from companion.wiki_curation import commit_curation_plan, inspect_graduation, list_curation_history, revert_curation, validate_curation_plan
 from companion.wiki_engine import get_wiki_engine
@@ -692,7 +688,7 @@ def execute_core_action(action_name: str, params: Optional[Dict[str, Any]] = Non
 
 
 def handle_harvest_slash(verb: str, arg: str, store: Optional[MemoryStore] = None) -> str:
-    """Unified CLI/REPL slash handler delegating to `companion.harvest_tools.dispatch_harvest_slash`."""
-    from companion.harvest_tools import dispatch_harvest_slash
+    """Unified CLI/REPL slash handler delegating to `companion.tools.dispatch_harvest_slash`."""
+    from companion.tools import dispatch_harvest_slash
 
     return dispatch_harvest_slash(verb, arg, store=store)

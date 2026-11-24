@@ -6,12 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from companion.archive_and_approvals import set_trust_mode
+from companion.approvals import set_trust_mode
 from companion.background_jobs import marshal_job_envelope
 from companion.core_actions import execute_core_action, handle_harvest_slash
 from companion.memory_store import MemoryStore
 from companion.routines import BUILTIN_IDLE_ROUTINES, RoutineManager
-from companion.tool_schemas import check_phase_tool_permission
+from companion.tools import check_phase_tool_permission
 from companion.wiki_curation import pending_curation_nudge
 from companion.wiki_engine import WikiEngine
 from companion.wiki_templates import list_templates, load_tag_authority, parse_frontmatter, render_frontmatter

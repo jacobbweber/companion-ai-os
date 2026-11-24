@@ -30,7 +30,7 @@ class TestConfigAndArchitecture(unittest.TestCase):
         self.assertEqual(issues, [])
 
     def test_syntax_guard_catches_invalid_python_and_json(self) -> None:
-        from companion.safety import lint_single_file_edit
+        from companion.tools import lint_single_file_edit
 
         with tempfile.TemporaryDirectory() as tmp:
             gov = Path(tmp)
@@ -102,7 +102,7 @@ class TestConfigAndArchitecture(unittest.TestCase):
         """Verify trailing/consecutive `system` messages are normalized for vLLM Jinja and empty external builds fail gate."""
         from unittest.mock import patch
 
-        from companion.autonomy import _evaluate_hard_verification
+        from companion.agent import _evaluate_hard_verification
         from companion.config import workspace_context
         from companion.llm import _sanitize_wire_messages, chat
 
@@ -198,7 +198,7 @@ class TestConfigAndArchitecture(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 store = MemoryStore(db_path=Path(tmp) / "swap_tier.db")
                 try:
-                    with patch("companion.intake.settings", cfg_swap):
+                    with patch("companion.agent.settings", cfg_swap):
                         self.assertEqual(_select_step_tier("auto", store, consecutive_errors=3, step=2, intent_mode="GUIDED_CHANGE"), "reasoning")
                         self.assertEqual(_select_step_tier("auto", store, consecutive_errors=0, step=0, intent_mode="DEEP_CONSULT"), "reasoning")
                         self.assertEqual(_select_step_tier("auto", store, consecutive_errors=0, step=1, intent_mode="DEEP_CONSULT", prior_tier="reasoning"), "reasoning")

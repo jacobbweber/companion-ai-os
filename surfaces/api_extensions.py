@@ -19,7 +19,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue, get_trust_mode, peek_session_nudges
+from companion.approvals import get_approval_queue, get_trust_mode, peek_session_nudges
 from companion.attachments import (
     get_attachment_record,
     ingest_attachment,
@@ -27,7 +27,7 @@ from companion.attachments import (
     read_attachment_raw,
 )
 from companion.background_jobs import get_job_manager
-from companion.checkpoints import get_active_checkpoint_manager
+from companion.vault import get_active_checkpoint_manager
 from companion.config import settings
 from companion.core_actions import execute_core_action, list_core_actions
 from companion.education_engine import get_education_engine
@@ -41,7 +41,7 @@ from companion.streaming import wire_attachment_context
 from companion.telemetry import TelemetryEngine, read_ro_rows, telemetry
 from companion.wiki_engine import get_wiki_engine
 from companion.wiki_maintenance import read_wiki_asset_raw
-from companion.workflow_graph import WorkflowEngine
+from companion.agent import WorkflowEngine
 
 __all__ = [
     "build_history_payload",

@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue
+from companion.approvals import get_approval_queue
 from companion.attachments import MAX_ATTACHMENT_BYTES, inspect_image_bytes
 from companion.config import walk_pruned_files
 from companion.telemetry import redact_secrets

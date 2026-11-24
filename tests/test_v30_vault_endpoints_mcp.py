@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict
 
-from companion.archive_and_approvals import get_approval_queue, peek_session_nudges, set_trust_mode
+from companion.approvals import get_approval_queue, peek_session_nudges, set_trust_mode
 from companion.context import build_system_prompt
 from companion.core_actions import execute_core_action
 from companion.endpoints import EndpointManager

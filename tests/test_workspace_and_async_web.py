@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from companion.agent import handle_slash_command
-from companion.autonomy import run_autonomous_goal
+from companion.agent import run_autonomous_goal
 from companion.config import SELF_PROJECT_ID, settings, workspace_context
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.telemetry import TelemetryEngine
-from companion.tool_schemas import phase_tool_context
+from companion.tools import phase_tool_context
 from companion.tools import dispatch, resolve, tool_project_manage, tool_read_file, tool_write_file
 from surfaces import create_web_server, dispatch_raw_http
 

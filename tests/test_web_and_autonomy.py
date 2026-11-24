@@ -12,16 +12,10 @@ from unittest.mock import patch
 
 from companion.agent import run_agent_turn
 from companion.config import settings
-from companion.autonomy import (
-    PHASE_TIERS,
-    resolve_workflow_phase_tier,
-    run_autonomous_goal,
-    run_http_smoke_probe,
-    scan_placeholder_violations,
-)
+from companion.agent import PHASE_TIERS, resolve_workflow_phase_tier, run_autonomous_goal, run_http_smoke_probe, scan_placeholder_violations
 from companion.llm import current_tier_name
 from companion.memory_store import MemoryStore
-from companion.safety import CheckpointManager, normalize_windows_shell_command
+from companion.tools import CheckpointManager, normalize_windows_shell_command
 from companion.tools import dispatch, tool_run_shell
 from harness import _coalesce_pasted_lines
 from surfaces import CompanionWebSession, create_web_server, detect_lan_ip, dispatch_raw_http, render_web_index_html

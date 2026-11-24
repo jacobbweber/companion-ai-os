@@ -24,10 +24,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.config import settings
-from companion.archive_and_approvals import ActionRiskTier
-from companion.safety import validate_python_syntax
-from companion.grounding import get_execution_target
-from companion.safety import check_command_safety
+from companion.approvals import ActionRiskTier
+from companion.tools import validate_python_syntax
+from companion.tools import get_execution_target
+from companion.tools import check_command_safety
 
 __all__ = [
     "DOMAIN_VALIDATOR_REGISTRY",

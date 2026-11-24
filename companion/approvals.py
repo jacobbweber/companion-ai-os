@@ -23,8 +23,7 @@ from enum import Enum
 from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 from companion.config import is_in_agent_tool_turn
-from companion.memory_store import MemoryStore, get_memory_store, parse_time_window
-from companion.semantic_memory import hybrid_rrf_rank
+from companion.memory_store import MemoryStore, get_memory_store, hybrid_rrf_rank, parse_time_window
 from companion.telemetry import redact_secrets
 
 __all__ = [

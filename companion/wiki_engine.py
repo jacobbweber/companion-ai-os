@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue, get_trust_mode
+from companion.approvals import get_approval_queue, get_trust_mode
 from companion.config import get_execution_origin, settings, walk_pruned_files
 from companion.memory_store import MemoryStore, get_memory_store
-from companion.semantic_memory import hybrid_rrf_rank
+from companion.memory_store import hybrid_rrf_rank
 from companion.telemetry import redact_secrets
 from companion.wiki_templates import (
     BUILTIN_TEMPLATE_MAP, as_slug_list, canonicalize_ontology, compute_body_metrics, default_review_days,
