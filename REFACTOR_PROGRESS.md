@@ -40,9 +40,9 @@
   - [x] Consolidate `integrations.py` (`endpoints.py` + `mcp_hub.py` with persistent `stdio` MCP client & real LLM MCP `Harvest Pack` generating `SKILL.md` + `*.workflow.json`), update `core_actions.py`, and upgrade `/checkin` to synthesize a real LLM priority coaching brief over deterministic state.
   - [x] Build frontend (`npm --prefix frontend test` & `npm --prefix frontend run build`), run backend tests, & commit Phase 5 checkpoint.
 
-- [ ] **Phase 6: Comprehensive Test Suite Alignment & Static UI Build Verification**
-  - [ ] Align `tests/` suite with the lean ~25-module architecture; verify 100% of 18 HTTP/SSE routes, 18 `callAction` domains, declarative workflows, attachment `storage_path` handoff, domain SQLite packs, and LLM-validated verbs.
-  - [ ] Run `npm --prefix frontend test`, `npm --prefix frontend run build`, full Python test suite, and Runtime Doctor; commit Phase 6 checkpoint.
+- [x] **Phase 6: Comprehensive Test Suite Alignment & Static UI Build Verification**
+  - [x] Align `tests/` suite with the lean ~25-module architecture; verify 100% of 18 HTTP/SSE routes, 18 `callAction` domains, declarative workflows, attachment `storage_path` handoff, domain SQLite packs, and LLM-validated verbs.
+  - [x] Run `npm --prefix frontend test`, `npm --prefix frontend run build`, full Python test suite, and Runtime Doctor; commit Phase 6 checkpoint.
 
 - [ ] **Phase 7: Mandatory Live End-to-End Dogfood Gate & Final Cleanup**
   - [ ] Launch refactored Companion web server on ephemeral local port wired to a real live LLM (isolated test `COMPANION_DATA_DIR` so personal `data/` stays clean, or verified domain sandbox).

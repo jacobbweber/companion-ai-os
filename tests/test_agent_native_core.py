@@ -595,5 +595,141 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
             self.assertTrue(fence.startswith("```companion-flashcards"))
 
 
+class TestFrontierStandardHarnessContracts(unittest.TestCase):
+    """End-to-end verification of the 25-module Frontier Standard Harness invariants."""
+
+    def test_module_budget_tool_budget_and_zero_builder_leakage(self) -> None:
+        from companion.context import discover_skills
+        from companion.tools import TOOLS
+
+        py_modules = sorted(p.name for p in (settings.root / "companion").glob("*.py"))
+        self.assertLessEqual(len(py_modules), 25, f"Expected <=25 companion/*.py modules, found {len(py_modules)}: {py_modules}")
+        self.assertLess(len(TOOLS), 20, f"Expected <20 orthogonal tool schemas, found {len(TOOLS)}")
+
+        runtime_skill_names = {str(s["name"]) for s in discover_skills(root=settings.root)}
+        builder_only = {"anti-sprawl-gate", "product-intent-dogfood", "web-surface-dev", "devops-ops", "release-readiness"}
+        self.assertEqual(runtime_skill_names & builder_only, set())
+
+        legacy_py_dags = list((settings.root / "skills").glob("*/dags/*.py"))
+        self.assertEqual(legacy_py_dags, [])
+
+    def test_domain_sqlite_pack_declarative_json_workflow_and_18_core_action_domains(self) -> None:
+        import base64
+        import sqlite3
+        from companion.attachments import ingest_attachment, rehydrate_recent_turn_images
+        from companion.workflows import DAGRuntimeBindings, ensure_domain_pack, execute_dag_by_name
+        from tests.test_attachments import _make_valid_png
+
+        orig_data = settings.data_dir
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                custom_data = (tmp_path / "data").resolve()
+                settings.data_dir = custom_data
+                with contextlib.closing(MemoryStore(db_path=custom_data / "companion.db")) as store, memory_store_context(store):
+                    # 1. Initialize isolated Domain Capability Pack (`household-finance.db` in WAL mode)
+                    pack_res = ensure_domain_pack("household-finance", description="Track groceries and receipts in isolated SQLite.")
+                    self.assertTrue(pack_res["ok"], pack_res)
+                    db_path = Path(pack_res["db_path"])
+                    self.assertTrue(db_path.is_file())
+                    with contextlib.closing(sqlite3.connect(db_path)) as dconn:
+                        jmode = dconn.execute("PRAGMA journal_mode;").fetchone()[0].lower()
+                        self.assertEqual(jmode, "wal")
+
+                    # 2. Write deterministic script + declarative `.workflow.json` inside the domain pack
+                    pack_dir = Path(pack_res["path"])
+                    script_file = pack_dir / "scripts" / "rollup.py"
+                    script_file.write_text(
+                        "import json, sqlite3, sys\n"
+                        "db = sys.argv[1]\n"
+                        "conn = sqlite3.connect(db)\n"
+                        "conn.execute('CREATE TABLE IF NOT EXISTS expenses (category TEXT, cents INTEGER)')\n"
+                        "conn.execute('DELETE FROM expenses')\n"
+                        "conn.executemany('INSERT INTO expenses VALUES (?, ?)', [('produce', 4250), ('bakery', 1875)])\n"
+                        "conn.commit()\n"
+                        "tot = conn.execute('SELECT SUM(cents) FROM expenses').fetchone()[0]\n"
+                        "conn.close()\n"
+                        "print(json.dumps({'total_cents': tot, 'total_usd': round(tot / 100.0, 2)}))\n",
+                        encoding="utf-8",
+                    )
+                    wf_file = pack_dir / "workflows" / "budget_check.workflow.json"
+                    wf_file.write_text(
+                        json.dumps({
+                            "name": "household-budget-check",
+                            "description": "Compute deterministic SQLite grocery rollup and synthesize budget note.",
+                            "nodes": [
+                                {"id": "calc", "type": "run_script", "script": str(script_file), "args": [str(db_path)]},
+                                {
+                                    "id": "brief",
+                                    "type": "llm_step",
+                                    "depends_on": ["calc"],
+                                    "prompt": "Summarize grocery spend: {{calc}}",
+                                    "output_schema": {"headline": "str"},
+                                },
+                            ],
+                        }),
+                        encoding="utf-8",
+                    )
+
+                    wf_out = execute_dag_by_name(
+                        "household-budget-check",
+                        store=store,
+                        root=settings.root,
+                        bindings=DAGRuntimeBindings(
+                            llm_fn=lambda *_a, **_kw: json.dumps({"headline": "Spent $61.25 across produce and bakery."})
+                        ),
+                    )
+                    self.assertTrue(wf_out["ok"], wf_out)
+                    self.assertEqual(wf_out["status"], "completed")
+                    self.assertEqual(wf_out["nodes"]["calc"]["total_cents"], 6125)
+                    self.assertIn("$61.25", wf_out["final_output"]["headline"])
+
+                    # 3. Verify `customizations.list` exposes Domain Capability Pack + workflow cleanly
+                    cust = execute_core_action("customizations", {"subaction": "list"}, actor="web", store=store)
+                    self.assertTrue(cust["ok"])
+                    pack_entries = [s for s in cust["skills"] if s["name"] == "household-finance"]
+                    self.assertEqual(len(pack_entries), 1)
+                    self.assertEqual(pack_entries[0]["scope"], "domain")
+                    self.assertTrue(any(d["name"] == "household-budget-check" for d in cust["dags"]))
+
+                    # 4. Verify follow-up image vision rehydration from persisted turn history
+                    png_b64 = "data:image/png;base64," + base64.b64encode(_make_valid_png(8, 8)).decode("ascii")
+                    att_r = ingest_attachment("receipt.png", png_b64, store=store)
+                    self.assertTrue(att_r["ok"])
+                    aid = att_r["attachment"]["id"]
+                    prior_msgs = [{"role": "user", "content": f"Here is the market photo [Attached Image `receipt.png` | attachment_id=`{aid}`]"}]
+                    rehydrated = rehydrate_recent_turn_images(prior_msgs, user_message="What total is on the receipt?", store=store)
+                    self.assertEqual(len(rehydrated), 1)
+                    self.assertTrue(rehydrated[0].startswith("data:image/png;base64,"))
+
+                    # 5. Smoke-check all 18 CoreActions domains
+                    domain_probes = [
+                        ("jobs", {"subaction": "list"}),
+                        ("wiki", {"subaction": "list_templates"}),
+                        ("vault", {"subaction": "list"}),
+                        ("endpoints", {"subaction": "list"}),
+                        ("mcp", {"subaction": "list_servers"}),
+                        ("partners", {"subaction": "list"}),
+                        ("routines", {"subaction": "list"}),
+                        ("autonomy", {"subaction": "status"}),
+                        ("approvals", {"subaction": "list"}),
+                        ("models", {"subaction": "matrix"}),
+                        ("agile", {"subaction": "hud"}),
+                        ("calendar", {"subaction": "agenda"}),
+                        ("education", {"subaction": "list_courses"}),
+                        ("customizations", {"subaction": "list"}),
+                        ("dags", {"subaction": "list"}),
+                        ("git", {"subaction": "status"}),
+                        ("worktrees", {"subaction": "list"}),
+                        ("preview", {"subaction": "list"}),
+                    ]
+                    self.assertEqual(len(domain_probes), 18)
+                    for dom, payload in domain_probes:
+                        res = execute_core_action(dom, payload, actor="web", store=store)
+                        self.assertIn("ok", res, f"Domain {dom} missing ok key: {res}")
+        finally:
+            settings.data_dir = orig_data
+
+
 if __name__ == "__main__":
     unittest.main()

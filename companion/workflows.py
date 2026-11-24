@@ -239,18 +239,19 @@ class WorkflowNode:
         self.output_schema = _norm_schema(self.output_schema)
         cfg = dict(self.config or {})
         if cfg:
-            if not self.tool_name and cfg.get("tool_name"):
-                self.tool_name = str(cfg["tool_name"])
+            if not self.tool_name and (cfg.get("tool_name") or cfg.get("tool")):
+                self.tool_name = str(cfg.get("tool_name") or cfg.get("tool"))
             if not self.script and cfg.get("script"):
                 self.script = str(cfg["script"])
-            if not self.cli_args and isinstance(cfg.get("cli_args"), list):
-                self.cli_args = [str(x) for x in cfg["cli_args"]]
+            raw_cli = cfg.get("cli_args") if isinstance(cfg.get("cli_args"), list) else (cfg.get("args") if isinstance(cfg.get("args"), list) else None)
+            if not self.cli_args and raw_cli is not None:
+                self.cli_args = [str(x) for x in raw_cli]
             if self.args_builder is None and isinstance(cfg.get("args"), dict):
                 self.args_builder = dict(cfg["args"])
-            if not self.server_id and cfg.get("server_id"):
-                self.server_id = str(cfg["server_id"])
-            if not self.prompt_template and cfg.get("prompt_template"):
-                self.prompt_template = str(cfg["prompt_template"])
+            if not self.server_id and (cfg.get("server_id") or cfg.get("server")):
+                self.server_id = str(cfg.get("server_id") or cfg.get("server"))
+            if not self.prompt_template and (cfg.get("prompt_template") or cfg.get("prompt")):
+                self.prompt_template = str(cfg.get("prompt_template") or cfg.get("prompt"))
             if cfg.get("system_prompt"):
                 self.system_prompt = str(cfg["system_prompt"])
             if cfg.get("tier"):
@@ -359,8 +360,17 @@ class WorkflowSpec:
                 kw["kind"] = _KIND_ALIAS.get(raw_k, raw_k)
                 if "func" in d and "fn" not in kw:
                     kw["fn"] = d["func"]
-                if "args" in d and "args_builder" not in kw and isinstance(d["args"], dict):
-                    kw["args_builder"] = dict(d["args"])
+                if "prompt" in d and "prompt_template" not in kw:
+                    kw["prompt_template"] = str(d["prompt"])
+                if "tool" in d and "tool_name" not in kw:
+                    kw["tool_name"] = str(d["tool"])
+                if "args" in d:
+                    if isinstance(d["args"], dict) and "args_builder" not in kw:
+                        kw["args_builder"] = dict(d["args"])
+                    elif isinstance(d["args"], list) and "cli_args" not in kw:
+                        kw["cli_args"] = [str(x) for x in d["args"]]
+                if "script_args" in d and isinstance(d["script_args"], list) and "cli_args" not in kw:
+                    kw["cli_args"] = [str(x) for x in d["script_args"]]
                 coerced.append(WorkflowNode(**kw))
             else:
                 coerced.append(nd)
