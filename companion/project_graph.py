@@ -20,11 +20,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from companion.config import SELF_PROJECT_ID, _WORKSPACE_OVERRIDE, settings, workspace_context
 from companion.memory_store import MemoryStore, get_memory_store
-from companion.trigger_policy import (
-    TriggerPolicy,
-    evaluate_trigger_eligibility,
-    register_trigger_precheck,
-)
+from companion.routines import TriggerPolicy, evaluate_trigger_eligibility, register_trigger_precheck
 from companion.vault import normalize_secret_name
 
 VALID_ITEM_OWNERS = ("companion", "human", "collaborative")

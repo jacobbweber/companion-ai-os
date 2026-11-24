@@ -14,7 +14,7 @@ from pathlib import Path
 
 from companion.agent import handle_slash_command, run_agent_turn
 from companion.approvals import archive_aged_conversations, consume_session_nudges, enqueue_session_nudge, get_approval_queue, get_trust_mode, peek_session_nudges, render_prompt_template, save_prompt_template, search_forever_history, session_id_context, set_trust_mode
-from companion.background_jobs import MAX_ENVELOPE_CHARS, BackgroundJobManager, resolve_paired_worker_tools
+from companion.jobs import MAX_ENVELOPE_CHARS, BackgroundJobManager, resolve_paired_worker_tools
 from companion.config import execution_origin_context
 from companion.core_actions import execute_core_action, list_core_actions
 from companion.context import build_epistemic_grounding

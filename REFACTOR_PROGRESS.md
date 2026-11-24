@@ -21,12 +21,12 @@
   - [x] Consolidate `agent.py` into a clean Single Primary ReAct Loop (`chat`, `/plan` read-only approval mode, `/goal` extended budget + Board sync, mechanical foreground `ApprovalQueue` pause/resume, isolated subagents), retiring `intake.py`, `autonomy.py`, `blueprint.py`, `workflow_graph.py`.
   - [x] Run tests & commit Phase 2 checkpoint on `refactor/frontier-standard-harness`.
 
-- [ ] **Phase 3: Full-Fidelity Attachment Handoff, Declarative JSON Workflows & Domain Capability Packs**
-  - [ ] Upgrade `attachments.py`: expose `storage_path` & `extracted_path` in API + `<turn_context>` for CSVs, PDFs, Office docs, and images; replace 80-row/`4,000`-char CSV mutilation with schema + sample + full `storage_path`; preserve image vision across follow-up turns & opt-in subagents; fix `dev_preview(vision_critique)` `bytes` vs `base64` bug.
-  - [ ] Build `companion/workflows.py` (declarative `*.workflow.json` schema + typed Node Catalog: `llm_step` w/ JSON schema validation, `run_script`, `call_tool`, `mcp_step`, `human_gate`, `foreach` + `contextvars.copy_context()` + SQLite `workflow_runs`/`dag_runs` checkpoints), retiring `dag_runtime.py` & `workflow_dag.py` and migrating valid runtime workflows to `*.workflow.json`.
-  - [ ] Establish `data/CONTEXT.md` + `data/domains/<pack>/` ICM Domain Capability Pack support (`data/domains/<pack>/<pack>.db` or `data/domains/<pack>/data/<pack>.db` WAL SQLite isolation + `scripts/` + `workflows/*.workflow.json`).
-  - [ ] Consolidate `jobs.py` (from `background_jobs.py` with full runtime skill/pack context) and `routines.py` (absorbing `trigger_policy.py`).
-  - [ ] Run tests & commit Phase 3 checkpoint on `refactor/frontier-standard-harness`.
+- [x] **Phase 3: Full-Fidelity Attachment Handoff, Declarative JSON Workflows & Domain Capability Packs**
+  - [x] Upgrade `attachments.py`: expose `storage_path` & `extracted_path` in API + `<turn_context>` for CSVs, PDFs, Office docs, and images; replace 80-row/`4,000`-char CSV mutilation with schema + sample + full `storage_path`; preserve image vision across follow-up turns & opt-in subagents; fix `dev_preview(vision_critique)` `bytes` vs `base64` bug.
+  - [x] Build `companion/workflows.py` (declarative `*.workflow.json` schema + typed Node Catalog: `llm_step` w/ JSON schema validation, `run_script`, `call_tool`, `mcp_step`, `human_gate`, `foreach` + `contextvars.copy_context()` + SQLite `workflow_runs`/`dag_runs` checkpoints), retiring `dag_runtime.py` & `workflow_dag.py` and migrating valid runtime workflows to `*.workflow.json`.
+  - [x] Establish `data/CONTEXT.md` + `data/domains/<pack>/` ICM Domain Capability Pack support (`data/domains/<pack>/<pack>.db` WAL SQLite isolation + `scripts/` + `workflows/*.workflow.json`).
+  - [x] Consolidate `jobs.py` (from `background_jobs.py` with full runtime skill/pack context) and `routines.py` (absorbing `trigger_policy.py`).
+  - [x] Run tests & commit Phase 3 checkpoint on `refactor/frontier-standard-harness`.
 
 - [ ] **Phase 4: Eliminate All Hollow Verbs in `Knowledge` & `Study` Studios**
   - [ ] Consolidate `wiki.py` (`wiki_engine.py` + `wiki_templates.py` + `wiki_maintenance.py`) and `wiki_curation.py` (absorbing `skill_forge.py` staging validator).

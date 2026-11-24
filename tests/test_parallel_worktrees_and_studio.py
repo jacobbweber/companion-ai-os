@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from companion.attachments import read_attachment_raw
-from companion.background_jobs import BackgroundJobManager
+from companion.jobs import BackgroundJobManager
 from companion.config import settings
 from companion.core_actions import execute_core_action
 from companion.llm import ModelGate

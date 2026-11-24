@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion import __version__
 from companion.approvals import get_approval_queue, get_trust_mode
-from companion.background_jobs import get_job_manager
+from companion.jobs import get_job_manager
 from companion.config import is_in_agent_tool_turn, settings
 from companion.llm_wire import check_url_ssrf, urlopen_safe
 from companion.memory_store import MemoryStore, get_memory_store
@@ -663,14 +663,30 @@ def harvest_mcp_capability_pack(server_id: str, pack_name: Optional[str] = None,
         '        print(json.dumps({"ok": True, "server_id": SERVER_ID, "tool_count": len(TOOLS)}))\n        return 0\n'
         '    print(json.dumps({"server_id": SERVER_ID, "tools": [t.get("name") for t in TOOLS]}))\n    return 0\n\n\nif __name__ == "__main__":\n    raise SystemExit(main())\n'
     )
-    dag_py = (
-        f'"""Harvested deterministic Python DAG for MCP server `{srv["server_id"]}`."""\n\nfrom companion.dag_runtime import DAGNode, DAGSpec\n\n\n'
-        'def _summarize_mcp(ctx):\n    raw = ctx["nodes"].get("invoke_mcp", {})\n    return {"ok": bool(raw.get("ok", True)), "summary": str(raw.get("output") or raw.get("summary") or "MCP call complete.")}\n\n\n'
-        f"DAG = DAGSpec(name={dag_name!r}, description={('Deterministic MCP pipeline for ' + srv['label'])!r}, nodes=[\n"
-        f"    DAGNode(node_id='invoke_mcp', kind='mcp_step', server_id={srv['server_id']!r}, tool_name={first_tool!r}, args_builder=lambda ctx: dict(ctx['params'])),\n"
-        "    DAGNode(node_id='summarize', kind='python_step', depends_on=['invoke_mcp'], fn=_summarize_mcp, output_schema={'ok': 'bool', 'summary': 'str'}),\n], self_test_fn=lambda: True)\n"
-    )
-    res = stage_and_promote_skill(name=pack, skill_md=skill_md, scripts={"mcp_client_helper.py": helper_py}, dags={f"{dag_name.replace('-', '_')}.py": dag_py}, references={"mcp-tools.md": "\n".join(ref_lines)}, overwrite=overwrite, root=root, scope="user")
+    wf_spec = {
+        "name": dag_name,
+        "description": f"Deterministic declarative MCP workflow for {srv['label']}.",
+        "nodes": [
+            {
+                "id": "invoke_mcp",
+                "type": "mcp_step",
+                "config": {
+                    "server_id": srv["server_id"],
+                    "tool_name": first_tool,
+                    "args": {},
+                },
+                "output_schema": {"ok": "bool"},
+            },
+            {
+                "id": "verify_schema",
+                "type": "run_script",
+                "depends_on": ["invoke_mcp"],
+                "config": {"script": "scripts/mcp_client_helper.py"},
+                "output_schema": {"server_id": "str", "tools": "list"},
+            },
+        ],
+    }
+    res = stage_and_promote_skill(name=pack, skill_md=skill_md, scripts={"mcp_client_helper.py": helper_py}, dags={f"{dag_name}.workflow.json": json.dumps(wf_spec, indent=2)}, references={"mcp-tools.md": "\n".join(ref_lines)}, overwrite=overwrite, root=root, scope="user")
     hint = f" Harvested DAG `{dag_name}` (run via `workflow_manage(action='run_dag', dag='{dag_name}', params=...)` or `mcp_manage(action='call_tool', server_id='{srv['server_id']}', tool_name='{first_tool}', arguments=...)`)." if res.get("promoted") else ""
     return {**res, "ok": bool(res.get("promoted")), "pack_name": pack, "dag_name": dag_name, "summary": str(res.get("summary") or "") + hint}
 

@@ -20,7 +20,7 @@ from companion.config import (
     workspace_context,
 )
 from companion.core_actions import execute_core_action
-from companion.dag_runtime import execute_dag_by_name, resume_dag_run
+from companion.workflows import execute_dag_by_name, resume_dag_run
 from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.project_graph import get_project_graph

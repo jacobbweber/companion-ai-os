@@ -28,7 +28,7 @@ from companion.tools import CheckpointManager
 from companion.skill_forge import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
 from companion.tools import check_phase_tool_permission, phase_tool_context
 from companion.tools import dispatch
-from companion.workflow_dag import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks, evaluate_step_verification
+from companion.workflows import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks, evaluate_step_verification
 from companion.agent import WorkflowEngine
 from surfaces.web_server import CompanionWebSession
 
@@ -306,7 +306,7 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
 
             try:
                 with workspace_context(ws, "dag-proj"), memory_store_context(st):
-                    from companion.dag_runtime import execute_dag_by_name
+                    from companion.workflows import execute_dag_by_name
                     dag_res = execute_dag_by_name("full-audit", params={"run_tests": False}, store=st)
                     self.assertIn("status", dag_res)
 

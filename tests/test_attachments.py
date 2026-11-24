@@ -225,6 +225,19 @@ class TestMultimodalChatAttachments(unittest.TestCase):
                 with wire_attachment_context("doc block", ("data:image/png;base64,AAA",)):
                     self.assertEqual(classify_turn_intent("Build 4 files now").mode, "CHAT_DIRECT")
                     self.assertIn(select_turn_step_tier("fast", None, 0), ("reasoning", "image"))
+
+                # 5. Large multi-row CSV preserves exact on-disk storage_path without 80-row/12KB mutilation
+                csv_lines = ["date,merchant,category,amount"] + [f"2026-11-{(i % 28) + 1:02d},Grocer_{i},groceries,{10.25 + i:.2f}" for i in range(250)]
+                csv_raw = ("\n".join(csv_lines) + "\n").encode("utf-8")
+                r_csv = ingest_attachment("household_november.csv", base64.b64encode(csv_raw).decode("ascii"), store=store)
+                self.assertTrue(r_csv["ok"])
+                csv_att = r_csv["attachment"]
+                self.assertTrue(Path(csv_att["storage_path"]).is_file())
+                self.assertEqual(len(Path(csv_att["storage_path"]).read_text(encoding="utf-8").splitlines()), 251)
+                prep_csv = prepare_turn_attachments("Sum all 250 grocery rows", [csv_att["id"]], store=store)
+                self.assertIn(csv_att["storage_path"], prep_csv.wire_doc_context)
+                self.assertIn("251", prep_csv.wire_doc_context)
+                self.assertIn(csv_att["storage_path"], prep_csv.followup_doc_note)
             finally:
                 store.close()
 

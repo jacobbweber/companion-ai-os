@@ -654,10 +654,11 @@ def _critique_screenshots(raw_paths: Any, prompt: str) -> str:
         if info is None:
             return f"error: invalid image file: {p}"
         mime, w, h = info
-        att = ingest_attachment(p.name, raw, store=get_memory_store())
+        b64_img = base64.b64encode(raw).decode("ascii")
+        att = ingest_attachment(p.name, b64_img, mime_type=mime, store=get_memory_store())
         aid = (att.get("attachment") or {}).get("id", "") if att.get("ok") else ""
         ingested.append(f"`{p.name}` ({w}x{h}" + (f", attachment=`{aid}`" if aid else "") + ")")
-        uris.append(f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}")
+        uris.append(f"data:{mime};base64,{b64_img}")
     ask = prompt.strip() or "Inspect these Desktop and Mobile UI screenshots for layout overlap, broken contrast, missing controls, or visible error banners."
     try:
         with wire_attachment_context(image_data_uris=uris), tier_context("image"):

@@ -382,7 +382,7 @@ def scenario_06_tdd_bugfix_comparison() -> Dict[str, Any]:
 
 
 def scenario_07_parallel_vllm_worktrees() -> Dict[str, Any]:
-    from companion.background_jobs import BackgroundJobManager
+    from companion.jobs import BackgroundJobManager
     from companion.llm import chat
     from companion.project_graph import get_project_graph
     from companion.tools import run_unit_tests

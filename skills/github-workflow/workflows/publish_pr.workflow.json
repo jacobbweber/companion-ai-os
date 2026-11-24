@@ -1,0 +1,80 @@
+{
+  "name": "publish-pr",
+  "description": "Push verified feature branch, open/update GitHub PR via Blind Vault, inspect Actions checks, and gate PR merge behind human approval.",
+  "input_schema": {
+    "repo": "str",
+    "head": "str",
+    "base?": "str",
+    "title?": "str",
+    "body?": "str",
+    "credential_ref?": "str",
+    "auto_merge?": "bool"
+  },
+  "nodes": [
+    {
+      "id": "verify_delivery_policy",
+      "type": "run_script",
+      "config": {
+        "script": "scripts/github_pr_ci.py",
+        "cli_args": ["--action", "verify-policy"]
+      },
+      "output_schema": {
+        "ok": "bool",
+        "delivery_policy": "str",
+        "credential_ref": "str",
+        "head": "str"
+      }
+    },
+    {
+      "id": "push_feature_branch",
+      "type": "call_tool",
+      "depends_on": ["verify_delivery_policy"],
+      "config": {
+        "tool_name": "git_manage",
+        "args": {
+          "action": "push",
+          "remote": "origin",
+          "branch": "{{params.head}}"
+        }
+      },
+      "output_schema": {
+        "ok": "bool"
+      }
+    },
+    {
+      "id": "open_or_update_pr",
+      "type": "run_script",
+      "depends_on": ["verify_delivery_policy", "push_feature_branch"],
+      "config": {
+        "script": "scripts/github_pr_ci.py",
+        "cli_args": ["--action", "upsert-pr"]
+      },
+      "output_schema": {
+        "ok": "bool",
+        "pr_number": "int",
+        "html_url": "str"
+      }
+    },
+    {
+      "id": "merge_approval_gate",
+      "type": "human_gate",
+      "depends_on": ["open_or_update_pr"],
+      "condition": "params.auto_merge",
+      "risk_tier": "R3",
+      "description": "Approve squash-merge of verified Pull Request into base branch."
+    },
+    {
+      "id": "merge_pr",
+      "type": "run_script",
+      "depends_on": ["verify_delivery_policy", "open_or_update_pr", "merge_approval_gate"],
+      "condition": "params.auto_merge",
+      "config": {
+        "script": "scripts/github_pr_ci.py",
+        "cli_args": ["--action", "merge-pr", "--approved"]
+      },
+      "output_schema": {
+        "ok": "bool"
+      }
+    }
+  ]
+}

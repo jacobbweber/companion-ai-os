@@ -1,0 +1,46 @@
+{
+  "name": "pre-commit-verify",
+  "description": "Deterministic pre-commit SDLC gate checking feature-branch safety, secret/DB staging blocks, and repository unit tests.",
+  "input_schema": {
+    "repo_root?": "str",
+    "files?": "list",
+    "test_command?": "str",
+    "require_feature_branch?": "bool"
+  },
+  "nodes": [
+    {
+      "id": "check_stage_safety",
+      "type": "run_script",
+      "config": {
+        "script": "scripts/pre_commit_check.py",
+        "cli_args": ["--action", "stage-safety"]
+      },
+      "output_schema": {
+        "ok": "bool",
+        "repo_root": "str",
+        "branch": "str"
+      }
+    },
+    {
+      "id": "run_repo_tests",
+      "type": "run_script",
+      "depends_on": ["check_stage_safety"],
+      "timeout_sec": 200.0,
+      "config": {
+        "script": "scripts/pre_commit_check.py",
+        "cli_args": ["--action", "run-tests"]
+      },
+      "output_schema": {
+        "ok": "bool",
+        "skipped": "bool"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "check_stage_safety",
+      "to": "run_repo_tests",
+      "condition": "check_stage_safety.ok"
+    }
+  ]
+}

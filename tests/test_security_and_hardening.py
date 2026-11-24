@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from companion.approvals import ActionRiskTier, ApprovalQueue, classify_action_risk, peek_session_nudges, set_trust_mode
-from companion.background_jobs import BackgroundJobManager
+from companion.jobs import BackgroundJobManager
 from companion.config import agent_tool_turn_context, settings
 from companion.core_actions import execute_core_action
 from companion.endpoints import EndpointManager
@@ -275,7 +275,7 @@ class TestSecurityAndHardening(unittest.TestCase):
 
         jm = BackgroundJobManager(store=self.store)
         with patch(
-            "companion.dag_runtime.execute_dag_by_name",
+            "companion.workflows.execute_dag_by_name",
             return_value={"ok": False, "status": "failed", "error": "gate failed"},
         ):
             dispatched = jm.dispatch_job(

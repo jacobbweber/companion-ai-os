@@ -339,7 +339,7 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
         import threading
 
         from companion.memory_store import memory_store_context
-        from companion.workflow_dag import GoalPlan, GoalStep, VerificationSpec
+        from companion.workflows import GoalPlan, GoalStep, VerificationSpec
         from companion.agent import WorkflowEngine
 
         with tempfile.TemporaryDirectory() as tmp:

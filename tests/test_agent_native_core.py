@@ -8,6 +8,7 @@ End-to-End Verification Suite for the 5-Phase Agent-Native Headless Core Refacto
 """
 
 import contextlib
+import json
 import tempfile
 import time
 import unittest
@@ -17,18 +18,7 @@ from pathlib import Path
 from companion.approvals import get_approval_queue
 from companion.config import settings
 from companion.core_actions import execute_core_action
-from companion.dag_runtime import (
-    DAGNode,
-    DAGRuntimeBindings,
-    DAGSpec,
-    dag_node,
-    discover_dags,
-    dry_run_dag,
-    execute_dag_spec,
-    get_dag_run,
-    resume_dag_run,
-    self_test_dag,
-)
+from companion.workflows import DAGNode, DAGRuntimeBindings, DAGSpec, dag_node, discover_dags, dry_run_dag, execute_dag_spec, get_dag_run, resume_dag_run, self_test_dag
 from companion.endpoints import get_endpoint_manager
 from companion.agent import match_verified_dag, triage_turn
 from companion.mcp_hub import get_mcp_hub, harvest_mcp_capability_pack
@@ -43,18 +33,8 @@ from companion.routines import (
 from companion.tools import lint_single_file_edit
 from companion.skill_forge import run_skill_script, stage_and_promote_skill, validate_skill_markdown
 from companion.tools import resolve
-from companion.trigger_policy import (
-    TriggerPolicy,
-    evaluate_trigger_eligibility,
-    is_within_allowed_window,
-    matches_cron_5field,
-    register_trigger_precheck,
-)
-from companion.workflow_dag import (
-    VerificationSpec,
-    evaluate_step_verification,
-    register_domain_validator,
-)
+from companion.routines import TriggerPolicy, evaluate_trigger_eligibility, is_within_allowed_window, matches_cron_5field, register_trigger_precheck
+from companion.workflows import VerificationSpec, evaluate_step_verification, register_domain_validator
 
 
 def _mock_chat_fn(_messages, _tools=None, _tool_choice="auto"):
@@ -255,29 +235,38 @@ class TestPhase2CodeControlledDAGRuntimeAndForge(unittest.TestCase):
             (root / "skills").mkdir(parents=True)
             skill_md = (
                 "---\nname: sample-forged-pack\n"
-                "description: Use when testing forged code-controlled Python DAG promotion.\n"
-                "required_tools: [workflow_manage]\n---\n"
+                "description: Use when testing forged declarative JSON workflow promotion.\n"
+                "required_tools: [ops_manage]\n---\n"
                 "# Sample Forged Pack\n\n"
-                "## When to Use This Skill\nUse during DAG forge tests.\n\n"
-                "## Step-by-Step Procedure\n1. Run `dags/sample_pipeline.py`.\n"
+                "## When to Use This Skill\nUse during workflow forge tests.\n\n"
+                "## Step-by-Step Procedure\n1. Run `workflows/sample_pipeline.workflow.json`.\n"
             )
-            dag_code = (
-                "from companion.dag_runtime import DAGNode, DAGSpec, execute_dag_spec\n\n"
-                "DAG = DAGSpec(\n"
-                "    name='sample-pipeline',\n"
-                "    description='Sample deterministic forged pipeline',\n"
-                "    nodes=[DAGNode('step1', output_schema={'ok': 'bool'}, fn=lambda _c: {'ok': True})],\n"
-                "    self_test_fn=lambda: execute_dag_spec(DAG)['status'] == 'completed',\n"
-                ")\n"
+            helper_py = (
+                '"""Helper script for sample-pipeline."""\nimport json, sys\n'
+                'if "--self-test" in sys.argv:\n    print(json.dumps({"ok": True}))\n    raise SystemExit(0)\n'
+                'print(json.dumps({"ok": True, "rows": 3}))\n'
             )
+            wf_json = json.dumps({
+                "name": "sample-pipeline",
+                "description": "Sample deterministic declarative JSON workflow",
+                "nodes": [
+                    {
+                        "id": "step1",
+                        "type": "run_script",
+                        "config": {"script": "scripts/step1.py"},
+                        "output_schema": {"ok": "bool", "rows": "int"},
+                    }
+                ],
+            })
             res = stage_and_promote_skill(
                 name="sample-forged-pack",
                 skill_md=skill_md,
-                dags={"sample_pipeline.py": dag_code},
+                scripts={"step1.py": helper_py},
+                dags={"sample_pipeline.workflow.json": wf_json},
                 root=root,
             )
             self.assertTrue(res["promoted"], f"Forge failed: {res}")
-            self.assertTrue((root / "skills" / "sample-forged-pack" / "dags" / "sample_pipeline.py").is_file())
+            self.assertTrue((root / "skills" / "sample-forged-pack" / "workflows" / "sample_pipeline.workflow.json").is_file())
 
 
 class TestPhase3UniversalProjectGraphAndAgileCoach(unittest.TestCase):
@@ -440,7 +429,7 @@ class TestPhase5SelfWiringHarvesterAndDomainValidators(unittest.TestCase):
                 self.assertTrue((pack_dir / "SKILL.md").is_file())
                 self.assertTrue((pack_dir / "references" / "mcp-tools.md").is_file())
                 self.assertTrue((pack_dir / "scripts" / "mcp_client_helper.py").is_file())
-                dags = list((pack_dir / "dags").glob("*.py"))
+                dags = list((pack_dir / "workflows").glob("*.workflow.json"))
                 self.assertEqual(len(dags), 1)
                 self.assertTrue(self_test_dag(dags[0])["ok"])
 
@@ -534,19 +523,19 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
                 )
                 self.assertTrue(ok, detail)
 
-                dag_src = (
-                    "from companion.dag_runtime import DAGNode, DAGSpec\n"
-                    "DAG = DAGSpec(name='ext-data-dag', description='External data dir DAG test', "
-                    "nodes=[DAGNode('n1', fn=lambda _c: {'ok': True})], self_test_fn=lambda: True)\n"
-                )
+                wf_src = json.dumps({
+                    "name": "ext-data-dag",
+                    "description": "External data dir declarative JSON workflow test",
+                    "nodes": [{"id": "n1", "type": "call_tool", "config": {"tool_name": "list_dir", "args": {"path": "."}}}],
+                })
                 err, _warn = lint_single_file_edit(
-                    settings.root / "data" / "skills" / "ext-pack" / "dags" / "ext_dag.py",
-                    dag_src,
+                    settings.root / "data" / "skills" / "ext-pack" / "workflows" / "ext_dag.workflow.json",
+                    wf_src,
                 )
                 self.assertIsNone(err)
-                dag_dir = custom_data / "skills" / "ext-pack" / "dags"
-                dag_dir.mkdir(parents=True)
-                (dag_dir / "ext_dag.py").write_text(dag_src, encoding="utf-8")
+                wf_dir = custom_data / "skills" / "ext-pack" / "workflows"
+                wf_dir.mkdir(parents=True)
+                (wf_dir / "ext_dag.workflow.json").write_text(wf_src, encoding="utf-8")
                 names = [d["name"] for d in discover_dags(root=settings.root)]
                 self.assertIn("ext-data-dag", names)
         finally:

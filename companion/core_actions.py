@@ -8,11 +8,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from companion.approvals import TRUST_MODES, archive_aged_conversations, current_session_id, delete_prompt_template, dismiss_session_nudges, format_forever_search_results, get_approval_queue, get_trust_mode, list_prompt_templates, render_prompt_template, save_prompt_template, search_forever_history, set_trust_mode
-from companion.background_jobs import get_job_manager
+from companion.jobs import get_job_manager
 from companion.calendar_engine import execute_calendar_action
 from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, workspace_context
 from companion.context import execute_identity_action
-from companion.dag_runtime import resume_dag_run
+from companion.workflows import resume_dag_run
 from companion.education_engine import execute_education_action
 from companion.endpoints import get_endpoint_manager
 from companion.mcp_hub import format_connected_partners_hud, get_mcp_hub, harvest_mcp_capability_pack

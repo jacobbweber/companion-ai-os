@@ -28,7 +28,9 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from companion.memory_store import MemoryStore  # noqa: E402
+from companion.config import settings  # noqa: E402
+from companion.memory_store import MemoryStore, get_memory_store  # noqa: E402
+from companion.project_graph import get_project_graph  # noqa: E402
 from companion.vault import VaultManager, get_vault_manager  # noqa: E402
 
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -233,29 +235,67 @@ def _run_self_test() -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def verify_delivery_policy(params: Dict[str, Any]) -> Dict[str, Any]:
+    head = str(params.get("head") or "").strip()
+    if not head or head in ("main", "master"):
+        return {"ok": False, "error": f"Feature branch required (`head={head!r}`); direct `main`/`master` PR publish is blocked."}
+    pg = get_project_graph(store=get_memory_store())
+    pid = str(params.get("project_id") or settings.get_workspace().project_id or "").strip()
+    proj = pg.get_project(pid) if pid else None
+    policy = str((proj or {}).get("delivery_policy") or params.get("delivery_policy") or "local_only")
+    if policy == "local_only":
+        return {"ok": False, "error": "Project `delivery_policy` is `local_only`; remote branch push & PR creation are blocked."}
+    cred_ref = str(params.get("credential_ref") or (proj or {}).get("git_credential_ref") or "github-pat")
+    return {"ok": True, "delivery_policy": policy, "credential_ref": cred_ref, "head": head}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Blind-Vault GitHub PR & Actions helper.")
     parser.add_argument("--self-test", action="store_true", help="Run offline loopback mock GitHub API self-test.")
-    parser.add_argument("--action", choices=["upsert-pr", "checks", "merge-pr"], default="checks")
+    parser.add_argument("--action", choices=["verify-policy", "upsert-pr", "checks", "merge-pr"], default="checks")
     parser.add_argument("--repo", default="", help="owner/repo")
     parser.add_argument("--head", default="", help="Feature branch or commit SHA")
     parser.add_argument("--base", default="main", help="Base branch")
     parser.add_argument("--title", default="", help="PR title")
     parser.add_argument("--body", default="", help="PR description")
     parser.add_argument("--pr-number", type=int, default=0, help="PR number for merge-pr")
-    parser.add_argument("--credential-ref", default="github-pat", help="Symbolic Blind Vault secret slug")
+    parser.add_argument("--credential-ref", default="", help="Symbolic Blind Vault secret slug")
     parser.add_argument("--api-base", default="https://api.github.com", help="GitHub REST API base URL")
     parser.add_argument("--approved", action="store_true", help="Confirm human approval for merge-pr")
     args = parser.parse_args()
     if args.self_test:
         return _run_self_test()
-    if args.action == "upsert-pr":
-        res = upsert_pull_request(args.repo, args.head, args.base, args.title, args.body, args.credential_ref, api_base=args.api_base)
+    stdin_payload: Dict[str, Any] = {}
+    if sys.stdin is not None and not sys.stdin.isatty():
+        raw_in = sys.stdin.read().strip()
+        if raw_in:
+            try:
+                stdin_payload = json.loads(raw_in)
+            except Exception:
+                stdin_payload = {}
+    wf_in = dict(stdin_payload.get("input") or stdin_payload.get("params") or {})
+    repo = args.repo or str(wf_in.get("repo") or "")
+    head = args.head or str(wf_in.get("head") or "")
+    base = args.base if args.base != "main" else str(wf_in.get("base") or "main")
+    title = args.title or str(wf_in.get("title") or f"feat: {head}")
+    body = args.body or str(wf_in.get("body") or "Automated verified PR from Companion SDLC.")
+    cred_ref = args.credential_ref or str(wf_in.get("credential_ref") or "github-pat")
+    api_base = args.api_base if args.api_base != "https://api.github.com" else str(wf_in.get("api_base") or "https://api.github.com")
+    pr_num = args.pr_number or int(wf_in.get("pr_number") or wf_in.get("number") or 0)
+    if args.action == "verify-policy":
+        res = verify_delivery_policy({**wf_in, "head": head})
+    elif args.action == "upsert-pr":
+        pr_res = upsert_pull_request(repo, head, base, title, body, cred_ref, api_base=api_base)
+        if pr_res.get("ok"):
+            chk = inspect_check_runs(repo, head, cred_ref, api_base=api_base)
+            res = {**pr_res, "pr_number": int(pr_res.get("number") or 0), "checks": chk}
+        else:
+            res = pr_res
     elif args.action == "merge-pr":
-        res = merge_pull_request(args.repo, args.pr_number, args.credential_ref, approved=args.approved, api_base=args.api_base)
+        res = merge_pull_request(repo, pr_num, cred_ref, approved=bool(args.approved or wf_in.get("approved")), api_base=api_base)
     else:
-        res = inspect_check_runs(args.repo, args.head, args.credential_ref, api_base=args.api_base)
-    print(json.dumps(res, indent=2))
+        res = inspect_check_runs(repo, head, cred_ref, api_base=api_base)
+    print(json.dumps(res))
     return 0 if res.get("ok") else 1
 
 

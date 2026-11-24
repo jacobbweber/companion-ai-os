@@ -25,7 +25,15 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from companion.vault import CheckpointManager, checkpoint_manager
 from companion.config import SELF_PROJECT_ID, settings
-from companion.dag_runtime import discover_dags, execute_dag_by_name, get_dag_run, list_dag_runs, resume_dag_run, self_test_dag
+from companion.workflows import (
+    WorkflowSpec,
+    discover_dags,
+    execute_dag_by_name,
+    get_dag_run,
+    list_dag_runs,
+    resume_dag_run,
+    self_test_dag,
+)
 from companion.context import discover_skills, get_knowledge_port, invalidate_skills_cache, rank_relevant_skills
 from companion.tools import get_execution_target
 from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
@@ -192,21 +200,6 @@ def _populate_staged_skill_dir(
         ref_d.mkdir(exist_ok=True)
         (ref_d / clean_f).write_text(str(content).replace("\r\n", "\n"), encoding="utf-8", newline="\n")
 
-    staged_dags: List[Path] = []
-    for fname, content in (dags or {}).items():
-        clean_f = Path(fname).name
-        if not clean_f.endswith(".py"):
-            return f"SKILL FORGE REJECTED: Python DAG `{fname}` must end with `.py`.", [], []
-        norm_code = str(content).replace("\r\n", "\n")
-        lint_err = _lint_staged_python(clean_f, norm_code, "DAG")
-        if lint_err:
-            return f"SKILL FORGE REJECTED (`dags/{clean_f}`): {lint_err}", [], []
-        dag_d = stage_skill / "dags"
-        dag_d.mkdir(exist_ok=True)
-        dag_p = dag_d / clean_f
-        dag_p.write_text(norm_code, encoding="utf-8", newline="\n")
-        staged_dags.append(dag_p)
-
     staged_scripts: List[Path] = []
     for fname, content in (scripts or {}).items():
         clean_f = Path(fname).name
@@ -221,6 +214,32 @@ def _populate_staged_skill_dir(
         sc_path = sc_d / clean_f
         sc_path.write_text(norm_code, encoding="utf-8", newline="\n")
         staged_scripts.append(sc_path)
+
+    staged_dags: List[Path] = []
+    for fname, content in (dags or {}).items():
+        clean_f = Path(fname).name
+        if clean_f.endswith(".py"):
+            return (
+                f"SKILL FORGE REJECTED (`{clean_f}`): Python-lambda `.py` DAG files are retired. "
+                "Author a declarative JSON workflow (`<name>.workflow.json`) using `run_script`, `call_tool`, `llm_step`, `mcp_step`, or `human_gate`.",
+                [],
+                [],
+            )
+        stem = clean_f.removesuffix(".workflow.json").removesuffix(".json")
+        out_name = f"{stem}.workflow.json"
+        try:
+            wf_obj = dict(content) if isinstance(content, dict) else json.loads(str(content))
+            wf_spec = WorkflowSpec.from_dict(wf_obj)
+            val_err = wf_spec.validate()
+        except Exception as exc:
+            return f"SKILL FORGE REJECTED (`workflows/{out_name}`): invalid declarative workflow JSON ({exc}).", [], []
+        if val_err:
+            return f"SKILL FORGE REJECTED (`workflows/{out_name}`): {val_err}", [], []
+        wf_d = stage_skill / "workflows"
+        wf_d.mkdir(exist_ok=True)
+        wf_p = wf_d / out_name
+        wf_p.write_text(json.dumps(wf_obj, indent=2) + "\n", encoding="utf-8", newline="\n")
+        staged_dags.append(wf_p)
     return None, staged_dags, staged_scripts
 
 
@@ -351,9 +370,9 @@ def run_skill_script(
         f_clean += ".py"
     base_root = (root or settings.root).resolve()
     cand_roots = (
-        [settings.user_skills_dir.resolve(), (base_root / "skills").resolve()]
+        [settings.domains_dir.resolve(), settings.user_skills_dir.resolve(), (base_root / "skills").resolve()]
         if root is None or base_root == settings.root.resolve()
-        else [(base_root / "data" / "skills").resolve(), (base_root / "skills").resolve()]
+        else [(base_root / "data" / "domains").resolve(), (base_root / "data" / "skills").resolve(), (base_root / "skills").resolve()]
     )
     sc_path = next(
         (

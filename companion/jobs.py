@@ -25,7 +25,6 @@ from companion.approvals import enqueue_session_nudge
 from companion.config import execution_origin_context, settings, workspace_context
 from companion.llm import chat, model_gate, tier_context
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
-from companion.project_graph import get_project_graph
 from companion.streaming import (
     CancelScope,
     cancel_scope_context,
@@ -292,20 +291,24 @@ class BackgroundJobManager:
         }
 
     def _run_zero_identity_worker(self, job: Dict[str, Any], deadline_mono: float) -> Tuple[str, str, str]:
-        """Delegate Zero-Identity Worker execution to the canonical `run_worker_step_loop` (`agent.py`)."""
+        """Delegate background worker execution to `run_worker_step_loop` with Tier-1 skill & domain-pack index."""
         from companion.agent import run_worker_step_loop
+        from companion.context import discover_skills
 
         allowed_names = set(job.get("allowed_tools") or _DEFAULT_WORKER_TOOLS) - {"job_manage"}
         ws_root = settings.get_workspace().project_root
+        packs = discover_skills(settings.root)
+        pack_lines = "\n".join(f"  - `{p['name']}` ({p['path']}): {p['description'][:110]}" for p in packs[:16])
+        pack_block = f"\nAvailable Runtime Skills & Domain Packs (read via `read_file` when relevant):\n{pack_lines}" if pack_lines else ""
         sys_msg = (
-            "[ZERO-IDENTITY BACKGROUND WORKER BRIEF]\n"
+            "[BACKGROUND WORKER BRIEF]\n"
             f"Job ID: {job['job_id']} | Title: {job['title']}\n"
-            f"Workspace Root: {ws_root}\n"
+            f"Workspace Root: {ws_root} | Domains Dir: {settings.domains_dir}\n"
             "Rules:\n"
             "1. Execute the assigned task concisely using your paired tools.\n"
             "2. Never invent facts; cite exact files, endpoints, or notes inspected.\n"
             "3. If a tool returns an APPROVAL REQUIRED message (`apr_...`), stop immediately and report that approval ID.\n"
-            "4. Return a crisp, outcome-first report."
+            f"4. Return a crisp, outcome-first report.{pack_block}"
         )
         prior_partial = str(job.get("partial_output") or "").strip()
         user_brief = str(job["goal"]) + (f"\n\n[PRIOR PARTIAL PROGRESS]\n{prior_partial[-1500:]}" if prior_partial else "")
@@ -360,6 +363,8 @@ class BackgroundJobManager:
         deadline = time.monotonic() + float(job.get("timeout_sec") or 600)
         is_live_db = mem.db_path.resolve() == settings.db_path.resolve()
         eff_prio = "foreground" if str(job.get("starter") or "") in ("worktree", "board_worktree") else "background"
+        from companion.project_graph import get_project_graph
+
         st, raw_out, meta_err = "failed", "", ""
         try:
             with (
@@ -374,7 +379,7 @@ class BackgroundJobManager:
             ):
                 if job["kind"] in ("dag", "recipe") and str(job["goal"]).startswith("{"):
                     spec = json.loads(job["goal"])
-                    from companion import dag_runtime
+                    from companion import workflows as dag_runtime
 
                     rt_bindings = dag_runtime.DAGRuntimeBindings(tool_fn=self._dispatch_tool)
                     if spec.get("dag_run_id"):

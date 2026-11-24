@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from companion.approvals import set_trust_mode
-from companion.background_jobs import marshal_job_envelope
+from companion.jobs import marshal_job_envelope
 from companion.core_actions import execute_core_action, handle_harvest_slash
 from companion.memory_store import MemoryStore
 from companion.routines import BUILTIN_IDLE_ROUTINES, RoutineManager

@@ -58,13 +58,7 @@ from companion.context import (
     run_first_boot_onboarding,
     should_compact,
 )
-from companion.dag_runtime import (
-    DAGRuntimeBindings,
-    discover_dags,
-    execute_dag_by_name,
-    register_dag_runtime_bindings,
-    resume_dag_run,
-)
+from companion.workflows import DAGRuntimeBindings, discover_dags, execute_dag_by_name, register_dag_runtime_bindings, resume_dag_run
 from companion.education_engine import get_education_engine
 from companion.llm import chat, current_tier_name, model_gate, normalize_assistant_message, recover_empty_synthesis, tier_context
 from companion.mcp_hub import get_mcp_hub
@@ -98,15 +92,7 @@ from companion.tools import (
     validate_python_syntax,
 )
 from companion.wiki_curation import pending_curation_nudge
-from companion.workflow_dag import (
-    ExecutorBindings,
-    GoalPlan,
-    GoalStep,
-    VerificationSpec,
-    build_goal_plan_from_tasks,
-    evaluate_step_verification,
-    is_node_output_passed as _is_node_output_passed,
-)
+from companion.workflows import ExecutorBindings, GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks, evaluate_step_verification, is_node_output_passed as _is_node_output_passed
 
 __all__ = [
     "ALLOWED_TRANSITIONS",

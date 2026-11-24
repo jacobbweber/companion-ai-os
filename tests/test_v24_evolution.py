@@ -25,7 +25,7 @@ from companion.skill_forge import build_skill_script_command, parse_pep723_depen
 from companion.streaming import emit_stream_event, read_completion_or_sse_stream, stream_event_context
 from companion.telemetry import TelemetryEngine
 from companion.tools import tool_read_file, tool_search, tool_web_fetch
-from companion.workflow_dag import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks
+from companion.workflows import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks
 from companion.agent import WorkflowEngine
 from surfaces.web_assets import read_static_asset, render_web_index_html
 from surfaces.web_server import CompanionHTTPServer, CompanionWebSession, dispatch_raw_http

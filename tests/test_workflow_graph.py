@@ -1,27 +1,15 @@
 """Unit tests for the Deterministic State-Machine Workflow Engine, Python DAG Runtime, and VerificationSpec."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from companion.dag_runtime import (
-    DAGNode,
-    DAGRuntimeBindings,
-    DAGSpec,
-    discover_dags,
-    execute_dag_by_name,
-    execute_dag_spec,
-)
+from companion.workflows import DAGNode, DAGRuntimeBindings, DAGSpec, discover_dags, execute_dag_by_name, execute_dag_spec
 from companion.tools import LocalWorkspaceTarget, register_execution_target
 from companion.memory_store import MemoryStore
 from companion.tools import CheckpointManager
-from companion.workflow_dag import (
-    GoalPlan,
-    GoalStep,
-    VerificationSpec,
-    evaluate_step_verification,
-    is_node_output_passed,
-)
+from companion.workflows import GoalPlan, GoalStep, VerificationSpec, evaluate_step_verification, is_node_output_passed
 from companion.agent import WorkflowEngine, WorkflowState
 
 
@@ -83,21 +71,37 @@ class TestWorkflowGraph(unittest.TestCase):
         self.assertIn("GATE BLOCKED", bad.message)
 
     def test_code_controlled_python_dag_discovery_and_execution(self) -> None:
-        dag_dir = self.root / "skills" / "demo-skill" / "dags"
-        dag_dir.mkdir(parents=True)
-        dag_code = (
-            "from companion.dag_runtime import DAGNode, DAGSpec\n"
-            "DAG = DAGSpec(\n"
-            "    name='demo-pipeline',\n"
-            "    description='Test tool + conditional Python DAG execution.',\n"
-            "    input_schema={'target': 'str'},\n"
-            "    nodes=[\n"
-            "        DAGNode('step_check', kind='tool_or_script_step', tool_name='check_tool', args_builder=lambda c: {'item': c['params']['target']}),\n"
-            "        DAGNode('step_summary', kind='python_step', depends_on=['step_check'], fn=lambda c: {'out': c['nodes']['step_check']['output']}),\n"
-            "    ],\n"
-            ")\n"
+        from companion.workflows import ensure_domain_pack
+
+        wf_dir = self.root / "skills" / "demo-skill" / "workflows"
+        sc_dir = self.root / "skills" / "demo-skill" / "scripts"
+        wf_dir.mkdir(parents=True)
+        sc_dir.mkdir(parents=True)
+        (sc_dir / "summarize.py").write_text(
+            "import json, sys\npayload = json.loads(sys.stdin.read() or '{}')\n"
+            "print(json.dumps({'out': payload['nodes']['step_check']['output']}))\n",
+            encoding="utf-8",
         )
-        (dag_dir / "demo_pipeline.py").write_text(dag_code, encoding="utf-8")
+        wf_json = {
+            "name": "demo-pipeline",
+            "description": "Test declarative JSON workflow execution with call_tool + run_script + edges.",
+            "input_schema": {"target": "str"},
+            "nodes": [
+                {
+                    "id": "step_check",
+                    "type": "call_tool",
+                    "config": {"tool_name": "check_tool", "args": {"item": "{{params.target}}"}},
+                },
+                {
+                    "id": "step_summary",
+                    "type": "run_script",
+                    "config": {"script": "scripts/summarize.py"},
+                    "output_schema": {"out": "str"},
+                },
+            ],
+            "edges": [{"from": "step_check", "to": "step_summary", "condition": "step_check.ok"}],
+        }
+        (wf_dir / "demo_pipeline.workflow.json").write_text(json.dumps(wf_json, indent=2), encoding="utf-8")
 
         dags = discover_dags(root=self.root)
         self.assertEqual(len(dags), 1)
@@ -112,6 +116,17 @@ class TestWorkflowGraph(unittest.TestCase):
         )
         self.assertEqual(res["status"], "completed")
         self.assertEqual(res["final_output"]["out"], "ok:check_tool:beta")
+
+        # Verify self-contained ICM Domain Capability Pack (`data/domains/<pack>/<pack>.db` WAL SQLite)
+        dom_res = ensure_domain_pack(
+            "household-budget",
+            "Track household grocery expenses in isolated WAL SQLite.",
+            schema_sql="CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY, item TEXT, amount REAL);",
+            domains_root=self.root / "data" / "domains",
+        )
+        self.assertTrue(dom_res["ok"])
+        self.assertTrue(Path(dom_res["db_path"]).is_file())
+        self.assertTrue(Path(dom_res["context_md"]).is_file())
 
     def test_bounded_llm_step_and_builtin_dags_discovery(self) -> None:
         spec = DAGSpec(

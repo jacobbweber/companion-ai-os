@@ -25,8 +25,9 @@ from companion.attachments import (
     ingest_attachment,
     prepare_turn_attachments,
     read_attachment_raw,
+    rehydrate_recent_turn_images,
 )
-from companion.background_jobs import get_job_manager
+from companion.jobs import get_job_manager
 from companion.vault import get_active_checkpoint_manager
 from companion.config import settings
 from companion.core_actions import execute_core_action, list_core_actions
@@ -475,7 +476,8 @@ def dispatch_chat_or_job_with_attachments(
     raw_ids = body.get("attachment_ids")
     att_ids = [str(x) for x in raw_ids] if isinstance(raw_ids, list) else None
     prep = prepare_turn_attachments(msg, att_ids, store=sess.store)
-    with wire_attachment_context(prep.wire_doc_context, prep.wire_image_uris):
+    eff_imgs = prep.wire_image_uris or rehydrate_recent_turn_images(getattr(sess, "messages", []), user_message=msg, store=sess.store, max_images=2)
+    with wire_attachment_context(prep.wire_doc_context, eff_imgs):
         if is_async:
             code, res = sess.submit_async_chat(prep.display_message, mode=mode, focus_project_id=focus_pid, followup_doc_note=prep.followup_doc_note)
         else:

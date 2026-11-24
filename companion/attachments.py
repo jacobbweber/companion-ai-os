@@ -1,12 +1,13 @@
 """
-Multimodal Image & Document Attachment Engine (`companion/attachments.py` — A-Frame Domain Layer).
+Full-Fidelity Multimodal Image & Document Attachment Engine (`companion/attachments.py`).
 
 Provides 100% Python 3.12 stdlib ingestion, validation, secret-scrubbed text extraction,
-Co-Owned Wiki `03_resources/` overflow filing, and OpenAI multimodal wire preparation for:
-- Images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) -> Vision routing + base64 `data:image/...` URIs
-- PDFs (`.pdf`) -> Ring-1 `scripts/extract_pdf.py` (`pypdf`) subprocess + stdlib stream fallback
-- Office (`.docx`, `.xlsx`, `.pptx`) -> Pure stdlib `zipfile` + `xml.etree.ElementTree`
-- Data, Text & Code (`.md`, `.txt`, `.csv`, `.tsv`, `.json`, `.yaml`, `.toml`, `.html`, `.log`, code)
+full on-disk `storage_path` + `extracted_path` handoff (zero 12KB/80-row silent mutilation),
+multi-turn vision context persistence, and Co-Owned Wiki `03_resources/` filing for:
+- Images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) -> Vision routing + base64 `data:image/...` URIs + `storage_path`
+- PDFs (`.pdf`) -> `companion/scripts/extract_pdf.py` (`pypdf`) subprocess + stdlib stream fallback + `storage_path`
+- Office (`.docx`, `.xlsx`, `.pptx`) -> Pure stdlib `zipfile` + `xml.etree.ElementTree` + `storage_path`
+- Data, Text & Code (`.csv`, `.tsv`, `.json`, `.yaml`, `.md`, `.txt`, code) -> Schema + sample rows + exact `storage_path`
 """
 
 import base64
@@ -38,7 +39,7 @@ from companion.wiki_engine import get_wiki_engine
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB per file
 MAX_UNCOMPRESSED_STREAM_BYTES = 32 * 1024 * 1024  # 32 MB zip/zlib bomb cap
 INLINE_DOC_CHAR_LIMIT = 12_000
-MAX_EXTRACTED_CHARS = 250_000
+MAX_EXTRACTED_CHARS = 500_000
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 AUDIO_MIMES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg"}
@@ -54,6 +55,7 @@ ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | set(AUDIO_MIMES) | set(VIDEO_MIMES) | {"
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+_ATT_ID_RE = re.compile(r"\b(att_\d+_[a-f0-9]+)\b")
 
 
 @dataclass(frozen=True)
@@ -176,26 +178,25 @@ def _extract_pdf_stdlib_fallback(raw: bytes) -> str:
     out: List[str] = []
     for m in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", raw, re.S):
         chunk = m.group(1)
-        for candidate in (chunk,):
-            try:
-                decomp = zlib.decompressobj()
-                dec = decomp.decompress(candidate, 4 * 1024 * 1024)
-            except Exception:
-                dec = chunk[: 4 * 1024 * 1024]
-            txt = dec.decode("latin-1", errors="ignore")
-            for lit in re.findall(r"\(([^()\\]*(?:\\.[^()\\]*)*)\)\s*Tj", txt):
-                cleaned = lit.replace(r"\(", "(").replace(r"\)", ")").replace(r"\n", "\n").strip()
-                if cleaned:
-                    out.append(cleaned)
-            for arr in re.findall(r"\[(.*?)\]\s*TJ", txt, re.S):
-                seg = "".join(re.findall(r"\(([^()\\]*(?:\\.[^()\\]*)*)\)", arr)).strip()
-                if seg:
-                    out.append(seg)
+        try:
+            decomp = zlib.decompressobj()
+            dec = decomp.decompress(chunk, 4 * 1024 * 1024)
+        except Exception:
+            dec = chunk[: 4 * 1024 * 1024]
+        txt = dec.decode("latin-1", errors="ignore")
+        for lit in re.findall(r"\(([^()\\]*(?:\\.[^()\\]*)*)\)\s*Tj", txt):
+            cleaned = lit.replace(r"\(", "(").replace(r"\)", ")").replace(r"\n", "\n").strip()
+            if cleaned:
+                out.append(cleaned)
+        for arr in re.findall(r"\[(.*?)\]\s*TJ", txt, re.S):
+            seg = "".join(re.findall(r"\(([^()\\]*(?:\\.[^()\\]*)*)\)", arr)).strip()
+            if seg:
+                out.append(seg)
     return "\n".join(out).strip()
 
 
 def _extract_pdf(pdf_path: Path, raw: bytes) -> Tuple[str, str]:
-    """Extract PDF text via first-class runtime `companion/scripts/extract_pdf.py` (`uv run --script` / `pypdf`), falling back to stdlib stream scan."""
+    """Extract PDF text via first-class runtime `companion/scripts/extract_pdf.py` (`uv run --script` / `pypdf`)."""
     script = (settings.root / "companion" / "scripts" / "extract_pdf.py").resolve()
     if script.is_file():
         uv_bin = shutil.which("uv")
@@ -223,7 +224,6 @@ def _extract_pdf(pdf_path: Path, raw: bytes) -> Tuple[str, str]:
 
 
 def _extract_docx(raw: bytes) -> Tuple[str, str]:
-    """Extract paragraphs and Markdown tables from `.docx` in 100% Python stdlib."""
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
         xml_bytes = _read_zip_member_safe(zf, "word/document.xml")
@@ -262,7 +262,6 @@ def _col_letters_to_idx(cell_ref: str) -> int:
 
 
 def _extract_xlsx(raw: bytes) -> Tuple[str, str]:
-    """Extract worksheets from `.xlsx` as clean Markdown tables in 100% Python stdlib."""
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
         shared: List[str] = []
         if "xl/sharedStrings.xml" in zf.namelist():
@@ -275,6 +274,7 @@ def _extract_xlsx(raw: bytes) -> Tuple[str, str]:
         for s_idx, s_name in enumerate(sheet_names, 1):
             s_root = ET.fromstring(_read_zip_member_safe(zf, s_name))
             rows_out: List[List[str]] = []
+            total_rows = 0
             for row_el in s_root.iter():
                 if row_el.tag.rsplit("}", 1)[-1] != "row":
                     continue
@@ -292,20 +292,21 @@ def _extract_xlsx(raw: bytes) -> Tuple[str, str]:
                         elif stag == "t" and c_type == "inlineStr" and sub.text:
                             v_txt += sub.text
                     vals[col_i] = v_txt.strip().replace("|", "\\|").replace("\n", " ")
-                if vals and len(rows_out) < 150:
-                    max_c = min(max(vals) + 1, 24)
-                    rows_out.append([vals.get(ci, "") for ci in range(max_c)])
+                if vals:
+                    total_rows += 1
+                    if len(rows_out) < 50:
+                        max_c = min(max(vals) + 1, 32)
+                        rows_out.append([vals.get(ci, "") for ci in range(max_c)])
             if rows_out:
                 w = max(len(r) for r in rows_out)
                 norm = [r + [""] * (w - len(r)) for r in rows_out]
-                tbl = [f"### Sheet {s_idx}", "| " + " | ".join(norm[0]) + " |", "| " + " | ".join(["---"] * w) + " |"]
+                tbl = [f"### Sheet {s_idx} ({total_rows} total rows)", "| " + " | ".join(norm[0]) + " |", "| " + " | ".join(["---"] * w) + " |"]
                 tbl.extend("| " + " | ".join(r) + " |" for r in norm[1:])
                 sections.append("\n".join(tbl))
     return "\n\n".join(sections).strip(), f"{len(sheet_names)} sheet{'s' if len(sheet_names) != 1 else ''}"
 
 
 def _extract_pptx(raw: bytes) -> Tuple[str, str]:
-    """Extract slide text runs from `.pptx` in 100% Python stdlib."""
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
         slides = sorted(n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml"))
         out: List[str] = []
@@ -318,21 +319,30 @@ def _extract_pptx(raw: bytes) -> Tuple[str, str]:
 
 
 def _extract_csv_or_text(ext: str, raw: bytes) -> Tuple[str, str, str]:
-    """Extract structured data, HTML, Markdown, or source code from UTF-8 bytes."""
+    """Extract CSV schema + sample rows (preserving 100% of raw file at `storage_path`) or structured text/code."""
     text = raw.decode("utf-8", errors="replace")
     if ext in (".csv", ".tsv"):
         delim = "\t" if ext == ".tsv" else ","
         rows = list(csv.reader(io.StringIO(text), delimiter=delim))
         if not rows:
             return "", "data", "0 rows"
-        preview = rows[:80]
-        w = max(1, min(max(len(r) for r in preview), 24))
+        headers = [h.strip() for h in rows[0]]
+        data_rows = rows[1:]
+        sample_limit = 25
+        preview = [rows[0], *data_rows[:sample_limit]]
+        w = max(1, min(max(len(r) for r in preview), 40))
         norm = [[c.strip().replace("|", "\\|") for c in (r[:w] + [""] * max(0, w - len(r)))] for r in preview]
-        md = ["| " + " | ".join(norm[0]) + " |", "| " + " | ".join(["---"] * w) + " |"]
+        hdr_summary = f"**Columns ({len(headers)})**: " + ", ".join(f"`{h or f'col_{i+1}'}`" for i, h in enumerate(headers[:40]))
+        row_summary = f"**Total Rows**: {len(rows)} ({len(data_rows)} data row(s))"
+        md = [hdr_summary, row_summary, "", "| " + " | ".join(norm[0]) + " |", "| " + " | ".join(["---"] * w) + " |"]
         md.extend("| " + " | ".join(r) + " |" for r in norm[1:])
-        if len(rows) > 80:
-            md.append(f"\n*(Showing first 80 of {len(rows)} rows)*\n\n```csv\n{text[:40000]}\n```")
-        return "\n".join(md), "data", f"{len(rows)} rows"
+        if len(data_rows) > sample_limit:
+            md.append(
+                f"\n*(Showing first {sample_limit} of {len(data_rows)} data rows in inline preview. "
+                "100% of rows are preserved untouched on disk at `storage_path` — ALWAYS use `run_command(python_code=...)` "
+                "with `csv.DictReader` / `sqlite3` on `storage_path` for exact totals, sums, filtering, or SQLite ingestion!)*"
+            )
+        return "\n".join(md), "data", f"{len(rows)} rows • {len(headers)} cols"
     if ext == ".json":
         try:
             parsed = json.loads(text)
@@ -354,10 +364,11 @@ def _extract_csv_or_text(ext: str, raw: bytes) -> Tuple[str, str, str]:
 
 
 def _serialize_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
-    (aid, fname, mime, kind, sz, sha, _sp, _ep, _etxt, echars, mlabel, wpath, w, h, cat) = row
+    (aid, fname, mime, kind, sz, sha, sp, ep, _etxt, echars, mlabel, wpath, w, h, cat) = row
     return {
         "id": str(aid), "filename": str(fname), "mime_type": str(mime), "kind": str(kind),
         "size_bytes": int(sz), "size_human": _format_size(int(sz)), "sha256": str(sha),
+        "storage_path": str(sp), "extracted_path": str(ep),
         "extracted_chars": int(echars), "meta_label": str(mlabel), "wiki_resource_path": str(wpath),
         "width": int(w), "height": int(h), "raw_url": f"/api/attachments/{aid}/raw", "created_at": str(cat),
     }
@@ -378,15 +389,18 @@ def ingest_attachment(filename: str, data_base64: str, mime_type: str = "", stor
     ext = Path(safe_name).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         return {"ok": False, "error": f"Unsupported file extension `{ext or '(none)'}`. Allowed: images (.png/.jpg/.webp/.gif), .pdf, .docx, .xlsx, .pptx, .md, .txt, .csv, .json, .yaml, and source code."}
-    b64_clean = (data_base64 or "").strip()
-    if "," in b64_clean[:256] and b64_clean.lower().startswith("data:"):
-        b64_clean = b64_clean.split(",", 1)[1]
-    if len(b64_clean) > ((MAX_ATTACHMENT_BYTES * 4) // 3) + 256:
-        return {"ok": False, "error": "Attachment exceeds 20 MB limit."}
-    try:
-        raw = base64.b64decode(b64_clean, validate=False)
-    except Exception as exc:
-        return {"ok": False, "error": f"Invalid base64 attachment payload: {exc}"}
+    if isinstance(data_base64, (bytes, bytearray)):
+        raw = bytes(data_base64)
+    else:
+        b64_clean = (data_base64 or "").strip()
+        if "," in b64_clean[:256] and b64_clean.lower().startswith("data:"):
+            b64_clean = b64_clean.split(",", 1)[1]
+        if len(b64_clean) > ((MAX_ATTACHMENT_BYTES * 4) // 3) + 256:
+            return {"ok": False, "error": "Attachment exceeds 20 MB limit."}
+        try:
+            raw = base64.b64decode(b64_clean, validate=False)
+        except Exception as exc:
+            return {"ok": False, "error": f"Invalid base64 attachment payload: {exc}"}
     if not raw or len(raw) > MAX_ATTACHMENT_BYTES:
         return {"ok": False, "error": "Attachment file is empty (0 bytes)." if not raw else f"Attachment exceeds 20 MB limit ({_format_size(len(raw))})."}
 
@@ -430,12 +444,18 @@ def ingest_attachment(filename: str, data_base64: str, mime_type: str = "", stor
         extracted_text = get_vault_manager(store=mem).scrub_output(extracted_text[:MAX_EXTRACTED_CHARS]).strip()
         meta_label = f"{sub_lbl} • {_format_size(len(raw))}"
         ext_file = month_dir / f"{aid}.extracted.md"
-        ext_file.write_text(f"# Extracted Attachment: {safe_name}\n\n{extracted_text}\n", encoding="utf-8")
+        ext_file.write_text(f"# Extracted Attachment: {safe_name}\n- storage_path: `{raw_path}`\n\n{extracted_text}\n", encoding="utf-8")
         extracted_path_str = str(ext_file)
         if len(extracted_text) > INLINE_DOC_CHAR_LIMIT:
             slug = _SLUG_RE.sub("-", Path(safe_name).stem.lower()).strip("-")[:48] or "document"
             rel_wiki = f"03_resources/{now_dt.strftime('%Y-%m-%d')}-{slug}-{aid[-6:]}.md"
-            proxy_body = f"# {safe_name}\n\n## Asset Metadata & Location\n- **Source**: `{safe_name}` (`{meta_label}`, id=`{aid}`)\n\n## Executive Summary & Key Facts\nAuto-filed Forever Chat `{kind}` attachment.\n\n## Extracted Highlights\n{extracted_text}"
+            proxy_body = (
+                f"# {safe_name}\n\n## Asset Metadata & Location\n"
+                f"- **Source**: `{safe_name}` (`{meta_label}`, id=`{aid}`)\n"
+                f"- **Raw File Path (`storage_path`)**: `{raw_path}`\n"
+                f"- **Extracted Text Path (`extracted_path`)**: `{ext_file}`\n\n"
+                f"## Executive Summary & Key Facts\nAuto-filed Forever Chat `{kind}` attachment.\n\n## Extracted Highlights\n{extracted_text}"
+            )
             w_res = get_wiki_engine(store=mem).save_or_update_note(rel_wiki, content=proxy_body, title=f"Attachment: {safe_name}", tags=["attachment", "resource", kind], actor="companion", template="proxy-asset-note", ontology=["asset-provenance", "reference-knowledge"])
             if w_res.get("ok"):
                 wiki_path = str(w_res.get("path") or rel_wiki)
@@ -451,7 +471,7 @@ def ingest_attachment(filename: str, data_base64: str, mime_type: str = "", stor
 
 
 def get_attachment_record(attachment_id: str, store: Optional[MemoryStore] = None) -> Optional[Dict[str, Any]]:
-    """Fetch attachment metadata dictionary by `attachment_id`."""
+    """Fetch attachment metadata dictionary (including `storage_path` & `extracted_path`) by `attachment_id`."""
     mem = store or get_memory_store()
     _ensure_attachments_schema(mem)
     clean_id = re.sub(r"[^A-Za-z0-9_-]", "", (attachment_id or "").strip())
@@ -473,10 +493,7 @@ def read_attachment_raw(attachment_id: str, store: Optional[MemoryStore] = None)
     clean_id = re.sub(r"[^A-Za-z0-9_-]", "", (attachment_id or "").strip())
     if not clean_id:
         return None
-    rows = mem._fetch_rows(
-        "SELECT mime_type, storage_path, filename FROM chat_attachments WHERE attachment_id = ? LIMIT 1",
-        (clean_id,),
-    )
+    rows = mem._fetch_rows("SELECT mime_type, storage_path, filename FROM chat_attachments WHERE attachment_id = ? LIMIT 1", (clean_id,))
     if not rows:
         return None
     mime, spath, fname = str(rows[0][0]), Path(str(rows[0][1])), str(rows[0][2])
@@ -486,10 +503,45 @@ def read_attachment_raw(attachment_id: str, store: Optional[MemoryStore] = None)
     return safe_ct, spath.read_bytes(), fname
 
 
+_VISUAL_FOLLOWUP_RE = re.compile(
+    r"\b(?:image|photo|picture|screenshot|receipt|diagram|chart|invoice|label|ocr|in\s+the\s+(?:pic|image|photo|receipt)|on\s+the\s+receipt)\b",
+    re.I,
+)
+
+
+def rehydrate_recent_turn_images(
+    messages: List[Dict[str, Any]], user_message: str = "", store: Optional[MemoryStore] = None, max_images: int = 2,
+) -> Tuple[str, ...]:
+    """Re-hydrate recent image attachments ONLY when a follow-up question explicitly references visual content."""
+    if not messages or not _VISUAL_FOLLOWUP_RE.search(user_message or ""):
+        return ()
+    mem = store or get_memory_store()
+    _ensure_attachments_schema(mem)
+    found_ids: List[str] = []
+    for msg in reversed(messages[-8:]):
+        if msg.get("role") != "user":
+            continue
+        content = str(msg.get("content") or "")
+        for aid in _ATT_ID_RE.findall(content):
+            if aid not in found_ids:
+                found_ids.append(aid)
+        if len(found_ids) >= max_images:
+            break
+    uris: List[str] = []
+    for aid in reversed(found_ids[:max_images]):
+        rows = mem._fetch_rows("SELECT kind, mime_type, storage_path FROM chat_attachments WHERE attachment_id = ? LIMIT 1", (aid,))
+        if not rows:
+            continue
+        kind, mime, spath = str(rows[0][0]), str(rows[0][1]), Path(str(rows[0][2]))
+        if kind == "image" and spath.is_file():
+            uris.append(f"data:{mime};base64,{base64.b64encode(spath.read_bytes()).decode('ascii')}")
+    return tuple(uris)
+
+
 def prepare_turn_attachments(
     user_message: str, attachment_ids: Optional[List[str]], store: Optional[MemoryStore] = None,
 ) -> PreparedAttachmentTurn:
-    """Assemble clean persistent chat badges + active-turn wire context (multimodal images & extracted docs)."""
+    """Assemble persistent chat badges + full-fidelity `<turn_context>` with exact `storage_path` for scripts/workflows."""
     clean_ids = [re.sub(r"[^A-Za-z0-9_-]", "", str(x)) for x in (attachment_ids or []) if str(x).strip()][:8]
     base_msg = (user_message or "").strip()
     if not clean_ids:
@@ -516,30 +568,33 @@ def prepare_turn_attachments(
         loaded_meta.append(meta)
         fname, mime, kind = meta["filename"], meta["mime_type"], meta["kind"]
         spath, ep_str, etxt = Path(str(row[6])), str(row[7]), str(row[8])
-        mlabel, wpath = meta["meta_label"], meta["wiki_resource_path"]
-        raw_url = meta["raw_url"]
+        mlabel, wpath, raw_url = meta["meta_label"], meta["wiki_resource_path"], meta["raw_url"]
 
         if kind in ("image", "audio", "video") and spath.is_file():
             b64 = base64.b64encode(spath.read_bytes()).decode("ascii")
             image_uris.append(f"data:{mime};base64,{b64}")
             badges.append(f"![{fname}]({raw_url})" if kind == "image" else f"[🎬 {fname} ({mlabel})]({raw_url})")
-            doc_blocks.append(f"[ATTACHED {kind.upper()}: `{fname}` ({mlabel}) — provided directly to your multimodal input.]")
+            doc_blocks.append(
+                f"[ATTACHED {kind.upper()}: `{fname}` ({mlabel}) | attachment_id=`{aid}` | storage_path=`{spath}` — provided directly to your multimodal vision/media input.]"
+            )
         else:
             wiki_tag = f" • Wiki: [[{wpath.removesuffix('.md')}]]" if wpath else ""
             badges.append(f"[📎 {fname} ({mlabel})]({raw_url}){wiki_tag}")
-            if wpath:
-                preview = etxt[:4000]
+            if wpath or len(etxt) > INLINE_DOC_CHAR_LIMIT:
+                preview = etxt[:6000]
+                wiki_line = f"Wiki resource: `{wpath}` (`[[{wpath.removesuffix('.md')}]]`)\n" if wpath else ""
                 doc_blocks.append(
                     f"[ATTACHED LARGE DOCUMENT: `{fname}` ({mlabel})]\n"
-                    f"Full searchable Markdown auto-filed in Co-Owned Wiki: `{wpath}` (`[[{wpath.removesuffix('.md')}]]`).\n"
-                    f"--- Preview (first {len(preview)} of {len(etxt)} chars) ---\n{preview}\n"
-                    f"--- Use `wiki_manage(action='read', path='{wpath}')` or `wiki_manage(action='search', ...)` for deeper sections ---\n"
+                    f"- Raw File on Disk (`storage_path`): `{spath}`\n"
+                    f"- Full Extracted Text (`extracted_path`): `{ep_str}`\n"
+                    f"{wiki_line}"
+                    f"--- Preview (first {len(preview)} of {len(etxt)} extracted chars) ---\n{preview}\n"
+                    f"--- Use `run_command(python_code=...)` or `read_file` on `{spath}` / `{ep_str}` to process 100% of rows/pages without truncation ---\n"
                     f"[/ATTACHED LARGE DOCUMENT]"
                 )
             else:
-                loc_note = f" | local_extract: `{ep_str}`" if ep_str else ""
                 doc_blocks.append(
-                    f"[ATTACHED DOCUMENT: `{fname}` ({mlabel}){loc_note}]\n{etxt}\n[/ATTACHED DOCUMENT]"
+                    f"[ATTACHED DOCUMENT: `{fname}` ({mlabel}) | storage_path=`{spath}` | extracted_path=`{ep_str}`]\n{etxt}\n[/ATTACHED DOCUMENT]"
                 )
 
     if not base_msg and loaded_meta:
@@ -548,12 +603,19 @@ def prepare_turn_attachments(
     display = f"{base_msg}\n\n{badge_block}".strip() if badge_block else base_msg
     followup_parts: List[str] = []
     for meta in loaded_meta:
-        if meta["kind"] not in ("image", "audio", "video"):
-            if meta["wiki_resource_path"]:
-                followup_parts.append(f"[Attached Document `{meta['filename']}` filed in Wiki `{meta['wiki_resource_path']}`]")
-            else:
-                rec_rows = mem._fetch_rows("SELECT extracted_text FROM chat_attachments WHERE attachment_id = ? LIMIT 1", (meta["id"],))
-                ex_s = str(rec_rows[0][0])[:4000].strip() if rec_rows else ""
-                if ex_s:
-                    followup_parts.append(f"[Attached Document Excerpt (`{meta['filename']}`)]\n{ex_s}\n[/Attached Document Excerpt]")
+        if meta["kind"] in ("image", "audio", "video"):
+            followup_parts.append(
+                f"[Attached {meta['kind'].title()} `{meta['filename']}` | attachment_id=`{meta['id']}` | storage_path=`{meta['storage_path']}`]"
+            )
+        elif meta["wiki_resource_path"]:
+            followup_parts.append(
+                f"[Attached Document `{meta['filename']}` | storage_path=`{meta['storage_path']}` | extracted_path=`{meta['extracted_path']}` | Wiki `{meta['wiki_resource_path']}`]"
+            )
+        else:
+            rec_rows = mem._fetch_rows("SELECT extracted_text FROM chat_attachments WHERE attachment_id = ? LIMIT 1", (meta["id"],))
+            ex_s = str(rec_rows[0][0])[:4000].strip() if rec_rows else ""
+            followup_parts.append(
+                f"[Attached Document `{meta['filename']}` | storage_path=`{meta['storage_path']}` | extracted_path=`{meta['extracted_path']}`]"
+                + (f"\n{ex_s}" if ex_s else "")
+            )
     return PreparedAttachmentTurn(display, "\n\n".join(doc_blocks).strip(), tuple(image_uris), loaded_meta, "\n\n".join(followup_parts))

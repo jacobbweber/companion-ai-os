@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion.attachments import ingest_attachment
-from companion.background_jobs import BackgroundJobManager, get_job_manager
+from companion.jobs import BackgroundJobManager, get_job_manager
 from companion.config import is_in_agent_tool_turn, settings, workspace_context
 from companion.llm import chat
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context

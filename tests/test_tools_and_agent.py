@@ -301,7 +301,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
                 self.assertIn("skill-creator", str(catalog_out))
 
                 runbook_out = handle_slash_command("/skills skill-creator", [], store=store)
-                self.assertIn("# Skill Creator & Capability Pack Forge Guide", str(runbook_out))
+                self.assertIn("# Skill Creator & Domain Capability Pack Guide", str(runbook_out))
                 wiki_out = handle_slash_command("/skills knowledge-wiki", [], store=store)
                 self.assertIn("agentic-patterns.md", str(wiki_out))
             finally:

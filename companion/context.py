@@ -25,14 +25,11 @@ from companion.config import (
     GENERAL_TRACKED_EXTENSIONS, MODEL_TIERS, SELF_PROJECT_ID, SKIP_DIRS,
     settings, slugify_project_id, walk_pruned_files,
 )
-from companion.education_engine import format_education_hud
 from companion.llm import chat, format_model_tiers_status, tier_context
 from companion.memory_store import (
     MemoryStore, expand_semantic_terms, get_memory_store, semantic_similarity,
 )
-from companion.project_graph import format_project_graph_hud, get_project_graph
 from companion.telemetry import telemetry
-from companion.wiki_engine import get_wiki_engine
 
 __all__ = [
     "DEFAULT_SOUL_AND_USER", "EpistemicGrounding", "KeyTokens", "KnowledgeEntry", "KnowledgePort",
@@ -184,6 +181,8 @@ class LocalKnowledgeAdapter:
                 if len(entries) >= limit:
                     return entries
         if tokens and len(entries) < limit:
+            from companion.wiki_engine import get_wiki_engine
+
             for wn in get_wiki_engine(store=self.store).search_notes(q_clean, limit=limit - len(entries)):
                 wkey = f"wiki:{wn['rel_path']}"
                 if wkey not in seen:
@@ -207,6 +206,8 @@ class LocalKnowledgeAdapter:
         if not k:
             return None
         if k.startswith("wiki:"):
+            from companion.wiki_engine import get_wiki_engine
+
             wn = get_wiki_engine(store=self.store).read_note(k[5:])
             return KnowledgeEntry(f"wiki:{wn['path']}", wn["title"], wn["body"][:240], f"wiki:{wn['author']}", 0.92, wn["raw"]) if wn.get("ok") else None
         if k.startswith("doc:"):
@@ -527,6 +528,8 @@ def _load_known_projects(mem: MemoryStore) -> Dict[str, str]:
 
 
 def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known: Dict[str, str]) -> None:
+    from companion.project_graph import get_project_graph
+
     pg = get_project_graph(store=mem)
     if pid != SELF_PROJECT_ID:
         known[pid] = str(proot)
@@ -811,7 +814,9 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
         if ws.is_self_project
         else f"External Workspace (`{ws.project_id}` -> `{ws.project_root}`; `data/domains/` & `data/scratch/` also accessible)"
     )
+    from companion.education_engine import format_education_hud
     from companion.mcp_hub import format_connected_partners_hud
+    from companion.project_graph import format_project_graph_hud
 
     trust_mode, partners_hud = get_trust_mode(store=mem), format_connected_partners_hud(store=mem)
     partners_section = f"\n{partners_hud}\n" if partners_hud else ""
@@ -882,6 +887,7 @@ def build_turn_context(
     if pending_tasks:
         lines.append("focus_tasks: " + "; ".join(f"#{tid}({st}) {desc[:60]}" for tid, desc, st, _ in pending_tasks))
     if not ws.is_self_project and ws.project_root.is_dir():
+        from companion.project_graph import get_project_graph
         from companion.sdlc_tools import discover_repo_sdlc_context
 
         proj_rec = get_project_graph(mem).get_project()
