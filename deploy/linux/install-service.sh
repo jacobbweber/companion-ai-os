@@ -79,6 +79,7 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="COMPANION_DATA_DIR=${DATA_DIR}"
 Environment="COMPANION_IMMUTABLE_APP=1"
 ExecStart=${PY_BIN} ${APP_DIR}/harness.py --data-dir "${DATA_DIR}" --immutable --web --host ${HOST} --port ${PORT}
+LimitNOFILE=65536
 Restart=always
 RestartSec=3
 

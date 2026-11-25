@@ -74,9 +74,16 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     const res = await fetchHistory(80);
     if (res.ok && Array.isArray(res.messages)) {
       setMessages((prev) => {
-        const streamingTail = prev.filter((m) => m.streaming);
-        if (streamingTail.length === 0) return res.messages;
-        return [...res.messages, ...streamingTail];
+        if (res.messages.length === 0 && prev.some((m) => typeof m.id === 'number' && m.id > 0)) {
+          return prev;
+        }
+        const transientTail = prev.filter(
+          (m) =>
+            m.streaming ||
+            (typeof m.id === 'string' && m.id.startsWith('job_') && m.content.startsWith('Error:'))
+        );
+        if (transientTail.length === 0) return res.messages;
+        return [...res.messages, ...transientTail];
       });
       setHasOlder(Boolean(res.has_more));
     }
@@ -175,9 +182,10 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
             )
           );
         },
-        onDone: ({ response, error }) => {
+        onDone: ({ status: doneStatus, response, error }) => {
           attachedJobIdRef.current = '';
           unsubRef.current = null;
+          const isTurnError = doneStatus === 'error' || Boolean(error && !response);
           setMessages((prev) =>
             prev.map((m) =>
               m.id === streamId
@@ -191,7 +199,11 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
             )
           );
           setSending(false);
-          void loadHistory();
+          if (isTurnError) {
+            onToast(error || 'Turn failed — please check LLM connection.');
+          } else {
+            void loadHistory();
+          }
           void onRefreshStatus();
         },
         onError: (err) => {

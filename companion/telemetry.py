@@ -12,6 +12,7 @@ both Companion and any Frontend Web UI / external application share a single sou
 import contextlib
 import contextvars
 import os
+import queue
 import re
 import sqlite3
 import threading
@@ -572,24 +573,37 @@ class TelemetryEngine:
             self._test_mem_conn = None
 
 
-_RO_LOCAL = threading.local()
+_RO_POOL_MAX_SIZE = 4
 _RO_POOL_LOCK = threading.Lock()
-_RO_ALL_CONNS: Dict[str, List[sqlite3.Connection]] = {}
+_RO_POOLS: Dict[str, Tuple[int, "queue.LifoQueue[sqlite3.Connection]"]] = {}
+
+
+def _drain_ro_queue(q: "queue.LifoQueue[sqlite3.Connection]") -> None:
+    while True:
+        try:
+            c = q.get_nowait()
+        except queue.Empty:
+            break
+        with contextlib.suppress(Exception):
+            c.close()
 
 
 def _close_ro_readers(db_path: Path) -> None:
     key = _norm_db_key(db_path)
     with _RO_POOL_LOCK:
-        conns = _RO_ALL_CONNS.pop(key, [])
-    cache: Dict[str, Tuple[int, sqlite3.Connection]] = getattr(_RO_LOCAL, "conns", None) or {}
-    cache.pop(key, None)
-    for c in conns:
-        with contextlib.suppress(Exception):
-            c.close()
+        entry = _RO_POOLS.pop(key, None)
+    if entry is not None:
+        _drain_ro_queue(entry[1])
 
 
-def read_ro_rows(db_path: Path, sql: str, params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
-    """Execute a fast read-only WAL query using a thread-local `?mode=ro` connection pool."""
+def read_ro_rows(
+    db_path: Path,
+    sql: str,
+    params: Tuple[Any, ...] = (),
+    *,
+    strict: bool = False,
+) -> List[Tuple[Any, ...]]:
+    """Execute a fast read-only WAL query using a bounded (`<= 4` handles) `?mode=ro` connection pool."""
     if not db_path.is_file():
         return []
     resolved = db_path.resolve()
@@ -597,35 +611,60 @@ def read_ro_rows(db_path: Path, sql: str, params: Tuple[Any, ...] = ()) -> List[
     try:
         ctime_ns = resolved.stat().st_ctime_ns
     except OSError:
+        if strict:
+            raise
         return []
-    cache: Optional[Dict[str, Tuple[int, sqlite3.Connection]]] = getattr(_RO_LOCAL, "conns", None)
-    if cache is None:
-        cache = {}
-        _RO_LOCAL.conns = cache
-    entry = cache.get(key)
+
+    with _RO_POOL_LOCK:
+        entry = _RO_POOLS.get(key)
+        if entry is None or entry[0] != ctime_ns:
+            if entry is not None:
+                _drain_ro_queue(entry[1])
+            pool: "queue.LifoQueue[sqlite3.Connection]" = queue.LifoQueue(maxsize=_RO_POOL_MAX_SIZE)
+            _RO_POOLS[key] = (ctime_ns, pool)
+        else:
+            pool = entry[1]
+
     conn: Optional[sqlite3.Connection] = None
-    if entry is not None and entry[0] == ctime_ns:
-        conn = entry[1]
-    if conn is None:
-        if entry is not None:
-            with contextlib.suppress(Exception):
-                entry[1].close()
+    try:
+        conn = pool.get_nowait()
+    except queue.Empty:
         try:
-            conn = sqlite3.connect(f"file:{resolved.as_posix()}?mode=ro", uri=True, timeout=15.0, check_same_thread=False)
+            conn = sqlite3.connect(
+                f"file:{resolved.as_posix()}?mode=ro",
+                uri=True,
+                timeout=15.0,
+                check_same_thread=False,
+            )
             conn.execute("PRAGMA query_only=ON")
             conn.execute("PRAGMA busy_timeout=15000")
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError):
+            if strict:
+                raise
             return []
-        cache[key] = (ctime_ns, conn)
-        with _RO_POOL_LOCK:
-            _RO_ALL_CONNS.setdefault(key, []).append(conn)
+
     try:
-        return conn.execute(sql, params).fetchall()
-    except sqlite3.Error:
-        cache.pop(key, None)
+        rows = conn.execute(sql, params).fetchall()
+    except (sqlite3.Error, OSError) as exc:
         with contextlib.suppress(Exception):
             conn.close()
+        if strict and "no such table" not in str(exc).lower():
+            raise
         return []
+
+    with _RO_POOL_LOCK:
+        cur_entry = _RO_POOLS.get(key)
+        same_pool = cur_entry is not None and cur_entry[1] is pool
+    if same_pool:
+        try:
+            pool.put_nowait(conn)
+            conn = None
+        except queue.Full:
+            pass
+    if conn is not None:
+        with contextlib.suppress(Exception):
+            conn.close()
+    return rows
 
 
 telemetry = TelemetryEngine()

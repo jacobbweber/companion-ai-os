@@ -12,7 +12,7 @@ Built on a zero-dependency Python 3.12 standard library core (25 cohesive module
 import os
 import sys
 
-__version__ = "5.0.0"
+__version__ = "5.0.1"
 
 
 def ensure_utf8_streams() -> None:

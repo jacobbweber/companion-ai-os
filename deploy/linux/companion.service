@@ -13,6 +13,7 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="COMPANION_DATA_DIR=/var/lib/companion"
 Environment="COMPANION_IMMUTABLE_APP=1"
 ExecStart=/usr/bin/python3 /opt/companion/harness.py --data-dir /var/lib/companion --immutable --web --host 127.0.0.1 --port 8000
+LimitNOFILE=65536
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

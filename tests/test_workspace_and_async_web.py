@@ -353,6 +353,49 @@ class TestWorkspaceAndAsyncWeb(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_read_ro_rows_bounded_pool_across_150_ephemeral_threads_and_strict_history(self) -> None:
+        """Verify 150 ephemeral HTTP-style threads never leak >4 SQLite RO handles and DB errors never fake empty history."""
+        from unittest.mock import patch
+        from companion.telemetry import _RO_POOLS, _norm_db_key, read_ro_rows
+        from surfaces.api_extensions import build_history_payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ro_pool.db"
+            store = MemoryStore(db_path=db_path)
+            try:
+                store.log_message("user", "Truck is leaking coolant", session_tag="web_ui")
+                store.log_message("assistant", "Added coolant check task.", session_tag="web_ui")
+
+                errors: List[Exception] = []
+
+                def _ephemeral_poll() -> None:
+                    try:
+                        rows = read_ro_rows(db_path, "SELECT COUNT(*) FROM conversations")
+                        if not rows or int(rows[0][0]) < 2:
+                            errors.append(AssertionError(f"Unexpected count: {rows}"))
+                    except Exception as exc:  # pragma: no cover
+                        errors.append(exc)
+
+                for _ in range(150):
+                    t = threading.Thread(target=_ephemeral_poll)
+                    t.start()
+                    t.join()
+
+                self.assertEqual(errors, [])
+                pool_entry = _RO_POOLS.get(_norm_db_key(db_path))
+                self.assertIsNotNone(pool_entry)
+                assert pool_entry is not None
+                self.assertLessEqual(pool_entry[1].qsize(), 4)
+
+                # Simulate `[Errno 24] Too many open files` during history read: must return ok=False, NEVER ok=True + []!
+                with patch("surfaces.api_extensions.read_ro_rows", side_effect=OSError(24, "Too many open files")):
+                    err_hist = build_history_payload(db_path, limit=60)
+                self.assertFalse(err_hist["ok"])
+                self.assertIn("Too many open files", err_hist["error"])
+            finally:
+                store.close()
+                self.assertNotIn(_norm_db_key(db_path), _RO_POOLS)
+
 
 if __name__ == "__main__":
     unittest.main()

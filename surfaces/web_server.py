@@ -549,7 +549,8 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             if lim is None or bef is None:
                 self._send_json(400, {"ok": False, "error": "Invalid integer `limit` or `before_id` parameter"})
                 return
-            self._send_json(200, sess.get_history_payload(limit=lim, include_tools=(qs.get("include_tools") or ["0"])[0] in ("1", "true", "yes"), before_id=max(0, bef)))
+            hist_payload = sess.get_history_payload(limit=lim, include_tools=(qs.get("include_tools") or ["0"])[0] in ("1", "true", "yes"), before_id=max(0, bef))
+            self._send_json(200 if hist_payload.get("ok", True) else 500, hist_payload)
         elif route == "/api/telemetry":
             lim = _parse_int_qs(qs, "limit", 12)
             if lim is None:

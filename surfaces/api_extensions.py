@@ -414,11 +414,15 @@ def build_history_payload(db_path: Path, limit: int = 60, include_tools: bool = 
     if before_id > 0:
         clauses.append("id < ?")
     where_sql = f"WHERE {' AND '.join(clauses)} "
-    rows = read_ro_rows(
-        db_path,
-        f"SELECT id, role, content, timestamp, COALESCE(session_tag, ''), COALESCE(meta_json, '{{}}') FROM conversations {where_sql}ORDER BY id DESC LIMIT ?",
-        (*((int(before_id),) if before_id > 0 else ()), cap + 1),
-    )
+    try:
+        rows = read_ro_rows(
+            db_path,
+            f"SELECT id, role, content, timestamp, COALESCE(session_tag, ''), COALESCE(meta_json, '{{}}') FROM conversations {where_sql}ORDER BY id DESC LIMIT ?",
+            (*((int(before_id),) if before_id > 0 else ()), cap + 1),
+            strict=True,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"History read error: {exc}", "messages": []}
     items: List[Dict[str, Any]] = []
     for cid, role, content, ts, tag, raw_meta in reversed(rows[:cap]):
         try:

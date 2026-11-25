@@ -4,7 +4,7 @@
 ; User data stays isolated in : %LOCALAPPDATA%\Companion\data (preserved across upgrades & uninstalls)
 
 #define MyAppName "Companion AI OS"
-#define MyAppVersion "5.0.0"
+#define MyAppVersion "5.0.1"
 #define MyAppPublisher "Companion AI OS Contributors"
 #define MyAppExeName "launch-companion.vbs"
 
