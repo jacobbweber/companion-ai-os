@@ -18,14 +18,15 @@ from companion.memory_store import MemoryStore, get_memory_store, memory_store_c
 from companion.projects import get_project_graph
 from companion.tools import run_system_doctor
 from companion.streaming import CancelScope, cancel_scope_context, get_active_cancel_scope, stream_event_context
-from companion.telemetry import notify_db_closed, read_ro_rows, telemetry
+from companion.telemetry import notify_db_closed, read_ro_rows, telemetry, telemetry_db_context
 from surfaces.api_extensions import (
-    build_history_payload, build_telemetry_payload, build_web_status_payload, cancel_web_or_bg_job, commit_cancelled_turn,
-    create_session_idle_watcher, dispatch_chat_or_job_with_attachments, handle_extended_get, handle_extended_post,
-    handle_extended_raw_get, load_or_create_csrf_token, record_coalesced_job_event, register_service_reload_handler,
+    build_health_payload, build_history_payload, build_telemetry_payload, build_web_status_payload, cancel_web_or_bg_job,
+    commit_cancelled_turn, commit_failed_turn, create_session_idle_watcher, dispatch_chat_or_job_with_attachments,
+    ensure_visible_turn_reply, handle_extended_get, handle_extended_post, handle_extended_raw_get,
+    load_or_create_csrf_token, log_http_rejection, record_coalesced_job_event, register_service_reload_handler,
     spawn_companion_reload, wait_for_port_release,
 )
-from surfaces.web_assets import read_static_asset, render_web_index_html
+from surfaces.web_assets import compute_static_asset_hash, read_static_asset, render_web_index_html
 
 _CARRIER_NAT_NET = ipaddress.ip_network("100.64.0.0/10")
 _LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".home.arpa", ".localdomain", ".ts.net")
@@ -149,7 +150,6 @@ def verify_post_request_security(headers: Any, expected_csrf: str) -> Optional[s
 
 
 def _read_rows(db_path: Path, sql: str, params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
-    """Execute a thread-local `?mode=ro` WAL read query against SQLite so status polling never churns connections."""
     return read_ro_rows(db_path, sql, params)
 
 
@@ -202,7 +202,6 @@ class CompanionWebSession:
         return out
 
     def get_status_payload(self) -> Dict[str, Any]:
-        """Build non-blocking live status JSON for `GET /api/status`."""
         return build_web_status_payload(self)
 
     def get_history_payload(self, limit: int = 60, include_tools: bool = False, before_id: int = 0) -> Dict[str, Any]:
@@ -234,9 +233,11 @@ class CompanionWebSession:
         """Execute a foreground chat message, `/slash` command, or multi-phase autonomous goal."""
         clean_msg = (message or "").strip()
         if not clean_msg:
-            return 400, {"ok": False, "error": "message is required"}
+            log_http_rejection(self, 400, "POST", "/api/chat", "empty message")
+            return 400, {"ok": False, "error": "message is required", "error_code": "empty_message"}
         if not self._turn_lock.acquire(timeout=2.0):
-            return 409, {"ok": False, "error": "Companion is currently busy processing an active turn. Please wait.", "active_job_id": self.active_job_id}
+            log_http_rejection(self, 409, "POST", "/api/chat", f"turn_lock busy (active_job_id={self.active_job_id})")
+            return 409, {"ok": False, "error": "Companion is currently busy processing an active turn. Please wait.", "error_code": "turn_busy", "active_job_id": self.active_job_id}
         scope = cancel_scope or get_active_cancel_scope() or CancelScope()
         self._active_cancel_scope = scope
         self.busy, self._busy_started = True, time.monotonic()
@@ -245,7 +246,7 @@ class CompanionWebSession:
             get_project_graph(store=self.store).set_focus_project(focus_project_id)
         pre_msgs = copy.deepcopy(self.messages)
         try:
-            with cancel_scope_context(scope), memory_store_context(self.store):
+            with cancel_scope_context(scope), memory_store_context(self.store), telemetry_db_context(self.db_path):
                 try:
                     slash_out = handle_slash_command(clean_msg, self.messages, store=self.store, chat_fn=self.chat_fn, interactive=False)
                     if slash_out is not None:
@@ -255,14 +256,15 @@ class CompanionWebSession:
                             marker = "Fresh working focus — earlier messages remain saved & searchable." if m_tag == "focus_marker" else "Context compacted into long-term memory — earlier messages remain saved & searchable."
                             self.store.log_message("assistant", marker, session_tag=m_tag)
                             return 200, {"ok": True, "role": "assistant", "mode": "slash", "session_tag": m_tag, "response": marker}
+                        vis_slash = ensure_visible_turn_reply(slash_out, mode="slash")
                         self.store.log_message("user", clean_msg, session_tag="web_slash")
-                        self.store.log_message("assistant", slash_out, session_tag="web_slash")
-                        return 200, {"ok": True, "role": "assistant", "mode": "slash", "response": slash_out}
+                        self.store.log_message("assistant", vis_slash, session_tag="web_slash")
+                        return 200, {"ok": True, "role": "assistant", "mode": "slash", "response": vis_slash}
                     if mode in ("plan", "goal") and not is_awaiting_blueprint_approval(self.store):
                         tag, label = ("web_plan", "[Plan First]") if mode == "plan" else ("web_goal", "[Goal Mode]")
                         self.store.log_message("user", f"{label} {clean_msg}", session_tag=tag)
                         res = create_or_revise_blueprint(clean_msg, chat_fn=self.chat_fn, store=self.store, verbose=False) if mode == "plan" else run_autonomous_goal(clean_msg, chat_fn=self.chat_fn, store=self.store, verbose=False)
-                        reply = str(res.get("summary", ""))
+                        reply = ensure_visible_turn_reply(res.get("summary", ""), mode=mode)
                         self.store.log_message("assistant", reply, session_tag=tag)
                         u_hist = f"{clean_msg}\n\n{followup_doc_note}".strip() if followup_doc_note else clean_msg
                         self.messages.extend([{"role": "user", "content": u_hist}, {"role": "assistant", "content": reply}])
@@ -270,26 +272,20 @@ class CompanionWebSession:
                 except InterruptedError:
                     return commit_cancelled_turn(self, pre_msgs, clean_msg, mode, is_awaiting_blueprint_approval(self.store))
                 except Exception as exc:
-                    err_text = f"{mode.title()} error: {type(exc).__name__}: {exc}"
-                    telemetry.log("ERROR", "web_ui", err_text)
-                    return 500, {"ok": False, "error": err_text}
+                    return commit_failed_turn(self, pre_msgs, clean_msg, mode, f"{mode.title()} error: {type(exc).__name__}: {exc}")
                 u_idx = len(self.messages)
                 self.messages.append({"role": "user", "content": clean_msg})
                 try:
                     with model_gate.foreground_turn():
-                        reply = run_agent_turn(self.messages, chat_fn=self.chat_fn, store=self.store, session_tag="web_ui", verbose=False)
+                        raw_reply = run_agent_turn(self.messages, chat_fn=self.chat_fn, store=self.store, session_tag="web_ui", verbose=False)
+                    reply = ensure_visible_turn_reply(raw_reply, mode="chat")
                     if followup_doc_note and u_idx < len(self.messages) and self.messages[u_idx].get("role") == "user":
                         self.messages[u_idx]["content"] = f"{self.messages[u_idx]['content']}\n\n{followup_doc_note}".strip()
                     return 200, {"ok": True, "role": "assistant", "mode": "chat", "awaiting_approval": is_awaiting_blueprint_approval(self.store), "response": reply}
                 except InterruptedError:
                     return commit_cancelled_turn(self, pre_msgs, clean_msg, mode, is_awaiting_blueprint_approval(self.store))
                 except Exception as exc:
-                    self.messages[:] = pre_msgs
-                    err_text = f"Turn error: {type(exc).__name__}: {exc}"
-                    telemetry.log("ERROR", "web_ui", err_text)
-                    with contextlib.suppress(Exception):
-                        self.store.log_message("assistant", f"⚠️ **{err_text}**", session_tag="web_ui")
-                    return 500, {"ok": False, "error": err_text}
+                    return commit_failed_turn(self, pre_msgs, clean_msg, mode, f"Turn error: {type(exc).__name__}: {exc}")
         finally:
             self._active_cancel_scope = None
             self.busy, self.active_action = False, ""
@@ -306,13 +302,15 @@ class CompanionWebSession:
         """Launch a disconnect-proof background turn/goal job (`202 Accepted`) with live SSE event streaming."""
         clean_msg = (message or "").strip()
         if not clean_msg:
-            return 400, {"ok": False, "error": "message is required"}
+            log_http_rejection(self, 400, "POST", "/api/chat", "empty message")
+            return 400, {"ok": False, "error": "message is required", "error_code": "empty_message"}
         if clean_msg.startswith(("/", ".")) and not clean_msg.lower().startswith(("/goal ", "/plan ", "/blueprint ", "/approve", "/eval", "/subagent ", "/doctor")):
             return self.execute_chat(clean_msg, mode=mode, focus_project_id=focus_project_id, followup_doc_note=followup_doc_note)
         scope = CancelScope()
         with self._jobs_lock:
             if self.busy or (self.active_job_id and self._jobs.get(self.active_job_id, {}).get("status") == "running"):
-                return 409, {"ok": False, "error": "Companion is currently busy processing an active job.", "active_job_id": self.active_job_id}
+                log_http_rejection(self, 409, "POST", "/api/chat", f"active job running ({self.active_job_id})")
+                return 409, {"ok": False, "error": "Companion is currently busy processing an active job.", "error_code": "turn_busy", "active_job_id": self.active_job_id}
             job_id = f"job_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
             job: Dict[str, Any] = {
                 "job_id": job_id, "message": clean_msg, "mode": mode, "status": "running", "cancel_scope": scope,
@@ -328,23 +326,25 @@ class CompanionWebSession:
             self.active_job_id = job_id
 
         def _bg_job_runner() -> None:
+            code, payload = 500, {"ok": False, "error": "Unhandled background job error"}
             try:
                 with stream_event_context(lambda ev: self._record_job_stream_event(job, ev)):
                     code, payload = self.execute_chat(clean_msg, mode=mode, cancel_scope=scope, focus_project_id=focus_project_id, followup_doc_note=followup_doc_note)
             except Exception as exc:
-                code, payload = 500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            with self._jobs_lock:
-                job["elapsed_seconds"] = round(max(0.0, time.monotonic() - float(job["started_mono"])), 2)
-                if payload.get("cancelled"):
-                    job.update({"status": "cancelled", "response": str(payload.get("response") or "*(Stopped by user.)*"), "awaiting_approval": bool(payload.get("awaiting_approval"))})
-                elif code < 400 and payload.get("ok"):
-                    job.update({"status": "completed", "response": str(payload.get("response") or ""), "passed": payload.get("passed"), "awaiting_approval": bool(payload.get("awaiting_approval"))})
-                else:
-                    job.update({"status": "error", "error": str(payload.get("error") or f"HTTP {code}")})
-                job["events"].append({"type": "done", "status": job["status"], "cancelled": bool(payload.get("cancelled")), "response": job["response"], "error": job["error"], "passed": job["passed"], "awaiting_approval": job["awaiting_approval"]})
-                if self.active_job_id == job_id:
-                    self.active_job_id = ""
-                self._stream_cond.notify_all()
+                code, payload = commit_failed_turn(self, list(self.messages), clean_msg, mode, f"Turn error: {type(exc).__name__}: {exc}")
+            finally:
+                with self._jobs_lock:
+                    job["elapsed_seconds"] = round(max(0.0, time.monotonic() - float(job["started_mono"])), 2)
+                    if payload.get("cancelled"):
+                        job.update({"status": "cancelled", "response": str(payload.get("response") or "*(Stopped by user.)*"), "awaiting_approval": bool(payload.get("awaiting_approval"))})
+                    elif code < 400 and payload.get("ok"):
+                        job.update({"status": "completed", "response": ensure_visible_turn_reply(payload.get("response"), mode=mode), "passed": payload.get("passed"), "awaiting_approval": bool(payload.get("awaiting_approval"))})
+                    else:
+                        job.update({"status": "error", "error": str(payload.get("error") or f"HTTP {code}"), "error_code": str(payload.get("error_code") or "turn_exception")})
+                    job["events"].append({"type": "done", "status": job["status"], "cancelled": bool(payload.get("cancelled")), "response": job["response"], "error": job["error"], "error_code": job.get("error_code", ""), "passed": job["passed"], "awaiting_approval": job["awaiting_approval"]})
+                    if self.active_job_id == job_id:
+                        self.active_job_id = ""
+                    self._stream_cond.notify_all()
 
         ctx = contextvars.copy_context()
         threading.Thread(target=lambda: ctx.run(_bg_job_runner), daemon=True, name=f"companion-{job_id}").start()
@@ -398,10 +398,7 @@ def _parse_int_qs(qs: Dict[str, List[str]], key: str, default: int) -> Optional[
 
 
 class CompanionHTTPServer(ThreadingHTTPServer):
-    """Threaded stdlib HTTP server with daemon worker threads and fast socket reuse."""
-
-    daemon_threads = True
-    allow_reuse_address = True
+    daemon_threads, allow_reuse_address = True, True
 
     def __init__(self, server_address: Tuple[str, int], handler_cls: type, session: CompanionWebSession) -> None:
         super().__init__(server_address, handler_cls)
@@ -433,10 +430,10 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         for hdr, val in (("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"), ("Referrer-Policy", "no-referrer")):
             self.send_header(hdr, val)
 
-    def _send_bytes(self, status: int, content_type: str, raw: bytes, extra_headers: Tuple[Tuple[str, str], ...] = ()) -> None:
+    def _send_bytes(self, status: int, content_type: str, raw: bytes, extra_headers: Tuple[Tuple[str, str], ...] = (), cache_control: str = "no-store, max-age=0, must-revalidate") -> None:
         with contextlib.suppress(ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
             self.send_response(status)
-            for hdr, val in (("Content-Type", content_type), ("Content-Length", str(len(raw))), ("Cache-Control", "no-store"), *extra_headers):
+            for hdr, val in (("Content-Type", content_type), ("Content-Length", str(len(raw))), ("Cache-Control", cache_control), *extra_headers):
                 self.send_header(hdr, val)
             self._send_security_headers()
             self.end_headers()
@@ -450,7 +447,9 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         xf_host = str(self.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
         if is_allowed_lan_host(host_hdr) and (not xf_host or is_allowed_lan_host(xf_host)):
             return True
-        self._send_json(403, {"ok": False, "error": "DNS rebinding guard: non-LAN Host header rejected"})
+        client_ip = str(self.client_address[0]) if self.client_address else ""
+        log_http_rejection(self.server.session, 403, self.command or "HTTP", self.path, f"non-LAN Host header ({host_hdr})", client_ip)
+        self._send_json(403, {"ok": False, "error_code": "host_rejected", "error": "DNS rebinding guard: non-LAN Host header rejected"})
         return False
 
     def _read_json_body(self, max_bytes: int = 1_048_576) -> Tuple[Optional[int], Dict[str, Any]]:
@@ -492,9 +491,9 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
                 if job_now is None:
                     return
                 if not batch and job_now.get("status") == "running":
-                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.write(b': keepalive\n\ndata: {"type": "heartbeat"}\n\n')
                     self.wfile.flush()
-                frames = batch or ([{"type": "done", "status": job_now.get("status"), "response": job_now.get("response", ""), "error": job_now.get("error", "")}] if job_now.get("status") != "running" else [])
+                frames = batch or ([{"type": "done", "status": job_now.get("status"), "response": job_now.get("response", ""), "error": job_now.get("error", ""), "error_code": job_now.get("error_code", "")}] if job_now.get("status") != "running" else [])
                 for offset, ev in enumerate(frames, 1):
                     self.wfile.write(f"id: {base_cur + offset}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8"))
                     self.wfile.flush()
@@ -504,7 +503,9 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             return
 
     def do_OPTIONS(self) -> None:
-        self._send_json(403, {"ok": False, "error": "CORS preflight disabled on private LAN Companion server"})
+        client_ip = str(self.client_address[0]) if self.client_address else ""
+        log_http_rejection(self.server.session, 403, "OPTIONS", self.path, "CORS preflight blocked", client_ip)
+        self._send_json(403, {"ok": False, "error_code": "cors_disabled", "error": "CORS preflight disabled on private LAN Companion server"})
 
     def do_GET(self) -> None:
         if not self._check_host_guard():
@@ -515,15 +516,11 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         auth_ok, set_cookie = verify_lan_client_auth(self.headers, client_ip, qs=qs)
         extra_cookie = (("Set-Cookie", set_cookie),) if set_cookie else ()
         if route == "/api/health":
-            payload: Dict[str, Any] = {"ok": True, "service": "companion-web-ui", "lan_url": sess.lan_url}
-            if auth_ok:
-                payload["csrf_token"] = sess.csrf_token
-            else:
-                payload["auth_required"] = True
-            self._send_bytes(200, "application/json; charset=utf-8", json.dumps(payload, ensure_ascii=False).encode("utf-8"), extra_cookie)
+            self._send_bytes(200, "application/json; charset=utf-8", json.dumps(build_health_payload(sess, auth_ok), ensure_ascii=False).encode("utf-8"), extra_cookie)
             return
         if not auth_ok and route != "/api/mcp":
-            self._send_json(401, {"ok": False, "auth_required": True, "error": "LAN access requires a valid COMPANION_WEB_TOKEN (Bearer header, cookie, or ?token=)."})
+            log_http_rejection(sess, 401, "GET", route, "missing or invalid COMPANION_WEB_TOKEN", client_ip)
+            self._send_json(401, {"ok": False, "auth_required": True, "error_code": "auth_required", "error": "LAN access requires a valid COMPANION_WEB_TOKEN (Bearer header, cookie, or ?token=)."})
             return
         raw_ext = handle_extended_raw_get(route, sess.store)
         if raw_ext is not None:
@@ -537,7 +534,9 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             self._send_bytes(200, "text/html; charset=utf-8", render_web_index_html(csrf_token=sess.csrf_token).encode("utf-8"), extra_cookie)
         elif route.startswith("/static/"):
             asset = read_static_asset(route.split("/static/", 1)[1])
-            self._send_bytes(200, asset[0], asset[1], extra_cookie) if asset is not None else self._send_json(404, {"ok": False, "error": f"Unknown static asset: {route}"})
+            req_v = str((qs.get("v") or [""])[0]).strip()
+            cc = "public, max-age=31536000, immutable" if (req_v and req_v == compute_static_asset_hash()) else "no-store, max-age=0, must-revalidate"
+            self._send_bytes(200, asset[0], asset[1], extra_cookie, cache_control=cc) if asset is not None else self._send_json(404, {"ok": False, "error": f"Unknown static asset: {route}"})
         elif route == "/favicon.ico":
             self._send_bytes(204, "image/x-icon", b"")
         elif route == "/api/status":
@@ -577,14 +576,17 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
         if route != "/api/mcp":
             auth_ok, _ = verify_lan_client_auth(self.headers, client_ip)
             if not auth_ok:
-                self._send_json(401, {"ok": False, "error": "LAN access requires a valid COMPANION_WEB_TOKEN."})
+                log_http_rejection(sess, 401, "POST", route, "missing or invalid COMPANION_WEB_TOKEN", client_ip)
+                self._send_json(401, {"ok": False, "auth_required": True, "error_code": "auth_required", "error": "LAN access requires a valid COMPANION_WEB_TOKEN."})
                 return
             sec_err = verify_post_request_security(self.headers, sess.csrf_token)
             if sec_err:
-                self._send_json(403, {"ok": False, "error": sec_err})
+                log_http_rejection(sess, 403, "POST", route, sec_err, client_ip)
+                self._send_json(403, {"ok": False, "error_code": "csrf_mismatch" if sec_err == "csrf_mismatch" else "security_rejected", "error": sec_err})
                 return
         body_err, body = self._read_json_body(28_311_552 if route == "/api/attachments" else 1_048_576)
         if body_err is not None:
+            log_http_rejection(sess, body_err, "POST", route, str(body.get("error") or "invalid body"), client_ip)
             self._send_json(body_err, body)
             return
         if route == "/api/mcp":
@@ -669,7 +671,6 @@ def start_web_server(host: Optional[str] = None, port: Optional[int] = None) -> 
         srv, sess = create_web_server(host=eff_host, port=eff_port)
     except OSError as exc:
         from surfaces.windows_tray import format_port_conflict_error
-
         print(f"error: {format_port_conflict_error(eff_host, eff_port, exc)}", file=sys.stderr)
         sys.exit(1)
     bound_port, do_reload = int(srv.server_address[1]), [False]

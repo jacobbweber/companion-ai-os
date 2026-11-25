@@ -8,15 +8,7 @@ privacy classification, and live model discovery across three wire dialects:
 3. `gemini_native`      — Native Google Gemini API (`v1beta` `:generateContent` + `thoughtSignature` + multimodal `inlineData`)
 """
 
-import http.client
-import ipaddress
-import json
-import re
-import socket
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
+import http.client, ipaddress, json, re, socket, urllib.error, urllib.parse, urllib.request, uuid  # noqa: E401
 from typing import Any, Dict, List, Optional, Tuple
 
 from companion.streaming import (
@@ -119,27 +111,34 @@ def urlopen_safe(
                     new_req.unredirected_hdrs.pop(sensitive, None)
             return new_req
 
-    handlers: List[Any] = [_SafeRedirectHandler()]
-    if scope is not None:
-        class _CancelHTTPHandler(urllib.request.HTTPHandler):
-            def http_open(self, req: Any) -> Any:
-                class _Conn(http.client.HTTPConnection):
-                    def connect(self_c) -> None:
-                        super().connect()
-                        scope.register_socket(self_c.sock)
-                return self.do_open(_Conn, req)
+    connect_to = min(max(0.5, float(timeout)), 10.0)
 
-        class _CancelHTTPSHandler(urllib.request.HTTPSHandler):
-            def https_open(self, req: Any) -> Any:
-                class _SConn(http.client.HTTPSConnection):
-                    def connect(self_c) -> None:
-                        super().connect()
-                        scope.register_socket(self_c.sock)
-                return self.do_open(_SConn, req, context=self._context)
+    def _finish_conn(conn_obj: Any, orig_to: Any) -> None:
+        conn_obj.timeout = orig_to
+        if conn_obj.sock is not None:
+            conn_obj.sock.settimeout(orig_to)
+            if scope is not None:
+                scope.register_socket(conn_obj.sock)
 
-        handlers.extend([_CancelHTTPHandler(), _CancelHTTPSHandler(context=context)])
-    elif context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=context))
+    class _BoundedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req: Any) -> Any:
+            class _Conn(http.client.HTTPConnection):
+                def connect(self_c) -> None:
+                    orig_to, self_c.timeout = self_c.timeout, connect_to
+                    super().connect()
+                    _finish_conn(self_c, orig_to)
+            return self.do_open(_Conn, req)
+
+    class _BoundedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req: Any) -> Any:
+            class _SConn(http.client.HTTPSConnection):
+                def connect(self_c) -> None:
+                    orig_to, self_c.timeout = self_c.timeout, connect_to
+                    super().connect()
+                    _finish_conn(self_c, orig_to)
+            return self.do_open(_SConn, req, context=self._context)
+
+    handlers: List[Any] = [_SafeRedirectHandler(), _BoundedHTTPHandler(), _BoundedHTTPSHandler(context=context)]
     if is_local_or_lan_endpoint(url):
         handlers.append(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener(*handlers).open(req_or_url, timeout=timeout)

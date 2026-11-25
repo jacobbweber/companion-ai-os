@@ -1,6 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Inbox, KeyRound, PanelLeftOpen, PanelRight } from 'lucide-react';
-import { apiPost, callAction, fetchStatus, pairLanToken } from './api';
+import { Inbox, KeyRound, PanelLeftOpen, PanelRight, RefreshCw, X } from 'lucide-react';
+import {
+  apiPost,
+  callAction,
+  fetchStatus,
+  getBootAppVersion,
+  getBootAssetHash,
+  pairLanToken,
+} from './api';
 import { SettingsModal } from './settings/SettingsModal';
 import { ActivityPopover } from './shell/ActivityPopover';
 import { AuxSplitPane } from './shell/AuxSplitPane';
@@ -54,6 +61,10 @@ export const App: React.FC = () => {
   const [authRequired, setAuthRequired] = useState(false);
   const [lanTokenInput, setLanTokenInput] = useState('');
   const [toast, setToast] = useState('');
+  const [versionDrift, setVersionDrift] = useState<{ serverVer: string } | null>(null);
+  const [driftDismissedFor, setDriftDismissedFor] = useState('');
+  const bootVersionRef = useRef<string>(getBootAppVersion());
+  const bootHashRef = useRef<string>(getBootAssetHash());
   const activityAnchorRef = useRef<HTMLDivElement | null>(null);
 
   const showToast = (msg: string) => {
@@ -81,6 +92,21 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
+  const checkServerVersionDrift = (st: WebStatus) => {
+    const bootVer = bootVersionRef.current;
+    const bootHash = bootHashRef.current;
+    const srvVer = st.app_version || '';
+    const srvHash = st.asset_hash || '';
+    const verChanged = Boolean(bootVer && srvVer && bootVer !== srvVer);
+    const hashChanged = Boolean(bootHash && srvHash && bootHash !== srvHash);
+    const key = `${srvVer}:${srvHash}`;
+    if ((verChanged || hashChanged) && key !== driftDismissedFor) {
+      setVersionDrift({ serverVer: srvVer || srvHash.slice(0, 8) || 'latest' });
+    } else if (!verChanged && !hashChanged) {
+      setVersionDrift(null);
+    }
+  };
+
   const refreshStatusAndProjects = async () => {
     try {
       const st = await fetchStatus();
@@ -91,6 +117,7 @@ export const App: React.FC = () => {
       if (st.ok) {
         setAuthRequired(false);
         setStatus(st);
+        checkServerVersionDrift(st);
         const initialFocus = st.focus_project_id || st.workspace?.project_id || '';
         if (!selectedProjectId && initialFocus) {
           setSelectedProjectId(initialFocus);
@@ -117,6 +144,7 @@ export const App: React.FC = () => {
           else if (s.ok) {
             setAuthRequired(false);
             setStatus(s);
+            checkServerVersionDrift(s);
           }
         });
       }
@@ -126,12 +154,15 @@ export const App: React.FC = () => {
         void refreshStatusAndProjects();
       }
     };
+    const onAuthRequired = () => setAuthRequired(true);
     document.addEventListener('visibilitychange', onWakeOrOnline);
     window.addEventListener('online', onWakeOrOnline);
+    window.addEventListener('companion:auth-required', onAuthRequired);
     return () => {
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onWakeOrOnline);
       window.removeEventListener('online', onWakeOrOnline);
+      window.removeEventListener('companion:auth-required', onAuthRequired);
     };
   }, []);
 
@@ -319,6 +350,36 @@ export const App: React.FC = () => {
             </div>
           </header>
 
+          {versionDrift && (
+            <div className="version-drift-banner" data-testid="version-drift-banner">
+              <span>
+                Companion upgraded on server (<strong>v{versionDrift.serverVer}</strong>) — reload to run the latest Web Studio bundle.
+              </span>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  data-testid="version-reload-btn"
+                  onClick={() => window.location.reload()}
+                >
+                  <RefreshCw size={12} /> Reload UI
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  aria-label="Dismiss update notice"
+                  onClick={() => {
+                    const key = `${status?.app_version || ''}:${status?.asset_hash || ''}`;
+                    setDriftDismissedFor(key);
+                    setVersionDrift(null);
+                  }}
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Active Workspace Surface */}
           {surface === 'chat' && (
             <ChatSurface
@@ -328,6 +389,7 @@ export const App: React.FC = () => {
               onSelectProject={(pid) => syncProjectFocus(pid)}
               onInspect={(t) => setAuxTarget(t)}
               onRefreshStatus={refreshStatusAndProjects}
+              onRequireAuth={() => setAuthRequired(true)}
               onToast={showToast}
             />
           )}

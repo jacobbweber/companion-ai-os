@@ -437,6 +437,12 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
     usage: Dict[str, Any] = {}
     finish_reason = "stop"
     splitter = _ThinkTagStreamSplitter()
+    raw_sock = CancelScope._extract_raw_socket(resp)
+    if raw_sock is not None and hasattr(raw_sock, "gettimeout") and hasattr(raw_sock, "settimeout"):
+        with contextlib.suppress(Exception):
+            cur_to = raw_sock.gettimeout()
+            if cur_to is not None and float(cur_to) > 180.0:
+                raw_sock.settimeout(180.0)
 
     for raw_line in resp:
         check_cancelled()

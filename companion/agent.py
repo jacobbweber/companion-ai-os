@@ -974,12 +974,13 @@ def _finish_orchestrated_turn(
     summary: str, ok_flag: bool, messages: List[Dict[str, Any]], mem: MemoryStore,
     session_tag: Optional[str], tid: Optional[str], log_conv: bool,
 ) -> str:
-    messages.append({"role": "assistant", "content": summary})
+    vis_summary = (summary or "").strip() or ("Completed workflow execution." if ok_flag else "⚠️ Workflow execution stopped without a summary.")
+    messages.append({"role": "assistant", "content": vis_summary})
     if log_conv:
-        mem.log_message("assistant", summary, session_tag=session_tag)
+        mem.log_message("assistant", vis_summary, session_tag=session_tag)
     if tid:
         telemetry.end_trace(tid, status="ok" if ok_flag else "error")
-    return summary
+    return vis_summary
 
 
 def run_agent_turn(
@@ -2091,6 +2092,8 @@ def handle_slash_command(
             messages[0]["content"] = build_system_prompt(store=mem)
         return out
     if verb in ("status", "stat"):
+        from companion import __version__
+
         ws, hud, tasks, backlog = settings.get_workspace(), workflow_engine.render_hud(), mem.get_pending_tasks(), mem.get_backlog(status="pending")
         spr, edu = get_project_graph(store=mem).get_active_timebox(), get_education_engine(store=mem).get_progress_summary()
         ac = edu.get("active_course")
@@ -2098,7 +2101,7 @@ def handle_slash_command(
         code_seg = f" | coding=`{c_cfg.model}` (temp={c_cfg.temperature})" if c_cfg.is_dedicated else ""
         spr_s = f"`{spr['title']}` ({spr['start_date']}..{spr['end_date']})" if spr else "(none)"
         edu_s = f"`{ac['title']}` ({ac['mastery_pct']}%, {edu['due_total']} due)" if ac else "(none)"
-        return f"=== Companion AI OS v4.2 Status ===\nProject    : `{ws.project_id}` ({ws.project_root})\nRouting    : mode=`{mode}` | fast=`{f_cfg.model}` (temp={f_cfg.temperature}){code_seg} | reasoning=`{r_cfg.model}` (temp={r_cfg.temperature})\nPosture    : Background Autonomy={'ON' if mem.is_background_autonomy_enabled() else 'OFF'} | Installed App=IMMUTABLE (Idle: {settings.idle_minutes}m | Cooldown: {settings.hobby_cooldown_minutes}m)\nTimebox/Edu: Timebox={spr_s} | Study={edu_s}\n\n{hud}\n\nPending Tasks: {len(tasks)} | Pending Backlog: {len(backlog)}"
+        return f"=== Companion AI OS v{__version__} Status ===\nProject    : `{ws.project_id}` ({ws.project_root})\nRouting    : mode=`{mode}` | fast=`{f_cfg.model}` (temp={f_cfg.temperature}){code_seg} | reasoning=`{r_cfg.model}` (temp={r_cfg.temperature})\nPosture    : Background Autonomy={'ON' if mem.is_background_autonomy_enabled() else 'OFF'} | Installed App=IMMUTABLE (Idle: {settings.idle_minutes}m | Cooldown: {settings.hobby_cooldown_minutes}m)\nTimebox/Edu: Timebox={spr_s} | Study={edu_s}\n\n{hud}\n\nPending Tasks: {len(tasks)} | Pending Backlog: {len(backlog)}"
     if verb in ("doctor", "doc"):
         return str(run_system_doctor(run_tests=True)["summary"])
     if verb in ("plan", "blueprint"):

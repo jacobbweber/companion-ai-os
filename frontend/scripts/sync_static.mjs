@@ -3,6 +3,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf-8'));
+const appVersion = String(pkg.version || '5.0.5').trim();
 const distDir = path.resolve(__dirname, '..', 'dist');
 const staticDir = path.resolve(__dirname, '..', '..', 'surfaces', 'static');
 
@@ -29,7 +31,7 @@ const indexHtml = `<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <!-- COMPANION_CSRF_META -->
-  <title>Companion AI OS v3.5</title>
+  <title>Companion AI OS v${appVersion}</title>
   <!-- COMPANION_INLINE_CSS -->
 </head>
 <body>

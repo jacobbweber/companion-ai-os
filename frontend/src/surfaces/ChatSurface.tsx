@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   BookmarkPlus,
   Check,
   ChevronDown,
   ChevronRight,
   Cpu,
   Eye,
+  KeyRound,
+  RotateCcw,
   ShieldAlert,
   Sparkles,
   X,
@@ -17,12 +20,15 @@ import {
   cancelActiveJob,
   emitApprovalResolved,
   fetchHistory,
+  fetchJobSnapshot,
+  formatChatErrorBanner,
   subscribeJobStream,
 } from '../api';
 import { MarkdownView } from '../components/MarkdownView';
 import type {
   ActiveWebJob,
   AuxInspectorTarget,
+  ChatDeliveryFailure,
   ChatMessage,
   ProjectGraphEntry,
   ToolStepMeta,
@@ -37,6 +43,7 @@ interface ChatSurfaceProps {
   onSelectProject: (projectId: string) => void;
   onInspect: (target: AuxInspectorTarget) => void;
   onRefreshStatus: () => Promise<void>;
+  onRequireAuth?: () => void;
   onToast: (msg: string) => void;
 }
 
@@ -62,12 +69,19 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
   onSelectProject,
   onInspect,
   onRefreshStatus,
+  onRequireAuth,
   onToast,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [hasOlder, setHasOlder] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [sending, setSending] = useState(false);
+  const [deliveryError, setDeliveryError] = useState<ChatDeliveryFailure | null>(null);
+  const [dismissedOrphanId, setDismissedOrphanId] = useState<string>('');
+  const [clearedRetryText, setClearedRetryText] = useState<{ nonce: number; text: string }>({
+    nonce: 0,
+    text: '',
+  });
   const [resolvingApprovalId, setResolvingApprovalId] = useState('');
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [stagedIds, setStagedIds] = useState<Record<string, boolean>>({});
@@ -78,27 +92,26 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
   const lastTailIdRef = useRef<string>('');
   const unsubRef = useRef<(() => void) | null>(null);
   const attachedJobIdRef = useRef<string>('');
+  const inFlightPostRef = useRef<boolean>(false);
+  const reconcilingJobRef = useRef<string>('');
   const prevBusyRef = useRef<boolean>(false);
+  const busyLiveRef = useRef<boolean>(false);
 
-  const loadHistory = async () => {
+  const loadHistory = async (): Promise<ChatMessage[]> => {
     const res = await fetchHistory(80);
     if (res.ok && Array.isArray(res.messages)) {
       setMessages((prev) => {
         if (res.messages.length === 0 && prev.some((m) => typeof m.id === 'number' && m.id > 0)) {
           return prev;
         }
-        const transientTail = prev.filter(
-          (m) =>
-            m.streaming ||
-            (typeof m.id === 'string' &&
-              m.id.startsWith('job_') &&
-              (m.content.startsWith('Error:') || m.content.includes('⚠️')))
-        );
+        const transientTail = prev.filter((m) => m.streaming);
         if (transientTail.length === 0) return res.messages;
         return [...res.messages, ...transientTail];
       });
       setHasOlder(Boolean(res.has_more));
+      return res.messages;
     }
+    return [];
   };
 
   const loadOlderMessages = async () => {
@@ -133,7 +146,81 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     }
   };
 
-  const bindStreamToMessage = (jobId: string, streamId: string, cursor = 0) => {
+  const finalizeStreamOutcome = async (
+    streamId: string,
+    originPayload: { text: string; attachmentIds: string[]; execMode: ComposerExecMode },
+    doneStatus: string,
+    response: string,
+    error: string,
+    errorCode = ''
+  ) => {
+    attachedJobIdRef.current = '';
+    unsubRef.current = null;
+    setSending(false);
+
+    if (doneStatus === 'interrupted') {
+      setMessages((prev) => prev.filter((m) => m.id !== streamId));
+      const hist = await loadHistory();
+      const tail = hist[hist.length - 1];
+      if (!tail || tail.role === 'user') {
+        const banner = formatChatErrorBanner({ error_code: 'interrupted', error });
+        setDeliveryError({
+          id: `err_${Date.now()}`,
+          title: banner.title,
+          detail: banner.detail,
+          errorCode: 'interrupted',
+          text: originPayload.text,
+          attachmentIds: originPayload.attachmentIds,
+          execMode: originPayload.execMode,
+          timestamp: new Date().toISOString(),
+        });
+        onToast(`${banner.title}: ${banner.detail}`);
+      }
+      void onRefreshStatus();
+      return;
+    }
+
+    const isTurnError = doneStatus === 'error' || Boolean(error && !response);
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== streamId) return m;
+        let nextContent = response || m.content || '';
+        if (isTurnError && error) {
+          nextContent = m.content
+            ? `${m.content.trimEnd()}\n\n⚠️ **${error}**`
+            : `⚠️ **${error}**`;
+        } else if (!nextContent.trim()) {
+          nextContent = 'Completed.';
+        }
+        return {
+          ...m,
+          content: nextContent,
+          streaming: false,
+          activeTool: '',
+          is_error: isTurnError,
+          error_code: errorCode,
+          retry_payload: isTurnError ? originPayload : undefined,
+        };
+      })
+    );
+    if (isTurnError) {
+      const banner = formatChatErrorBanner({ error_code: errorCode, error });
+      onToast(`${banner.title}: ${banner.detail}`);
+    }
+    await loadHistory();
+    void onRefreshStatus();
+  };
+
+  const bindStreamToMessage = (
+    jobId: string,
+    streamId: string,
+    cursor = 0,
+    originPayload: { text: string; attachmentIds: string[]; execMode: ComposerExecMode } = {
+      text: '',
+      attachmentIds: [],
+      execMode: 'chat',
+    }
+  ) => {
     unsubRef.current?.();
     attachedJobIdRef.current = jobId;
     unsubRef.current = subscribeJobStream(
@@ -194,41 +281,18 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
             )
           );
         },
-        onDone: ({ status: doneStatus, response, error }) => {
-          attachedJobIdRef.current = '';
-          unsubRef.current = null;
-          const isTurnError = doneStatus === 'error' || Boolean(error && !response);
-          setMessages((prev) =>
-            prev.map((m) => {
-              if (m.id !== streamId) return m;
-              let nextContent = response || m.content || '';
-              if (isTurnError && error) {
-                nextContent = m.content
-                  ? `${m.content.trimEnd()}\n\n⚠️ **${error}**`
-                  : `Error: ${error}`;
-              }
-              return {
-                ...m,
-                content: nextContent,
-                streaming: false,
-                activeTool: '',
-              };
-            })
+        onDone: ({ status: doneStatus, response, error, errorCode }) => {
+          void finalizeStreamOutcome(
+            streamId,
+            originPayload,
+            doneStatus,
+            response,
+            error,
+            errorCode || ''
           );
-          setSending(false);
-          if (isTurnError) {
-            onToast(error || 'Turn failed — please check LLM connection.');
-          } else {
-            void loadHistory();
-          }
-          void onRefreshStatus();
         },
         onError: (err) => {
-          attachedJobIdRef.current = '';
-          unsubRef.current = null;
-          setSending(false);
-          onToast(err);
-          void loadHistory();
+          void finalizeStreamOutcome(streamId, originPayload, 'interrupted', '', err, 'interrupted');
         },
       },
       cursor
@@ -242,12 +306,13 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     };
   }, []);
 
-  // Auto re-attach to running `status.active_job` across F5 / tab switches + refresh when `busy` clears
+  // Self-Healing Busy State & Auto Re-Attach across F5 / Tab Switches / Dropped LAN SSE
   useEffect(() => {
     const aj: ActiveWebJob | null = status?.active_job || null;
     if (aj && aj.status === 'running' && attachedJobIdRef.current !== aj.job_id) {
       const streamId = `job_${aj.job_id}`;
       setSending(true);
+      setDeliveryError(null);
       setMessages((prev) => {
         if (prev.some((m) => m.id === streamId)) return prev;
         const tail = prev[prev.length - 1];
@@ -276,25 +341,75 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
         };
         return [...prev, ...seededUser, seededAsst];
       });
-      bindStreamToMessage(aj.job_id, streamId, aj.event_cursor || 0);
+      bindStreamToMessage(aj.job_id, streamId, aj.event_cursor || 0, {
+        text: aj.message,
+        attachmentIds: [],
+        execMode: (aj.mode as ComposerExecMode) || 'chat',
+      });
+      prevBusyRef.current = true;
+      return;
     }
-    const nowBusy = Boolean(status?.busy);
-    if (prevBusyRef.current && !nowBusy && !attachedJobIdRef.current) {
+
+    const nowBusy = Boolean(status?.busy) || Boolean(aj && aj.status === 'running');
+    const curAttached = attachedJobIdRef.current;
+
+    if (status?.ok && !nowBusy && curAttached && reconcilingJobRef.current !== curAttached) {
+      reconcilingJobRef.current = curAttached;
+      void (async () => {
+        try {
+          const snap = await fetchJobSnapshot(curAttached);
+          if (attachedJobIdRef.current !== curAttached) return;
+          unsubRef.current?.();
+          const streamId = `job_${curAttached}`;
+          const j = snap.job;
+          if (j && j.status && j.status !== 'running') {
+            await finalizeStreamOutcome(
+              streamId,
+              { text: '', attachmentIds: [], execMode: 'chat' },
+              String(j.status),
+              String(j.response || ''),
+              String(j.error || ''),
+              String(j.error_code || '')
+            );
+          } else if (!j || snap.status_code === 404) {
+            await finalizeStreamOutcome(
+              streamId,
+              { text: '', attachmentIds: [], execMode: 'chat' },
+              'interrupted',
+              '',
+              'Active turn ended while connection was offline.',
+              'interrupted'
+            );
+          }
+        } finally {
+          if (reconcilingJobRef.current === curAttached) {
+            reconcilingJobRef.current = '';
+          }
+        }
+      })();
+    } else if (status?.ok && !nowBusy && !curAttached && !inFlightPostRef.current && sending) {
+      setSending(false);
+      void loadHistory();
+    } else if (prevBusyRef.current && !nowBusy && !curAttached) {
       setSending(false);
       void loadHistory();
     }
     prevBusyRef.current = nowBusy;
-  }, [status?.active_job?.job_id, status?.busy]);
+  }, [status]);
 
   useEffect(() => {
-    const tailId = messages.length > 0 ? String(messages[messages.length - 1].id) : '';
+    const tailId = deliveryError
+      ? deliveryError.id
+      : messages.length > 0
+        ? String(messages[messages.length - 1].id)
+        : '';
     if (tailId && tailId !== lastTailIdRef.current) {
       lastTailIdRef.current = tailId;
       if (typeof endRef.current?.scrollIntoView === 'function') {
         endRef.current.scrollIntoView({ behavior: 'smooth' });
       }
     }
-  }, [messages]);
+  }, [messages, deliveryError]);
 
   const handleStopActiveTurn = async () => {
     const jid = status?.active_job?.job_id || attachedJobIdRef.current || 'active';
@@ -303,6 +418,9 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
       onToast(r.error || 'Could not cancel turn.');
       return;
     }
+    unsubRef.current?.();
+    unsubRef.current = null;
+    attachedJobIdRef.current = '';
     onToast('Stopped active turn.');
     setSending(false);
     await onRefreshStatus();
@@ -312,8 +430,11 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
   const sendMessage = async (
     text: string,
     attachmentIds: string[],
-    execMode: ComposerExecMode
+    execMode: ComposerExecMode,
+    fromRetry = false
   ): Promise<boolean> => {
+    setDeliveryError(null);
+
     if (execMode === 'job') {
       const jRes = await callAction('jobs', {
         subaction: 'dispatch',
@@ -323,9 +444,20 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
         attachment_ids: attachmentIds,
       });
       if (!jRes.ok) {
+        const banner = formatChatErrorBanner(jRes);
+        setDeliveryError({
+          id: `err_${Date.now()}`,
+          title: banner.title,
+          detail: banner.detail,
+          text,
+          attachmentIds,
+          execMode,
+          timestamp: new Date().toISOString(),
+        });
         onToast(jRes.error || 'Could not dispatch background job.');
         return false;
       }
+      if (fromRetry) setClearedRetryText((p) => ({ nonce: p.nonce + 1, text }));
       await onRefreshStatus();
       onToast(jRes.summary || 'Dispatched to Background Jobs.');
       return true;
@@ -339,9 +471,13 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
 
     if (isFocusMarkerCmd) {
       setSending(true);
+      inFlightPostRef.current = true;
       try {
         const mRes = await apiPost<{
           ok?: boolean;
+          status_code?: number;
+          error_code?: string;
+          auth_required?: boolean;
           network_error?: boolean;
           response?: string;
           session_tag?: string;
@@ -352,6 +488,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
           async: true,
         });
         if (mRes.ok) {
+          if (fromRetry) setClearedRetryText((p) => ({ nonce: p.nonce + 1, text }));
           setMessages((prev) => [
             ...prev,
             {
@@ -364,38 +501,82 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
               session_tag: mRes.session_tag || 'focus_marker',
             },
           ]);
+          await onRefreshStatus();
           return true;
         }
-        onToast(mRes.error || 'Could not run command.');
+        const banner = formatChatErrorBanner(mRes);
+        if (banner.authRequired) onRequireAuth?.();
+        setDeliveryError({
+          id: `err_${Date.now()}`,
+          title: banner.title,
+          detail: banner.detail,
+          statusCode: mRes.status_code,
+          errorCode: mRes.error_code,
+          authRequired: banner.authRequired,
+          text,
+          attachmentIds: [],
+          execMode: 'chat',
+          timestamp: new Date().toISOString(),
+        });
+        onToast(`${banner.title}: ${banner.detail}`);
         return false;
       } finally {
+        inFlightPostRef.current = false;
         setSending(false);
-        await onRefreshStatus();
       }
     }
 
     setSending(true);
-    const res = await apiPost<{
+    inFlightPostRef.current = true;
+    let res: {
       ok?: boolean;
+      status_code?: number;
+      error_code?: string;
+      auth_required?: boolean;
       network_error?: boolean;
       accepted?: boolean;
       job_id?: string;
       display_message?: string;
       response?: string;
       error?: string;
-    }>('/api/chat', {
-      message: text,
-      mode: execMode,
-      project_id: selectedProjectId,
-      attachment_ids: attachmentIds,
-      async: true,
-    });
+    };
+    try {
+      res = await apiPost('/api/chat', {
+        message: text,
+        mode: execMode,
+        project_id: selectedProjectId,
+        attachment_ids: attachmentIds,
+        async: true,
+      });
+    } finally {
+      inFlightPostRef.current = false;
+    }
 
     if (!res.ok || res.network_error) {
       setSending(false);
-      onToast(res.error || 'Connection error — your draft was preserved.');
-      await onRefreshStatus();
+      const banner = formatChatErrorBanner(res);
+      if (banner.authRequired) onRequireAuth?.();
+      setDeliveryError({
+        id: `err_${Date.now()}`,
+        title: banner.title,
+        detail: banner.detail,
+        statusCode: res.status_code,
+        errorCode: res.error_code,
+        authRequired: banner.authRequired,
+        text,
+        attachmentIds,
+        execMode,
+        timestamp: new Date().toISOString(),
+      });
+      onToast(`${banner.title}: ${banner.detail}`);
+      if (!banner.authRequired) {
+        await onRefreshStatus();
+      }
       return false;
+    }
+
+    if (fromRetry) {
+      setClearedRetryText((p) => ({ nonce: p.nonce + 1, text }));
     }
 
     const shownUserText = res.display_message || text;
@@ -418,7 +599,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
         streaming: true,
       };
       setMessages((prev) => [...prev, userMsg, placeholder]);
-      bindStreamToMessage(res.job_id, streamId, 0);
+      bindStreamToMessage(res.job_id, streamId, 0, { text, attachmentIds, execMode });
       void onRefreshStatus();
       return true;
     }
@@ -436,16 +617,20 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     return true;
   };
 
-  const stageReplyToWiki = async (msg: ChatMessage) => {
+  const findPrecedingUserPrompt = (msg: ChatMessage): string => {
     const key = String(msg.id);
     const idx = messages.findIndex((m) => String(m.id) === key);
-    let userPrompt = '';
     for (let i = idx - 1; i >= 0; i -= 1) {
       if (messages[i]?.role === 'user' && messages[i].content.trim()) {
-        userPrompt = messages[i].content.trim();
-        break;
+        return messages[i].content.trim();
       }
     }
+    return '';
+  };
+
+  const stageReplyToWiki = async (msg: ChatMessage) => {
+    const key = String(msg.id);
+    const userPrompt = findPrecedingUserPrompt(msg);
     const res = await callAction('wiki', {
       subaction: 'stage_turn',
       message_id: typeof msg.id === 'number' ? msg.id : undefined,
@@ -492,17 +677,41 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     }
   };
 
+  const userName = status?.user_name || 'Partner';
+  const inlineApprovals = status?.pending_approvals || [];
+  const totalWaitingApprovals = status?.pending_approvals_count ?? inlineApprovals.length;
+  const isTurnBusy = sending || Boolean(status?.busy);
+  busyLiveRef.current = isTurnBusy || Boolean(attachedJobIdRef.current);
+
   const autoContinueRef = useRef<(detail: ApprovalResolvedDetail) => void>(() => {});
   autoContinueRef.current = (detail: ApprovalResolvedDetail) => {
     if (detail.decision !== 'approve' || detail.resumedBackgroundJob) return;
-    if (sending || Boolean(status?.busy) || attachedJobIdRef.current) return;
     const isInteractiveExec =
       detail.source === 'chat' ||
       detail.category === 'endpoint_exec' ||
       detail.category === 'r3_tool' ||
       detail.category === 'mcp_tool';
     if (!isInteractiveExec) return;
-    void sendMessage(`Approved \`${detail.approvalId}\` — please continue with the results.`, [], 'chat');
+    const prompt = `Approved \`${detail.approvalId}\` — please continue with the results.`;
+    void (async () => {
+      for (let waitIdx = 0; waitIdx < 12 && busyLiveRef.current; waitIdx += 1) {
+        await new Promise((r) => window.setTimeout(r, 250));
+      }
+      if (busyLiveRef.current) {
+        setDeliveryError({
+          id: `err_${Date.now()}`,
+          title: 'Approval Continuation Queued',
+          detail: 'Approval succeeded while an active turn was still busy. Click Retry once ready to continue.',
+          errorCode: 'turn_busy',
+          text: prompt,
+          attachmentIds: [],
+          execMode: 'chat',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      await sendMessage(prompt, [], 'chat');
+    })();
   };
 
   useEffect(() => {
@@ -515,11 +724,6 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     window.addEventListener('companion:approval-resolved', onResolved);
     return () => window.removeEventListener('companion:approval-resolved', onResolved);
   }, []);
-
-  const userName = status?.user_name || 'Partner';
-  const inlineApprovals = status?.pending_approvals || [];
-  const totalWaitingApprovals = status?.pending_approvals_count ?? inlineApprovals.length;
-  const isTurnBusy = sending || Boolean(status?.busy);
 
   useEffect(() => {
     if (!isTurnBusy) {
@@ -538,6 +742,36 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     const timer = window.setInterval(updateTick, 1000);
     return () => window.clearInterval(timer);
   }, [isTurnBusy, status?.active_job?.job_id]);
+
+  // Detect orphaned trailing `user` message in persisted SQLite history when server is idle
+  const tailMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+  const orphanedUserMsg =
+    !isTurnBusy &&
+    !attachedJobIdRef.current &&
+    !deliveryError &&
+    tailMsg &&
+    tailMsg.role === 'user' &&
+    typeof tailMsg.id === 'number' &&
+    tailMsg.id > 0 &&
+    dismissedOrphanId !== String(tailMsg.id)
+      ? tailMsg
+      : null;
+
+  const activeErrorCard: ChatDeliveryFailure | null =
+    deliveryError ||
+    (orphanedUserMsg
+      ? {
+          id: `orphan_${orphanedUserMsg.id}`,
+          title: 'Turn Interrupted Before Completion',
+          detail:
+            'Companion restarted or lost its upstream connection before finishing a reply to your last message.',
+          errorCode: 'interrupted',
+          text: orphanedUserMsg.content,
+          attachmentIds: [],
+          execMode: 'chat',
+          timestamp: orphanedUserMsg.timestamp,
+        }
+      : null);
 
   return (
     <div className="chat-canvas-wrap" data-testid="chat-surface">
@@ -604,7 +838,10 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
             <ShieldAlert size={14} style={{ color: 'var(--status-warn)', flexShrink: 0 }} />
             <span>
               <strong>{inlineApprovals[0].category}:</strong>{' '}
-              {(inlineApprovals[0].summary || `${inlineApprovals[0].action_name} (${inlineApprovals[0].target})`).replace(/`/g, '')}
+              {(
+                inlineApprovals[0].summary ||
+                `${inlineApprovals[0].action_name} (${inlineApprovals[0].target})`
+              ).replace(/`/g, '')}
             </span>
           </span>
           <div style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
@@ -614,7 +851,8 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
               data-testid="chat-approvals-view-all"
               onClick={() => onInspect({ kind: 'approvals' })}
             >
-              <Eye size={12} /> {totalWaitingApprovals > 1 ? `View all (${totalWaitingApprovals})` : 'Preview'}
+              <Eye size={12} />{' '}
+              {totalWaitingApprovals > 1 ? `View all (${totalWaitingApprovals})` : 'Preview'}
             </button>
             <button
               type="button"
@@ -637,7 +875,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
       )}
 
       <div className="chat-scroll-area" ref={scrollAreaRef}>
-        {messages.length === 0 ? (
+        {messages.length === 0 && !activeErrorCard ? (
           <div className="chat-empty-hero">
             <div className="chat-hero-glyph">
               <Sparkles size={22} />
@@ -661,10 +899,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
             )}
             {messages.map((msg) => {
               const mid = String(msg.id);
-              if (
-                msg.session_tag === 'focus_marker' ||
-                msg.session_tag === 'compact_marker'
-              ) {
+              if (msg.session_tag === 'focus_marker' || msg.session_tag === 'compact_marker') {
                 return (
                   <div
                     key={mid}
@@ -680,9 +915,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
                   <div key={mid} className="msg-user-bubble md-body">
                     <MarkdownView
                       content={msg.content}
-                      onOpenWikiNote={(notePath) =>
-                        onInspect({ kind: 'wiki_note', notePath })
-                      }
+                      onOpenWikiNote={(notePath) => onInspect({ kind: 'wiki_note', notePath })}
                     />
                   </div>
                 );
@@ -692,6 +925,9 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
                 toolSteps.length > 0 || msg.thinking || msg.activeTool || msg.activePhase
               );
               const traceOpen = Boolean(expandedThinking[mid]);
+              const isErrRow = Boolean(msg.is_error || msg.content.trim().startsWith('⚠️ **'));
+              const retryPrompt = msg.retry_payload?.text || (isErrRow ? findPrecedingUserPrompt(msg) : '');
+
               return (
                 <div key={mid} className="msg-assistant-block">
                   {hasTrace && (
@@ -700,9 +936,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
                         type="button"
                         className="tool-step-pill"
                         data-testid="msg-trace-pill"
-                        onClick={() =>
-                          setExpandedThinking((p) => ({ ...p, [mid]: !p[mid] }))
-                        }
+                        onClick={() => setExpandedThinking((p) => ({ ...p, [mid]: !p[mid] }))}
                       >
                         {traceOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                         <Cpu size={12} />
@@ -730,7 +964,10 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
                                     display: 'flex',
                                     justifyContent: 'space-between',
                                     gap: 8,
-                                    color: st.ok === false ? 'var(--status-err)' : 'var(--text-secondary)',
+                                    color:
+                                      st.ok === false
+                                        ? 'var(--status-danger)'
+                                        : 'var(--text-secondary)',
                                   }}
                                 >
                                   <span>
@@ -768,9 +1005,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
                     {msg.content ? (
                       <MarkdownView
                         content={msg.content}
-                        onOpenWikiNote={(notePath) =>
-                          onInspect({ kind: 'wiki_note', notePath })
-                        }
+                        onOpenWikiNote={(notePath) => onInspect({ kind: 'wiki_note', notePath })}
                         onFlashcardGraded={() => void onRefreshStatus()}
                       />
                     ) : null}
@@ -791,7 +1026,13 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
                         }}
                       >
                         <span className="status-dot busy" style={{ flexShrink: 0 }} />
-                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        <span
+                          style={{
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
                           {msg.activeTool
                             ? `Running ${msg.activeTool}...`
                             : msg.activePhase
@@ -808,6 +1049,24 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
 
                   {!msg.streaming && msg.content && (
                     <div className="msg-meta-footer">
+                      {isErrRow && retryPrompt && (
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          data-testid="msg-turn-retry-btn"
+                          disabled={isTurnBusy}
+                          onClick={() =>
+                            void sendMessage(
+                              retryPrompt,
+                              msg.retry_payload?.attachmentIds || [],
+                              msg.retry_payload?.execMode || 'chat',
+                              true
+                            )
+                          }
+                        >
+                          <RotateCcw size={12} /> Retry Turn
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm"
@@ -822,6 +1081,65 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
                 </div>
               );
             })}
+
+            {activeErrorCard && (
+              <div className="chat-delivery-error-card" data-testid="chat-delivery-error-card" role="alert">
+                <div className="chat-delivery-error-head">
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontWeight: 600 }}>
+                    <AlertTriangle size={15} style={{ color: 'var(--status-danger)', flexShrink: 0 }} />
+                    <span>{activeErrorCard.title}</span>
+                  </span>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    {activeErrorCard.authRequired && onRequireAuth && (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        data-testid="chat-error-pair-btn"
+                        onClick={() => onRequireAuth()}
+                      >
+                        <KeyRound size={12} /> Pair Token
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      data-testid="chat-error-retry-btn"
+                      disabled={isTurnBusy}
+                      onClick={() =>
+                        void sendMessage(
+                          activeErrorCard.text,
+                          activeErrorCard.attachmentIds,
+                          activeErrorCard.execMode,
+                          true
+                        )
+                      }
+                    >
+                      <RotateCcw size={12} /> Retry
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      data-testid="chat-error-dismiss-btn"
+                      aria-label="Dismiss error notice"
+                      onClick={() => {
+                        if (orphanedUserMsg) {
+                          setDismissedOrphanId(String(orphanedUserMsg.id));
+                        }
+                        setDeliveryError(null);
+                      }}
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                </div>
+                <div className="chat-delivery-error-detail">{activeErrorCard.detail}</div>
+                {activeErrorCard.text && !orphanedUserMsg && (
+                  <div className="chat-delivery-error-preview">
+                    Unsent message preserved: <code>{activeErrorCard.text.slice(0, 140)}</code>
+                  </div>
+                )}
+              </div>
+            )}
             <div ref={endRef} />
           </div>
         )}
@@ -832,6 +1150,7 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
         projects={projects}
         selectedProjectId={selectedProjectId}
         busy={isTurnBusy}
+        clearedRetryText={clearedRetryText}
         onSelectProject={onSelectProject}
         onSendMessage={sendMessage}
         onStopActiveTurn={handleStopActiveTurn}

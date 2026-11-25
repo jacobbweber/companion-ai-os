@@ -330,6 +330,177 @@ class TestWebSurfaceAndAutonomy(unittest.TestCase):
                 srv.server_close()
                 store.close()
 
+    def test_turn_delivery_observability_admission_telemetry_and_cache_headers(self) -> None:
+        """Verify Invariant 1 (versioned assets + Cache-Control) and Invariant 2 (400/401/403/409/413 telemetry)."""
+        from companion import __version__
+        from surfaces.web_assets import compute_static_asset_hash
+
+        asset_hash = compute_static_asset_hash()
+        self.assertEqual(len(asset_hash), 12)
+        rendered = render_web_index_html(csrf_token="csrf-check-505")
+        self.assertIn(f"<title>Companion AI OS v{__version__}</title>", rendered)
+        self.assertIn(f'<meta name="companion-version" content="{__version__}">', rendered)
+        self.assertIn(f'<meta name="companion-asset-hash" content="{asset_hash}">', rendered)
+        self.assertIn(f'/static/app.js?v={asset_hash}', rendered)
+        self.assertIn(f'/static/styles.css?v={asset_hash}', rendered)
+
+        ext_html = render_web_index_html(csrf_token="csrf-ext", inline_assets=False)
+        self.assertIn(f'<script defer src="/static/app.js?v={asset_hash}"></script>', ext_html)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(db_path=Path(tmp) / "obs_web.db")
+            srv, sess = create_web_server(host="127.0.0.1", port=0, store=store)
+            try:
+                hlth_code, hlth_raw = dispatch_raw_http(srv, "GET", "/api/health")
+                self.assertEqual(hlth_code, 200)
+                hlth = json.loads(hlth_raw)
+                self.assertEqual(hlth["app_version"], __version__)
+                self.assertEqual(hlth["asset_hash"], asset_hash)
+
+                st_code, st_raw = dispatch_raw_http(srv, "GET", "/api/status")
+                self.assertEqual(st_code, 200)
+                st = json.loads(st_raw)
+                self.assertEqual(st["app_version"], __version__)
+                self.assertEqual(st["asset_hash"], asset_hash)
+
+                # Verify Cache-Control on hashed vs unhashed static asset requests
+                from surfaces.web_server import CompanionWebRequestHandler, _InMemorySocket
+
+                def _raw_head_and_status(path: str) -> Tuple[int, str]:
+                    sock = _InMemorySocket(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".encode("utf-8"))
+                    CompanionWebRequestHandler(sock, ("127.0.0.1", 0), srv)
+                    head_b, _, _ = sock.wbuf.getvalue().partition(b"\r\n\r\n")
+                    head_s = head_b.decode("iso-8859-1", errors="replace")
+                    code = int(head_s.splitlines()[0].split()[1])
+                    return code, head_s
+
+                c_imm, h_imm = _raw_head_and_status(f"/static/app.js?v={asset_hash}")
+                self.assertEqual(c_imm, 200)
+                self.assertIn("Cache-Control: public, max-age=31536000, immutable", h_imm)
+
+                c_nostore, h_nostore = _raw_head_and_status("/static/app.js?v=stale000")
+                self.assertEqual(c_nostore, 200)
+                self.assertIn("Cache-Control: no-store", h_nostore)
+
+                # Fault-inject 401, 403 (Host, CSRF, Origin), 400, and 409 rejections -> must log structured WARN with zero secret leaks
+                secret_probe = "sk-supersecretkey1234567890abcdef"
+                with patch.object(settings, "web_token", "lan_tok_secret_999"):
+                    c401, _ = dispatch_raw_http(
+                        srv, "POST", "/api/chat", body=b'{"message":"continue"}',
+                        headers={"Authorization": f"Bearer {secret_probe}"}, client_ip="192.168.1.77",
+                    )
+                    self.assertEqual(c401, 401)
+
+                c403_csrf, _ = dispatch_raw_http(
+                    srv, "POST", "/api/chat", body=b'{"message":"continue"}',
+                    headers={"X-Companion-CSRF": "wrong_csrf"},
+                )
+                self.assertEqual(c403_csrf, 403)
+
+                c403_host, _ = dispatch_raw_http(srv, "GET", "/api/status", headers={"Host": "attacker.example.com"})
+                self.assertEqual(c403_host, 403)
+
+                c400, _ = dispatch_raw_http(
+                    srv, "POST", "/api/chat", body=b'{"message":"   "}',
+                    headers={"X-Companion-CSRF": sess.csrf_token},
+                )
+                self.assertEqual(c400, 400)
+
+                sess.busy = True
+                c409, b409 = dispatch_raw_http(
+                    srv, "POST", "/api/chat", body=b'{"message":"continue","async":true}',
+                    headers={"X-Companion-CSRF": sess.csrf_token},
+                )
+                sess.busy = False
+                self.assertEqual(c409, 409)
+                self.assertEqual(json.loads(b409).get("error_code"), "turn_busy")
+
+                tel = sess.get_telemetry_payload(limit=20)
+                http_logs = [lg for lg in tel["logs"] if lg["component"] == "web_http"]
+                self.assertGreaterEqual(len(http_logs), 5)
+                joined_logs = "\n".join(lg["message"] for lg in http_logs)
+                self.assertIn("HTTP 401 POST /api/chat", joined_logs)
+                self.assertIn("csrf_mismatch", joined_logs)
+                self.assertIn("HTTP 409 POST /api/chat", joined_logs)
+                self.assertNotIn(secret_probe, joined_logs)
+                self.assertNotIn("lan_tok_secret_999", joined_logs)
+            finally:
+                srv.server_close()
+                store.close()
+
+    def test_atomic_turn_ledger_think_only_malformed_tool_json_and_midstream_crash(self) -> None:
+        """Verify Invariant 3: zero empty replies on `<think>`-only LLM output, malformed tool JSON recovery, and zero orphaned `user` rows on exceptions."""
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(db_path=Path(tmp) / "atomic_ledger.db")
+            mode_box = {"behavior": "think_only", "step": 0}
+
+            def fault_chat(messages: List[Dict[str, Any]], tools=None, tool_choice="auto") -> Dict[str, Any]:
+                b = mode_box["behavior"]
+                if b == "think_only":
+                    return {"choices": [{"message": {"role": "assistant", "content": "<think>internal thoughts without closing answer</think>"}}]}
+                if b == "malformed_tool":
+                    mode_box["step"] += 1
+                    if mode_box["step"] == 1 and tools:
+                        return {
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [{"id": "bad_tc_1", "type": "function", "function": {"name": "list_dir", "arguments": '{"path": "unclosed'}}],
+                                }
+                            }]
+                        }
+                    return {"choices": [{"message": {"role": "assistant", "content": "Recovered cleanly after malformed tool JSON."}}]}
+                raise RuntimeError("mid-stream socket reset")
+
+            srv, sess = create_web_server(host="127.0.0.1", port=0, store=store, chat_fn=fault_chat)
+            try:
+                # 1. `<think>`-only LLM output -> guaranteed non-empty visible response in SSE job & SQLite history
+                code1, start1 = sess.submit_async_chat("continue", mode="chat")
+                self.assertEqual(code1, 202)
+                jid1 = start1["job_id"]
+                for _ in range(60):
+                    _, j1 = sess.get_job_payload(jid1)
+                    if j1["job"]["status"] != "running":
+                        break
+                    time.sleep(0.03)
+                self.assertEqual(j1["job"]["status"], "completed")
+                self.assertTrue(bool(j1["job"]["response"].strip()))
+                self.assertNotIn("<think>", j1["job"]["response"])
+
+                # 2. Malformed tool JSON -> strict JSON guard feeds parse error back to model, turn completes cleanly
+                mode_box["behavior"] = "malformed_tool"
+                mode_box["step"] = 0
+                code2, res2 = sess.execute_chat("Check workspace files", mode="chat")
+                self.assertEqual(code2, 200)
+                self.assertIn("Recovered cleanly", res2["response"])
+
+                # 3. Mid-turn exceptions in `chat`, `plan`, and `goal` modes -> balanced user+assistant pairs in SQLite, clean locks
+                mode_box["behavior"] = "crash"
+                for m_kind in ("chat", "plan", "goal"):
+                    c_err, p_err = sess.execute_chat(f"Trigger {m_kind} crash", mode=m_kind)
+                    self.assertEqual(c_err, 500)
+                    self.assertFalse(p_err["ok"])
+                    self.assertFalse(sess.busy)
+                    self.assertFalse(sess._turn_lock.locked())
+                    self.assertEqual(sess.active_job_id, "")
+
+                hist = sess.get_history_payload(limit=50)["messages"]
+                ua_roles = [m["role"] for m in hist]
+                # Every single user message must be followed by an assistant message (zero orphaned user rows!)
+                for idx, role in enumerate(ua_roles):
+                    if role == "user":
+                        self.assertLess(idx + 1, len(ua_roles), f"Orphaned trailing user row in history: {hist[idx]}")
+                        self.assertEqual(ua_roles[idx + 1], "assistant")
+                        self.assertTrue(bool(hist[idx + 1]["content"].strip()))
+                err_rows = [m for m in hist if m.get("is_error")]
+                self.assertGreaterEqual(len(err_rows), 3)
+            finally:
+                srv.server_close()
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

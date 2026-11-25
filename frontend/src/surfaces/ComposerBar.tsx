@@ -21,6 +21,7 @@ interface ComposerBarProps {
   projects: ProjectGraphEntry[];
   selectedProjectId: string;
   busy: boolean;
+  clearedRetryText?: { nonce: number; text: string };
   onSelectProject: (projectId: string) => void;
   onSendMessage: (
     message: string,
@@ -47,6 +48,7 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
   projects,
   selectedProjectId,
   busy,
+  clearedRetryText,
   onSelectProject,
   onSendMessage,
   onStopActiveTurn,
@@ -153,9 +155,26 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
     onToast(res.summary || res.error || `Background Autonomy ${!bgAutonomy ? 'ON' : 'OFF'}.`);
   };
 
+  useEffect(() => {
+    if (!clearedRetryText || !clearedRetryText.nonce) return;
+    if (draft.trim() === clearedRetryText.text.trim()) {
+      setDraft('');
+      setAttachments([]);
+      setExecMode('chat');
+    }
+  }, [clearedRetryText?.nonce]);
+
   const submit = async () => {
     let text = draft.trim();
-    if ((!text && attachments.length === 0) || busy || uploading) return;
+    if (!text && attachments.length === 0) return;
+    if (uploading) {
+      onToast('Still uploading attachment — please wait a moment.');
+      return;
+    }
+    if (busy) {
+      onToast('Companion is finishing the active turn — click Stop to interrupt or wait a moment.');
+      return;
+    }
     let chosenMode = execMode;
     if (text.toLowerCase().startsWith('/plan ') && chosenMode === 'chat') {
       chosenMode = 'plan';

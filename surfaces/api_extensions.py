@@ -19,6 +19,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from companion import __version__
 from companion.approvals import get_approval_queue, get_trust_mode, peek_session_nudges
 from companion.attachments import (
     get_attachment_record,
@@ -39,25 +40,31 @@ from companion.model_registry import get_model_matrix_snapshot
 from companion.projects import get_project_graph
 from companion.routines import IdleAutonomyWatcher, describe_operating_quadrant
 from companion.streaming import wire_attachment_context
-from companion.telemetry import TelemetryEngine, read_ro_rows, telemetry
+from companion.telemetry import TelemetryEngine, read_ro_rows, telemetry, telemetry_db_context
 from companion.wiki import get_wiki_engine
 from companion.wiki import read_wiki_asset_raw
 from companion.agent import WorkflowEngine
+from surfaces.web_assets import compute_static_asset_hash
 
 __all__ = [
+    "build_health_payload",
     "build_history_payload",
     "build_reload_command",
     "build_telemetry_payload",
     "build_web_status_payload",
     "cancel_web_or_bg_job",
+    "classify_turn_error_code",
     "commit_cancelled_turn",
+    "commit_failed_turn",
     "create_session_idle_watcher",
     "dispatch_chat_or_job_with_attachments",
     "enrich_web_status",
+    "ensure_visible_turn_reply",
     "handle_extended_get",
     "handle_extended_post",
     "handle_extended_raw_get",
     "load_or_create_csrf_token",
+    "log_http_rejection",
     "record_coalesced_job_event",
     "register_service_reload_handler",
     "request_service_reload",
@@ -66,6 +73,71 @@ __all__ = [
 ]
 
 _RELOAD_HANDLER: Optional[Callable[[], None]] = None
+_REJECTION_RATE_LOCK = threading.Lock()
+_REJECTION_BUCKETS: Dict[Tuple[str, int, str], Tuple[float, int]] = {}
+
+
+def build_health_payload(sess: Any, auth_ok: bool) -> Dict[str, Any]:
+    """Build `GET /api/health` payload exposing `app_version` and `asset_hash` without leaking CSRF to unauthenticated LAN callers."""
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "service": "companion-web-ui",
+        "app_version": __version__,
+        "asset_hash": compute_static_asset_hash(),
+        "lan_url": sess.lan_url,
+    }
+    if auth_ok:
+        payload["csrf_token"] = sess.csrf_token
+    else:
+        payload["auth_required"] = True
+    return payload
+
+
+def log_http_rejection(sess: Any, status: int, method: str, route: str, reason: str, client_ip: str = "") -> None:
+    """Record rate-limited, secret-redacted `WARN`/`ERROR` telemetry for HTTP `400`/`401`/`403`/`409`/`413`/`500` rejections."""
+    now = time.monotonic()
+    clean_ip = (client_ip or "local").strip()[:48]
+    clean_route = (route or "/").strip()[:80]
+    key = (clean_ip, int(status), clean_route)
+    suppressed = 0
+    with _REJECTION_RATE_LOCK:
+        if len(_REJECTION_BUCKETS) > 256:
+            _REJECTION_BUCKETS.clear()
+        win_start, count = _REJECTION_BUCKETS.get(key, (now, 0))
+        if (now - win_start) > 60.0:
+            if count > 6:
+                suppressed = count - 6
+            win_start, count = now, 1
+        else:
+            count += 1
+        _REJECTION_BUCKETS[key] = (win_start, count)
+        if count > 6:
+            return
+    lvl = "ERROR" if status >= 500 else "WARN"
+    sup_note = f" (+{suppressed} suppressed in prior 60s)" if suppressed else ""
+    msg = f"HTTP {status} {method.upper()} {clean_route} [{clean_ip}]: {reason}{sup_note}"
+    with telemetry_db_context(getattr(sess, "db_path", None)):
+        telemetry.log(lvl, "web_http", msg)
+
+
+def classify_turn_error_code(err_text: str) -> str:
+    """Classify a backend turn failure into a deterministic client error code."""
+    low = (err_text or "").lower()
+    if any(k in low for k in ("could not reach", "connection refused", "timed out", "timeout", "offline", "502", "503", "504")):
+        return "llm_unreachable"
+    if "privacy lock" in low:
+        return "privacy_lock"
+    return "turn_exception"
+
+
+def ensure_visible_turn_reply(raw_reply: Any, mode: str = "chat") -> str:
+    """Guarantee every completed foreground turn returns non-empty human-visible text."""
+    text = str(raw_reply or "").strip()
+    if text:
+        return text
+    if mode == "slash":
+        return "Command completed."
+    return "Completed the turn, though the model returned no visible text. Reply `continue` or ask a follow-up if more detail is needed."
 
 
 def register_service_reload_handler(handler: Optional[Callable[[], None]]) -> None:
@@ -321,6 +393,7 @@ def build_web_status_payload(sess: Any) -> Dict[str, Any]:
         active_job = sess._serialize_job(sess._jobs[sess.active_job_id], include_live_spans=True) if sess.active_job_id in sess._jobs else None
     return {
         "ok": True, "csrf_token": sess.csrf_token,
+        "app_version": __version__, "asset_hash": compute_static_asset_hash(),
         "companion_name": prof.get("companion_name") or settings.companion_name or "Companion",
         "user_name": prof.get("user_name") or settings.user_name or "Partner",
         "tone": prof.get("companion_tone", "balanced"), "active_model_tier": prof.get("active_model_tier", "auto"),
@@ -373,6 +446,29 @@ def commit_cancelled_turn(
         sess.store.log_message("user", clean_msg, session_tag=tag)
     sess.store.log_message("assistant", stopped_reply, session_tag=tag)
     return 200, {"ok": True, "cancelled": True, "role": "assistant", "mode": mode, "awaiting_approval": awaiting_approval, "response": stopped_reply}
+
+
+def commit_failed_turn(
+    sess: Any, pre_msgs: List[Dict[str, Any]], clean_msg: str, mode: str, err_text: str,
+) -> Tuple[int, Dict[str, Any]]:
+    """Persist balanced `user` + visible `assistant` error rows in SQLite while rolling back `sess.messages` for clean Retry."""
+    sess.messages[:] = pre_msgs
+    tag = "web_plan" if mode == "plan" else ("web_goal" if mode == "goal" else ("web_slash" if clean_msg.startswith(("/", ".")) else "web_ui"))
+    with telemetry_db_context(getattr(sess, "db_path", None)):
+        telemetry.log("ERROR", "web_ui", err_text)
+    visible_err = f"⚠️ **{err_text}**"
+    try:
+        last_ua = read_ro_rows(
+            sess.db_path,
+            "SELECT role FROM conversations WHERE role IN ('user', 'assistant') AND COALESCE(session_tag, '') NOT LIKE 'subagent:%' AND COALESCE(session_tag, '') NOT LIKE 'autonomy:%' ORDER BY id DESC LIMIT 1",
+        )
+        if not last_ua or str(last_ua[0][0]) != "user":
+            label = "[Plan First] " if mode == "plan" else ("[Goal Mode] " if mode == "goal" else "")
+            sess.store.log_message("user", f"{label}{clean_msg}", session_tag=tag)
+        sess.store.log_message("assistant", visible_err, session_tag=tag, meta={"error": True})
+    except Exception:
+        pass
+    return 500, {"ok": False, "error": err_text, "error_code": classify_turn_error_code(err_text), "response": visible_err}
 
 
 def cancel_web_or_bg_job(sess: Any, raw_job_id: str = "") -> Tuple[int, Dict[str, Any]]:
@@ -440,6 +536,8 @@ def build_history_payload(db_path: Path, limit: int = 60, include_tools: bool = 
             entry["duration_ms"] = meta["duration_ms"]
         if meta.get("model"):
             entry["model"] = str(meta["model"])
+        if meta.get("error"):
+            entry["is_error"] = True
         items.append(entry)
     return {"ok": True, "count": len(items), "has_more": len(rows) > cap, "messages": items}
 

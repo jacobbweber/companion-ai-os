@@ -4,6 +4,7 @@ import * as readline from 'node:readline';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { setCsrfToken } from '../src/api';
 import { App } from '../src/App';
 
 const PYTHON_FRONTIER_SERVER = `
@@ -25,6 +26,7 @@ from companion.approvals import get_approval_queue
 from companion.core_actions import execute_core_action
 from companion.workflows import DAGNode, DAGSpec, execute_dag_spec
 from companion.projects import get_project_graph
+from surfaces.web_assets import compute_static_asset_hash
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 store = ms.MemoryStore(db_path=tmp_dir / "data" / "companion.db")
@@ -125,7 +127,7 @@ def fake_chat(*args, **kwargs):
 mr.chat = fake_chat
 
 srv, sess = create_web_server(host="127.0.0.1", port=0, store=store, chat_fn=fake_chat)
-ipc_out.write(json.dumps({"ready": True, "csrf_token": sess.csrf_token}) + "\\n")
+ipc_out.write(json.dumps({"ready": True, "csrf_token": sess.csrf_token, "asset_hash": compute_static_asset_hash()}) + "\\n")
 ipc_out.flush()
 
 for raw_line in sys.stdin:
@@ -197,6 +199,7 @@ class PyFrontierBridge {
   private bootResolve: ((line: string) => void) | null = null;
   private nextId = 1;
   public csrfToken = '';
+  public assetHash = '';
 
   async start(): Promise<void> {
     const repoRoot = path.resolve(__dirname, '..', '..');
@@ -233,6 +236,7 @@ class PyFrontierBridge {
     });
     const boot = JSON.parse(bootLine);
     this.csrfToken = boot.csrf_token;
+    this.assetHash = boot.asset_hash || '';
   }
 
   async cmd(command: string): Promise<void> {
@@ -304,12 +308,15 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
   let root: Root;
   let simulateAuth401 = false;
   let simulateChatNetworkDrop = false;
+  let simulateChatHttpStatus = 0;
+  let simulateChatHttpBody: Record<string, unknown> = {};
+  let simulateServerVersion = '';
   let cancelCalls: string[] = [];
 
   beforeAll(async () => {
     (globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
     await bridge.start();
-    document.head.innerHTML = `<meta name="companion-csrf" content="${bridge.csrfToken}">`;
+    document.head.innerHTML = `<meta name="companion-csrf" content="${bridge.csrfToken}"><meta name="companion-version" content="5.0.5"><meta name="companion-asset-hash" content="${bridge.assetHash}">`;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr = typeof input === 'string' ? input : input.toString();
@@ -330,6 +337,12 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
       }
       if (simulateChatNetworkDrop && parsed.pathname === '/api/chat') {
         throw new TypeError('Failed to fetch');
+      }
+      if (simulateChatHttpStatus > 0 && parsed.pathname === '/api/chat') {
+        return new Response(JSON.stringify(simulateChatHttpBody), {
+          status: simulateChatHttpStatus,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       if (parsed.pathname.endsWith('/cancel') && parsed.pathname.startsWith('/api/jobs/')) {
         cancelCalls.push(parsed.pathname);
@@ -365,7 +378,14 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
         headersObj,
         bodyB64
       );
-      return new Response(res.body, {
+      let outBody = res.body;
+      if (simulateServerVersion && parsed.pathname === '/api/status' && res.status === 200) {
+        const parsedSt = JSON.parse(res.body);
+        parsedSt.app_version = simulateServerVersion;
+        parsedSt.asset_hash = 'new_hash_9999';
+        outBody = JSON.stringify(parsedSt);
+      }
+      return new Response(outBody, {
         status: res.status,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -491,6 +511,15 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
     expect(textarea.value).toBe('Preserve this carefully drafted message');
     expect(container.textContent).toContain('notes.txt');
     expect(container.querySelectorAll('.msg-assistant-block').length).toBe(beforeMsgCount);
+    const netErrCard = container.querySelector('[data-testid="chat-delivery-error-card"]');
+    expect(netErrCard).not.toBeNull();
+    expect(netErrCard!.textContent).toContain('Connection Unreachable');
+    const dismissErrBtn = container.querySelector('[data-testid="chat-error-dismiss-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      dismissErrBtn.click();
+    });
+    await flushUi(30);
+    expect(container.querySelector('[data-testid="chat-delivery-error-card"]')).toBeNull();
 
     // Clear draft + `/plan` slash command mode pill check
     await act(async () => {
@@ -680,5 +709,116 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
     });
     await flushUi(50);
     expect(container.querySelector('[data-testid="command-palette-input"]')).toBeNull();
+  });
+
+  it('enforces Turn Delivery invariants: 401/403/409/500 inline cards + 1-click Retry, stale CSRF auto-heal, wedged-SSE busy self-healing, and version-drift banner', async () => {
+    const chatNav = container.querySelector('[data-testid="nav-chat"]') as HTMLButtonElement;
+    await act(async () => {
+      chatNav.click();
+    });
+    await flushUi(80);
+
+    const textarea = container.querySelector('[data-testid="chat-composer-input"]') as HTMLTextAreaElement;
+
+    // 1. Simulate HTTP 409 Turn Busy -> inline error card + preserved draft
+    await act(async () => {
+      setInputValue(textarea, 'continue');
+    });
+    await flushUi(30);
+    simulateChatHttpStatus = 409;
+    simulateChatHttpBody = {
+      ok: false,
+      error_code: 'turn_busy',
+      error: 'Companion is currently busy processing an active job.',
+    };
+    const sendBtn1 = container.querySelector('[data-testid="composer-send-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      sendBtn1.click();
+    });
+    await flushUi(80);
+    let errCard = container.querySelector('[data-testid="chat-delivery-error-card"]');
+    expect(errCard).not.toBeNull();
+    expect(errCard!.textContent).toContain('409 Turn Busy');
+    expect(textarea.value).toBe('continue');
+
+    // 2. Simulate HTTP 403 Origin rejection -> updates inline error card
+    simulateChatHttpStatus = 403;
+    simulateChatHttpBody = { ok: false, error: 'Origin mismatch (tailscale != lan)' };
+    await act(async () => {
+      (container.querySelector('[data-testid="chat-error-retry-btn"]') as HTMLButtonElement).click();
+    });
+    await flushUi(80);
+    errCard = container.querySelector('[data-testid="chat-delivery-error-card"]');
+    expect(errCard!.textContent).toContain('403 Request Rejected');
+
+    // 3. Simulate HTTP 500 Turn Error -> updates inline error card
+    simulateChatHttpStatus = 500;
+    simulateChatHttpBody = { ok: false, error: 'Turn error: RuntimeError: upstream crashed' };
+    await act(async () => {
+      (container.querySelector('[data-testid="chat-error-retry-btn"]') as HTMLButtonElement).click();
+    });
+    await flushUi(80);
+    errCard = container.querySelector('[data-testid="chat-delivery-error-card"]');
+    expect(errCard!.textContent).toContain('500 Turn Error');
+
+    // 4. Simulate HTTP 401 on POST /api/chat -> opens LAN token modal immediately + 401 card
+    simulateChatHttpStatus = 401;
+    simulateChatHttpBody = { ok: false, auth_required: true, error: 'LAN token expired' };
+    await act(async () => {
+      (container.querySelector('[data-testid="chat-error-retry-btn"]') as HTMLButtonElement).click();
+    });
+    await flushUi(80);
+    expect(container.querySelector('[data-testid="lan-token-modal"]')).not.toBeNull();
+    errCard = container.querySelector('[data-testid="chat-delivery-error-card"]');
+    expect(errCard!.textContent).toContain('401 Auth Required');
+
+    // Pair token to dismiss modal, corrupt cached CSRF to verify automatic 403 csrf_mismatch self-heal, and click 1-click Retry!
+    simulateChatHttpStatus = 0;
+    const tokenInput = container.querySelector('[data-testid="lan-token-input"]') as HTMLInputElement;
+    await act(async () => {
+      setInputValue(tokenInput, 'valid-lan-token');
+    });
+    const pairSubmit = container.querySelector('[data-testid="lan-token-modal"] button[type="submit"]') as HTMLButtonElement;
+    await act(async () => {
+      pairSubmit.click();
+    });
+    await flushUi(80);
+    expect(container.querySelector('[data-testid="lan-token-modal"]')).toBeNull();
+
+    setCsrfToken('expired_csrf_after_restart');
+    const retryBtn = container.querySelector('[data-testid="chat-error-retry-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      retryBtn.click();
+    });
+    await flushUi(150);
+
+    // `IdleEventSource` never emits `done`, simulating a wedged mobile/Tailscale SSE socket while Python finished the turn.
+    // Reconciling `/api/status` (`online` event) must self-heal `sending`, render the reply, and clear the preserved draft!
+    expect(container.querySelector('[data-testid="version-drift-banner"]')).toBeNull();
+    expect(container.querySelector('[data-testid="sidebar-version-label"]')?.textContent).toBe('v5.0.5');
+    for (let poll = 0; poll < 12; poll += 1) {
+      await flushUi(120);
+      await act(async () => {
+        window.dispatchEvent(new Event('online'));
+      });
+      await flushUi(120);
+      if ((container.textContent || '').includes('Frontier reply verified.')) break;
+    }
+
+    expect(container.querySelector('[data-testid="chat-delivery-error-card"]')).toBeNull();
+    expect(textarea.value).toBe('');
+    expect(container.textContent).toContain('Frontier reply verified.');
+    expect(container.querySelector('[data-testid="composer-send-btn"]')).not.toBeNull();
+
+    // 5. Simulate server upgrade (`v5.9.0`) -> polite version-drift reload banner appears
+    simulateServerVersion = '5.9.0';
+    await act(async () => {
+      window.dispatchEvent(new Event('online'));
+    });
+    await flushUi(100);
+    const driftBanner = container.querySelector('[data-testid="version-drift-banner"]');
+    expect(driftBanner).not.toBeNull();
+    expect(driftBanner!.textContent).toContain('v5.9.0');
+    simulateServerVersion = '';
   });
 });

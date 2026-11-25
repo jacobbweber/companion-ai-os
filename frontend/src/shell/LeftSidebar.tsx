@@ -208,9 +208,10 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
           </span>
           <span
             className="mono"
+            data-testid="sidebar-version-label"
             style={{ fontSize: 10.5, color: 'var(--text-muted)' }}
           >
-            v5.0.1
+            v{status?.app_version || '5.0.5'}
           </span>
         </button>
       </div>

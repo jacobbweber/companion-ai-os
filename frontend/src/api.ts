@@ -20,6 +20,102 @@ export function setCsrfToken(tok: string): void {
   if (tok) cachedCsrfToken = tok;
 }
 
+export function getBootAppVersion(): string {
+  return document.querySelector('meta[name="companion-version"]')?.getAttribute('content') || '';
+}
+
+export function getBootAssetHash(): string {
+  return document.querySelector('meta[name="companion-asset-hash"]')?.getAttribute('content') || '';
+}
+
+export function emitAuthRequired(): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('companion:auth-required'));
+  }
+}
+
+export function formatChatErrorBanner(res: {
+  status_code?: number;
+  error_code?: string;
+  auth_required?: boolean;
+  network_error?: boolean;
+  error?: string;
+}): { title: string; detail: string; authRequired: boolean } {
+  const code = Number(res.status_code || 0);
+  const ecode = String(res.error_code || '').toLowerCase();
+  const rawErr = String(res.error || '').trim();
+  if (code === 401 || res.auth_required || ecode === 'auth_required') {
+    return {
+      title: '401 Auth Required',
+      detail: rawErr || 'LAN session token is missing or expired. Pair your COMPANION_WEB_TOKEN, then click Retry.',
+      authRequired: true,
+    };
+  }
+  if (code === 403 && (ecode === 'csrf_mismatch' || rawErr === 'csrf_mismatch')) {
+    return {
+      title: '403 Session / CSRF Expired',
+      detail: 'Your browser security token expired across a service restart or cookie reset. Click Retry to refresh and resend.',
+      authRequired: false,
+    };
+  }
+  if (code === 403) {
+    return {
+      title: '403 Request Rejected',
+      detail: rawErr || 'Browser Origin/Host security guard rejected this request.',
+      authRequired: false,
+    };
+  }
+  if (code === 409 || ecode === 'turn_busy') {
+    return {
+      title: '409 Turn Busy',
+      detail: rawErr || 'Companion is currently finishing an active turn. Wait a moment or click Retry.',
+      authRequired: false,
+    };
+  }
+  if (code === 413) {
+    return {
+      title: '413 Payload Too Large',
+      detail: rawErr || 'Message or attachment exceeds the server request limit.',
+      authRequired: false,
+    };
+  }
+  if (ecode === 'admission_timeout') {
+    return {
+      title: 'Submission Timed Out',
+      detail: rawErr || 'Companion did not acknowledge the message within 25s. Your message is preserved — click Retry.',
+      authRequired: false,
+    };
+  }
+  if (res.network_error) {
+    return {
+      title: 'Connection Unreachable',
+      detail: rawErr
+        ? `Could not reach Companion server (${rawErr}). Your message is preserved — click Retry.`
+        : 'Could not reach Companion server. Your message is preserved — click Retry.',
+      authRequired: false,
+    };
+  }
+  if (ecode === 'llm_unreachable' || /could not reach|connection refused|timed out|offline/i.test(rawErr)) {
+    return {
+      title: 'LLM Endpoint Unreachable',
+      detail: rawErr || 'The configured LLM provider could not be reached.',
+      authRequired: false,
+    };
+  }
+  if (ecode === 'interrupted') {
+    return {
+      title: 'Turn Interrupted',
+      detail: rawErr || 'The active turn was interrupted before completion (service restarted or stream disconnected).',
+      authRequired: false,
+    };
+  }
+  return {
+    title: code >= 400 ? `${code} Turn Error` : 'Turn Error',
+    detail: rawErr || 'Turn failed unexpectedly — click Retry to resend.',
+    authRequired: false,
+  };
+}
+
 async function parseJsonSafe(res: Response): Promise<Record<string, unknown>> {
   const raw = await res.text();
   if (!raw) {
@@ -71,9 +167,18 @@ export async function apiGet<T>(path: string): Promise<T> {
 export async function apiPost<T>(
   path: string,
   body: Record<string, unknown> = {},
-  retried = false
+  retried = false,
+  timeoutMs = 0
 ): Promise<T> {
   const csrf = getCsrfToken();
+  const effTimeout = timeoutMs > 0 ? timeoutMs : path === '/api/chat' && body.async === true ? 25000 : 0;
+  const ctrl = effTimeout > 0 && typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer =
+    ctrl && effTimeout > 0
+      ? window.setTimeout(() => {
+          ctrl.abort();
+        }, effTimeout)
+      : 0;
   try {
     const res = await fetch(path, {
       method: 'POST',
@@ -84,25 +189,39 @@ export async function apiPost<T>(
       },
       credentials: 'same-origin',
       body: JSON.stringify(body),
+      ...(ctrl ? { signal: ctrl.signal } : {}),
     });
     const data = await parseJsonSafe(res);
     if (res.status === 401) {
       data.ok = false;
       data.auth_required = true;
+      emitAuthRequired();
     }
     if (!retried && res.status === 403 && data && data.error === 'csrf_mismatch') {
-      const h = await apiGet<{ ok?: boolean; csrf_token?: string }>('/api/health');
+      const h = await apiGet<{ ok?: boolean; csrf_token?: string; auth_required?: boolean }>('/api/health');
       if (h && h.csrf_token) {
-        return apiPost<T>(path, body, true);
+        return apiPost<T>(path, body, true, timeoutMs);
+      }
+      if (h && h.auth_required) {
+        data.auth_required = true;
+        emitAuthRequired();
       }
     }
     return data as T;
   } catch (err) {
+    const isAbort = err instanceof Error && err.name === 'AbortError';
     return {
       ok: false,
       network_error: true,
-      error: err instanceof Error ? err.message : 'Network connection unavailable.',
+      ...(isAbort ? { error_code: 'admission_timeout' } : {}),
+      error: isAbort
+        ? 'Request timed out waiting for server acknowledgment.'
+        : err instanceof Error
+          ? err.message
+          : 'Network connection unavailable.',
     } as unknown as T;
+  } finally {
+    if (timer) window.clearTimeout(timer);
   }
 }
 
@@ -167,6 +286,28 @@ export async function fetchHistory(
   return apiGet<{ ok: boolean; has_more?: boolean; messages: ChatMessage[] }>(`/api/history${qs}`);
 }
 
+export interface JobPollResponse {
+  ok?: boolean;
+  network_error?: boolean;
+  status_code?: number;
+  job?: {
+    job_id?: string;
+    status?: string;
+    response?: string;
+    error?: string;
+    error_code?: string;
+    stream_text?: string;
+    stream_thinking?: string;
+    active_phase?: string;
+    active_tool?: string;
+    tool_steps?: ToolStepMeta[];
+  };
+}
+
+export async function fetchJobSnapshot(jobId: string): Promise<JobPollResponse> {
+  return apiGet<JobPollResponse>(`/api/jobs/${encodeURIComponent(jobId)}`);
+}
+
 export function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -205,39 +346,50 @@ export interface StreamCallbacks {
     activeTool: string;
     toolSteps: ToolStepMeta[];
   }) => void;
-  onDone?: (payload: { status: string; response: string; error: string; cancelled?: boolean }) => void;
+  onDone?: (payload: {
+    status: string;
+    response: string;
+    error: string;
+    errorCode?: string;
+    cancelled?: boolean;
+  }) => void;
   onError?: (err: string) => void;
 }
 
-export function subscribeJobStream(jobId: string, cb: StreamCallbacks, cursor = 0): () => void {
+export function subscribeJobStream(
+  jobId: string,
+  cb: StreamCallbacks,
+  cursor = 0,
+  watchdogMs = 20000
+): () => void {
   const qs = cursor > 0 ? `?cursor=${cursor}` : '';
   const es = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream${qs}`);
   let closed = false;
   let unsubscribed = false;
+  let watchdogTimer = 0;
+
+  const clearWatchdog = () => {
+    if (watchdogTimer) {
+      window.clearTimeout(watchdogTimer);
+      watchdogTimer = 0;
+    }
+  };
 
   const pollFallback = async () => {
+    clearWatchdog();
     let consecutiveNetErrors = 0;
     while (!unsubscribed && consecutiveNetErrors < 40) {
-      const res = await apiGet<{
-        ok?: boolean;
-        network_error?: boolean;
-        status_code?: number;
-        job?: {
-          status?: string;
-          response?: string;
-          error?: string;
-          stream_text?: string;
-          stream_thinking?: string;
-          active_phase?: string;
-          active_tool?: string;
-          tool_steps?: ToolStepMeta[];
-        };
-      }>(`/api/jobs/${encodeURIComponent(jobId)}`);
+      const res = await fetchJobSnapshot(jobId);
       if (res.network_error) {
         consecutiveNetErrors += 1;
       } else if (res.status_code === 404) {
         if (!unsubscribed) {
-          cb.onDone?.({ status: 'completed', response: '', error: '' });
+          cb.onDone?.({
+            status: 'interrupted',
+            response: '',
+            error: 'Turn interrupted before completion (service restarted or job expired).',
+            errorCode: 'interrupted',
+          });
         }
         return;
       } else {
@@ -257,6 +409,7 @@ export function subscribeJobStream(jobId: string, cb: StreamCallbacks, cursor = 
                 status: String(job.status),
                 response: String(job.response || ''),
                 error: String(job.error || ''),
+                errorCode: String(job.error_code || ''),
                 cancelled: job.status === 'cancelled',
               });
             }
@@ -267,14 +420,30 @@ export function subscribeJobStream(jobId: string, cb: StreamCallbacks, cursor = 
       await new Promise((r) => window.setTimeout(r, 900));
     }
     if (!unsubscribed) {
-      cb.onError?.('Stream connection interrupted — refreshing conversation history.');
+      cb.onError?.('Stream connection interrupted — could not reach server to finish turn.');
     }
   };
 
+  const armWatchdog = () => {
+    clearWatchdog();
+    if (closed || unsubscribed || watchdogMs <= 0) return;
+    watchdogTimer = window.setTimeout(() => {
+      if (!closed && !unsubscribed) {
+        closed = true;
+        es.close();
+        void pollFallback();
+      }
+    }, watchdogMs);
+  };
+
+  armWatchdog();
+
   es.onmessage = (ev) => {
+    armWatchdog();
     try {
       const data = JSON.parse(ev.data);
       const t = String(data.type || '');
+      if (t === 'heartbeat') return;
       if (t === 'text_delta' && data.delta) cb.onTextDelta?.(String(data.delta));
       else if (t === 'thinking_delta' && data.delta) cb.onThinkingDelta?.(String(data.delta));
       else if (t === 'orphan_think_closed') cb.onOrphanThinkClosed?.(String(data.thinking || ''));
@@ -291,11 +460,13 @@ export function subscribeJobStream(jobId: string, cb: StreamCallbacks, cursor = 
         });
       } else if (t === 'done') {
         closed = true;
+        clearWatchdog();
         es.close();
         cb.onDone?.({
           status: String(data.status || 'done'),
           response: String(data.response || ''),
           error: String(data.error || ''),
+          errorCode: String(data.error_code || ''),
           cancelled: Boolean(data.cancelled) || data.status === 'cancelled',
         });
       }
@@ -307,6 +478,7 @@ export function subscribeJobStream(jobId: string, cb: StreamCallbacks, cursor = 
   es.onerror = () => {
     if (!closed) {
       closed = true;
+      clearWatchdog();
       es.close();
       void pollFallback();
     }
@@ -315,6 +487,7 @@ export function subscribeJobStream(jobId: string, cb: StreamCallbacks, cursor = 
   return () => {
     unsubscribed = true;
     closed = true;
+    clearWatchdog();
     es.close();
   };
 }

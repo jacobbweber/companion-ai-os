@@ -437,11 +437,7 @@ def normalize_assistant_message(msg_obj: Dict[str, Any]) -> Tuple[str, str, List
     return clean_content, combined_thinking, existing_tcalls
 
 
-def recover_empty_synthesis(
-    messages: List[Dict[str, Any]],
-    chat_fn: Callable[..., Dict[str, Any]],
-    prior_thinking: str = "",
-) -> str:
+def recover_empty_synthesis(messages: List[Dict[str, Any]], chat_fn: Callable[..., Dict[str, Any]], prior_thinking: str = "") -> str:
     """Retry once (`tools=None`) when an LLM returns an empty or `<think>`-truncated completion (`t81` guard)."""
     thought_ctx = f"\n[COMPLETED INTERNAL REASONING]\n{prior_thinking[-1600:]}\n" if prior_thinking.strip() else ""
     prompt_text = (
@@ -477,8 +473,18 @@ def recover_empty_synthesis(
     for m in reversed(messages):
         if m.get("role") == "tool" and str(m.get("content") or "").strip():
             snippet = str(m["content"]).strip()[:400]
-            return f"Completed the requested operation. Latest tool result:\n{snippet}"
-    return "Completed the requested check. Let me know how you would like to proceed."
+            fb_out = f"Completed the requested operation. Latest tool result:\n{snippet}"
+            if has_stream_sink():
+                emit_stream_event({"type": "text_delta", "delta": fb_out})
+            return fb_out
+    fb_msg = (
+        "The model completed internal reasoning without emitting visible reply text. Please click Retry or reply `continue`."
+        if prior_thinking.strip()
+        else "Completed the requested check. Let me know how you would like to proceed."
+    )
+    if has_stream_sink():
+        emit_stream_event({"type": "text_delta", "delta": fb_msg})
+    return fb_msg
 
 
 def _fail_llm(span_label: str, t0: float, msg: str) -> RuntimeError:

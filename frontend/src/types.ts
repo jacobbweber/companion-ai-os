@@ -100,6 +100,8 @@ export interface ActiveWebJob {
 export interface WebStatus {
   ok: boolean;
   csrf_token: string;
+  app_version?: string;
+  asset_hash?: string;
   companion_name: string;
   user_name: string;
   tone: string;
@@ -182,6 +184,26 @@ export interface ChatMessage {
   activePhase?: string;
   activeTool?: string;
   streaming?: boolean;
+  is_error?: boolean;
+  error_code?: string;
+  retry_payload?: {
+    text: string;
+    attachmentIds: string[];
+    execMode: 'chat' | 'plan' | 'goal' | 'job';
+  };
+}
+
+export interface ChatDeliveryFailure {
+  id: string;
+  title: string;
+  detail: string;
+  statusCode?: number;
+  errorCode?: string;
+  authRequired?: boolean;
+  text: string;
+  attachmentIds: string[];
+  execMode: 'chat' | 'plan' | 'goal' | 'job';
+  timestamp: string;
 }
 
 export interface PromptTemplate {
