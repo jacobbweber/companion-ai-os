@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Builds a self-contained Windows Desktop Installer (`dist\CompanionSetup-v4.1.0.exe`).
+Builds a self-contained Windows Desktop Installer (`dist\CompanionSetup-v5.0.0.exe`).
 Downloads the official Python 3.12 Windows Embeddable Runtime (zero pip packages needed!),
 stages the clean Companion app tree + silent Win32 tray launchers, and compiles `companion.iss`
 if Inno Setup 6 (`ISCC.exe`) is installed.
@@ -36,7 +36,7 @@ if ($PthFile) {
 }
 
 Write-Host "[2/4] Staging clean Companion AI OS application files (zero user data)..." -ForegroundColor Cyan
-foreach ($Item in @("harness.py", ".env.example", "LICENSE", "README.md", "companion", "configs", "memory", "skills", "specs", "surfaces")) {
+foreach ($Item in @("harness.py", ".env.example", "LICENSE", "README.md", "companion", "skills", "surfaces")) {
     $Src = Join-Path $RepoRoot $Item
     if (Test-Path $Src) {
         Copy-Item -Recurse -Force $Src (Join-Path $StageDir $Item)
@@ -69,8 +69,8 @@ $IsccCandidates = @(
 if ($IsccCandidates.Count -gt 0) {
     $Iscc = $IsccCandidates[0]
     & $Iscc (Join-Path $PSScriptRoot "companion.iss")
-    Write-Host "Built installer: $RepoRoot\dist\CompanionSetup-v4.1.0.exe" -ForegroundColor Green
+    Write-Host "Built installer: $RepoRoot\dist\CompanionSetup-v5.0.0.exe" -ForegroundColor Green
 } else {
     Write-Host "Portable bundle staged at: $StageDir" -ForegroundColor Yellow
-    Write-Host "Install Inno Setup 6 (https://jrsoftware.org/isinfo.php) and re-run this script to compile CompanionSetup-v4.1.0.exe."
+    Write-Host "Install Inno Setup 6 (https://jrsoftware.org/isinfo.php) and re-run this script to compile CompanionSetup-v5.0.0.exe."
 }

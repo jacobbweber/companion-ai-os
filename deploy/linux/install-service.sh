@@ -49,10 +49,8 @@ copy_clean_app() {
   rm -rf "${dest}/companion" "${dest}/configs" "${dest}/memory" \
          "${dest}/skills" "${dest}/specs" "${dest}/surfaces"
   cp -r "${REPO_ROOT}/harness.py" "${REPO_ROOT}/.env.example" "${REPO_ROOT}/companion" \
-        "${REPO_ROOT}/configs" "${REPO_ROOT}/memory" "${REPO_ROOT}/skills" \
-        "${REPO_ROOT}/specs" "${REPO_ROOT}/surfaces" "${dest}/"
-  rm -rf "${dest}/memory/"*.db* "${dest}/companion/__pycache__" "${dest}/surfaces/__pycache__" \
-         "${dest}/configs/__pycache__" "${dest}/memory/__pycache__"
+        "${REPO_ROOT}/skills" "${REPO_ROOT}/surfaces" "${dest}/"
+  find "${dest}/companion" "${dest}/skills" "${dest}/surfaces" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
   [[ -f "${REPO_ROOT}/LICENSE" ]] && cp "${REPO_ROOT}/LICENSE" "${dest}/"
   [[ -f "${REPO_ROOT}/README.md" ]] && cp "${REPO_ROOT}/README.md" "${dest}/"
 }
