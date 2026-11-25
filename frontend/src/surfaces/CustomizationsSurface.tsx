@@ -123,7 +123,7 @@ export const CustomizationsSurface: React.FC<CustomizationsSurfaceProps> = ({
           <div>
             <h1 style={{ margin: 0, fontSize: 19, fontWeight: 600 }}>Customizations</h1>
             <p style={{ margin: '3px 0 0', fontSize: 12.5, color: 'var(--text-secondary)' }}>
-              Capability Packs, Verified Python DAG workflows, and MCP server harvesting.
+              Skills, Domain Capability Packs, declarative JSON workflows, and MCP servers.
             </p>
           </div>
 
@@ -140,7 +140,7 @@ export const CustomizationsSurface: React.FC<CustomizationsSurfaceProps> = ({
               className={`segmented-pill ${tab === 'dags' ? 'active' : ''}`}
               onClick={() => setTab('dags')}
             >
-              Python DAGs ({dags.length})
+              Workflows ({dags.length})
             </button>
             <button
               type="button"
@@ -168,7 +168,7 @@ export const CustomizationsSurface: React.FC<CustomizationsSurfaceProps> = ({
                     <span className={`badge ${sk.scope === 'user' || sk.scope === 'domain' ? 'accent' : ''}`}>
                       {sk.scope === 'domain' ? 'Domain Pack' : sk.scope === 'user' ? 'User Forged' : 'Core'}
                     </span>
-                    {sk.dags && <span className="badge ok">DAG: {sk.dags}</span>}
+                    {sk.dags && <span className="badge ok">Workflow: {sk.dags}</span>}
                   </div>
                   <div className="card-row-desc">{sk.description}</div>
                 </div>
@@ -219,7 +219,7 @@ export const CustomizationsSurface: React.FC<CustomizationsSurfaceProps> = ({
             {dagRuns.length > 0 && (
               <>
                 <div className="field-label" style={{ marginBottom: 8 }}>
-                  Recent Step-Checkpointed DAG Runs
+                  Recent Step-Checkpointed Workflow Runs
                 </div>
                 <div className="card-group">
                   {dagRuns.slice(0, 10).map((run) => (

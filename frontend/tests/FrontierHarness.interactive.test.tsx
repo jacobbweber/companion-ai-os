@@ -640,7 +640,7 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
     await flushUi(100);
 
     const dagsTabBtn = Array.from(container.querySelectorAll('.segmented-pill')).find((el) =>
-      (el.textContent || '').includes('Python DAGs')
+      (el.textContent || '').includes('Workflows')
     ) as HTMLButtonElement;
     await act(async () => {
       dagsTabBtn.click();

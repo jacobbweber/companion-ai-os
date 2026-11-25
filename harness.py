@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Companion AI OS — Self-Evolving, Spec-Driven, State-Machine Local AI Companion & Engineering Agent.
+Companion AI OS — Local-First Frontier Single-Agent Companion & Capability Workspace.
 
-Entry Point, CLI/REPL & Non-Blocking Idle Autonomy Watcher (A-Frame Presentation Apex).
-Delegates to the modular `companion/` A-Frame package while preserving full
-backward-compatible module exports and boot-time self-recovery.
+Entry Point, CLI/REPL & Non-Blocking Routine Watcher.
+Delegates to the modular 25-module `companion/` package while preserving full
+backward-compatible CLI flags and boot-time checkpoint recovery.
 
 Usage:
   Interactive REPL : python harness.py
