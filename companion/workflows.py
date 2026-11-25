@@ -108,11 +108,17 @@ _FILE_TOKEN_RE = re.compile(r"`?([a-zA-Z0-9_./-]+\.(?:py|md|json|toml|yaml|yml|i
 _DAG_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 _TYPE_MAP: Dict[str, Tuple[type, ...]] = {
     "str": (str,),
+    "string": (str,),
     "int": (int,),
+    "integer": (int,),
     "float": (int, float),
+    "number": (int, float),
     "bool": (bool,),
+    "boolean": (bool,),
     "list": (list,),
+    "array": (list,),
     "dict": (dict,),
+    "object": (dict,),
     "any": (object,),
 }
 _KIND_ALIAS: Dict[str, str] = {
@@ -1853,6 +1859,11 @@ def execute_customizations_action(p: Dict[str, Any], _actor: str = "user", store
     """CoreAction handler for Customizations (`skills/`, `data/skills/`, `data/domains/`, declarative `workflows`, and `dag_runs`)."""
     mem = store or get_memory_store()
     sub = str(p.get("subaction") or p.get("action") or "list").strip().lower()
+    if sub in ("init_domain_pack", "ensure_domain_pack", "create_domain_pack"):
+        return ensure_domain_pack(
+            name=str(p.get("name") or p.get("pack") or p.get("domain") or ""),
+            description=str(p.get("description") or ""),
+        )
     if sub in ("read_skill", "inspect_skill"):
         s_clean = str(p.get("skill") or p.get("name") or "").strip().lower()
         req_asset = str(p.get("asset") or "").strip().lstrip("/\\").replace("\\", "/")

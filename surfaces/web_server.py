@@ -432,12 +432,13 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             self.send_header(hdr, val)
 
     def _send_bytes(self, status: int, content_type: str, raw: bytes, extra_headers: Tuple[Tuple[str, str], ...] = ()) -> None:
-        self.send_response(status)
-        for hdr, val in (("Content-Type", content_type), ("Content-Length", str(len(raw))), ("Cache-Control", "no-store"), *extra_headers):
-            self.send_header(hdr, val)
-        self._send_security_headers()
-        self.end_headers()
-        self.wfile.write(raw)
+        with contextlib.suppress(ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
+            self.send_response(status)
+            for hdr, val in (("Content-Type", content_type), ("Content-Length", str(len(raw))), ("Cache-Control", "no-store"), *extra_headers):
+                self.send_header(hdr, val)
+            self._send_security_headers()
+            self.end_headers()
+            self.wfile.write(raw)
 
     def _send_json(self, status: int, data: Dict[str, Any]) -> None:
         self._send_bytes(status, "application/json; charset=utf-8", json.dumps(data, ensure_ascii=False).encode("utf-8"))

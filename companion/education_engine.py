@@ -62,19 +62,29 @@ def _make_item_id() -> str:
     return f"edu_{_now_utc().strftime('%Y%m%d')}_{os.urandom(3).hex()}"
 
 
+def _is_placeholder_echo(val: Any) -> bool:
+    s = str(val or "").strip().lower()
+    return s in ("...", "…", "1-2 sentences", "kebab-slug", "2-3 sentence core mental model", "1.") or s.startswith("1. ...")
+
+
 def _extract_edu_json(raw_text: str) -> Dict[str, Any]:
     cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.DOTALL | re.IGNORECASE).strip()
     if "</think>" in cleaned.lower():
         cleaned = re.split(r"</think>", cleaned, flags=re.IGNORECASE)[-1].strip()
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
-    s, e = cleaned.find("{"), cleaned.rfind("}")
-    if s != -1 and e > s:
+    decoder = json.JSONDecoder()
+    pos = 0
+    while pos < len(cleaned):
+        idx = cleaned.find("{", pos)
+        if idx == -1:
+            break
         try:
-            obj = json.loads(cleaned[s : e + 1])
+            obj, _ = decoder.raw_decode(cleaned[idx:])
             if isinstance(obj, dict):
                 return obj
         except Exception:
             pass
+        pos = idx + 1
     return {}
 
 
@@ -192,21 +202,27 @@ class EducationEngine:
             llm_call = chat_fn or chat
             sys_msg = (
                 "You are Companion's Socratic Curriculum Architect designing a focused 4-5 module study syllabus.\n"
-                "Make every module title and objective specific and authentic to the subject (whether culinary, music, languages, science, or software).\n"
-                "Respond ONLY with JSON: {\"domain\":\"kebab-slug\",\"goal_summary\":\"1-2 sentences\",\"modules\":[{\"slug\":\"...\",\"title\":\"...\",\"objective\":\"...\"}]}"
+                "Think very briefly (at most 3 short sentences), then make every module title and objective specific and authentic to the subject (culinary, music, languages, science, or software).\n"
+                "Respond ONLY with a JSON object containing keys `domain` (kebab-case slug), `goal_summary` (concise learning goal), and `modules` (array of 4-5 objects each with `slug`, `title`, and `objective`)."
             )
             usr_msg = f"Course Title: {clean_title}\nGoal Hint: {goal_summary or '(design practical mastery path)'}"
             try:
                 with tier_context("fast"):
-                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=900) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
-                txt, thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
-                parsed = _extract_edu_json(txt) or _extract_edu_json(thk)
-                if isinstance(parsed.get("modules"), list) and parsed["modules"]:
-                    eff_modules_in = parsed["modules"]
-                if (not eff_domain_raw or eff_domain_raw == "general") and str(parsed.get("domain") or "").strip():
-                    eff_domain_raw = str(parsed["domain"]).strip()
-                if not eff_goal_raw and str(parsed.get("goal_summary") or "").strip():
-                    eff_goal_raw = str(parsed["goal_summary"]).strip()
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_edu_json(txt)
+                valid_mods = [
+                    m for m in (parsed.get("modules") or [])
+                    if isinstance(m, dict) and str(m.get("title") or "").strip() and not _is_placeholder_echo(m.get("title"))
+                ] if isinstance(parsed.get("modules"), list) else []
+                if valid_mods:
+                    eff_modules_in = valid_mods
+                dom_cand = str(parsed.get("domain") or "").strip()
+                if (not eff_domain_raw or eff_domain_raw == "general") and dom_cand and not _is_placeholder_echo(dom_cand):
+                    eff_domain_raw = dom_cand
+                goal_cand = str(parsed.get("goal_summary") or "").strip()
+                if not eff_goal_raw and goal_cand and not _is_placeholder_echo(goal_cand):
+                    eff_goal_raw = goal_cand
             except Exception:
                 pass
 
@@ -363,7 +379,7 @@ class EducationEngine:
         rows = self.store._fetch_dicts(_ITEM_COLS, f"SELECT {', '.join(_ITEM_COLS)} FROM education_mastery {where}ORDER BY srs_box ASC, due_at ASC LIMIT ?", tuple(params))
         return [self._hydrate_item(r) for r in rows]
 
-    def build_inline_flashcard_block(self, course_id: str = "", topic: str = "", item_ids: Optional[List[str]] = None, limit: int = 6) -> Dict[str, Any]:
+    def build_inline_flashcard_block(self, course_id: str = "", topic: str = "", item_ids: Optional[List[str]] = None, limit: int = 6, empty_ok: bool = False) -> Dict[str, Any]:
         """Generate a fenced `companion-flashcards` Markdown block for inline interactive Chat rendering."""
         course = self.get_course(course_id)
         cid = course["course_id"] if course else _slug(course_id)
@@ -381,6 +397,8 @@ class EducationEngine:
             cards = filtered or cards
         cards = cards[: max(1, min(15, int(limit)))]
         if not cards:
+            if empty_ok:
+                return {"ok": True, "course_id": cid, "deck": None, "cards": [], "markdown_block": "", "summary": f"0 flashcards saved yet for `{cid}`."}
             return {"ok": False, "error": "No flashcards found for this course/topic yet. Add study items first via `upsert_items`."}
         deck = {
             "course_id": cid,
@@ -434,11 +452,11 @@ class EducationEngine:
         llm_call = chat_fn or chat
         sys_msg = (
             "You are Companion's Socratic Active-Recall Author creating high-signal spaced-repetition items.\n"
-            "Rules:\n"
-            f"1. Author exactly {n_cards} `{kind}` items testing deep understanding (mechanisms, tradeoffs, failure modes, exact steps) rather than trivial surface definitions.\n"
+            "Think very briefly (at most 3 short sentences), then follow these rules:\n"
+            f"1. Author {n_cards} `{kind}` items testing real domain understanding (mechanisms, techniques, ratios, tradeoffs, or troubleshooting).\n"
             "2. Every item MUST include `prompt` (question), `answer` (concise exact answer), `explanation` (1-2 sentences why), and `topic`.\n"
             + ("3. Because `item_kind` is `quiz`, include `choices`: an array of 4 plausible options where one matches `answer`.\n" if kind == "quiz" else "")
-            + 'Respond ONLY with JSON: {"items":[{"prompt":"...","answer":"...","choices":["..."],"explanation":"...","topic":"..."}]}'
+            + "Respond ONLY with a JSON object containing key `items` (array of item objects)."
         )
         usr_msg = (
             f"Course: {course['title']} (domain: {course.get('domain')})\n"
@@ -450,9 +468,9 @@ class EducationEngine:
         for tier_name in ("fast", "reasoning"):
             try:
                 with tier_context(tier_name):
-                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=2048) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
-                txt, thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
-                parsed = _extract_edu_json(txt) or _extract_edu_json(thk)
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_edu_json(txt)
                 cand_list = parsed.get("items")
                 if isinstance(cand_list, list) and cand_list:
                     for raw_it in cand_list:
@@ -514,9 +532,9 @@ class EducationEngine:
             usr_msg = f"Course: {course['title']} ({course.get('goal_summary')})\nModule: {eff_mod_title}"
             try:
                 with tier_context("fast"):
-                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=1400) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
-                txt, thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
-                parsed = _extract_edu_json(txt) or _extract_edu_json(thk)
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_edu_json(txt)
                 eff_core = eff_core or str(parsed.get("core_idea") or "").strip()
                 eff_mech = eff_mech or str(parsed.get("mechanism_markdown") or "").strip()
                 eff_mermaid = eff_mermaid or str(parsed.get("mermaid_diagram") or "").strip()
@@ -631,7 +649,7 @@ def execute_education_action(p: Dict[str, Any], store: Optional[MemoryStore] = N
         items = eng.list_due_items(str(p.get("course_id") or ""), int(p.get("limit") or 20), bool(p.get("include_upcoming", False)))
         return {"ok": True, "items": items, "count": len(items), "summary": f"{len(items)} study item(s) due for review."}
     if sub in ("flashcard_deck", "flashcards", "deck"):
-        res = eng.build_inline_flashcard_block(str(p.get("course_id") or ""), str(p.get("topic") or ""), p.get("item_ids") if isinstance(p.get("item_ids"), list) else None, int(p.get("limit") or 6))
+        res = eng.build_inline_flashcard_block(str(p.get("course_id") or ""), str(p.get("topic") or ""), p.get("item_ids") if isinstance(p.get("item_ids"), list) else None, int(p.get("limit") or 6), empty_ok=bool(p.get("empty_ok", False)))
         if res.get("ok") and res.get("markdown_block") and bool(p.get("persist_to_chat", False)):
             chat_text = f"**{res['deck']['deck_title']}**\n\n{res['markdown_block']}"
             msg_id = eng.store.log_message("assistant", chat_text, session_tag="study_deck")

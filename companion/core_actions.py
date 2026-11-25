@@ -611,7 +611,7 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         return {"ok": ok, "epic_id": mid, "milestone_id": mid, "summary": f"Deleted milestone `{mid}`." if ok else f"Milestone `{mid}` not found.", **({} if ok else {"error": f"Milestone `{mid}` not found."})}
     if sub == "seed_dikw":
         seeded = mgr.seed_dikw_goal_milestones(pid or mgr.resolve_project_id())
-        return {"ok": True, "milestones": seeded, "summary": f"Seeded 4 DIKW prerequisite milestones: {seeded}"}
+        return {"ok": True, "milestones": seeded, "summary": f"Seeded {len(seeded)} progressive goal milestones and starter tasks."}
     if sub in ("create_sprint", "save_sprint", "create_timebox"):
         tb = mgr.create_timebox(pid or None, str(p.get("title") or "Weekly Timebox"), goal=str(p.get("goal") or ""), start_date=str(p.get("start_date") or ""), end_date=str(p.get("end_date") or ""))
         if _as_bool(p.get("activate"), True):

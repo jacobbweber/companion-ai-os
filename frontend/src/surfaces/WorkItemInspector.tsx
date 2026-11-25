@@ -272,12 +272,12 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 90px', gap: 10 }}>
             <div>
-              <label className="field-label">DIKW Prerequisite Stage</label>
+              <label className="field-label">Stage</label>
               <select className="select" value={stageKind} onChange={(e) => setStageKind(e.target.value)}>
-                <option value="OBSERVE_DATA">1. Observe Data</option>
-                <option value="CURATE_DIKW">2. Curate Knowledge</option>
-                <option value="FORGE_CAPABILITY">3. Forge Capability / DAG</option>
-                <option value="DELIVER_AND_VERIFY">4. Deliver &amp; Verify</option>
+                <option value="OBSERVE_DATA">1. Gather &amp; Observe</option>
+                <option value="CURATE_DIKW">2. Plan &amp; Synthesize</option>
+                <option value="FORGE_CAPABILITY">3. Prepare Materials / Tools</option>
+                <option value="DELIVER_AND_VERIFY">4. Execute &amp; Verify</option>
               </select>
             </div>
             <div>
@@ -295,34 +295,73 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
             <textarea className="textarea" rows={3} value={desc} onChange={(e) => setDesc(e.target.value)} />
           </div>
 
-          <div>
-            <label className="field-label">Bound Deterministic Python DAG (Optional)</label>
-            <select className="select" value={dagName} onChange={(e) => setDagName(e.target.value)}>
-              <option value="">None (Agentic phase slice)</option>
-              {dags.map((d) => (
-                <option key={d.name} value={d.name}>
-                  {d.name} ({d.skill})
-                </option>
-              ))}
-            </select>
-          </div>
+          {(board?.project?.kind === 'code' || Boolean(board?.project?.workspace_path) || Boolean(dagName) || verTarget.trim().length > 0) ? (
+            <>
+              <div>
+                <label className="field-label">Bound Workflow (Optional)</label>
+                <select className="select" value={dagName} onChange={(e) => setDagName(e.target.value)}>
+                  <option value="">None (Agentic slice)</option>
+                  {dags.map((d) => (
+                    <option key={d.name} value={d.name}>
+                      {d.name} ({d.skill})
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-          <div className="form-grid-2">
-            <div>
-              <label className="field-label">Verification Gate</label>
-              <select className="select" value={verKind} onChange={(e) => setVerKind(e.target.value)}>
-                <option value="assertion">Assertion</option>
-                <option value="evidence_file">Evidence File</option>
-                <option value="check_command">Check Command</option>
-                <option value="domain_validator">Domain Validator</option>
-                <option value="human_gate">Human Gate</option>
-              </select>
-            </div>
-            <div>
-              <label className="field-label">Gate Target</label>
-              <input className="input mono" placeholder="path or validator" value={verTarget} onChange={(e) => setVerTarget(e.target.value)} />
-            </div>
-          </div>
+              <div className="form-grid-2">
+                <div>
+                  <label className="field-label">Verification Gate</label>
+                  <select className="select" value={verKind} onChange={(e) => setVerKind(e.target.value)}>
+                    <option value="assertion">Assertion</option>
+                    <option value="evidence_file">Evidence File</option>
+                    <option value="check_command">Check Command</option>
+                    <option value="domain_validator">Domain Validator</option>
+                    <option value="human_gate">Human Gate</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="field-label">Gate Target</label>
+                  <input className="input mono" placeholder="path or validator" value={verTarget} onChange={(e) => setVerTarget(e.target.value)} />
+                </div>
+              </div>
+            </>
+          ) : (
+            <details style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+              <summary style={{ cursor: 'pointer', userSelect: 'none', padding: '2px 0' }}>
+                Automation &amp; Verification Options
+              </summary>
+              <div style={{ display: 'grid', gap: 10, marginTop: 8 }}>
+                <div>
+                  <label className="field-label">Bound Workflow (Optional)</label>
+                  <select className="select" value={dagName} onChange={(e) => setDagName(e.target.value)}>
+                    <option value="">None (Agentic slice)</option>
+                    {dags.map((d) => (
+                      <option key={d.name} value={d.name}>
+                        {d.name} ({d.skill})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-grid-2">
+                  <div>
+                    <label className="field-label">Verification Gate</label>
+                    <select className="select" value={verKind} onChange={(e) => setVerKind(e.target.value)}>
+                      <option value="assertion">Assertion</option>
+                      <option value="evidence_file">Evidence File</option>
+                      <option value="check_command">Check Command</option>
+                      <option value="domain_validator">Domain Validator</option>
+                      <option value="human_gate">Human Gate</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="field-label">Gate Target</label>
+                    <input className="input mono" placeholder="path or validator" value={verTarget} onChange={(e) => setVerTarget(e.target.value)} />
+                  </div>
+                </div>
+              </div>
+            </details>
+          )}
 
           <div className="form-grid-2">
             <div>

@@ -1499,12 +1499,13 @@ textarea {
 }
 
 .wiki-toolbar-search-wrap {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
-  flex: 1;
+  flex: 1 1 260px;
   justify-content: flex-end;
-  min-width: 240px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .wiki-fm-search-box {
@@ -1512,6 +1513,7 @@ textarea {
   align-items: center;
   gap: 6px;
   flex: 1;
+  min-width: 0;
   max-width: 440px;
   height: 32px;
   padding: 0 5px 0 9px;
@@ -2103,11 +2105,16 @@ textarea {
   }
 
   .wiki-toolbar-search-wrap {
+    flex: 1 1 100%;
     width: 100%;
+    min-width: 0;
     justify-content: space-between;
+    gap: 6px;
   }
 
   .wiki-fm-search-box {
+    flex: 1 1 150px;
+    min-width: 0;
     max-width: none;
   }
 

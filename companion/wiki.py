@@ -1670,9 +1670,9 @@ def verify_note_freshness(
         llm_call = chat_fn or chat
         sys_msg = (
             "You are Companion's Knowledge Freshness Auditor reviewing a curated Wiki note.\n"
-            "Inspect the note's concrete facts, measurements, versions, IP addresses, steps, or dates for internal contradictions, "
+            "Think very briefly (at most 3 short sentences), then inspect the note's concrete facts, measurements, versions, IP addresses, steps, or dates for internal contradictions, "
             "incomplete placeholders, or time-sensitive claims worth re-checking.\n"
-            "Respond ONLY with valid JSON: {\"fresh\": true|false, \"audit_summary\": \"1-2 concise sentences\", \"flagged_claims\": [\"...\"]}"
+            "Respond ONLY with valid JSON containing keys `fresh` (boolean), `audit_summary` (1-2 concise sentences), and `flagged_claims` (array of strings, empty if none)."
         )
         usr_msg = (
             f"Note Path: `{rel}`\nTitle: {meta.get('title') or rd['title']}\nTemplate: {meta.get('template')}\n"
@@ -1681,14 +1681,14 @@ def verify_note_freshness(
         )
         try:
             with tier_context("fast"):
-                resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=512) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
-            txt, think_t, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
-            parsed = _extract_llm_json_dict(txt) or _extract_llm_json_dict(think_t)
-            if parsed:
+                resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+            txt, _think_t, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+            parsed = _extract_llm_json_dict(txt)
+            if parsed and str(parsed.get("audit_summary") or "").strip() not in ("", "...", "1-2 concise sentences"):
                 used_ai = True
                 audit_summary = str(parsed.get("audit_summary") or "").strip()[:260]
                 if isinstance(parsed.get("flagged_claims"), list):
-                    flagged_claims = [str(c).strip() for c in parsed["flagged_claims"] if str(c).strip()][:5]
+                    flagged_claims = [str(c).strip() for c in parsed["flagged_claims"] if str(c).strip() and str(c).strip() != "..."][:5]
         except Exception:
             used_ai = False
 
@@ -1832,19 +1832,20 @@ def stage_chat_turn_to_inbox(
         avail_tpls = [t["slug"] for t in list_templates(engine.root)]
         sys_msg = (
             "You are Companion's Knowledge Inbox Curator staging a Chat turn into `01_inbox/`.\n"
-            f"Choose a crisp descriptive `title`, a 1-2 sentence `summary` (30-200 chars), a `domain_hint` (e.g. cooking, household, homelab, software-dev), "
-            f"2-4 kebab-case `tags`, and best `template` from {avail_tpls}.\n"
-            "Respond ONLY with JSON: {\"title\":\"...\",\"summary\":\"...\",\"domain_hint\":\"...\",\"tags\":[\"...\"],\"template\":\"...\"}"
+            "Think very briefly (at most 2 short sentences), then choose a crisp descriptive `title`, a 1-2 sentence `summary` (30-200 chars), "
+            f"a `domain_hint` (e.g. cooking, household, homelab, software-dev), 2-4 kebab-case `tags`, and best `template` from {avail_tpls}.\n"
+            "Respond ONLY with a JSON object containing keys `title`, `summary`, `domain_hint`, `tags`, and `template`."
         )
         usr_msg = f"User Prompt:\n{clean_prompt[:600]}\n\nAssistant Response:\n{body[:3500]}"
         try:
             with tier_context("fast"):
-                resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=450) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
-            txt, thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
-            parsed = _extract_llm_json_dict(txt) or _extract_llm_json_dict(thk)
+                resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+            txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+            parsed = _extract_llm_json_dict(txt)
             if parsed:
-                if not raw_title and str(parsed.get("title") or "").strip():
-                    raw_title = str(parsed["title"]).strip()
+                t_cand = str(parsed.get("title") or "").strip()
+                if not raw_title and t_cand and t_cand != "...":
+                    raw_title = t_cand
                 ai_summary = str(parsed.get("summary") or "").strip()
                 ai_domain = slugify_wiki(str(parsed.get("domain_hint") or ""), "")
                 ai_tags = [t for t in as_slug_list(parsed.get("tags")) if t not in ("inbox", "01-inbox", "01_inbox")]

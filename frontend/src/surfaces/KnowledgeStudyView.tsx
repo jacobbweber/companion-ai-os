@@ -28,6 +28,7 @@ export const KnowledgeStudyView: React.FC<KnowledgeStudyViewProps> = ({ onRefres
         subaction: 'flashcard_deck',
         course_id: targetId,
         limit: 8,
+        empty_ok: true,
       });
       setStudyDeck(dRes.ok && dRes.deck ? dRes.deck : null);
     } else {

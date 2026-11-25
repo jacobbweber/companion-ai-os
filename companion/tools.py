@@ -899,7 +899,7 @@ PHASE_ALLOWED_TOOLS: Dict[str, FrozenSet[str]] = {
 _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "checkpoint_manage": frozenset({"rollback", "git_save"}),
     "memory_manage": frozenset({"add_note", "set_profile", "add_adr", "upsert_fact", "sync"}),
-    "workflow_manage": frozenset({"start", "transition", "abort", "complete", "recover", "autonomy", "blueprint", "approve", "run_dag", "resume_dag", "run_recipe", "bootstrap_skill", "promote_skill", "run_script"}),
+    "workflow_manage": frozenset({"start", "transition", "abort", "complete", "recover", "autonomy", "blueprint", "approve", "run_dag", "resume_dag", "run_recipe", "bootstrap_skill", "promote_skill", "run_script", "init_domain_pack", "ensure_domain_pack", "create_domain_pack"}),
     "job_manage": frozenset({"dispatch", "cancel", "resume"}),
     "wiki_manage": frozenset({"capture_inbox", "save", "curate", "graduate", "commit_curation", "revert_curation", "save_template", "create_proxy_note", "deep_curate_job", "consolidate_ontology", "verify_note", "stage_turn", "trash", "restore", "export_chat"}),
     "vault_manage": frozenset({"declare", "request_scope"}),
@@ -1827,6 +1827,12 @@ def tool_workflow_manage(args: Dict[str, Any]) -> str:
         workflow_engine,
     )
 
+    if action in ("init_domain_pack", "ensure_domain_pack", "create_domain_pack"):
+        from companion.workflows import ensure_domain_pack
+
+        pack_name = str_arg(args, "name") or str_arg(args, "pack") or str_arg(args, "domain") or str_arg(args, "skill_name")
+        res = ensure_domain_pack(name=pack_name, description=str_arg(args, "description"))
+        return json.dumps(res, indent=2, default=str)
     if action in ("list_dags", "list_recipes"):
         return workflow_engine.format_dags_catalog()
     if action in ("check_skill", "bootstrap_skill", "promote_skill", "run_script"):

@@ -57,19 +57,29 @@ def _slugify(text: str, fallback: str = "project") -> str:
     return s[:48] or fallback
 
 
+def _is_project_placeholder(val: Any) -> bool:
+    s = str(val or "").strip().lower()
+    return s in ("...", "…", "1. ...", "step 1", "1-2 sentences") or s.endswith("...")
+
+
 def _extract_project_json(raw_text: str) -> Dict[str, Any]:
     cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.DOTALL | re.IGNORECASE).strip()
     if "</think>" in cleaned.lower():
         cleaned = re.split(r"</think>", cleaned, flags=re.IGNORECASE)[-1].strip()
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
-    s, e = cleaned.find("{"), cleaned.rfind("}")
-    if s != -1 and e > s:
+    decoder = json.JSONDecoder()
+    pos = 0
+    while pos < len(cleaned):
+        idx = cleaned.find("{", pos)
+        if idx == -1:
+            break
         try:
-            obj = json.loads(cleaned[s : e + 1])
+            obj, _ = decoder.raw_decode(cleaned[idx:])
             if isinstance(obj, dict):
                 return obj
         except Exception:
             pass
+        pos = idx + 1
     return {}
 
 
@@ -356,9 +366,9 @@ class ProjectGraphManager:
             llm_call = chat_fn or chat
             sys_msg = (
                 "You are Companion's Personal Agile Unblocker Coach.\n"
-                "Decompose a stuck/large task into the single smallest concrete <=15-minute physical or cognitive first action that breaks inertia.\n"
+                "Think very briefly (at most 3 short sentences), then decompose a stuck/large task into the single smallest concrete <=15-minute physical or cognitive first action that breaks inertia.\n"
                 "Make it domain-authentic (household, DIY, cooking, finances, or coding — NEVER generic '15m Unblocker: ...' repetition).\n"
-                'Respond ONLY with JSON: {"title":"...","description":"1-2 sentences","owner":"human"|"companion","checklist":["step 1","step 2","step 3"]}'
+                "Respond ONLY with a JSON object containing keys `title`, `description`, `owner` (`human` or `companion`), and `checklist` (array of 3 short steps)."
             )
             usr_msg = (
                 f"Project: {proj['title']} ({proj.get('goal_summary') or proj.get('kind')})\n"
@@ -367,18 +377,20 @@ class ProjectGraphManager:
             )
             try:
                 with tier_context("fast"):
-                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=500) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
-                txt, thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
-                parsed = _extract_project_json(txt) or _extract_project_json(thk)
-                if str(parsed.get("title") or "").strip():
-                    step_title = str(parsed["title"]).strip()[:120]
-                if not step_desc and str(parsed.get("description") or "").strip():
-                    step_desc = str(parsed["description"]).strip()[:400]
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_project_json(txt)
+                t_cand = str(parsed.get("title") or "").strip()
+                if t_cand and not _is_project_placeholder(t_cand):
+                    step_title = t_cand[:120]
+                d_cand = str(parsed.get("description") or "").strip()
+                if not step_desc and d_cand and not _is_project_placeholder(d_cand):
+                    step_desc = d_cand[:400]
                 cand_own = str(parsed.get("owner") or "").strip().lower()
                 if not step_owner and cand_own in VALID_ITEM_OWNERS:
                     step_owner = cand_own
                 if isinstance(parsed.get("checklist"), list):
-                    step_checklist = [str(c).strip() for c in parsed["checklist"] if str(c).strip()][:5]
+                    step_checklist = [str(c).strip() for c in parsed["checklist"] if str(c).strip() and not _is_project_placeholder(c)][:5]
             except Exception:
                 pass
 
@@ -429,26 +441,27 @@ class ProjectGraphManager:
             llm_call = chat_fn or chat
             sys_msg = (
                 "You are Companion's Goal & Milestone Planner.\n"
-                "Tailor 4 progressive milestones (`OBSERVE_DATA`, `CURATE_DIKW`, `FORGE_CAPABILITY`, `DELIVER_AND_VERIFY`) "
-                "specifically to the user's goal domain (e.g. DIY patio refresh, cooking, fitness, household budget, or software — NEVER use software/DAG jargon for non-software goals!).\n"
-                "For each stage, provide a specific milestone `title`, `description`, and 1 concrete `starter_item` (`title`, `owner`: `human` or `companion`).\n"
-                'Respond ONLY with JSON: {"stages":{"OBSERVE_DATA":{"title":"1. ...","description":"...","starter_item":{"title":"...","owner":"human"}},"CURATE_DIKW":{...},"FORGE_CAPABILITY":{...},"DELIVER_AND_VERIFY":{...}}}'
+                "Think very briefly (at most 3 short sentences), then tailor 4 progressive milestones (`OBSERVE_DATA`, `CURATE_DIKW`, `FORGE_CAPABILITY`, `DELIVER_AND_VERIFY`) "
+                "specifically to the user's goal domain (e.g. DIY patio refresh, cooking, fitness, household budget, or software — NEVER use software/DAG/DIKW jargon for non-software goals!).\n"
+                "For each of the 4 keys inside `stages`, provide a domain-authentic `title` (numbered `1.`..`4.`), `description`, and `starter_item` (`title` and `owner`: `human` or `companion`).\n"
+                "Respond ONLY with a JSON object containing key `stages` mapping `OBSERVE_DATA`, `CURATE_DIKW`, `FORGE_CAPABILITY`, and `DELIVER_AND_VERIFY`."
             )
             usr_msg = f"Project Title: {proj['title']}\nGoal Summary: {proj.get('goal_summary') or '(general goal)'}\nKind: {proj.get('kind')}"
             try:
                 with tier_context("fast"):
-                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=900) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
-                txt, thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
-                parsed = _extract_project_json(txt) or _extract_project_json(thk)
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_project_json(txt)
                 stages_obj = parsed.get("stages") if isinstance(parsed.get("stages"), dict) else parsed
                 if isinstance(stages_obj, dict):
                     for sk in VALID_STAGE_KINDS:
                         entry = stages_obj.get(sk)
-                        if isinstance(entry, dict) and str(entry.get("title") or "").strip():
+                        if isinstance(entry, dict) and str(entry.get("title") or "").strip() and not _is_project_placeholder(entry.get("title")):
                             titles[sk] = str(entry["title"]).strip()[:120]
                             descriptions[sk] = str(entry.get("description") or "").strip()[:260]
-                            if isinstance(entry.get("starter_item"), dict) and str(entry["starter_item"].get("title") or "").strip():
-                                starter_tasks[sk] = entry["starter_item"]
+                            st_it = entry.get("starter_item")
+                            if isinstance(st_it, dict) and str(st_it.get("title") or "").strip() and not _is_project_placeholder(st_it.get("title")):
+                                starter_tasks[sk] = st_it
             except Exception:
                 pass
 
