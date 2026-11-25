@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Activity, ArchiveRestore, ChevronDown, ChevronRight, Plus, RefreshCw, RotateCw, ShieldCheck, Trash2 } from 'lucide-react';
+import { Activity, ArchiveRestore, ChevronDown, ChevronRight, Pencil, Plus, RefreshCw, RotateCw, ShieldCheck, Trash2 } from 'lucide-react';
 import { apiPost, callAction, fetchTelemetry, reloadCompanionService } from '../api';
 import type { FederatedPartner, RemoteEndpoint, SnapshotBackup, TelemetryPayload, VaultAuditEntry, VaultSecretMeta } from '../types';
 
@@ -26,6 +26,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
   const [epHost, setEpHost] = useState('');
   const [epUser, setEpUser] = useState('');
   const [epPort, setEpPort] = useState('');
+  const [epAuth, setEpAuth] = useState('auto');
   const [epCred, setEpCred] = useState('');
 
   // Federation & Hosted MCP
@@ -112,6 +113,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
       host: epHost.trim(),
       username: epUser.trim(),
       port: epPort.trim() ? Number(epPort.trim()) : 0,
+      auth_mode: epAuth === 'auto' ? '' : epAuth,
       credential_ref: epCred.trim(),
       confirmed: true,
     });
@@ -120,6 +122,7 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
       setEpHost('');
       setEpUser('');
       setEpPort('');
+      setEpAuth('auto');
       setEpCred('');
       setShowAddEndpoint(false);
       await loadSection();
@@ -127,6 +130,17 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
     } else {
       onToast(res.error || 'Endpoint registration failed.');
     }
+  };
+
+  const editEndpoint = (ep: RemoteEndpoint) => {
+    setEpId(ep.endpoint_id);
+    setEpProto((ep.protocol === 'winrm' || ep.protocol === 'http_api' ? ep.protocol : 'ssh'));
+    setEpHost(ep.host || '');
+    setEpUser(ep.username || '');
+    setEpPort(ep.port ? String(ep.port) : '');
+    setEpAuth(ep.auth_mode || 'auto');
+    setEpCred(ep.credential_ref || '');
+    setShowAddEndpoint(true);
   };
 
   if (section === 'vault') {
@@ -151,8 +165,8 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
                 <select className="select" value={secType} onChange={(e) => setSecType(e.target.value)}>
                   <option value="bearer_token">Bearer Token</option>
                   <option value="api_key">API Key</option>
-                  <option value="ssh_key">SSH Key</option>
-                  <option value="basic_auth">Basic Auth</option>
+                  <option value="ssh_key">SSH Private Key</option>
+                  <option value="basic_auth">Password / Basic Auth</option>
                 </select>
               </div>
               <div>
@@ -179,7 +193,9 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
             secrets.map((s) => (
               <div key={s.name} className="card-row">
                 <div className="card-row-info">
-                  <div className="card-row-title mono">{s.name}</div>
+                  <div className="card-row-title mono">
+                    {s.name} <span className="badge" style={{ marginLeft: 6 }}>{s.cred_type}</span>
+                  </div>
                   <div className="card-row-desc">{s.description || s.cred_type}</div>
                 </div>
                 <span className={`badge ${s.is_set ? 'ok' : 'warn'}`}>
@@ -192,7 +208,21 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <span className="field-label" style={{ margin: 0 }}>Remote SSH / WinRM / HTTP Endpoints</span>
-          <button type="button" className="btn btn-sm" onClick={() => setShowAddEndpoint((v) => !v)}>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => {
+              if (!showAddEndpoint) {
+                setEpId('');
+                setEpHost('');
+                setEpUser('');
+                setEpPort('');
+                setEpAuth('auto');
+                setEpCred('');
+              }
+              setShowAddEndpoint((v) => !v);
+            }}
+          >
             <Plus size={12} /> Add Endpoint
           </button>
         </div>
@@ -206,7 +236,14 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
               </div>
               <div>
                 <label className="field-label">Protocol</label>
-                <select className="select" value={epProto} onChange={(e) => setEpProto(e.target.value as 'ssh' | 'winrm' | 'http_api')}>
+                <select
+                  className="select"
+                  value={epProto}
+                  onChange={(e) => {
+                    setEpProto(e.target.value as 'ssh' | 'winrm' | 'http_api');
+                    setEpAuth('auto');
+                  }}
+                >
                   <option value="ssh">SSH</option>
                   <option value="winrm">WinRM</option>
                   <option value="http_api">HTTP API</option>
@@ -229,13 +266,57 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
                 </>
               )}
               <div>
+                <label className="field-label">Auth Mode</label>
+                <select className="select" value={epAuth} onChange={(e) => setEpAuth(e.target.value)}>
+                  <option value="auto">Auto (Match Vault Secret)</option>
+                  {epProto === 'ssh' && (
+                    <>
+                      <option value="ssh_key">SSH Private Key (Vault)</option>
+                      <option value="basic_auth">Password / Basic Auth (Vault)</option>
+                      <option value="ssh_agent">Local SSH Agent / ~/.ssh</option>
+                      <option value="none">None</option>
+                    </>
+                  )}
+                  {epProto === 'winrm' && (
+                    <>
+                      <option value="basic_auth">Password / Basic Auth (Vault)</option>
+                      <option value="none">Current Windows Identity</option>
+                    </>
+                  )}
+                  {epProto === 'http_api' && (
+                    <>
+                      <option value="bearer_token">Bearer Token (Vault)</option>
+                      <option value="api_key_header">API Key Header (Vault)</option>
+                      <option value="basic_auth">Basic Auth (Vault)</option>
+                      <option value="none">None</option>
+                    </>
+                  )}
+                </select>
+              </div>
+              <div>
                 <label className="field-label">Vault Credential Ref</label>
-                <input className="input mono" placeholder="Optional symbolic ref" value={epCred} onChange={(e) => setEpCred(e.target.value)} />
+                <input
+                  className="input mono"
+                  list="vault-secret-ref-list"
+                  placeholder="Optional symbolic ref (e.g. nimopc)"
+                  value={epCred}
+                  onChange={(e) => setEpCred(e.target.value)}
+                />
+                <datalist id="vault-secret-ref-list">
+                  {secrets.map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {s.cred_type}
+                    </option>
+                  ))}
+                </datalist>
               </div>
             </div>
-            <div style={{ marginTop: 10 }}>
+            <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
               <button type="button" className="btn btn-primary btn-sm" onClick={() => void addEndpoint()}>
-                Register Endpoint
+                Save Endpoint
+              </button>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowAddEndpoint(false)}>
+                Cancel
               </button>
             </div>
           </div>
@@ -248,10 +329,31 @@ export const SettingsInfraPanel: React.FC<SettingsInfraPanelProps> = ({ section,
             endpoints.map((ep) => (
               <div key={ep.endpoint_id} className="card-row">
                 <div className="card-row-info">
-                  <div className="card-row-title">{ep.endpoint_id} <span className="badge">{ep.protocol}</span></div>
-                  <div className="card-row-desc mono">{ep.host}</div>
+                  <div className="card-row-title" style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    <span>{ep.endpoint_id}</span>
+                    <span className="badge">{ep.protocol}</span>
+                    <span className="badge mono">
+                      {ep.auth_mode}{ep.credential_ref ? `:${ep.credential_ref}` : ''}
+                    </span>
+                    {ep.last_probe_status && ep.last_probe_status !== 'untested' && (
+                      <span className={`badge ${ep.last_probe_status.startsWith('online') ? 'ok' : 'warn'}`}>
+                        {ep.last_probe_status}
+                      </span>
+                    )}
+                  </div>
+                  <div className="card-row-desc mono">
+                    {ep.username ? `${ep.username}@` : ''}{ep.host}{ep.port && !ep.host.includes('://') ? `:${ep.port}` : ''}
+                  </div>
                 </div>
                 <div style={{ display: 'inline-flex', gap: 6 }}>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => editEndpoint(ep)}
+                    title="Edit endpoint"
+                  >
+                    <Pencil size={12} /> Edit
+                  </button>
                   <button
                     type="button"
                     className="btn btn-sm"

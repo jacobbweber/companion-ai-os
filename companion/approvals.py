@@ -85,7 +85,7 @@ def classify_action_risk(tool_name: str, args: Optional[Dict[str, Any]] = None) 
     if tool_name == "workflow_manage":
         return ActionRiskTier.R0_READ_ONLY if action in ("", "status", "list_dags", "list_recipes", "http_smoke", "check_skill") else (ActionRiskTier.R2_CAPABILITY_PROMOTION if action == "bootstrap_skill" else ActionRiskTier.R1_LOCAL_REVERSIBLE)
     if tool_name == "endpoint_manage":
-        if action in ("ssh_exec", "winrm_exec", "propose", "register", "remove"):
+        if action in ("ssh_exec", "winrm_exec", "propose", "propose_endpoint", "register", "create", "add", "set", "update", "upsert", "remove"):
             return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
         if action == "api_request" and str(payload.get("method") or "GET").strip().upper() not in ("GET", "HEAD"):
             return ActionRiskTier.R3_HIGH_IMPACT_MUTATION
@@ -155,6 +155,7 @@ ARCHIVE_APPROVALS_DDL: Tuple[str, ...] = (
         status TEXT DEFAULT 'waiting',
         decided_by TEXT DEFAULT '',
         decision_note TEXT DEFAULT '',
+        execution_output TEXT DEFAULT '',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         decided_at DATETIME
     )""",
@@ -184,9 +185,12 @@ def _ensure_tables(mem: MemoryStore) -> None:
         cur = m.conn.cursor()
         for ddl in ARCHIVE_APPROVALS_DDL:
             cur.execute(ddl)
+        cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(approval_requests)").fetchall()}
+        if "execution_output" not in cols:
+            cur.execute("ALTER TABLE approval_requests ADD COLUMN execution_output TEXT DEFAULT ''")
         m.conn.commit()
 
-    mem.ensure_schema("archive_approvals", _init)
+    mem.ensure_schema("archive_approvals_v2", _init)
 
 
 def get_trust_mode(store: Optional[MemoryStore] = None) -> str:
@@ -249,13 +253,38 @@ class ApprovalQueue:
         )
         return rows[0] if rows else None
 
-    def mark_executed(self, approval_id: str) -> None:
+    def mark_executed(self, approval_id: str, output: str = "") -> None:
         clean_id = (approval_id or "").strip()
         if not clean_id:
             return
+        safe_out = redact_secrets(output or "")[:16000]
         with self.store._lock:
-            self.store.conn.execute("UPDATE approval_requests SET status = 'executed' WHERE approval_id = ? AND status = 'approved'", (clean_id,))
+            self.store.conn.execute(
+                "UPDATE approval_requests SET status = 'executed', execution_output = ? WHERE approval_id = ? AND status = 'approved'",
+                (safe_out, clean_id),
+            )
             self.store.conn.commit()
+
+    def consume_recent_executed(self, fingerprint: str) -> Optional[Dict[str, Any]]:
+        """Consume cached one-shot execution output when Companion immediately follows up after human Web/CLI approval."""
+        cols = [
+            "approval_id", "category", "action_name", "target", "summary", "fingerprint",
+            "payload_json", "requester", "session_id", "status", "decided_by", "decision_note",
+            "execution_output", "created_at", "decided_at",
+        ]
+        with self.store._lock:
+            row = self.store.conn.execute(
+                f"SELECT {', '.join(cols)} FROM approval_requests WHERE status = 'executed' AND fingerprint = ? "
+                "AND execution_output != '' AND (decided_at IS NULL OR decided_at >= datetime('now', '-10 minutes')) "
+                "ORDER BY rowid DESC LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+            if not row:
+                return None
+            rec = dict(zip(cols, row))
+            self.store.conn.execute("UPDATE approval_requests SET execution_output = '' WHERE approval_id = ?", (rec["approval_id"],))
+            self.store.conn.commit()
+            return rec
 
     def check_or_enqueue(
         self,

@@ -834,7 +834,7 @@ TOOLS: List[Dict[str, Any]] = [
     }, ["action"]),
     _tool("ops_manage", "Manage background jobs, scheduled/idle routines, Blind Credential Vault metadata, SSH/WinRM/HTTP endpoints, Capability Packs/JSON workflows, workspace focus, checkpoints, telemetry, and runtime health.", {
         "domain": _p("string", "Operational subsystem to manage.", enum=["jobs", "routines", "vault", "endpoints", "workflows", "projects", "checkpoints", "telemetry", "doctor"]),
-        "action": _p("string", "Subsystem sub-action (e.g. `list`, `dispatch`, `create`, `run_dag`, `resume_dag`, `bootstrap_skill`, `run_script`, `check_secret`, `ssh_exec`, `status`, `switch`)."),
+        "action": _p("string", "Subsystem sub-action (e.g. `list`, `dispatch`, `create`, `propose`, `test`, `inspect_host`, `ssh_exec`, `ssh_read_file`, `winrm_exec`, `api_request`, `run_dag`, `resume_dag`, `bootstrap_skill`, `run_script`, `check_secret`, `status`, `switch`)."),
         "target": _p("string", "Target identifier (`job_id`, `routine_id`, `endpoint_id`, `dag`, `skill`, `name`, or project path)."),
         "params": _p("object", "Additional subsystem parameters dictionary (e.g. `{goal, title, mode, schedule_expr, command, skill_md, scripts, workflows}`)."),
     }, ["domain"]),
@@ -903,7 +903,7 @@ _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "job_manage": frozenset({"dispatch", "cancel", "resume"}),
     "wiki_manage": frozenset({"capture_inbox", "save", "curate", "graduate", "commit_curation", "revert_curation", "save_template", "create_proxy_note", "deep_curate_job", "consolidate_ontology", "verify_note", "stage_turn", "trash", "restore", "export_chat"}),
     "vault_manage": frozenset({"declare", "request_scope"}),
-    "endpoint_manage": frozenset({"propose", "register", "remove", "ssh_exec", "winrm_exec", "api_request"}),
+    "endpoint_manage": frozenset({"propose", "propose_endpoint", "register", "create", "add", "set", "update", "upsert", "remove", "ssh_exec", "winrm_exec", "api_request"}),
     "mcp_manage": frozenset({"propose_server", "register_server", "call_tool", "harvest_skill", "register_partner", "delegate_partner"}),
     "call_mcp": frozenset({"propose_server", "register_server", "call_tool", "harvest_skill", "register_partner", "delegate_partner"}),
     "routine_manage": frozenset({"create", "enable", "disable", "delete", "tick", "run_now", "autonomy_on", "autonomy_off", "prompt_save"}),

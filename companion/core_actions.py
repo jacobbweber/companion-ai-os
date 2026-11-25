@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from companion.approvals import TRUST_MODES, archive_aged_conversations, current_session_id, delete_prompt_template, dismiss_session_nudges, format_forever_search_results, get_approval_queue, get_trust_mode, list_prompt_templates, render_prompt_template, save_prompt_template, search_forever_history, set_trust_mode
+from companion.approvals import TRUST_MODES, archive_aged_conversations, current_session_id, delete_prompt_template, dismiss_session_nudges, enqueue_session_nudge, format_forever_search_results, get_approval_queue, get_trust_mode, list_prompt_templates, render_prompt_template, save_prompt_template, search_forever_history, set_trust_mode
 from companion.jobs import get_job_manager
 from companion.calendar_engine import execute_calendar_action
 from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, workspace_context
@@ -76,8 +76,9 @@ def _act_trust(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
 
 def _exec_out(r: Dict[str, Any], default_sum: str = "Executed.") -> Dict[str, Any]:
     ok = bool(r.get("ok"))
+    full_out = str(r.get("output") or r.get("summary") or (default_sum if ok else r.get("error") or "Execution failed."))
     msg = str(r.get("summary") or r.get("output") or (default_sum if ok else r.get("error") or "Execution failed."))
-    return {"executed": True, "ok": ok, "summary": msg if ok else "", "error": "" if ok else str(r.get("error") or msg)}
+    return {"executed": True, "ok": ok, "summary": msg if ok else "", "output": full_out if ok else "", "error": "" if ok else str(r.get("error") or msg)}
 
 
 def _apply_wiki_approved(act: str, payload: Dict[str, Any], mem: MemoryStore) -> Dict[str, Any]:
@@ -131,7 +132,7 @@ def _apply_approved_request(req: Dict[str, Any], mem: MemoryStore, skip_dag_resu
         with r3_approval_context(True), agent_tool_turn_context():
             out_s = fn(t_args)
         bad = out_s.startswith(("error:", "exit=1", "SAFETY GUARD REJECTED", "RISK GATE REJECTED", "PHASE TOOL GATE REJECTED"))
-        return {"executed": True, "ok": not bad, "summary": "" if bad else out_s[:400], "error": out_s[:400] if bad else ""}
+        return {"executed": True, "ok": not bad, "summary": "" if bad else out_s[:400], "output": "" if bad else out_s, "error": out_s[:400] if bad else ""}
     if cat == "wiki_edit":
         return _apply_wiki_approved(act, payload, mem)
     sec_name = str(payload.get("name") or payload.get("secret") or "")
@@ -197,10 +198,18 @@ def _act_approvals(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str,
                 if app_res["executed"]:
                     res["execution_ok"] = app_res["ok"]
                     if app_res["ok"]:
-                        aq.mark_executed(str(apr_obj.get("approval_id") or aid))
+                        full_exec_out = str(app_res.get("output") or app_res["summary"] or "")
+                        aq.mark_executed(str(apr_obj.get("approval_id") or aid), output=full_exec_out)
                         res_note = app_res["summary"]
                         res["applied_summary"] = res_note
-                        res["summary"] = f"{res['summary']} -> Executed: {res_note}"
+                        res["summary"] = f"{res['summary']} -> Executed: {res_note[:240]}"
+                        enqueue_session_nudge(
+                            f"Approved & executed `{apr_obj.get('action_name')}` on `{apr_obj.get('target')}`: {full_exec_out[:220]}",
+                            category="approval_executed",
+                            session_id=str(apr_obj.get("session_id") or "web_ui"),
+                            ref_id=str(apr_obj.get("approval_id") or aid),
+                            store=mem,
+                        )
                     else:
                         res["ok"] = False
                         res["execution_error"] = app_res["error"]
@@ -395,12 +404,18 @@ def _act_backup(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, An
 
 def _act_endpoints(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any]:
     em = get_endpoint_manager(store=mem)
-    sub = str(p.get("subaction") or "list").lower()
+    raw_sub = str(p.get("subaction") or "list").lower()
+    sub = "register" if raw_sub in ("create", "add", "set", "update", "upsert") else raw_sub
+    proto = str(p.get("protocol") or p.get("transport") or "")
+    amode = str(p.get("auth_mode") or p.get("auth") or p.get("auth_type") or "")
+    uname = str(p.get("username") or p.get("ssh_username") or p.get("user") or "")
+    cref = str(p.get("credential_ref") or p.get("cred") or p.get("credential") or "")
+    eid = str(p.get("endpoint_id") or p.get("name") or "")
     is_human = actor.strip().lower() in ("user", "cli", "web") and not is_in_agent_tool_turn()
     if sub == "register" and is_human:
-        return em.register_endpoint(endpoint_id=str(p.get("endpoint_id") or ""), protocol=str(p.get("protocol") or ""), host=str(p.get("host") or ""), label=str(p.get("label") or ""), port=int(p.get("port") or 0), username=str(p.get("username") or ""), auth_mode=str(p.get("auth_mode") or ""), credential_ref=str(p.get("credential_ref") or ""), auth_header=str(p.get("auth_header") or "X-API-Key"), os_hint=str(p.get("os_hint") or ""), verify_tls=_as_bool(p.get("verify_tls"), True), tags=_as_list(p.get("tags")), actor=actor, confirmed=_human_confirmed(p, actor))
+        return em.register_endpoint(endpoint_id=eid, protocol=proto, host=str(p.get("host") or ""), label=str(p.get("label") or ""), port=int(p.get("port") or 0), username=uname, auth_mode=amode, credential_ref=cref, auth_header=str(p.get("auth_header") or "X-API-Key"), os_hint=str(p.get("os_hint") or ""), verify_tls=_as_bool(p.get("verify_tls"), True), tags=_as_list(p.get("tags")), actor=actor, confirmed=_human_confirmed(p, actor))
     if sub in ("propose", "propose_endpoint", "register"):
-        return em.propose_endpoint(endpoint_id=str(p.get("endpoint_id") or ""), protocol=str(p.get("protocol") or ""), host=str(p.get("host") or ""), label=str(p.get("label") or ""), port=int(p.get("port") or 0), username=str(p.get("username") or ""), auth_mode=str(p.get("auth_mode") or ""), credential_ref=str(p.get("credential_ref") or ""), auth_header=str(p.get("auth_header") or "X-API-Key"), os_hint=str(p.get("os_hint") or ""), verify_tls=_as_bool(p.get("verify_tls"), True), tags=_as_list(p.get("tags")), actor=actor)
+        return em.propose_endpoint(endpoint_id=eid, protocol=proto, host=str(p.get("host") or ""), label=str(p.get("label") or ""), port=int(p.get("port") or 0), username=uname, auth_mode=amode, credential_ref=cref, auth_header=str(p.get("auth_header") or "X-API-Key"), os_hint=str(p.get("os_hint") or ""), verify_tls=_as_bool(p.get("verify_tls"), True), tags=_as_list(p.get("tags")), actor=actor)
     if sub == "remove":
         return em.remove_endpoint(str(p.get("endpoint_id") or ""), actor=actor)
     if sub == "test":

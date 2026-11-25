@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from companion import __version__
-from companion.approvals import get_approval_queue, get_trust_mode
+from companion.approvals import compute_approval_fingerprint, get_approval_queue, get_trust_mode
 from companion.config import is_in_agent_tool_turn, settings
 from companion.llm import chat, normalize_assistant_message, tier_context
 from companion.llm_wire import check_url_ssrf, urlopen_safe
@@ -65,6 +65,42 @@ __all__ = [
 # ---------------------------------------------------------------------------
 VALID_PROTOCOLS = ("ssh", "winrm", "http_api")
 VALID_AUTH_MODES = ("none", "ssh_key", "ssh_agent", "basic_auth", "bearer_token", "api_key_header")
+_AUTH_MODE_ALIASES: Dict[str, str] = {
+    "password": "basic_auth",
+    "passwd": "basic_auth",
+    "userpass": "basic_auth",
+    "key": "ssh_key",
+    "private_key": "ssh_key",
+    "agent": "ssh_agent",
+    "bearer": "bearer_token",
+    "token": "bearer_token",
+    "api_key": "api_key_header",
+    "header": "api_key_header",
+}
+
+
+def _resolve_effective_auth_mode(raw_mode: str, proto: str, cred_slug: str, store: MemoryStore) -> str:
+    """Resolve explicit/aliased `auth_mode` or infer cleanly from the linked Blind Vault credential's `cred_type`."""
+    m = (raw_mode or "").strip().lower()
+    if m and m != "auto":
+        return _AUTH_MODE_ALIASES.get(m, m)
+    meta = get_vault_manager(store=store).get_metadata(cred_slug) if cred_slug else None
+    mtype = str((meta or {}).get("cred_type") or "").strip().lower()
+    if proto == "ssh":
+        if not cred_slug:
+            return "ssh_agent"
+        return "basic_auth" if mtype == "basic_auth" else "ssh_key"
+    if proto == "winrm":
+        return "basic_auth"
+    if proto == "http_api":
+        if not cred_slug:
+            return "none"
+        if mtype == "basic_auth":
+            return "basic_auth"
+        if mtype == "api_key":
+            return "api_key_header"
+        return "bearer_token"
+    return "none"
 _DEFAULT_PORTS = {"ssh": 22, "winrm": 5985, "http_api": 80}
 _BLOCKED_META_HOSTS = {"metadata.google.internal", "metadata", "instance-data", "169.254.169.254"}
 _SECRET_ENV_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASS")
@@ -207,13 +243,13 @@ class EndpointManager:
         if credential_ref and _LooksLikeRawSecret(credential_ref):
             return {"ok": False, "error": "VAULT GUARD REJECTED: `credential_ref` must be a symbolic Vault name (like `node-ssh`), NEVER a raw key or token."}
 
-        eff_auth = (auth_mode or ("ssh_key" if proto == "ssh" and credential_ref else ("ssh_agent" if proto == "ssh" else ("basic_auth" if proto == "winrm" else ("bearer_token" if credential_ref else "none"))))).strip().lower()
+        cred_slug = normalize_secret_name(credential_ref) if credential_ref else ""
+        eff_auth = _resolve_effective_auth_mode(auth_mode, proto, cred_slug, self.store)
         if eff_auth not in VALID_AUTH_MODES:
             return {"ok": False, "error": f"Invalid `auth_mode` '{eff_auth}'. Valid: {', '.join(VALID_AUTH_MODES)}."}
         parsed_url = urllib.parse.urlsplit(clean_host) if "://" in clean_host else None
         url_port = int(parsed_url.port) if (parsed_url and parsed_url.port) else 0
         eff_port = int(port) if int(port or 0) > 0 else (url_port or (443 if proto == "http_api" and clean_host.lower().startswith("https://") else _DEFAULT_PORTS[proto]))
-        cred_slug = normalize_secret_name(credential_ref) if credential_ref else ""
 
         if cred_slug:
             ctype = "ssh_key" if eff_auth == "ssh_key" else ("basic_auth" if eff_auth == "basic_auth" else ("bearer_token" if eff_auth == "bearer_token" else "api_key"))
@@ -269,13 +305,17 @@ class EndpointManager:
         if credential_ref and _LooksLikeRawSecret(credential_ref):
             return {"ok": False, "error": "VAULT GUARD REJECTED: `credential_ref` must be a symbolic Vault name, NEVER a raw secret."}
         cred_slug = normalize_secret_name(credential_ref) if credential_ref else ""
+        eff_auth = _resolve_effective_auth_mode(auth_mode, proto, cred_slug, self.store)
+        if eff_auth not in VALID_AUTH_MODES:
+            return {"ok": False, "error": f"Invalid `auth_mode` '{eff_auth}'. Valid: {', '.join(VALID_AUTH_MODES)}."}
         if cred_slug:
+            ctype = "ssh_key" if eff_auth == "ssh_key" else ("basic_auth" if eff_auth == "basic_auth" else ("bearer_token" if eff_auth == "bearer_token" else "api_key"))
             get_vault_manager(store=self.store).declare_placeholder(
-                cred_slug, cred_type="api_key", description=f"Proposed credential for endpoint `{eid}`", allow_list=[f"endpoint:{eid}"], actor=actor,
+                cred_slug, cred_type=ctype, description=f"Proposed credential for endpoint `{eid}`", allow_list=[f"endpoint:{eid}"], actor=actor,
             )
         payload = {
             "endpoint_id": eid, "protocol": proto, "host": clean_host, "label": label.strip() or eid,
-            "port": int(port or 0), "username": clean_user, "auth_mode": auth_mode.strip(),
+            "port": int(port or 0), "username": clean_user, "auth_mode": eff_auth,
             "credential_ref": cred_slug, "auth_header": auth_header.strip() or "X-API-Key",
             "os_hint": os_hint.strip(), "verify_tls": bool(verify_tls), "tags": list(tags or []),
         }
@@ -413,12 +453,26 @@ class EndpointManager:
         is_ro = internal_readonly or _is_readonly_remote_command(command, str(ep.get("protocol") or ""))
         if trust != "strict" and is_ro:
             return None
-        allowed, apr = get_approval_queue(self.store).check_or_enqueue(
+        aq = get_approval_queue(self.store)
+        act_name = f"{ep['protocol']}_exec"
+        req_payload = {"endpoint_id": ep["endpoint_id"], "command": command}
+        fp = compute_approval_fingerprint("endpoint_exec", act_name, ep["endpoint_id"], req_payload)
+        recent_exec = aq.consume_recent_executed(fp)
+        if recent_exec is not None:
+            return {
+                "_cached_approved_result": {
+                    "ok": True,
+                    "returncode": 0,
+                    "output": recent_exec["execution_output"],
+                    "error": "",
+                }
+            }
+        allowed, apr = aq.check_or_enqueue(
             category="endpoint_exec",
-            action_name=f"{ep['protocol']}_exec",
+            action_name=act_name,
             target=ep["endpoint_id"],
             summary=f"Execute `{command[:100]}` on remote `{ep['protocol']}` host `{ep['label']}` (`{ep['host']}`).",
-            payload={"endpoint_id": ep["endpoint_id"], "command": command},
+            payload=req_payload,
             requester=actor,
             confirmed=human_ok,
         )
@@ -430,7 +484,7 @@ class EndpointManager:
         self, endpoint_id: str, command: str, timeout: int = 30, actor: str = "companion",
         confirmed: bool = False, _internal_readonly: bool = False,
     ) -> Dict[str, Any]:
-        """Execute a safety-checked command over SSH using JIT Vault key injection or SSH agent."""
+        """Execute a safety-checked command over SSH using JIT Vault key injection, Vault password (`SSH_ASKPASS`), or SSH agent."""
         ep = self.get_endpoint(endpoint_id)
         if not ep or ep["protocol"] != "ssh":
             return {"ok": False, "error": f"SSH endpoint `{endpoint_id}` not found."}
@@ -445,6 +499,8 @@ class EndpointManager:
             return {"ok": False, "error": ssrf_err}
         gate_block = self._gate_remote_exec(ep, command, actor=actor, confirmed=confirmed, internal_readonly=_internal_readonly)
         if gate_block:
+            if "_cached_approved_result" in gate_block:
+                return dict(gate_block["_cached_approved_result"])
             return gate_block
         ssh_bin = shutil.which("ssh")
         if not ssh_bin:
@@ -452,15 +508,66 @@ class EndpointManager:
 
         vault = get_vault_manager(store=self.store)
         tmp_key_path = ""
+        tmp_askpass_path = ""
         extra_secrets: List[str] = []
+        ssh_env: Optional[Dict[str, str]] = None
         try:
+            eff_auth = str(ep.get("auth_mode") or "ssh_agent").strip().lower()
+            cred_ref = str(ep.get("credential_ref") or "").strip()
+            if cred_ref and eff_auth == "ssh_key":
+                meta = vault.get_metadata(cred_ref)
+                if meta and str(meta.get("cred_type") or "").lower() == "basic_auth":
+                    eff_auth = "basic_auth"
+
             ssh_args = [
-                ssh_bin, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                ssh_bin, "-T", "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2",
                 "-o", "StrictHostKeyChecking=accept-new", "-p", str(eff_port),
             ]
-            if ep["auth_mode"] == "ssh_key" and ep["credential_ref"]:
-                ok, val_or_err = vault.resolve_for_call(ep["credential_ref"], f"endpoint:{ep['endpoint_id']}", expected_types=("ssh_key",))
+            if eff_auth == "basic_auth" and cred_ref:
+                ok, val_or_err = vault.resolve_for_call(cred_ref, f"endpoint:{ep['endpoint_id']}", expected_types=("basic_auth",))
+                if not ok:
+                    return {"ok": False, "error": val_or_err}
+                extra_secrets.append(val_or_err)
+                if not user_s and ":" in val_or_err:
+                    u_cand, ssh_pass = val_or_err.split(":", 1)
+                    if not u_cand.startswith("-") and not any(c.isspace() or ord(c) < 32 for c in u_cand):
+                        user_s = u_cand
+                else:
+                    ssh_pass = val_or_err
+                if ssh_pass:
+                    extra_secrets.append(ssh_pass)
+                ssh_tmp_dir = settings.effective_data_dir / ".ssh_tmp"
+                ssh_tmp_dir.mkdir(parents=True, exist_ok=True)
+                _lock_windows_owner_dacl(ssh_tmp_dir)
+                if os.name == "nt":
+                    fd, tmp_askpass_path = tempfile.mkstemp(prefix=".comp_askpass_", suffix=".cmd", dir=str(ssh_tmp_dir))
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as af:
+                        af.write("@echo off\r\necho %_COMP_SSH_PASS%\r\n")
+                else:
+                    fd, tmp_askpass_path = tempfile.mkstemp(prefix=".comp_askpass_", suffix=".sh", dir=str(ssh_tmp_dir))
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as af:
+                        af.write('#!/bin/sh\nprintf \'%s\\n\' "$_COMP_SSH_PASS"\n')
+                    with contextlib.suppress(OSError):
+                        os.chmod(tmp_askpass_path, 0o700)
+                _lock_windows_owner_dacl(Path(tmp_askpass_path))
+                ssh_env = {
+                    k: v for k, v in os.environ.items()
+                    if k.upper() != "COMPANION_WEB_TOKEN" and not k.upper().endswith(_SECRET_ENV_SUFFIXES)
+                }
+                ssh_env["DISPLAY"] = "companion:0"
+                ssh_env["SSH_ASKPASS"] = tmp_askpass_path
+                ssh_env["SSH_ASKPASS_REQUIRE"] = "force"
+                ssh_env["_COMP_SSH_PASS"] = ssh_pass
+                ssh_args.extend([
+                    "-o", "BatchMode=no",
+                    "-o", "PreferredAuthentications=password,keyboard-interactive",
+                    "-o", "PubkeyAuthentication=no",
+                    "-o", "NumberOfPasswordPrompts=1",
+                ])
+            elif eff_auth == "ssh_key" and cred_ref:
+                ssh_args.extend(["-o", "BatchMode=yes"])
+                ok, val_or_err = vault.resolve_for_call(cred_ref, f"endpoint:{ep['endpoint_id']}", expected_types=("ssh_key",))
                 if not ok:
                     return {"ok": False, "error": val_or_err}
                 extra_secrets.append(val_or_err)
@@ -474,9 +581,11 @@ class EndpointManager:
                     os.chmod(tmp_key_path, 0o600)
                 _lock_windows_owner_dacl(Path(tmp_key_path))
                 ssh_args.extend(["-i", tmp_key_path])
+            else:
+                ssh_args.extend(["-o", "BatchMode=yes"])
 
             dest = f"{user_s}@{host_s}" if user_s else host_s
-            proc = subprocess.run([*ssh_args, "--", dest, command], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(5, int(timeout)))
+            proc = subprocess.run([*ssh_args, "--", dest, command], env=ssh_env, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(5, int(timeout)))
             out = vault.scrub_output((proc.stdout or "").strip(), extra_secrets=extra_secrets)
             err = vault.scrub_output((proc.stderr or "").strip(), extra_secrets=extra_secrets)
             combined = (out + (f"\n[stderr]\n{err}" if err else "")).strip() or "(no output)"
@@ -484,9 +593,10 @@ class EndpointManager:
         except Exception as exc:
             return {"ok": False, "error": vault.scrub_output(f"SSH error: {type(exc).__name__}: {exc}", extra_secrets=extra_secrets)}
         finally:
-            if tmp_key_path and os.path.exists(tmp_key_path):
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_key_path)
+            for p_tmp in (tmp_key_path, tmp_askpass_path):
+                if p_tmp and os.path.exists(p_tmp):
+                    with contextlib.suppress(OSError):
+                        os.unlink(p_tmp)
 
     def ssh_read_file(self, endpoint_id: str, remote_path: str, max_lines: int = 200, actor: str = "user", confirmed: bool = False) -> Dict[str, Any]:
         """Safely read bounded lines from a file on a remote SSH host without shell injection."""
@@ -509,6 +619,8 @@ class EndpointManager:
             return {"ok": False, "error": "Non-empty PowerShell `command` is required."}
         gate_block = self._gate_remote_exec(ep, command, actor=actor, confirmed=confirmed, internal_readonly=_internal_readonly)
         if gate_block:
+            if "_cached_approved_result" in gate_block:
+                return dict(gate_block["_cached_approved_result"])
             return gate_block
         ps_bin = shutil.which("pwsh") or shutil.which("powershell")
         if not ps_bin:

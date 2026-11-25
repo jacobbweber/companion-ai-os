@@ -396,6 +396,91 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
             out_destr = dispatch("mcp__local-stdio__wipe_box", {})
             self.assertIn("AWAITING_USER_APPROVAL", out_destr)
 
+    def test_ssh_basic_auth_askpass_vault_inference_ops_aliases_and_approval_handoff(self) -> None:
+        vm = VaultManager(store=self.primary_store)
+        vm.set_secret("nimopc", "SuperSecretPass!42", cred_type="basic_auth", allow_list=["*"], actor="user")
+        em = EndpointManager(store=self.primary_store)
+
+        # 1. Omitting auth_mode on SSH with a basic_auth Vault secret auto-infers basic_auth
+        reg = em.register_endpoint("nimopc", "ssh", "192.168.1.29", username="nimopc", credential_ref="nimopc", actor="user")
+        self.assertTrue(reg["ok"], reg)
+        self.assertEqual(reg["endpoint"]["auth_mode"], "basic_auth")
+
+        # 2. Legacy row saved with auth_mode='ssh_key' reconciles cleanly when Vault secret is basic_auth,
+        #    passes SSH_ASKPASS + SSH_ASKPASS_REQUIRE=force, scrubs password, and removes temp askpass helper.
+        with self.primary_store._lock:
+            self.primary_store.conn.execute("UPDATE remote_endpoints SET auth_mode = 'ssh_key' WHERE endpoint_id = 'nimopc'")
+            self.primary_store.conn.commit()
+
+        captured_env = {}
+        captured_cmd = []
+        real_subproc_run = subprocess.run
+
+        def _fake_ssh_run(cmd, **kwargs):
+            if not cmd or cmd[0] != "/usr/bin/ssh" or "-G" in cmd:
+                if cmd and cmd[0] == "/usr/bin/ssh" and "-G" in cmd:
+                    class _GProc:
+                        returncode = 0
+                        stdout = "hostname 192.168.1.29\nport 22\n"
+                        stderr = ""
+                    return _GProc()
+                return real_subproc_run(cmd, **kwargs)
+            captured_cmd.extend(cmd)
+            captured_env.update(kwargs.get("env") or {})
+            askpass_file = (kwargs.get("env") or {}).get("SSH_ASKPASS", "")
+            self.assertTrue(askpass_file and Path(askpass_file).exists())
+
+            class _Proc:
+                returncode = 0
+                stdout = "Ubuntu 24.04 LTS (leaked: SuperSecretPass!42)\n"
+                stderr = ""
+
+            return _Proc()
+
+        with unittest.mock.patch("companion.integrations.shutil.which", return_value="/usr/bin/ssh"), \
+             unittest.mock.patch("companion.integrations.subprocess.run", side_effect=_fake_ssh_run):
+            ro_res = em.ssh_exec("nimopc", "uname -a", actor="companion")
+            self.assertTrue(ro_res["ok"], ro_res)
+            self.assertEqual(captured_env.get("SSH_ASKPASS_REQUIRE"), "force")
+            self.assertEqual(captured_env.get("_COMP_SSH_PASS"), "SuperSecretPass!42")
+            self.assertIn("BatchMode=no", captured_cmd)
+            self.assertNotIn("SuperSecretPass!42", ro_res["output"])
+            self.assertFalse(Path(captured_env["SSH_ASKPASS"]).exists())
+
+            # 3. Compound SSH command queues approval -> Web approve executes once & caches one-shot output for follow-up turn
+            comp_cmd = "echo '=== OS ===' && uname -a"
+            paused = em.ssh_exec("nimopc", comp_cmd, actor="companion")
+            self.assertTrue(paused.get("awaiting_approval"))
+            apr_id = paused["approval_id"]
+
+            call_counter = {"n": 0}
+
+            def _counted_ssh_run(cmd, **kwargs):
+                if cmd and cmd[0] == "/usr/bin/ssh" and "-G" not in cmd:
+                    call_counter["n"] += 1
+                return _fake_ssh_run(cmd, **kwargs)
+
+            with unittest.mock.patch("companion.integrations.subprocess.run", side_effect=_counted_ssh_run):
+                apr_ok = execute_core_action("approvals", {"subaction": "approve", "approval_id": apr_id}, actor="web", store=self.primary_store)
+                self.assertTrue(apr_ok["ok"], apr_ok)
+                self.assertEqual(call_counter["n"], 1)
+
+                # Immediate follow-up turn receives cached approved output without running SSH twice or re-prompting!
+                followup = em.ssh_exec("nimopc", comp_cmd, actor="companion")
+                self.assertTrue(followup["ok"], followup)
+                self.assertIn("Ubuntu 24.04 LTS", followup["output"])
+                self.assertEqual(call_counter["n"], 1)
+
+        # 4. ops_manage(domain='endpoints', action='create', params={'transport': 'ssh', 'auth_type': 'basic_auth', ...}) stages proposal
+        with memory_store_context(self.primary_store):
+            ops_out = dispatch("ops_manage", {
+                "domain": "endpoints",
+                "action": "create",
+                "target": "nimopc-alt",
+                "params": {"transport": "ssh", "host": "192.168.1.29", "port": 22, "ssh_username": "nimopc", "auth_type": "basic_auth", "credential_ref": "nimopc"},
+            })
+            self.assertIn("AWAITING_USER_APPROVAL", ops_out)
+
 
 if __name__ == "__main__":
     unittest.main()
