@@ -16,10 +16,7 @@ WORKDIR /app
 # Copy application code & pre-built static Web UI bundle (zero user data)
 COPY --chown=companion:companion harness.py .env.example LICENSE README.md ./
 COPY --chown=companion:companion companion/ ./companion/
-COPY --chown=companion:companion configs/ ./configs/
-COPY --chown=companion:companion memory/ ./memory/
 COPY --chown=companion:companion skills/ ./skills/
-COPY --chown=companion:companion specs/ ./specs/
 COPY --chown=companion:companion surfaces/ ./surfaces/
 
 ENV PYTHONUNBUFFERED=1 \

@@ -7,34 +7,30 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from companion.archive_and_approvals import (
-    TRUST_MODES, archive_aged_conversations, current_session_id, delete_prompt_template, dismiss_session_nudges,
-    format_forever_search_results, get_approval_queue, get_trust_mode, list_prompt_templates, render_prompt_template,
-    save_prompt_template, search_forever_history, set_trust_mode,
-)
-from companion.background_jobs import get_job_manager
+from companion.approvals import TRUST_MODES, archive_aged_conversations, current_session_id, delete_prompt_template, dismiss_session_nudges, format_forever_search_results, get_approval_queue, get_trust_mode, list_prompt_templates, render_prompt_template, save_prompt_template, search_forever_history, set_trust_mode
+from companion.jobs import get_job_manager
 from companion.calendar_engine import execute_calendar_action
 from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, workspace_context
 from companion.context import execute_identity_action
-from companion.dag_runtime import resume_dag_run
+from companion.workflows import resume_dag_run
 from companion.education_engine import execute_education_action
-from companion.endpoints import get_endpoint_manager
-from companion.mcp_hub import format_connected_partners_hud, get_mcp_hub, harvest_mcp_capability_pack
+from companion.integrations import get_endpoint_manager
+from companion.integrations import format_connected_partners_hud, get_mcp_hub, harvest_mcp_capability_pack
 from companion.memory_store import MemoryStore, get_memory_store, memory_store_context
 from companion.model_registry import execute_model_registry_action
-from companion.project_graph import get_project_graph
+from companion.projects import get_project_graph
 from companion.routines import (
     execute_autonomy_mode_action,
     get_routine_manager,
 )
-from companion.skill_forge import execute_customizations_action
-from companion.tool_schemas import r3_approval_context
+from companion.workflows import execute_customizations_action
+from companion.tools import r3_approval_context
 from companion.vault import create_snapshot_backup, get_vault_manager, list_snapshot_backups, restore_snapshot_backup
 from companion.wiki_curation import commit_curation_plan, inspect_graduation, list_curation_history, revert_curation, validate_curation_plan
-from companion.wiki_engine import get_wiki_engine
-from companion.wiki_maintenance import execute_wiki_maintenance_subaction
-from companion.wiki_templates import get_template, list_templates, load_tag_authority, save_template, slugify_wiki
-from companion.worktree_runner import execute_agile_worktree_subaction
+from companion.wiki import get_wiki_engine
+from companion.wiki import execute_wiki_maintenance_subaction
+from companion.wiki import get_template, list_templates, load_tag_authority, save_template, slugify_wiki
+from companion.worktrees import execute_agile_worktree_subaction
 
 __all__ = ["CORE_ACTIONS", "HARVEST_SLASH_VERBS", "ActionSpec", "execute_core_action", "handle_harvest_slash", "list_core_actions"]
 
@@ -166,7 +162,7 @@ def _apply_approved_request(req: Dict[str, Any], mem: MemoryStore, skip_dag_resu
         return _exec_out(get_routine_manager(store=mem).create_or_update_routine(routine_id=str(payload["routine_id"]), schedule_expr=str(payload.get("schedule") or ""), target_kind=str(payload.get("target_kind") or ""), title=str(payload.get("title") or ""), target_name=str(payload.get("target_name") or ""), inputs=payload.get("inputs") if isinstance(payload.get("inputs"), dict) else None, trigger_policy=payload.get("trigger_policy") if isinstance(payload.get("trigger_policy"), dict) else None, enabled=True, catch_up=_as_bool(payload.get("catch_up")), actor="user", confirmed=True))
     if cat == "git_push" and payload.get("repo_path"):
         from pathlib import Path
-        from companion.sdlc_tools import tool_git_manage
+        from companion.worktrees import tool_git_manage
 
         rp = Path(str(payload["repo_path"]))
         with memory_store_context(mem), workspace_context(rp, str(payload.get("project_id") or rp.name)):
@@ -615,7 +611,7 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         return {"ok": ok, "epic_id": mid, "milestone_id": mid, "summary": f"Deleted milestone `{mid}`." if ok else f"Milestone `{mid}` not found.", **({} if ok else {"error": f"Milestone `{mid}` not found."})}
     if sub == "seed_dikw":
         seeded = mgr.seed_dikw_goal_milestones(pid or mgr.resolve_project_id())
-        return {"ok": True, "milestones": seeded, "summary": f"Seeded 4 DIKW prerequisite milestones: {seeded}"}
+        return {"ok": True, "milestones": seeded, "summary": f"Seeded {len(seeded)} progressive goal milestones and starter tasks."}
     if sub in ("create_sprint", "save_sprint", "create_timebox"):
         tb = mgr.create_timebox(pid or None, str(p.get("title") or "Weekly Timebox"), goal=str(p.get("goal") or ""), start_date=str(p.get("start_date") or ""), end_date=str(p.get("end_date") or ""))
         if _as_bool(p.get("activate"), True):
@@ -692,7 +688,7 @@ def execute_core_action(action_name: str, params: Optional[Dict[str, Any]] = Non
 
 
 def handle_harvest_slash(verb: str, arg: str, store: Optional[MemoryStore] = None) -> str:
-    """Unified CLI/REPL slash handler delegating to `companion.harvest_tools.dispatch_harvest_slash`."""
-    from companion.harvest_tools import dispatch_harvest_slash
+    """Unified CLI/REPL slash handler delegating to `companion.tools.dispatch_harvest_slash`."""
+    from companion.tools import dispatch_harvest_slash
 
     return dispatch_harvest_slash(verb, arg, store=store)

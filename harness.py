@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Companion AI OS — Self-Evolving, Spec-Driven, State-Machine Local AI Companion & Engineering Agent.
+Companion AI OS — Local-First Frontier Single-Agent Companion & Capability Workspace.
 
-Entry Point, CLI/REPL & Non-Blocking Idle Autonomy Watcher (A-Frame Presentation Apex).
-Delegates to the modular `companion/` A-Frame package while preserving full
-backward-compatible module exports and boot-time self-recovery.
+Entry Point, CLI/REPL & Non-Blocking Routine Watcher.
+Delegates to the modular 25-module `companion/` package while preserving full
+backward-compatible CLI flags and boot-time checkpoint recovery.
 
 Usage:
   Interactive REPL : python harness.py
@@ -138,17 +138,17 @@ for _boot_attempt in range(2):
         from companion.llm import chat, model_gate
         from companion.memory_store import get_memory_store
         from companion.routines import IdleAutonomyWatcher, reconcile_startup_missed_runs
-        from companion.safety import checkpoint_manager, run_system_doctor
+        from companion.tools import checkpoint_manager, run_system_doctor
         from companion.tools import (
             TOOL_IMPLS, TOOLS, dispatch, resolve,
             tool_agile_manage, tool_calendar_manage, tool_checkpoint_manage, tool_dev_preview, tool_edit_file,
             tool_education_manage, tool_endpoint_manage, tool_git_manage,
             tool_job_manage, tool_list_dir, tool_mcp_manage, tool_memory_manage, tool_project_manage,
-            tool_read_file, tool_routine_manage, tool_run_python, tool_run_shell, tool_sdd_manage,
+            tool_read_file, tool_routine_manage, tool_run_python, tool_run_shell,
             tool_search, tool_system_doctor, tool_task_manage, tool_telemetry_manage,
             tool_vault_manage, tool_web_fetch, tool_web_search, tool_wiki_manage, tool_workflow_manage, tool_write_file,
         )
-        from companion.workflow_graph import workflow_engine
+        from companion.agent import workflow_engine
 
         break
     except Exception as _boot_exc:
@@ -297,10 +297,10 @@ def _handle_cli_args(argv: List[str], store) -> None:
         "--status": "/status", "-s": "/status",
         "--project": "/project", "-p": "/project",
         "--workflow": "/workflow", "-w": "/workflow",
-        "--plan": "/plan", "--blueprint": "/plan", "--approve": "/approve", "--eval": "/eval",
+        "--plan": "/plan", "--blueprint": "/plan", "--approve": "/approve",
         "--goal": "/goal", "-g": "/goal",
         "--backlog": "/backlog", "-b": "/backlog",
-        "--specs": "/specs", "--skills": "/skills", "--subagent": "/subagent", "--hygiene": "/hygiene",
+        "--skills": "/skills", "--subagent": "/subagent",
         "--autonomy": "/autonomy", "--morning": "/morning",
         "--memory": "/memory", "--checkpoint": "/checkpoint",
         "--rollback": "/rollback", "--reset": "/reset",

@@ -8,10 +8,10 @@ import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from companion.archive_and_approvals import set_trust_mode
+from companion.approvals import set_trust_mode
 from companion.core_actions import execute_core_action, handle_harvest_slash
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.wiki_engine import get_wiki_engine, parse_frontmatter, render_frontmatter
+from companion.wiki import get_wiki_engine, parse_frontmatter, render_frontmatter
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 
@@ -158,10 +158,20 @@ class TestWikiV31Enhancements(unittest.TestCase):
             comp_ver = execute_core_action("wiki", {"subaction": "verify_note", "path": "02_knowledge/homelab/pve-01.md"}, actor="companion", store=self.store)
             self.assertFalse(comp_ver["ok"])
 
-            # User 1-click verification clears staleness immediately
+            # User 1-click verification clears staleness immediately + supports real AI claim audit
             usr_ver = execute_core_action("wiki", {"subaction": "verify_note", "path": "02_knowledge/homelab/pve-01.md"}, actor="user", store=self.store)
             self.assertTrue(usr_ver["ok"], usr_ver)
             self.assertFalse(usr_ver["stale"])
+            from companion.wiki import verify_note_freshness
+
+            ai_ver = verify_note_freshness(
+                self.wk,
+                "02_knowledge/homelab/pve-01.md",
+                actor="user",
+                chat_fn=lambda *_a, **_kw: {"choices": [{"message": {"role": "assistant", "content": '{"fresh":true,"audit_summary":"Verified Ryzen 9 and 10.0.0.11 management IP.","flagged_claims":[]}'}}]},
+            )
+            self.assertTrue(ai_ver["ai_audited"])
+            self.assertIn("Verified Ryzen 9", ai_ver["audit_summary"])
             stale_after = execute_core_action("wiki", {"subaction": "list_stale"}, actor="user", store=self.store)
             self.assertEqual(stale_after["stale_notes"], [])
             self.assertIn("0 stale", handle_harvest_slash("/wiki", "stale", store=self.store))

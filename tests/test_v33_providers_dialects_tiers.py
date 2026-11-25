@@ -14,12 +14,12 @@ from companion.agent import handle_slash_command, run_agent_turn
 from companion.attachments import ingest_attachment, prepare_turn_attachments
 from companion.config import settings, workspace_context
 from companion.core_actions import execute_core_action
-from companion.intake import select_turn_step_tier, triage_turn
+from companion.agent import select_turn_step_tier, triage_turn
 from companion.llm import chat, discover_provider_models, format_model_tiers_status, normalize_assistant_message
 from companion.llm_wire import build_openai_resource_url, is_local_or_lan_endpoint, prepare_wire_request
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.sdlc_tools import tool_git_manage
-from companion.semantic_memory import fetch_optional_embedding
+from companion.worktrees import tool_git_manage
+from companion.memory_store import fetch_optional_embedding
 from companion.streaming import ThinkTagStreamSplitter, stream_event_context, wire_attachment_context
 from companion.tools import dispatch
 from companion.vault import VaultManager

@@ -210,7 +210,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
             className="mono"
             style={{ fontSize: 10.5, color: 'var(--text-muted)' }}
           >
-            v4.1
+            v5.0
           </span>
         </button>
       </div>

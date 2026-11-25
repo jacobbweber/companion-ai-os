@@ -21,10 +21,10 @@ sys.path.insert(0, str(repo_root))
 
 import companion.memory_store as ms
 import companion.model_registry as mr
-from companion.archive_and_approvals import get_approval_queue
+from companion.approvals import get_approval_queue
 from companion.core_actions import execute_core_action
-from companion.dag_runtime import DAGNode, DAGSpec, execute_dag_spec
-from companion.project_graph import get_project_graph
+from companion.workflows import DAGNode, DAGSpec, execute_dag_spec
+from companion.projects import get_project_graph
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 store = ms.MemoryStore(db_path=tmp_dir / "data" / "companion.db")
@@ -640,7 +640,7 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
     await flushUi(100);
 
     const dagsTabBtn = Array.from(container.querySelectorAll('.segmented-pill')).find((el) =>
-      (el.textContent || '').includes('Python DAGs')
+      (el.textContent || '').includes('Workflows')
     ) as HTMLButtonElement;
     await act(async () => {
       dagsTabBtn.click();

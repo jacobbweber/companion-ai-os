@@ -12,7 +12,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterator, Optional
+from typing import Callable, Dict, FrozenSet, Iterator, List, Optional
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
@@ -20,15 +20,39 @@ SKIP_DIRS = {
     ".git", "__pycache__", ".companion_backups", "data", "companion-data", "venv", ".venv", "node_modules",
     ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "dist", "build", "coverage",
 }
+GENERAL_TRACKED_EXTENSIONS: FrozenSet[str] = frozenset({
+    ".py", ".pyi", ".md", ".mdx", ".json", ".jsonc", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+    ".html", ".htm", ".css", ".scss", ".less", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".txt", ".rst", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".sql", ".graphql", ".proto",
+    ".csv", ".xml", ".svg", ".cs", ".csproj", ".sln", ".razor", ".go", ".mod", ".rs",
+    ".java", ".kt", ".kts", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".rb", ".php", ".lua",
+})
 MODEL_TIERS = ("default", "fast", "coding", "reasoning", "audio", "image", "video")
 CAPABILITY_TIERS = ("default", "fast", "coding", "reasoning", "image", "audio", "video", "embedding")
 SELF_PROJECT_ID = "companion-self"
 
 __all__ = [
-    "CAPABILITY_TIERS", "DEFAULT_ROOT", "MODEL_TIERS", "SELF_PROJECT_ID", "SKIP_DIRS", "Settings", "TierConfig",
-    "WorkspaceContext", "agent_tool_turn_context", "execution_origin_context", "get_execution_origin",
-    "is_in_agent_tool_turn", "settings", "slugify_project_id", "workspace_context",
+    "CAPABILITY_TIERS", "DEFAULT_ROOT", "GENERAL_TRACKED_EXTENSIONS", "MODEL_TIERS", "SELF_PROJECT_ID", "SKIP_DIRS",
+    "Settings", "TierConfig", "WorkspaceContext", "agent_tool_turn_context", "execution_origin_context",
+    "get_execution_origin", "is_in_agent_tool_turn", "settings", "slugify_project_id", "walk_pruned_files",
+    "workspace_context",
 ]
+
+
+def walk_pruned_files(root: Path) -> List[Path]:
+    """Return sorted regular files under `root` while pruning `SKIP_DIRS` via `os.walk`."""
+    if not root.is_dir():
+        return []
+    found: List[Path] = []
+    for cur_root, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        base = Path(cur_root)
+        for fn in sorted(files):
+            cand = base / fn
+            if cand.is_file():
+                found.append(cand)
+    found.sort()
+    return found
 
 _DEFAULT_TIER_TEMPS: Dict[str, float] = {"fast": 0.15, "coding": 0.15, "reasoning": 0.6}
 _DEFAULT_TIER_MAX_TOKENS: Dict[str, int] = {"reasoning": 4096}
@@ -448,8 +472,12 @@ class Settings:
         return self.effective_data_dir / "IDENTITY.md"
 
     @property
-    def specs_dir(self) -> Path:
-        return self.root / "specs"
+    def root_context_md_path(self) -> Path:
+        return self.effective_data_dir / "CONTEXT.md"
+
+    @property
+    def domains_dir(self) -> Path:
+        return self.effective_data_dir / "domains"
 
     @property
     def skills_dir(self) -> Path:

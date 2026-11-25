@@ -12,16 +12,15 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from companion.archive_and_approvals import ApprovalQueue, peek_session_nudges, set_trust_mode
-from companion.background_jobs import BackgroundJobManager
+from companion.approvals import ActionRiskTier, ApprovalQueue, classify_action_risk, peek_session_nudges, set_trust_mode
+from companion.jobs import BackgroundJobManager
 from companion.config import agent_tool_turn_context, settings
 from companion.core_actions import execute_core_action
-from companion.disciplines import ActionRiskTier, classify_action_risk
-from companion.endpoints import EndpointManager
+from companion.integrations import EndpointManager
 from companion.llm import ModelGate
 from companion.llm_wire import urlopen_safe
 from companion.memory_store import MemoryStore
-from companion.safety import LoopGuard, check_command_safety, check_path_safety
+from companion.tools import LoopGuard, check_command_safety, check_path_safety
 from companion.vault import VaultManager, restore_snapshot_backup
 from surfaces.web_server import (
     create_web_server,
@@ -276,7 +275,7 @@ class TestSecurityAndHardening(unittest.TestCase):
 
         jm = BackgroundJobManager(store=self.store)
         with patch(
-            "companion.dag_runtime.execute_dag_by_name",
+            "companion.workflows.execute_dag_by_name",
             return_value={"ok": False, "status": "failed", "error": "gate failed"},
         ):
             dispatched = jm.dispatch_job(

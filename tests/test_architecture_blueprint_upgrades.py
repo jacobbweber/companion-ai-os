@@ -13,26 +13,23 @@ from typing import Any, Dict, List
 from unittest.mock import patch
 
 from companion.agent import run_agent_turn
-from companion.autonomy import run_autonomous_goal
-from companion.blueprint import approve_blueprint_and_build, create_or_revise_blueprint, is_awaiting_blueprint_approval
-from companion.compaction import compact_messages_if_needed
+from companion.agent import run_autonomous_goal
+from companion.agent import approve_blueprint_and_build, create_or_revise_blueprint, is_awaiting_blueprint_approval
+from companion.approvals import ActionRiskTier, classify_action_risk
+from companion.context import compact_messages_if_needed
 from companion.config import SELF_PROJECT_ID, settings, workspace_context
 from companion.context import build_system_prompt
-from companion.disciplines import ActionRiskTier, classify_action_risk, resolve_workspace_contract
-from companion.eval_harness import run_live_flight_eval
-from companion.grounding import (
-    KnowledgeEntry, LocalWorkspaceTarget, build_epistemic_grounding, build_workspace_radar,
-    get_knowledge_port, register_execution_target, register_knowledge_adapter,
-)
-from companion.intake import assess_turn_readiness, select_turn_step_tier
+from companion.context import KnowledgeEntry, build_epistemic_grounding, build_workspace_radar, get_knowledge_port, register_knowledge_adapter
+from companion.tools import LocalWorkspaceTarget, register_execution_target
+from companion.agent import assess_turn_readiness, select_turn_step_tier
 from companion.llm import current_tier_name
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.safety import CheckpointManager
-from companion.skill_forge import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
-from companion.tool_schemas import check_phase_tool_permission, phase_tool_context
+from companion.tools import CheckpointManager
+from companion.workflows import check_make_vs_borrow, run_skill_script, stage_and_promote_skill
+from companion.tools import check_phase_tool_permission, phase_tool_context
 from companion.tools import dispatch
-from companion.workflow_dag import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks, evaluate_step_verification
-from companion.workflow_graph import WorkflowEngine
+from companion.workflows import GoalPlan, GoalStep, VerificationSpec, build_goal_plan_from_tasks, evaluate_step_verification
+from companion.agent import WorkflowEngine
 from surfaces.web_server import CompanionWebSession
 
 
@@ -207,7 +204,6 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
         self.assertIn("PHASE TOOL GATE REJECTED", check_phase_tool_permission("project_manage", "DISCOVER", {"action": "switch"}) or "")
         self.assertIsNone(check_phase_tool_permission("project_manage", "IMPLEMENT", {"action": "switch"}))
         self.assertIn("PHASE TOOL GATE REJECTED", check_phase_tool_permission("memory_manage", "PLAN", {"action": "upsert_fact"}) or "")
-        self.assertIn("PHASE TOOL GATE REJECTED", check_phase_tool_permission("sdd_manage", "DISCOVER", {"action": "sync"}) or "")
         self.assertIsNone(check_phase_tool_permission("memory_manage", "REFLECT", {"action": "upsert_fact"}))
 
         self.assertEqual(classify_action_risk("read_file", {"path": "README.md"}), ActionRiskTier.R0_READ_ONLY)
@@ -283,11 +279,6 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ws = Path(tmp) / "dag_ws"
             ws.mkdir()
-            # External workspace contract allows third-party imports in user projects (unlike companion-self)
-            ext_c = resolve_workspace_contract(ws, is_self_project=False)
-            self_c = resolve_workspace_contract(settings.root, is_self_project=True)
-            self.assertFalse(ext_c.enforce_stdlib_only)
-            self.assertTrue(self_c.enforce_stdlib_only)
 
             # Invalid JSON fails structured VerificationSpec; valid TOML passes
             bad_json = ws / "bad.json"
@@ -315,7 +306,7 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
 
             try:
                 with workspace_context(ws, "dag-proj"), memory_store_context(st):
-                    from companion.dag_runtime import execute_dag_by_name
+                    from companion.workflows import execute_dag_by_name
                     dag_res = execute_dag_by_name("full-audit", params={"run_tests": False}, store=st)
                     self.assertIn("status", dag_res)
 
@@ -374,8 +365,6 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
                     r_syn = stage_and_promote_skill("json-schema-check", valid_md, scripts={"checker.py": "def broken(:\n"}, root=repo)
                     self.assertFalse(r_syn["promoted"])
                     self.assertFalse((repo / "skills" / "json-schema-check").exists())
-                    r_imp = stage_and_promote_skill("json-schema-check", valid_md, scripts={"checker.py": '"""Doc."""\nimport requests\nprint(requests)\n'}, root=repo)
-                    self.assertFalse(r_imp["promoted"])
                     r_fail = stage_and_promote_skill("json-schema-check", valid_md, scripts={"checker.py": '"""Doc."""\nimport sys\nif "--self-test" in sys.argv:\n    sys.exit(2)\n'}, root=repo)
                     self.assertFalse(r_fail["promoted"])
                     self.assertFalse((repo / "skills" / "json-schema-check").exists())
@@ -391,25 +380,6 @@ class TestArchitectureBlueprintUpgrades(unittest.TestCase):
                     self.assertIn("CHECKED:alpha,beta", out)
             finally:
                 st.close()
-
-        # Verify Flight 4 (`suite="general"`) end-to-end
-        def _f4_mock(messages: List[Dict[str, Any]], _tools=None, _choice="auto") -> Dict[str, Any]:
-            u = "\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "user")
-            is_tool = messages[-1].get("role") == "tool"
-            if "[AUTONOMOUS WORKFLOW PHASE: PLAN" in u and not is_tool:
-                tc = {"id": "p4", "function": {"name": "task_manage", "arguments": json.dumps({"action": "add_task", "description": "Create service_manifest.toml and rollout_policy.json"})}}
-                return {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [tc]}}]}
-            if "[AUTONOMOUS WORKFLOW PHASE: IMPLEMENT" in u and not is_tool:
-                tcs = [
-                    {"id": "w4_1", "function": {"name": "write_file", "arguments": json.dumps({"path": "service_manifest.toml", "content": '[service]\nname = "edge-gateway"\nport = 8095\n'})}},
-                    {"id": "w4_2", "function": {"name": "write_file", "arguments": json.dumps({"path": "rollout_policy.json", "content": '{"strategy": "canary", "max_surge": 1}\n'})}},
-                ]
-                return {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": tcs}}]}
-            return {"choices": [{"message": {"role": "assistant", "content": "Completed phase."}}]}
-
-        ev = run_live_flight_eval(suite="general", chat_fn=_f4_mock, check_endpoints=False, verbose=False)
-        self.assertTrue(ev["passed"], ev["summary"])
-        self.assertEqual(len(ev["flights"]), 1)
 
     def test_execution_target_seam_and_live_grounding_and_consult_lock(self) -> None:
         """Verify custom `ExecutionTarget` interception, live `reasoning` readiness, `DEEP_CONSULT` tool lock, and auto-Blueprint."""

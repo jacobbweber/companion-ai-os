@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 
 from companion.config import MODEL_TIERS, Settings, parse_env_file
-from configs import get_architecture_frame, verify_architecture
 
 
 class TestConfigAndArchitecture(unittest.TestCase):
@@ -30,31 +29,15 @@ class TestConfigAndArchitecture(unittest.TestCase):
         issues = cfg.validate()
         self.assertEqual(issues, [])
 
-    def test_architecture_frame_does_not_duplicate_on_repeated_calls(self) -> None:
-        frame1 = get_architecture_frame()
-        frame2 = get_architecture_frame()
-        count1 = sum(len(v) for v in frame1.layers.values())
-        count2 = sum(len(v) for v in frame2.layers.values())
-        self.assertEqual(count1, count2)
-        self.assertGreaterEqual(count1, 8)
+    def test_syntax_guard_catches_invalid_python_and_json(self) -> None:
+        from companion.tools import lint_single_file_edit
 
-    def test_verify_architecture_passes(self) -> None:
-        from companion import __version__
-        from companion.safety import lint_single_file_edit
-
-        res = verify_architecture()
-        self.assertTrue(res["valid"], f"Architecture verification failed: {res}")
-        self.assertEqual(res["version"], __version__)
         with tempfile.TemporaryDirectory() as tmp:
             gov = Path(tmp)
-            (gov / "companion").mkdir()
-            err, _ = lint_single_file_edit(
-                gov / "companion" / "config.py",
-                '"""Bad package-level upward import."""\nfrom companion import agent\nprint(agent)\n',
-                governed_root=gov,
-            )
-            self.assertIn("ARCHITECTURE GUARD REJECTED", str(err))
-            self.assertIn("companion.agent", str(err))
+            err_py, _ = lint_single_file_edit(gov / "bad.py", "def broken(:\n")
+            self.assertIn("SYNTAX GUARD REJECTED", str(err_py))
+            err_js, _ = lint_single_file_edit(gov / "bad.json", "{invalid_json")
+            self.assertIn("SYNTAX GUARD REJECTED", str(err_js))
 
     def test_multi_tier_and_multimodal_endpoint_resolution(self) -> None:
         self.assertEqual(MODEL_TIERS, ("default", "fast", "coding", "reasoning", "audio", "image", "video"))
@@ -119,7 +102,7 @@ class TestConfigAndArchitecture(unittest.TestCase):
         """Verify trailing/consecutive `system` messages are normalized for vLLM Jinja and empty external builds fail gate."""
         from unittest.mock import patch
 
-        from companion.autonomy import _evaluate_hard_verification
+        from companion.agent import _evaluate_hard_verification
         from companion.config import workspace_context
         from companion.llm import _sanitize_wire_messages, chat
 
@@ -215,7 +198,7 @@ class TestConfigAndArchitecture(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 store = MemoryStore(db_path=Path(tmp) / "swap_tier.db")
                 try:
-                    with patch("companion.intake.settings", cfg_swap):
+                    with patch("companion.agent.settings", cfg_swap):
                         self.assertEqual(_select_step_tier("auto", store, consecutive_errors=3, step=2, intent_mode="GUIDED_CHANGE"), "reasoning")
                         self.assertEqual(_select_step_tier("auto", store, consecutive_errors=0, step=0, intent_mode="DEEP_CONSULT"), "reasoning")
                         self.assertEqual(_select_step_tier("auto", store, consecutive_errors=0, step=1, intent_mode="DEEP_CONSULT", prior_tier="reasoning"), "reasoning")

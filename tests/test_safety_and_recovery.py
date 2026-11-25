@@ -6,14 +6,7 @@ import unittest
 from pathlib import Path
 
 from companion.memory_store import MemoryStore
-from companion.safety import (
-    CheckpointManager,
-    LoopGuard,
-    check_command_safety,
-    check_path_safety,
-    try_indent_shifted_replace,
-    validate_python_syntax,
-)
+from companion.tools import CheckpointManager, LoopGuard, check_command_safety, check_path_safety, try_indent_shifted_replace, validate_python_syntax
 
 
 class TestSafetyAndRecovery(unittest.TestCase):
@@ -141,11 +134,11 @@ class TestSafetyAndRecovery(unittest.TestCase):
             self.assertIn("SAFETY GUARD REJECTED path", str(env_err))
 
     def test_external_linter_scoping_and_vault_subprocess_fence(self) -> None:
-        from companion.autonomy import scan_placeholder_violations
+        from companion.agent import scan_placeholder_violations
         from companion.config import settings, workspace_context
-        from companion.grounding import LocalWorkspaceTarget
+        from companion.tools import LocalWorkspaceTarget
         from companion.memory_store import memory_store_context
-        from companion.safety import lint_single_file_edit
+        from companion.tools import lint_single_file_edit
         from companion.tools import dispatch
         from companion.vault import VaultManager
 

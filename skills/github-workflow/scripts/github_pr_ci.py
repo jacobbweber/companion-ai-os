@@ -28,132 +28,11 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from companion.memory_store import MemoryStore  # noqa: E402
-from companion.vault import VaultManager, get_vault_manager  # noqa: E402
-
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-def _github_request(
-    method: str,
-    api_base: str,
-    path: str,
-    token: str,
-    payload: Optional[Dict[str, Any]] = None,
-) -> Any:
-    url = api_base.rstrip("/") + "/" + path.lstrip("/")
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "Companion-SDLC/3.5",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
-    host = (urllib.parse.urlparse(url).hostname or "").lower()
-    opener = _NO_PROXY_OPENER if host in ("127.0.0.1", "localhost", "::1") else urllib.request.build_opener()
-    with opener.open(req, timeout=20.0) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw) if raw.strip() else {"ok": True}
-
-
-def _resolve_github_token(credential_ref: str, vault: Optional[VaultManager] = None) -> Tuple[str, VaultManager]:
-    vm = vault or get_vault_manager()
-    ok, tok_or_err = vm.resolve_for_call(credential_ref, caller_scope="skill:github-workflow")
-    if not ok:
-        raise RuntimeError(tok_or_err)
-    return tok_or_err, vm
-
-
-def upsert_pull_request(
-    repo: str,
-    head: str,
-    base: str,
-    title: str,
-    body: str,
-    credential_ref: str,
-    *,
-    api_base: str = "https://api.github.com",
-    vault: Optional[VaultManager] = None,
-) -> Dict[str, Any]:
-    """Idempotently create or update an open GitHub Pull Request for `head -> base`."""
-    if "/" not in repo or head in ("main", "master"):
-        return {"ok": False, "error": f"Invalid repo `{repo}` or protected head branch `{head}`."}
-    owner = repo.split("/", 1)[0]
-    token, vm = _resolve_github_token(credential_ref, vault)
-    try:
-        q = urllib.parse.urlencode({"head": f"{owner}:{head}", "base": base, "state": "open"})
-        existing = _github_request("GET", api_base, f"/repos/{repo}/pulls?{q}", token)
-        if isinstance(existing, list) and existing:
-            pr_num = int(existing[0]["number"])
-            pr = _github_request("PATCH", api_base, f"/repos/{repo}/pulls/{pr_num}", token, {"title": title, "body": body})
-            action = "updated"
-        else:
-            pr = _github_request("POST", api_base, f"/repos/{repo}/pulls", token, {"title": title, "body": body, "head": head, "base": base})
-            action = "created"
-        out = {"ok": True, "action": action, "number": pr.get("number"), "html_url": pr.get("html_url", ""), "state": pr.get("state", "open")}
-        return json.loads(vm.scrub_output(json.dumps(out)))
-    except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")[:400]
-        return {"ok": False, "error": vm.scrub_output(f"GitHub HTTP {exc.code}: {err_body}")}
-    except Exception as exc:
-        return {"ok": False, "error": vm.scrub_output(f"{type(exc).__name__}: {exc}")}
-
-
-def inspect_check_runs(
-    repo: str,
-    git_ref: str,
-    credential_ref: str,
-    *,
-    api_base: str = "https://api.github.com",
-    vault: Optional[VaultManager] = None,
-) -> Dict[str, Any]:
-    """Inspect GitHub Actions check-runs for `git_ref`."""
-    token, vm = _resolve_github_token(credential_ref, vault)
-    try:
-        res = _github_request("GET", api_base, f"/repos/{repo}/commits/{git_ref}/check-runs", token)
-        runs = res.get("check_runs") or []
-        passed = [r["name"] for r in runs if r.get("conclusion") in ("success", "neutral", "skipped")]
-        failed = [{"name": r.get("name"), "url": r.get("html_url", "")} for r in runs if r.get("conclusion") in ("failure", "timed_out", "cancelled", "action_required")]
-        pending = [r["name"] for r in runs if r.get("status") != "completed"]
-        out = {
-            "ok": len(failed) == 0,
-            "ref": git_ref,
-            "total": len(runs),
-            "passed": passed,
-            "failed": failed,
-            "pending": pending,
-        }
-        return json.loads(vm.scrub_output(json.dumps(out)))
-    except Exception as exc:
-        return {"ok": False, "error": vm.scrub_output(f"{type(exc).__name__}: {exc}")}
-
-
-def merge_pull_request(
-    repo: str,
-    pr_number: int,
-    credential_ref: str,
-    *,
-    merge_method: str = "squash",
-    approved: bool = False,
-    api_base: str = "https://api.github.com",
-    vault: Optional[VaultManager] = None,
-) -> Dict[str, Any]:
-    """Merge an approved Pull Request after human gate confirmation."""
-    if not approved:
-        return {"ok": False, "error": "PR merge requires explicit human gate approval (`--approved`)."}
-    token, vm = _resolve_github_token(credential_ref, vault)
-    try:
-        res = _github_request(
-            "PUT", api_base, f"/repos/{repo}/pulls/{int(pr_number)}/merge", token,
-            {"merge_method": merge_method if merge_method in ("squash", "merge", "rebase") else "squash"},
-        )
-        out = {"ok": bool(res.get("merged", True)), "sha": res.get("sha", ""), "message": res.get("message", "Merged")}
-        return json.loads(vm.scrub_output(json.dumps(out)))
-    except Exception as exc:
-        return {"ok": False, "error": vm.scrub_output(f"{type(exc).__name__}: {exc}")}
+from companion.config import settings  # noqa: E402
+from companion.memory_store import MemoryStore, get_memory_store  # noqa: E402
+from companion.projects import get_project_graph  # noqa: E402
+from companion.vault import VaultManager  # noqa: E402
+from companion.worktrees import inspect_check_runs, merge_pull_request, upsert_pull_request  # noqa: E402
 
 
 def _run_self_test() -> int:
@@ -233,29 +112,67 @@ def _run_self_test() -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def verify_delivery_policy(params: Dict[str, Any]) -> Dict[str, Any]:
+    head = str(params.get("head") or "").strip()
+    if not head or head in ("main", "master"):
+        return {"ok": False, "error": f"Feature branch required (`head={head!r}`); direct `main`/`master` PR publish is blocked."}
+    pg = get_project_graph(store=get_memory_store())
+    pid = str(params.get("project_id") or settings.get_workspace().project_id or "").strip()
+    proj = pg.get_project(pid) if pid else None
+    policy = str((proj or {}).get("delivery_policy") or params.get("delivery_policy") or "local_only")
+    if policy == "local_only":
+        return {"ok": False, "error": "Project `delivery_policy` is `local_only`; remote branch push & PR creation are blocked."}
+    cred_ref = str(params.get("credential_ref") or (proj or {}).get("git_credential_ref") or "github-pat")
+    return {"ok": True, "delivery_policy": policy, "credential_ref": cred_ref, "head": head}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Blind-Vault GitHub PR & Actions helper.")
     parser.add_argument("--self-test", action="store_true", help="Run offline loopback mock GitHub API self-test.")
-    parser.add_argument("--action", choices=["upsert-pr", "checks", "merge-pr"], default="checks")
+    parser.add_argument("--action", choices=["verify-policy", "upsert-pr", "checks", "merge-pr"], default="checks")
     parser.add_argument("--repo", default="", help="owner/repo")
     parser.add_argument("--head", default="", help="Feature branch or commit SHA")
     parser.add_argument("--base", default="main", help="Base branch")
     parser.add_argument("--title", default="", help="PR title")
     parser.add_argument("--body", default="", help="PR description")
     parser.add_argument("--pr-number", type=int, default=0, help="PR number for merge-pr")
-    parser.add_argument("--credential-ref", default="github-pat", help="Symbolic Blind Vault secret slug")
+    parser.add_argument("--credential-ref", default="", help="Symbolic Blind Vault secret slug")
     parser.add_argument("--api-base", default="https://api.github.com", help="GitHub REST API base URL")
     parser.add_argument("--approved", action="store_true", help="Confirm human approval for merge-pr")
     args = parser.parse_args()
     if args.self_test:
         return _run_self_test()
-    if args.action == "upsert-pr":
-        res = upsert_pull_request(args.repo, args.head, args.base, args.title, args.body, args.credential_ref, api_base=args.api_base)
+    stdin_payload: Dict[str, Any] = {}
+    if sys.stdin is not None and not sys.stdin.isatty():
+        raw_in = sys.stdin.read().strip()
+        if raw_in:
+            try:
+                stdin_payload = json.loads(raw_in)
+            except Exception:
+                stdin_payload = {}
+    wf_in = dict(stdin_payload.get("input") or stdin_payload.get("params") or {})
+    repo = args.repo or str(wf_in.get("repo") or "")
+    head = args.head or str(wf_in.get("head") or "")
+    base = args.base if args.base != "main" else str(wf_in.get("base") or "main")
+    title = args.title or str(wf_in.get("title") or f"feat: {head}")
+    body = args.body or str(wf_in.get("body") or "Automated verified PR from Companion SDLC.")
+    cred_ref = args.credential_ref or str(wf_in.get("credential_ref") or "github-pat")
+    api_base = args.api_base if args.api_base != "https://api.github.com" else str(wf_in.get("api_base") or "https://api.github.com")
+    pr_num = args.pr_number or int(wf_in.get("pr_number") or wf_in.get("number") or 0)
+    if args.action == "verify-policy":
+        res = verify_delivery_policy({**wf_in, "head": head})
+    elif args.action == "upsert-pr":
+        pr_res = upsert_pull_request(repo, head, base, title, body, cred_ref, api_base=api_base)
+        if pr_res.get("ok"):
+            chk = inspect_check_runs(repo, head, cred_ref, api_base=api_base)
+            res = {**pr_res, "pr_number": int(pr_res.get("number") or 0), "checks": chk}
+        else:
+            res = pr_res
     elif args.action == "merge-pr":
-        res = merge_pull_request(args.repo, args.pr_number, args.credential_ref, approved=args.approved, api_base=args.api_base)
+        res = merge_pull_request(repo, pr_num, cred_ref, approved=bool(args.approved or wf_in.get("approved")), api_base=api_base)
     else:
-        res = inspect_check_runs(args.repo, args.head, args.credential_ref, api_base=args.api_base)
-    print(json.dumps(res, indent=2))
+        res = inspect_check_runs(repo, head, cred_ref, api_base=api_base)
+    print(json.dumps(res))
     return 0 if res.get("ok") else 1
 
 

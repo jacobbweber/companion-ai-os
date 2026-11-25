@@ -21,16 +21,16 @@ from companion.config import settings, workspace_context
 from companion.context import build_system_prompt
 from companion.core_actions import execute_core_action, handle_harvest_slash
 from companion.education_engine import get_education_engine
-from companion.grounding import discover_skills, rank_relevant_skills
-from companion.harvest_tools import tool_agile_manage, tool_education_manage
-from companion.intake import classify_turn_intent
+from companion.context import discover_skills, rank_relevant_skills
+from companion.tools import tool_agile_manage, tool_education_manage
+from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.project_graph import get_project_graph, sync_workflow_to_project_graph
+from companion.projects import get_project_graph, sync_workflow_to_project_graph
 from companion.routines import get_routine_manager
-from companion.skill_forge import run_skill_script
-from companion.tool_schemas import check_phase_tool_permission, filter_tools_for_phase
+from companion.workflows import run_skill_script
+from companion.tools import check_phase_tool_permission, filter_tools_for_phase
 from companion.tools import tool_search, tool_web_search
-from companion.wiki_templates import list_templates
+from companion.wiki import list_templates
 from surfaces.api_extensions import enrich_web_status
 
 
@@ -191,6 +191,34 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
         edu = get_education_engine(store=self.store)
         cr = edu.upsert_course(title="Go Concurrency", domain="systems", modules=["Goroutines", "Channels"])
         edu.upsert_study_items(cr["course_id"], [{"prompt": "What buffered channel op blocks?", "answer": "Send when buffer is full."}])
+        gen_res = edu.generate_study_items(
+            course_id=cr["course_id"],
+            item_kind="quiz",
+            count=2,
+            chat_fn=lambda *_a, **_kw: {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"items":[{"prompt":"When does an unbuffered channel send complete?","answer":"When a receiver is ready","choices":["Immediately","When a receiver is ready","On close","Never"],"explanation":"Rendezvous synchronization.","topic":"Channels"}]}',
+                    }
+                }]
+            },
+        )
+        self.assertTrue(gen_res["ok"], gen_res)
+        self.assertGreaterEqual(gen_res["count"], 1)
+        ai_course = edu.upsert_course(
+            title="French Mother Sauces",
+            chat_fn=lambda *_a, **_kw: {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"domain":"cooking","goal_summary":"Master the five classical French mother sauces.","modules":[{"slug":"roux","title":"Roux Ratios & Starch","objective":"Cook white, blond, and brown roux."},{"slug":"bechamel","title":"Bechamel & Veloute","objective":"Emulsify dairy and stock bases."}]}',
+                    }
+                }]
+            },
+        )
+        self.assertEqual(ai_course["course"]["total_modules"], 2)
+        self.assertEqual(ai_course["course"]["domain"], "cooking")
         with memory_store_context(self.store):
             tool_out = tool_education_manage({"action": "flashcard_deck", "course_id": cr["course_id"]})
         self.assertIn("```companion-flashcards", tool_out)
@@ -231,6 +259,37 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
             self.assertTrue(ub["ok"])
             self.assertEqual(ub["unblocker"]["estimate_minutes"], 15)
             self.assertEqual(get_project_graph(self.store).get_item(cid)["status"], "blocked")
+
+            patio = get_project_graph(self.store).create_project(title="Backyard Patio Refresh", goal_summary="Level pavers and add string lights")
+            seeded_ms = get_project_graph(self.store).seed_dikw_goal_milestones(
+                patio["project_id"],
+                chat_fn=lambda *_a, **_kw: {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"stages":{"OBSERVE_DATA":{"title":"1. Measure Patio Footprint & Slope","description":"Check drainage","starter_item":{"title":"Measure 12x16 patio perimeter","owner":"human"}},"CURATE_DIKW":{"title":"2. Compare Paver Materials & Budget","description":"Cost sheet","starter_item":{"title":"Price gravel base and pavers","owner":"companion"}},"FORGE_CAPABILITY":{"title":"3. Rent Compactor & Stage Base","description":"Prep tools","starter_item":{"title":"Reserve plate compactor","owner":"human"}},"DELIVER_AND_VERIFY":{"title":"4. Lay Pavers & Hang String Lights","description":"Final build","starter_item":{"title":"Sweep polymeric sand and test lights","owner":"human"}}}}',
+                        }
+                    }]
+                },
+            )
+            self.assertEqual(len(seeded_ms), 4)
+            patio_ms = get_project_graph(self.store).list_milestones(patio["project_id"])
+            self.assertIn("Measure Patio Footprint", patio_ms[0]["title"])
+            patio_items = get_project_graph(self.store).list_items(project_id=patio["project_id"])
+            self.assertEqual(len(patio_items), 4)
+            ai_ub = get_project_graph(self.store).slice_unblocker(
+                patio_items[0]["item_id"],
+                chat_fn=lambda *_a, **_kw: {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"title":"Grab 25ft tape measure and sketch corners","description":"Quick 10-minute yard measurement.","owner":"human","checklist":["Find tape measure","Measure length","Measure width"]}',
+                        }
+                    }]
+                },
+            )
+            self.assertEqual(ai_ub["title"], "Grab 25ft tape measure and sketch corners")
+            self.assertEqual(len(ai_ub["checklist"]), 3)
             self.assertEqual(len(execute_core_action("agile", {"subaction": "list_items", "project_id": pid}, store=self.store)["items"]), 2)
             self.assertTrue(execute_core_action("agile", {"subaction": "delete_epic", "epic_id": mid}, store=self.store)["ok"])
             bad_sub = execute_core_action("agile", {"subaction": "nonexistent_subaction"}, store=self.store)
@@ -252,13 +311,13 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
                 self.assertNotIn("notes.md", s_py)
 
             # web_search privacy lock + HTML Lite parsing
-            with unittest.mock.patch("companion.os_tools.settings.effective_privacy_mode", return_value="local_only"), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
+            with unittest.mock.patch("companion.tools.settings.effective_privacy_mode", return_value="local_only"), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
                 self.assertIn("PRIVACY LOCK", tool_web_search({"query": "Ubuntu GDM black screen"}))
             fake_html = b'<html><body><a class="result__a" href="https://example.com/gdm">Fix GDM Black Screen</a><a class="result__snippet">Restart gdm service.</a></body></html>'
             fake_resp = unittest.mock.MagicMock()
             fake_resp.read.return_value = fake_html
             fake_resp.__enter__.return_value = fake_resp
-            with unittest.mock.patch("companion.os_tools.settings.effective_privacy_mode", return_value="hybrid"), unittest.mock.patch("companion.os_tools.urlopen_safe", return_value=fake_resp), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
+            with unittest.mock.patch("companion.tools.settings.effective_privacy_mode", return_value="hybrid"), unittest.mock.patch("companion.tools.urlopen_safe", return_value=fake_resp), unittest.mock.patch.dict(os.environ, {"COMPANION_SEARCH_URL": ""}, clear=False):
                 ws_out = tool_web_search({"query": "Ubuntu GDM", "max_results": 3})
             self.assertIn("Fix GDM Black Screen", ws_out)
             self.assertIn("https://example.com/gdm", ws_out)
@@ -266,7 +325,6 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
             # Scoped repo-internal tools: hidden in daily OS mode, exposed when focused on an external repo workspace
             with workspace_context(settings.root, "companion-self"):
                 daily_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
-                self.assertNotIn("sdd_manage", daily_names)
                 self.assertNotIn("system_doctor", daily_names)
                 self.assertNotIn("git_manage", daily_names)
                 self.assertNotIn("dev_preview", daily_names)
@@ -276,14 +334,6 @@ class TestCompanionProjectGraphCalendarEducation(unittest.TestCase):
                 dev_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
                 self.assertIn("git_manage", dev_names)
                 self.assertIn("dev_preview", dev_names)
-                self.assertNotIn("sdd_manage", dev_names)
-            (ext_ws / "companion").mkdir(parents=True, exist_ok=True)
-            (ext_ws / "specs").mkdir(parents=True, exist_ok=True)
-            (ext_ws / "specs" / "ARCHITECTURE.md").write_text("# architecture\n", encoding="utf-8")
-            with workspace_context(ext_ws, "ext-companion-clone"):
-                comp_names = {t["function"]["name"] for t in filter_tools_for_phase("")}
-                self.assertIn("sdd_manage", comp_names)
-                self.assertIn("system_doctor", comp_names)
 
 
 if __name__ == "__main__":

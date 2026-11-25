@@ -15,17 +15,18 @@ Enforces quality-over-speed absorption from `01_inbox/` into `02_knowledge/`:
 import json
 import os
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue, get_trust_mode
+from companion.approvals import get_approval_queue, get_trust_mode
 from companion.config import get_execution_origin
 from companion.llm import chat, normalize_assistant_message, tier_context
-from companion.semantic_memory import semantic_similarity
+from companion.memory_store import semantic_similarity
 from companion.telemetry import redact_secrets
-from companion.wiki_engine import WikiEngine
-from companion.wiki_templates import (
+from companion.wiki import (
+    WikiEngine,
     as_slug_list, canonicalize_ontology, compute_body_metrics, extract_wikilinks, hydrate_note_meta,
     list_templates, load_tag_authority, parse_frontmatter, recommend_templates,
     register_authority_terms, render_frontmatter, scaffold_foreground_body, scrub_conversational_chatter,
@@ -557,25 +558,39 @@ def _extract_json_obj(raw_text: str) -> Dict[str, Any]:
 
 
 def _query_librarian_graduation_json(
-    rd: Dict[str, Any], audit: Dict[str, Any], kb_tree: Dict[str, List[str]],
-    sibling_inbox: List[str], chat_fn: Any = None,
+    rd: Dict[str, Any],
+    audit: Dict[str, Any],
+    kb_tree: Dict[str, List[str]],
+    sibling_inbox: List[str],
+    overlap_notes: Optional[List[Dict[str, Any]]] = None,
+    chat_fn: Any = None,
 ) -> Tuple[Dict[str, Any], str]:
     llm_call = chat_fn or chat
     tpl_lines = [f"- `{t['slug']}` [{t['document_type']}] required_sections={t['required_sections']} — {t['when_to_use']}" for t in audit["available_templates"]]
+    overlap_blob = (
+        "\n\n".join(
+            f"Candidate Overlap `{ov['path']}` (tpl={ov.get('template')}):\n{ov.get('body', '')[:2500]}"
+            for ov in (overlap_notes or [])
+        )
+        or "(none)"
+    )
     sys_msg = (
         "You are Companion's Senior Knowledge Librarian curating an `01_inbox/` note into `02_knowledge/`.\n"
         "Rules:\n"
-        "1. Design an intuitive human folder taxonomy (`domain` + optional `topic` subfolder) considering BOTH existing `02_knowledge/` folders AND sibling `01_inbox/` notes so related notes land in a tidy, consistent folder hierarchy.\n"
+        "1. Design an intuitive human folder taxonomy (`domain` + optional `topic` subfolder) considering BOTH existing `02_knowledge/` folders AND sibling `01_inbox/` notes so related notes land in a tidy, consistent hierarchy.\n"
         "2. NEVER use `inbox`, `01-inbox`, or `01_inbox` as `domain`, `topic`, or `tags`.\n"
         "3. `slug` MUST name this specific note's subject (e.g. `chicken-stir-fry`), NEVER the template name (`cooking-recipe`).\n"
-        "4. Strip scratch prefixes like `Test: ` from `title` when appropriate, and write a genuine 1-2 sentence prose `summary` (40-200 chars, NEVER a raw bullet list).\n"
+        "4. Strip scratch prefixes like `Test: ` or `> **Origin Prompt**:` chatter, and write a genuine 1-2 sentence prose `summary` (40-200 chars, NEVER a raw bullet list).\n"
         "5. Pick the best matching `template` from Available Templates (preferring domain-specific templates like `cooking-recipe` when sections match). NEVER apply IT/server concepts (`operational-runbook`, `preventive-maintenance`) to everyday personal topics like cooking, home life, or hobbies.\n"
-        "6. Link genuinely related existing `02_knowledge/` notes in `related` using `[[stem]]` syntax.\n"
+        "6. If a Candidate Overlap in `02_knowledge/` covers the exact same entity/topic and should absorb this update, set `strategy` to `MERGE_AND_REFINE` and `merge_target` to its `02_knowledge/...` path, weaving both notes cleanly together with zero lost facts or code blocks. Otherwise set `strategy` to `CREATE_NEW`.\n"
+        "7. Write `content` as complete, well-structured Markdown starting with `# <Curated Title>` and containing EVERY `## <Section>` required by your chosen `template`, preserving 100% of measurements, ingredients, commands, code blocks, and facts from the source note (NEVER write placeholder text).\n"
+        "8. Link genuinely related existing `02_knowledge/` notes in `related` using `[[stem]]` syntax.\n"
         "Respond ONLY with a single valid JSON object matching:\n"
-        '{"domain":"...","topic":"...","slug":"...","title":"...","summary":"...","template":"...","tags":["..."],"ontology":["..."],"related":["[[...]]"],"rationale":"..."}'
+        '{"strategy":"CREATE_NEW","merge_target":"","domain":"...","topic":"...","slug":"...","title":"...","summary":"...","template":"...","tags":["..."],"ontology":["..."],"related":["[[...]]"],"rationale":"...","content":"# Title\\n\\n## Section..."}'
     )
     usr_msg = (
         f"Existing `02_knowledge/` Folder Tree & Notes:\n{json.dumps(kb_tree, indent=2) if kb_tree else '(empty)'}\n\n"
+        f"High-Overlap Existing Notes:\n{overlap_blob}\n\n"
         f"Other Sibling Notes Waiting in `01_inbox/`:\n{json.dumps(sibling_inbox) if sibling_inbox else '[]'}\n\n"
         f"Available Governed Templates:\n" + "\n".join(tpl_lines) + "\n\n"
         f"Target `01_inbox/` Note (`{rd['path']}`):\nCurrent Frontmatter: {json.dumps(rd.get('frontmatter') or {})}\n\n"
@@ -585,7 +600,7 @@ def _query_librarian_graduation_json(
     for tier_name in ("reasoning", "fast"):
         try:
             with tier_context(tier_name):
-                resp = llm_call(msgs, None, "none", max_tokens=2048) if chat_fn is None else llm_call(msgs, None, "none")
+                resp = llm_call(msgs, None, "none", max_tokens=4096) if chat_fn is None else llm_call(msgs, None, "none")
             txt, think_txt, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
             parsed = _extract_json_obj(txt) or _extract_json_obj(think_txt)
             if parsed.get("domain") or parsed.get("title"):
@@ -609,8 +624,11 @@ def propose_ai_graduation(engine: WikiEngine, inbox_path: str, chat_fn: Any = No
     with engine.store._lock:
         engine.store.conn.execute("UPDATE wiki_curation_sessions SET curation_id = ? WHERE curation_id = ?", (cid, audit["curation_id"]))
         engine.store.conn.commit()
+    overlap_notes: List[Dict[str, Any]] = []
     for req_p in audit.get("required_reads") or []:
-        engine.read_note(req_p)
+        ov_rd = engine.read_note(req_p)
+        if ov_rd.get("ok") and str(ov_rd["path"]).startswith("02_knowledge/"):
+            overlap_notes.append(ov_rd)
 
     kb_notes = engine.list_notes(folder="02_knowledge", limit=200)
     kb_tree: Dict[str, List[str]] = {}
@@ -622,25 +640,48 @@ def propose_ai_graduation(engine: WikiEngine, inbox_path: str, chat_fn: Any = No
         kb_tree.setdefault(folder_key, []).append(f"{n['title']} [[{Path(str(n['rel_path'])).stem}]]")
     sibling_inbox = [f"{n['title']} ({Path(str(n['rel_path'])).name})" for n in engine.list_notes(folder="01_inbox", limit=40) if n["rel_path"] != rd["path"]]
 
-    ai_obj, used_tier = _query_librarian_graduation_json(rd, audit, kb_tree, sibling_inbox, chat_fn=chat_fn)
+    ai_obj, used_tier = _query_librarian_graduation_json(rd, audit, kb_tree, sibling_inbox, overlap_notes=overlap_notes, chat_fn=chat_fn)
+    if used_tier == "fallback" and chat_fn is None and "unittest" not in sys.modules and os.environ.get("COMPANION_TEST_MODE") != "1":
+        return {
+            "ok": False,
+            "curation_id": cid,
+            "inbox_path": rd["path"],
+            "used_tier": "offline",
+            "error": "AI Knowledge Librarian could not reach a live LLM provider. Check Settings -> Models & Tiers before running AI Graduation.",
+        }
+
     avail_slugs = {t["slug"] for t in audit["available_templates"]}
-    rec_tpl = (audit["recommended_templates"][0]["slug"] if audit.get("recommended_templates") else "standard-note")
+    rec_tpl = audit["recommended_templates"][0]["slug"] if audit.get("recommended_templates") else "standard-note"
     tpl_slug = slugify_wiki(str(ai_obj.get("template") or ""), "")
     if tpl_slug not in avail_slugs or tpl_slug == "inbox-raw":
         tpl_slug = rec_tpl if rec_tpl in avail_slugs else "standard-note"
 
-    clean_title = re.sub(r"^test:\s*", "", str(ai_obj.get("title") or rd["title"] or "").strip(), flags=re.IGNORECASE).strip() or rd["title"]
-    dom_slug = slugify_wiki(str(ai_obj.get("domain") or rd.get("domain") or ""), "")
-    if dom_slug in ("", "inbox", "01-inbox", "01_inbox"):
-        dom_slug = "general"
-    top_slug = slugify_wiki(str(ai_obj.get("topic") or ""), "")
-    if top_slug in (dom_slug, "inbox", "01-inbox", "01_inbox", "none", "null"):
-        top_slug = ""
-    note_slug = slugify_wiki(str(ai_obj.get("slug") or ""), "")
-    if not note_slug or note_slug in (tpl_slug, "inbox-note", "note") or Path(rd["path"]).stem.lower() == tpl_slug:
-        note_slug = slugify_wiki(re.sub(r"\s*\([^)]*\)\s*$", "", clean_title), fallback=Path(rd["path"]).stem)
+    raw_strategy = str(ai_obj.get("strategy") or "CREATE_NEW").strip().upper()
+    merge_target = str(ai_obj.get("merge_target") or "").strip().replace("\\", "/").lstrip("/")
+    if raw_strategy == "MERGE_AND_REFINE" and merge_target.startswith("02_knowledge/") and (engine.root / merge_target).is_file():
+        engine.read_note(merge_target)
+        m_parts = merge_target.split("/")
+        dom_slug = m_parts[1] if len(m_parts) >= 3 else "general"
+        top_slug = m_parts[2] if len(m_parts) == 4 else ""
+        note_slug = Path(merge_target).stem
+        dst_rel = merge_target
+        strategy = "MERGE_AND_REFINE"
+    else:
+        strategy = "KEEP_SEPARATE" if overlap_notes else "CREATE_NEW"
+        merge_target = ""
+        dom_slug = slugify_wiki(str(ai_obj.get("domain") or rd.get("domain") or ""), "")
+        if dom_slug in ("", "inbox", "01-inbox", "01_inbox"):
+            dom_slug = "general"
+        top_slug = slugify_wiki(str(ai_obj.get("topic") or ""), "")
+        if top_slug in (dom_slug, "inbox", "01-inbox", "01_inbox", "none", "null"):
+            top_slug = ""
+        clean_title_seed = re.sub(r"^test:\s*", "", str(ai_obj.get("title") or rd["title"] or "").strip(), flags=re.IGNORECASE).strip() or rd["title"]
+        note_slug = slugify_wiki(str(ai_obj.get("slug") or ""), "")
+        if not note_slug or note_slug in (tpl_slug, "inbox-note", "note") or Path(rd["path"]).stem.lower() == tpl_slug:
+            note_slug = slugify_wiki(re.sub(r"\s*\([^)]*\)\s*$", "", clean_title_seed), fallback=Path(rd["path"]).stem)
+        dst_rel = f"02_knowledge/{dom_slug}/{top_slug}/{note_slug}.md" if top_slug else f"02_knowledge/{dom_slug}/{note_slug}.md"
 
-    dst_rel = f"02_knowledge/{dom_slug}/{top_slug}/{note_slug}.md" if top_slug else f"02_knowledge/{dom_slug}/{note_slug}.md"
+    clean_title = re.sub(r"^test:\s*", "", str(ai_obj.get("title") or rd["title"] or "").strip(), flags=re.IGNORECASE).strip() or rd["title"]
     raw_tags = [t for t in as_slug_list(ai_obj.get("tags") or rd.get("tags")) if t not in ("inbox", "01-inbox", "01_inbox")]
     tags = list(dict.fromkeys(raw_tags or [dom_slug, *([top_slug] if top_slug else [])]))
     it_bias = {"operational-runbook", "preventive-maintenance"}
@@ -658,17 +699,35 @@ def propose_ai_graduation(engine: WikiEngine, inbox_path: str, chat_fn: Any = No
         if peer := engine._find_domain_peer_link(dom_slug, dst_rel):
             rel_links.append(peer)
 
-    body_norm = re.sub(r"^\s*#\s+[^\n]+\n*", "", (rd["body"] or "").strip())
-    body_out = scaffold_foreground_body(engine.root, tpl_slug, clean_title, eff_summary, f"# {clean_title}\n\n{body_norm}", dst_rel)
+    ai_body = scrub_conversational_chatter(str(ai_obj.get("content") or ai_obj.get("body") or "").strip())
+    if ai_body:
+        _, ai_body_stripped = parse_frontmatter(ai_body)
+        cand_body = ai_body_stripped if ai_body_stripped.strip() else ai_body
+        if not cand_body.lstrip().startswith("#"):
+            cand_body = f"# {clean_title}\n\n{cand_body}"
+        body_out = scaffold_foreground_body(engine.root, tpl_slug, clean_title, eff_summary, cand_body, dst_rel)
+    else:
+        body_norm = re.sub(r"^\s*#\s+[^\n]+\n*", "", (rd["body"] or "").strip())
+        body_out = scaffold_foreground_body(engine.root, tpl_slug, clean_title, eff_summary, f"# {clean_title}\n\n{body_norm}", dst_rel)
+
     rationale = str(ai_obj.get("rationale") or f"Organized into `02_knowledge/{dom_slug}{'/' + top_slug if top_slug else ''}` using template `{tpl_slug}`.").strip()
 
-    out_spec = {"path": dst_rel, "title": clean_title, "summary": eff_summary, "template": tpl_slug, "domain": dom_slug, "topic": top_slug, "tags": tags, "ontology": ont, "related": rel_links, "content": body_out}
-    val_res = validate_curation_plan(engine, cid, "CREATE_NEW", outputs=[out_spec], rationale=rationale)
+    out_spec = {
+        "path": dst_rel, "title": clean_title, "summary": eff_summary, "template": tpl_slug,
+        "domain": dom_slug, "topic": top_slug, "tags": tags, "ontology": ont, "related": rel_links, "content": body_out,
+    }
+    val_res = validate_curation_plan(engine, cid, strategy, outputs=[out_spec], rationale=rationale)
+    if not val_res.get("ok") and strategy == "MERGE_AND_REFINE":
+        strategy = "KEEP_SEPARATE"
+        dst_rel = f"02_knowledge/{dom_slug}/{top_slug}/{note_slug}-update.md" if top_slug else f"02_knowledge/{dom_slug}/{note_slug}-update.md"
+        out_spec["path"] = dst_rel
+        val_res = validate_curation_plan(engine, cid, strategy, outputs=[out_spec], rationale=rationale)
     if not val_res.get("ok") and tpl_slug != "standard-note":
         tpl_slug = "standard-note"
         out_spec["template"] = tpl_slug
+        body_norm = re.sub(r"^\s*#\s+[^\n]+\n*", "", (rd["body"] or "").strip())
         out_spec["content"] = scaffold_foreground_body(engine.root, tpl_slug, clean_title, eff_summary, f"# {clean_title}\n\n{body_norm}", dst_rel)
-        val_res = validate_curation_plan(engine, cid, "CREATE_NEW", outputs=[out_spec], rationale=rationale)
+        val_res = validate_curation_plan(engine, cid, strategy, outputs=[out_spec], rationale=rationale)
 
     sess_after = _load_curation_session(engine, cid)
     rendered_preview = ""
@@ -678,9 +737,10 @@ def propose_ai_graduation(engine: WikiEngine, inbox_path: str, chat_fn: Any = No
 
     return {
         "ok": bool(val_res.get("ok")), "curation_id": cid, "inbox_path": rd["path"], "used_tier": used_tier,
+        "ai_synthesized": used_tier != "fallback", "strategy": strategy, "merge_target": merge_target,
         "validation_ok": bool(val_res.get("ok")), "validation_errors": val_res.get("validation_errors") or [],
-        "proposed": {**out_spec, "rendered_markdown": rendered_preview, "rationale": rationale},
+        "proposed": {**out_spec, "strategy": strategy, "merge_target": merge_target, "rendered_markdown": rendered_preview, "rationale": rationale},
         "available_templates": audit["available_templates"], "existing_folders": sorted(kb_tree.keys()),
         "sibling_inbox_count": len(sibling_inbox), "error": val_res.get("error") or "",
-        "summary": f"AI Librarian ({used_tier}) proposed `{dst_rel}` (`template: {tpl_slug}`). {rationale}",
+        "summary": f"AI Librarian ({used_tier}, {strategy}) proposed `{dst_rel}` (`template: {tpl_slug}`). {rationale}",
     }

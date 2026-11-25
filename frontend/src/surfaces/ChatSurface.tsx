@@ -409,10 +409,18 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
 
   const stageReplyToWiki = async (msg: ChatMessage) => {
     const key = String(msg.id);
+    const idx = messages.findIndex((m) => String(m.id) === key);
+    let userPrompt = '';
+    for (let i = idx - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === 'user' && messages[i].content.trim()) {
+        userPrompt = messages[i].content.trim();
+        break;
+      }
+    }
     const res = await callAction('wiki', {
       subaction: 'stage_turn',
       message_id: typeof msg.id === 'number' ? msg.id : undefined,
-      title: `Chat Synthesis ${new Date().toISOString().slice(0, 10)}`,
+      user_prompt: userPrompt,
       content: msg.content,
       tags: 'chat-capture',
     });

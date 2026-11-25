@@ -19,29 +19,30 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from companion.archive_and_approvals import get_approval_queue, get_trust_mode, peek_session_nudges
+from companion.approvals import get_approval_queue, get_trust_mode, peek_session_nudges
 from companion.attachments import (
     get_attachment_record,
     ingest_attachment,
     prepare_turn_attachments,
     read_attachment_raw,
+    rehydrate_recent_turn_images,
 )
-from companion.background_jobs import get_job_manager
-from companion.checkpoints import get_active_checkpoint_manager
+from companion.jobs import get_job_manager
+from companion.vault import get_active_checkpoint_manager
 from companion.config import settings
 from companion.core_actions import execute_core_action, list_core_actions
 from companion.education_engine import get_education_engine
 from companion.llm import active_swap_status
-from companion.mcp_hub import get_mcp_hub
+from companion.integrations import get_mcp_hub
 from companion.memory_store import MemoryStore
 from companion.model_registry import get_model_matrix_snapshot
-from companion.project_graph import get_project_graph
+from companion.projects import get_project_graph
 from companion.routines import IdleAutonomyWatcher, describe_operating_quadrant
 from companion.streaming import wire_attachment_context
 from companion.telemetry import TelemetryEngine, read_ro_rows, telemetry
-from companion.wiki_engine import get_wiki_engine
-from companion.wiki_maintenance import read_wiki_asset_raw
-from companion.workflow_graph import WorkflowEngine
+from companion.wiki import get_wiki_engine
+from companion.wiki import read_wiki_asset_raw
+from companion.agent import WorkflowEngine
 
 __all__ = [
     "build_history_payload",
@@ -475,7 +476,8 @@ def dispatch_chat_or_job_with_attachments(
     raw_ids = body.get("attachment_ids")
     att_ids = [str(x) for x in raw_ids] if isinstance(raw_ids, list) else None
     prep = prepare_turn_attachments(msg, att_ids, store=sess.store)
-    with wire_attachment_context(prep.wire_doc_context, prep.wire_image_uris):
+    eff_imgs = prep.wire_image_uris or rehydrate_recent_turn_images(getattr(sess, "messages", []), user_message=msg, store=sess.store, max_images=2)
+    with wire_attachment_context(prep.wire_doc_context, eff_imgs):
         if is_async:
             code, res = sess.submit_async_chat(prep.display_message, mode=mode, focus_project_id=focus_pid, followup_doc_note=prep.followup_doc_note)
         else:

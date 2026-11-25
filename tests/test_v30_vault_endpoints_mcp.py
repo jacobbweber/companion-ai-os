@@ -16,19 +16,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict
 
-from companion.archive_and_approvals import get_approval_queue, peek_session_nudges, set_trust_mode
+from companion.approvals import get_approval_queue, peek_session_nudges, set_trust_mode
 from companion.context import build_system_prompt
 from companion.core_actions import execute_core_action
-from companion.endpoints import EndpointManager
-from companion.mcp_hub import MCPHub, format_connected_partners_hud
+from companion.integrations import EndpointManager
+from companion.integrations import MCPHub, format_connected_partners_hud
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.project_graph import get_project_graph
+from companion.projects import get_project_graph
 from companion.routines import RoutineManager, compute_next_run_utc
-from companion.sdlc_tools import check_git_stage_safety
+from companion.worktrees import check_git_stage_safety
 from companion.tools import dispatch, filter_tools_for_phase, phase_tool_context
-from companion.trigger_policy import evaluate_trigger_eligibility, TriggerPolicy
+from companion.routines import evaluate_trigger_eligibility, TriggerPolicy
 from companion.vault import VaultManager, create_snapshot_backup, restore_snapshot_backup
-from companion.wiki_engine import WikiEngine
+from companion.wiki import WikiEngine
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 
@@ -300,7 +300,7 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
         self.assertNotIn(":11434:80", em.format_status())
 
         fake_proc = subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="hostname 192.168.1.100\nport 2222\nuser ubuntu\n", stderr="")
-        with unittest.mock.patch("companion.endpoints.shutil.which", return_value="/usr/bin/ssh"), unittest.mock.patch("companion.endpoints.subprocess.run", return_value=fake_proc):
+        with unittest.mock.patch("companion.integrations.shutil.which", return_value="/usr/bin/ssh"), unittest.mock.patch("companion.integrations.subprocess.run", return_value=fake_proc):
             h, p = em._resolve_ssh_host_port({"protocol": "ssh", "host": "GpuHost", "port": 22, "username": "ubuntu"})
         self.assertEqual((h, p), ("192.168.1.100", 2222))
 

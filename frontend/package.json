@@ -1,6 +1,6 @@
 {
   "name": "companion-web-studio",
-  "version": "4.1.0",
+  "version": "5.0.0",
   "private": true,
   "type": "module",
   "description": "Companion AI OS 4.0 — Progressive-Disclosure Multi-Studio Web Interface & Parallel Worktree Studio (Ring-1 Build -> surfaces/static/ Ring-0 Runtime)",

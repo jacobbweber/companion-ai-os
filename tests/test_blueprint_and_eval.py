@@ -8,19 +8,12 @@ from typing import Any, Callable, Dict, List
 from unittest.mock import patch
 
 from companion.agent import handle_slash_command, run_agent_turn, run_subagent
-from companion.autonomy import resolve_workflow_phase_tier, run_autonomous_goal, run_phase_turn
-from companion.blueprint import (
-    approve_blueprint_and_build,
-    classify_blueprint_reply,
-    create_or_revise_blueprint,
-    format_blueprint_card,
-    is_awaiting_blueprint_approval,
-)
-from companion.compaction import classify_task_autoskip, format_task_carry_forward
+from companion.agent import resolve_workflow_phase_tier, run_autonomous_goal, run_phase_turn
+from companion.agent import approve_blueprint_and_build, classify_blueprint_reply, create_or_revise_blueprint, format_blueprint_card, is_awaiting_blueprint_approval
+from companion.context import classify_task_autoskip, format_task_carry_forward
 from companion.config import SELF_PROJECT_ID, TierConfig, settings, workspace_context
-from companion.eval_harness import run_live_flight_eval
 from companion.memory_store import MemoryStore
-from companion.safety import CheckpointManager
+from companion.tools import CheckpointManager
 from surfaces import create_web_server, dispatch_raw_http, render_web_index_html
 
 
@@ -159,7 +152,7 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
                     self.assertIn("Revised Blueprint Ready for Your Review", bp2["summary"])
                     self.assertNotIn("DISCOVER", phases_seen[4:])
 
-                    with patch("companion.autonomy.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
+                    with patch("companion.agent.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
                         reply = run_agent_turn([{"role": "user", "content": "Looks great, go ahead and build it!"}], chat_fn=fake_bp_chat, store=store, verbose=False)
                     self.assertIn("Autonomous Goal Execution: COMPLETE", reply)
                     self.assertTrue((ws_root / "greeter.py").is_file())
@@ -189,7 +182,7 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
                     _, st_raw = dispatch_raw_http(srv, method="GET", path="/api/status")
                     self.assertTrue(json.loads(st_raw)["awaiting_approval"])
 
-                    with patch("companion.autonomy.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
+                    with patch("companion.agent.run_unit_tests", return_value={"passed": True, "ran": 1, "output": "OK"}):
                         code2, raw2 = dispatch_raw_http(srv, method="POST", path="/api/chat", body=json.dumps({"message": "/approve", "async": False}).encode("utf-8"), headers=csrf_hdrs)
                     self.assertEqual(code2, 200)
                     self.assertIn("COMPLETE", json.loads(raw2)["response"])
@@ -198,13 +191,6 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
             finally:
                 srv.server_close()
                 store.close()
-
-    def test_live_flight_eval_harness_runs_all_three_flights_in_isolated_workspace(self) -> None:
-        """Verify `run_live_flight_eval` executes all 3 flights cleanly and restores `companion-self`."""
-        res = run_live_flight_eval(suite="full", chat_fn=_scripted_flight_model, check_endpoints=False, verbose=False)
-        self.assertTrue(res["passed"], res["summary"])
-        self.assertEqual(len(res["flights"]), 3)
-        self.assertEqual(settings.get_workspace().project_id, SELF_PROJECT_ID)
 
     def test_carry_forward_autoskip_coding_tier_and_git_savepoint(self) -> None:
         """Verify Carry-Forward ledger, 0-LLM auto-skip on trailing test task, `coding` tier routing, and Git save-points."""
@@ -244,10 +230,6 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
                         self.assertIn("Initial verified build", str(slash_log))
                 finally:
                     slash_store.close()
-
-        cmp_res = run_live_flight_eval(suite="compare", chat_fn=_scripted_flight_model, check_endpoints=False, verbose=False)
-        self.assertTrue(cmp_res["passed"], cmp_res["summary"])
-        self.assertGreaterEqual(cmp_res["candidates"][0]["auto_skipped_tasks"], 1)
 
     def test_autonomous_goal_injects_carry_forward_and_autoskips_trailing_verify(self) -> None:
         """Verify `_execute_implement_tasks` injects `[WORK ALREADY COMPLETED]` on Task #2 and skips pure-verify Task #3."""
@@ -357,8 +339,8 @@ class TestBlueprintAndFlightEval(unittest.TestCase):
         import threading
 
         from companion.memory_store import memory_store_context
-        from companion.workflow_dag import GoalPlan, GoalStep, VerificationSpec
-        from companion.workflow_graph import WorkflowEngine
+        from companion.workflows import GoalPlan, GoalStep, VerificationSpec
+        from companion.agent import WorkflowEngine
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

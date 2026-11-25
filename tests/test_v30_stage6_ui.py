@@ -10,8 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from companion.archive_and_approvals import enqueue_session_nudge
-from companion.disciplines import validate_embedded_scripts
+from companion.approvals import enqueue_session_nudge
 from companion.memory_store import MemoryStore
 from surfaces.web_assets import read_static_asset, render_web_index_html
 from surfaces.web_server import CompanionHTTPServer, create_web_server, dispatch_raw_http
@@ -84,7 +83,6 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
         self.assertIn('id="approval-banner"', rendered_html)
         self.assertIn("EventSource", js_text)
         self.assertIn("X-Companion-CSRF", js_text)
-        self.assertIsNone(validate_embedded_scripts(rendered_html, "index.html"))
 
     def test_studios_1_to_3_chat_wiki_and_jobs_http_contracts(self) -> None:
         """Verify HTTP contracts for Forever Chat, Co-Owned Wiki + 2D Graph + Trash, and Jobs/Approvals."""
@@ -190,8 +188,8 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
                     store.close()
 
     def test_web_surface_dev_skill_helper_self_test(self) -> None:
-        """Verify `skills/web-surface-dev/scripts/build_frontend.py --self-test` exits 0."""
-        script = Path(__file__).resolve().parent.parent / "skills" / "web-surface-dev" / "scripts" / "build_frontend.py"
+        """Verify `.agents/skills/web-surface-dev/scripts/build_frontend.py --self-test` exits 0."""
+        script = Path(__file__).resolve().parent.parent / ".agents" / "skills" / "web-surface-dev" / "scripts" / "build_frontend.py"
         proc = subprocess.run([sys.executable, "-B", str(script), "--self-test"], capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
         self.assertIn('"self_test": "PASS"', proc.stdout)
@@ -234,7 +232,7 @@ class TestStage6MultiStudioWebUI(unittest.TestCase):
         """Verify persistent CSRF, proxy HTTPS cookie, coalesced cursor SSE, meta_json hydration, and Turn 2+ doc excerpt."""
         import base64
         from companion.attachments import ingest_attachment
-        from companion.project_graph import get_project_graph
+        from companion.projects import get_project_graph
         from surfaces.api_extensions import record_coalesced_job_event
         from surfaces.web_server import verify_lan_client_auth
 

@@ -9,7 +9,7 @@ Companion combines a warm, long-memory everyday assistant with deterministic eng
   3. **Unified Calendar** (Google/Outlook-style `Day`, `Week`, and `Month` grids merging appointments, planned items, recurring routines & spaced-repetition reviews)
   4. **Co-Owned Knowledge Wiki & 2D Mind Map** (4-folder Markdown warehouse, collapsible Directory Tree Explorer, YAML frontmatter search & facet filters, 11 governed templates, visual diffs & Study decks)
   5. **Automations & Background Jobs** (unified `TriggerPolicy` routines supporting `manual`, `scheduled`, and `on_idle` with configurable time windows, Departures Board & Human Approvals Queue)
-  6. **Customizations & Settings** (3-Tier `Skills`, verified Python `DAGSpec` workflows, Federated MCP Hub, Multi-Provider LLM Router, Zero-Reveal Blind Credential Vault, SSH/WinRM/HTTP Endpoints & 7-Stage System Doctor)
+  6. **Customizations & Settings** (3-Tier `Skills`, Self-Contained Domain Capability Packs (`data/domains/<pack>/`), declarative `*.workflow.json` pipelines, Federated MCP Hub, Multi-Provider LLM Router, Zero-Reveal Blind Credential Vault, SSH/WinRM/HTTP Endpoints & 7-Stage Runtime Doctor)
 
 ---
 
@@ -41,11 +41,12 @@ Companion strictly separates **application code** from **your personal runtime d
 
 | What | Where It Lives | Tracked in Git? |
 | :--- | :--- | :--- |
-| **Application Core & Built-In Skills** | `harness.py`, `companion/`, `surfaces/`, `skills/`, `specs/` | Yes |
+| **Application Core & Built-In Skills** | `harness.py`, `companion/`, `surfaces/`, `skills/` | Yes |
+| **Builder / IDE Customizations** | `.agents/` (100% isolated from Companion runtime) | Yes |
 | **Your Memories, Chat DB & Profile** | `data/conversations.db`, `data/MEMORY.md`, `data/IDENTITY.md` | **Never** (gitignored) |
 | **Your Blind Credential Vault** | `data/secrets.env` (`0600` write-only, zero-reveal) | **Never** (gitignored) |
 | **Your Knowledge Wiki & Attachments** | `data/wiki/` (auto-seeded with 11 templates), `data/attachments/` | **Never** (gitignored) |
-| **Your Custom / Forged Skills** | `data/skills/<skill-name>/SKILL.md` | **Never** (gitignored) |
+| **Your Skills & Domain Capability Packs** | `data/skills/<name>/`, `data/domains/<pack>/` (`CONTEXT.md` + `<pack>.db` + `workflows/`) | **Never** (gitignored) |
 | **Backups & Checkpoints** | `data/snapshots/`, `data/.companion_backups/` | **Never** (gitignored) |
 
 > **Custom Data Location (`COMPANION_DATA_DIR`)**: Override where all personal data lives anytime via `COMPANION_DATA_DIR=/path/to/data` (used automatically by Docker `/data`, Linux `/var/lib/companion`, and Windows `%LOCALAPPDATA%\Companion\data`).
@@ -75,7 +76,7 @@ docker compose up -d
   # Remove anytime (preserves your user data):
   powershell -ExecutionPolicy Bypass -File deploy\windows\uninstall-startup-service.ps1
   ```
-- **Build a standalone `CompanionSetup-v4.1.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
+- **Build a standalone `CompanionSetup-v5.0.0.exe` Windows Installer** (bundles Python 3.12 Embeddable Runtime + Inno Setup 6 — requires zero admin rights):
   ```powershell
   powershell -ExecutionPolicy Bypass -File deploy\windows\build-installer.ps1
   ```
@@ -102,7 +103,7 @@ bash deploy/linux/uninstall-service.sh --user   # or: sudo bash deploy/linux/uni
 2. **Loopback-Default Web Studio + Token-Gated LAN/Tailscale**: By default, `COMPANION_WEB_HOST` binds strictly to `127.0.0.1` (`localhost`) with unconditional `Host`/`Origin`/`Sec-Fetch-Site`/`X-Companion-CSRF` enforcement. When bound to a LAN/Tailnet IP (`--host 0.0.0.0`), non-loopback requests require `COMPANION_WEB_TOKEN` (`Authorization: Bearer`, cookie, or `?token=` pairing).
 3. **Permanent Installed-App Immutability & Per-Project Delivery Policy (`COMPANION_IMMUTABLE_APP=1`, `ADR-019`)**: Companion's own installed `app/` runtime is permanently immutable while `data/`, `data/scratch/`, Wiki, Boards, Calendar, User Skills (`data/skills/`), and external Board Project clones (`workspace_path`) stay writable, governed by each Project's `delivery_policy` (`local_only` | `remote_branch_pr` | `ask_me`).
 4. **Zero-Reveal Blind Credential Vault**: API keys, SSH keys, and tokens entered in `Settings -> Vault & Endpoints` are sealed in `data/secrets.env`, never returned to the browser or LLM context, injected just-in-time into approved connectors, and scrubbed from tool outputs.
-5. **7-Stage System Doctor**: Run `python harness.py --doctor` anytime to verify configuration, Python & JS AST syntax, A-Frame layer boundaries, 4-file Spec-Driven Development (`specs/`), dead-code/line-ceiling hygiene (`<=700` lines/module, `<=100` lines/function), SQLite WAL integrity, and the full automated test suite.
+5. **7-Stage Runtime Doctor**: Run `python harness.py --doctor` anytime to verify configuration, Python syntax integrity, compiled Web Studio bundle sync, `.agents/` vs. `skills/` builder/runtime isolation, Domain Capability Pack SQLite health, Core SQLite WAL & Blind Vault integrity, and the full automated test suite.
 
 ---
 
@@ -134,38 +135,30 @@ npm run build     # Typechecks, bundles, and syncs surfaces/static/
 
 ---
 
-## Project Structure (A-Frame + 4-File Canonical SDD)
+## Project Structure (25-Module Frontier Single-Agent Harness)
 
 ```text
 Companion/
+├── .agents/                     # Antigravity/IDE builder rules & skills (isolated from runtime)
 ├── .env.example                 # Template configuration (defaults to local Ollama)
 ├── Dockerfile / docker-compose.yml # Non-root container deployment (`COMPANION_DATA_DIR=/data`)
 ├── harness.py                   # Self-recovering CLI, REPL, Web & System Tray launcher
 ├── data/                        # Isolated User Runtime Data (gitignored; auto-created on first boot)
-│   ├── conversations.db         # SQLite WAL database (chats, profile, boards, calendar, wiki graph)
+│   ├── conversations.db         # Core SQLite WAL database (chats, profile, boards, calendar, wiki index)
 │   ├── IDENTITY.md / MEMORY.md  # Compact Soul/Identity card & synced working memory
 │   ├── secrets.env              # 0600 Zero-Reveal Blind Credential Vault
 │   ├── wiki/                    # 4-Folder Markdown Wiki Warehouse + 11 seeded templates
-│   └── skills/                  # Custom / forged user skills (`data/skills/<name>/SKILL.md`)
+│   ├── skills/                  # Custom / forged user skills (`data/skills/<name>/SKILL.md`)
+│   └── domains/                 # Self-contained Domain Capability Packs (`CONTEXT.md`, `<pack>.db`, `workflows/`)
 ├── deploy/                      # Linux `systemd` service & Windows Startup / Inno Setup `.exe` installer
-├── specs/                       # Living Canonical Spec-Driven Development Pyramid (Strictly 4 Files)
-│   ├── PRODUCT.md               # 1. Vision, User Persona, Capability Matrix & Invariants
-│   ├── ARCHITECTURE.md          # 2. A-Frame Layers, 1-to-1 Module Registry & Simplicity Budgets
-│   ├── CONTRACTS.md             # 3. Bounded Subsystem Contracts (SPEC-01..SPEC-08) & Test Map
-│   └── DECISIONS.md             # 4. Self-Compacting Architecture Decision Records (ADRs)
 ├── skills/                      # Built-in 3-Tier Progressive-Disclosure Skill Packs (`skills/<name>/SKILL.md`)
-├── companion/                   # Headless Core A-Frame Engine (47 modules; `<=700L/module`, `<=100L/function`)
-│   ├── config.py, telemetry.py, streaming.py, llm_wire.py, llm.py
-│   ├── checkpoints.py, safety.py, semantic_memory.py, memory_store.py, trigger_policy.py, project_graph.py
-│   ├── disciplines.py, grounding.py, archive_and_approvals.py, vault.py, model_registry.py, wiki_templates.py
-│   ├── wiki_engine.py, wiki_curation.py, wiki_maintenance.py, attachments.py, education_engine.py
-│   ├── hygiene.py, sdd.py, workflow_graph.py, workflow_dag.py, dag_runtime.py
-│   ├── intake.py, skill_forge.py, compaction.py, tool_schemas.py, background_jobs.py
-│   ├── endpoints.py, mcp_hub.py, routines.py, calendar_engine.py, core_actions.py, harvest_tools.py
-│   └── sdlc_tools.py, worktree_runner.py, os_tools.py, tools.py, context.py, autonomy.py, blueprint.py, eval_harness.py, agent.py
+├── companion/                   # Pure-Stdlib Core Frontier Harness (25 cohesive modules)
+│   ├── config.py, telemetry.py, streaming.py, llm_wire.py, llm.py, model_registry.py, vault.py
+│   ├── memory_store.py, approvals.py, attachments.py, context.py, tools.py, agent.py
+│   ├── wiki.py, wiki_curation.py, education_engine.py, projects.py, calendar_engine.py, workflows.py
+│   └── jobs.py, routines.py, integrations.py, worktrees.py, core_actions.py, scripts/extract_pdf.py
 ├── frontend/                    # React 19 + TypeScript + Vite Multi-Studio UI source (-> surfaces/static/)
 ├── surfaces/                    # Presentation Layer: web_assets.py, api_extensions.py, web_server.py, windows_tray.py
-├── configs/                     # Executable A-Frame Architecture component registry (architecture.py)
 └── tests/                       # Automated unittest verification suite
 ```
 

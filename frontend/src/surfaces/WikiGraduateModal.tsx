@@ -22,6 +22,8 @@ interface ProposedGraduation {
   ontology: string[];
   related: string[];
   content: string;
+  strategy?: string;
+  merge_target?: string;
   rendered_markdown?: string;
   rationale: string;
 }
@@ -81,6 +83,7 @@ export const WikiGraduateModal: React.FC<WikiGraduateModalProps> = ({
   const [ontologyText, setOntologyText] = useState('');
   const [relatedText, setRelatedText] = useState('');
   const [bodyContent, setBodyContent] = useState('');
+  const [strategy, setStrategy] = useState('CREATE_NEW');
 
   useEffect(() => {
     let cancelled = false;
@@ -117,6 +120,7 @@ export const WikiGraduateModal: React.FC<WikiGraduateModalProps> = ({
       setOntologyText((p.ontology || []).join(', '));
       setRelatedText((p.related || []).join(', '));
       setBodyContent(p.content || '');
+      setStrategy(p.strategy || 'CREATE_NEW');
     });
     return () => {
       cancelled = true;
@@ -149,7 +153,7 @@ export const WikiGraduateModal: React.FC<WikiGraduateModalProps> = ({
       curation_id: curationId,
       confirmed: true,
       plan_override: {
-        strategy: 'CREATE_NEW',
+        strategy,
         rationale: rationale || `Curated into ${targetPath}`,
         outputs: [
           {
@@ -228,7 +232,7 @@ export const WikiGraduateModal: React.FC<WikiGraduateModalProps> = ({
               <span>{rationale}</span>
               <span style={{ display: 'inline-flex', gap: 6 }}>
                 <span className="badge ok">
-                  <CheckCircle2 size={11} /> Validated
+                  <CheckCircle2 size={11} /> Validated ({strategy})
                 </span>
                 <span className="badge mono">tier:{usedTier}</span>
               </span>
@@ -378,6 +382,17 @@ export const WikiGraduateModal: React.FC<WikiGraduateModalProps> = ({
                 placeholder="[[related-note]]"
               />
             </div>
+          </div>
+
+          <div>
+            <label className="field-label">Curated Markdown Body (Template Sections)</label>
+            <textarea
+              className="textarea mono"
+              rows={8}
+              data-testid="wiki-graduate-body-input"
+              value={bodyContent}
+              onChange={(e) => setBodyContent(e.target.value)}
+            />
           </div>
 
           {showDiff && diff && <DiffView diff={diff} onClose={() => setShowDiff(false)} />}

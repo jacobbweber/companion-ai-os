@@ -19,16 +19,16 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from companion.attachments import read_attachment_raw
-from companion.background_jobs import BackgroundJobManager
+from companion.jobs import BackgroundJobManager
 from companion.config import settings
 from companion.core_actions import execute_core_action
 from companion.llm import ModelGate
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.os_tools import summarize_tool_step
-from companion.project_graph import get_project_graph
+from companion.tools import summarize_tool_step
+from companion.projects import get_project_graph
 from companion.streaming import CancelScope, cancel_scope_context, check_cancelled, stream_event_context
 from companion.vault import get_vault_manager
-from companion.worktree_runner import (
+from companion.worktrees import (
     discard_worktree,
     dispatch_parallel_ready_items,
     dispatch_work_item_agent,
@@ -265,7 +265,7 @@ class TestParallelWorktreesAndStudio(unittest.TestCase):
         self.assertEqual(pg.get_item(card_c["item_id"])["column_key"], "ready")
 
     def test_request_changes_reuses_worktree_discard_cleans_up_and_push_pr_vault_flow(self) -> None:
-        from companion import sdlc_tools
+        from companion import worktrees as sdlc_tools
 
         repo_dir = self.tmp_path / "iter_repo"
         _init_temp_git_repo(repo_dir)

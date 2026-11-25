@@ -54,6 +54,7 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
   const [quickOwner, setQuickOwner] = useState<'companion' | 'human'>('companion');
   const [newMilestoneTitle, setNewMilestoneTitle] = useState('');
   const [dispatchingId, setDispatchingId] = useState('');
+  const [seedingStages, setSeedingStages] = useState(false);
 
   const loadBoard = async () => {
     const res = await callAction<ProjectBoardProjection>('agile', {
@@ -165,10 +166,13 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
   };
 
   const seedDikwMilestones = async () => {
-    if (!board?.project) return;
+    if (!board?.project || seedingStages) return;
+    setSeedingStages(true);
     const res = await callAction('agile', { subaction: 'seed_dikw', project_id: board.project.project_id });
+    setSeedingStages(false);
     await loadBoard();
-    onToast(res.summary || 'Seeded 4 DIKW milestones.');
+    await onRefreshStatus();
+    onToast(res.summary || 'Seeded 4 domain-tailored DIKW milestones.');
   };
 
   const createMilestone = async (e: React.FormEvent) => {
@@ -524,8 +528,14 @@ export const BoardGoalsSurface: React.FC<BoardGoalsSurfaceProps> = ({
                   <Plus size={12} /> Add
                 </button>
               </form>
-              <button type="button" className="btn btn-sm" onClick={() => void seedDikwMilestones()}>
-                <Sparkles size={12} /> Seed 4 DIKW Stages
+              <button
+                type="button"
+                className="btn btn-sm"
+                data-testid="seed-dikw-milestones-btn"
+                disabled={seedingStages}
+                onClick={() => void seedDikwMilestones()}
+              >
+                <Sparkles size={12} /> {seedingStages ? 'Planning Stages...' : 'Seed 4 DIKW Stages'}
               </button>
             </div>
 

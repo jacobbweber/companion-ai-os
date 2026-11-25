@@ -11,12 +11,12 @@ import zlib
 from pathlib import Path
 
 from companion.attachments import ingest_attachment, prepare_turn_attachments
-from companion.intake import classify_turn_intent, select_turn_step_tier
+from companion.agent import classify_turn_intent, select_turn_step_tier
 from companion.llm import _sanitize_wire_messages, current_tier_name
 from companion.memory_store import MemoryStore
 from companion.streaming import wire_attachment_context
 from companion.vault import get_vault_manager
-from companion.wiki_engine import get_wiki_engine
+from companion.wiki import get_wiki_engine
 from surfaces.web_server import create_web_server, dispatch_raw_http
 
 
@@ -225,6 +225,19 @@ class TestMultimodalChatAttachments(unittest.TestCase):
                 with wire_attachment_context("doc block", ("data:image/png;base64,AAA",)):
                     self.assertEqual(classify_turn_intent("Build 4 files now").mode, "CHAT_DIRECT")
                     self.assertIn(select_turn_step_tier("fast", None, 0), ("reasoning", "image"))
+
+                # 5. Large multi-row CSV preserves exact on-disk storage_path without 80-row/12KB mutilation
+                csv_lines = ["date,merchant,category,amount"] + [f"2026-11-{(i % 28) + 1:02d},Grocer_{i},groceries,{10.25 + i:.2f}" for i in range(250)]
+                csv_raw = ("\n".join(csv_lines) + "\n").encode("utf-8")
+                r_csv = ingest_attachment("household_november.csv", base64.b64encode(csv_raw).decode("ascii"), store=store)
+                self.assertTrue(r_csv["ok"])
+                csv_att = r_csv["attachment"]
+                self.assertTrue(Path(csv_att["storage_path"]).is_file())
+                self.assertEqual(len(Path(csv_att["storage_path"]).read_text(encoding="utf-8").splitlines()), 251)
+                prep_csv = prepare_turn_attachments("Sum all 250 grocery rows", [csv_att["id"]], store=store)
+                self.assertIn(csv_att["storage_path"], prep_csv.wire_doc_context)
+                self.assertIn("251", prep_csv.wire_doc_context)
+                self.assertIn(csv_att["storage_path"], prep_csv.followup_doc_note)
             finally:
                 store.close()
 

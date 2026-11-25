@@ -8,54 +8,33 @@ End-to-End Verification Suite for the 5-Phase Agent-Native Headless Core Refacto
 """
 
 import contextlib
+import json
 import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from companion.archive_and_approvals import get_approval_queue
+from companion.approvals import get_approval_queue
 from companion.config import settings
 from companion.core_actions import execute_core_action
-from companion.dag_runtime import (
-    DAGNode,
-    DAGRuntimeBindings,
-    DAGSpec,
-    dag_node,
-    discover_dags,
-    dry_run_dag,
-    execute_dag_spec,
-    get_dag_run,
-    resume_dag_run,
-    self_test_dag,
-)
-from companion.endpoints import get_endpoint_manager
-from companion.intake import match_verified_dag, triage_turn
-from companion.mcp_hub import get_mcp_hub, harvest_mcp_capability_pack
+from companion.workflows import DAGNode, DAGRuntimeBindings, DAGSpec, dag_node, discover_dags, dry_run_dag, execute_dag_spec, get_dag_run, resume_dag_run, self_test_dag
+from companion.integrations import get_endpoint_manager
+from companion.agent import match_verified_dag, triage_turn
+from companion.integrations import get_mcp_hub, harvest_mcp_capability_pack
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.os_tools import _dict_arg
-from companion.project_graph import get_project_graph
+from companion.tools import _dict_arg
+from companion.projects import get_project_graph
 from companion.routines import (
     IdleAutonomyWatcher,
     format_morning_briefing,
     get_routine_manager,
 )
-from companion.safety import lint_single_file_edit
-from companion.sdd import validate_skill_markdown
-from companion.skill_forge import run_skill_script, stage_and_promote_skill
+from companion.tools import lint_single_file_edit
+from companion.workflows import run_skill_script, stage_and_promote_skill, validate_skill_markdown
 from companion.tools import resolve
-from companion.trigger_policy import (
-    TriggerPolicy,
-    evaluate_trigger_eligibility,
-    is_within_allowed_window,
-    matches_cron_5field,
-    register_trigger_precheck,
-)
-from companion.workflow_dag import (
-    VerificationSpec,
-    evaluate_step_verification,
-    register_domain_validator,
-)
+from companion.routines import TriggerPolicy, evaluate_trigger_eligibility, is_within_allowed_window, matches_cron_5field, register_trigger_precheck
+from companion.workflows import VerificationSpec, evaluate_step_verification, register_domain_validator
 
 
 def _mock_chat_fn(_messages, _tools=None, _tool_choice="auto"):
@@ -243,11 +222,9 @@ class TestPhase2CodeControlledDAGRuntimeAndForge(unittest.TestCase):
     def test_all_builtin_skill_dags_pass_self_test_and_forge_promotes_dags(self) -> None:
         discovered = discover_dags(root=settings.root)
         names = {d["name"] for d in discovered}
-        expected = {
-            "deep-analysis", "deliver-feature", "full-audit",
-            "ooda-diagnose", "release-check", "verify-feature",
-        }
+        expected = {"pre-commit-verify", "publish-pr"}
         self.assertTrue(expected.issubset(names), f"Missing built-in DAGs: {expected - names}")
+        self.assertFalse({"full-audit", "release-check", "safe-deploy"} & names)
         for d in discovered:
             if d["name"] in expected:
                 st = self_test_dag(Path(d["path"]))
@@ -258,29 +235,38 @@ class TestPhase2CodeControlledDAGRuntimeAndForge(unittest.TestCase):
             (root / "skills").mkdir(parents=True)
             skill_md = (
                 "---\nname: sample-forged-pack\n"
-                "description: Use when testing forged code-controlled Python DAG promotion.\n"
-                "required_tools: [workflow_manage]\n---\n"
+                "description: Use when testing forged declarative JSON workflow promotion.\n"
+                "required_tools: [ops_manage]\n---\n"
                 "# Sample Forged Pack\n\n"
-                "## When to Use This Skill\nUse during DAG forge tests.\n\n"
-                "## Step-by-Step Procedure\n1. Run `dags/sample_pipeline.py`.\n"
+                "## When to Use This Skill\nUse during workflow forge tests.\n\n"
+                "## Step-by-Step Procedure\n1. Run `workflows/sample_pipeline.workflow.json`.\n"
             )
-            dag_code = (
-                "from companion.dag_runtime import DAGNode, DAGSpec, execute_dag_spec\n\n"
-                "DAG = DAGSpec(\n"
-                "    name='sample-pipeline',\n"
-                "    description='Sample deterministic forged pipeline',\n"
-                "    nodes=[DAGNode('step1', output_schema={'ok': 'bool'}, fn=lambda _c: {'ok': True})],\n"
-                "    self_test_fn=lambda: execute_dag_spec(DAG)['status'] == 'completed',\n"
-                ")\n"
+            helper_py = (
+                '"""Helper script for sample-pipeline."""\nimport json, sys\n'
+                'if "--self-test" in sys.argv:\n    print(json.dumps({"ok": True}))\n    raise SystemExit(0)\n'
+                'print(json.dumps({"ok": True, "rows": 3}))\n'
             )
+            wf_json = json.dumps({
+                "name": "sample-pipeline",
+                "description": "Sample deterministic declarative JSON workflow",
+                "nodes": [
+                    {
+                        "id": "step1",
+                        "type": "run_script",
+                        "config": {"script": "scripts/step1.py"},
+                        "output_schema": {"ok": "bool", "rows": "int"},
+                    }
+                ],
+            })
             res = stage_and_promote_skill(
                 name="sample-forged-pack",
                 skill_md=skill_md,
-                dags={"sample_pipeline.py": dag_code},
+                scripts={"step1.py": helper_py},
+                dags={"sample_pipeline.workflow.json": wf_json},
                 root=root,
             )
             self.assertTrue(res["promoted"], f"Forge failed: {res}")
-            self.assertTrue((root / "skills" / "sample-forged-pack" / "dags" / "sample_pipeline.py").is_file())
+            self.assertTrue((root / "skills" / "sample-forged-pack" / "workflows" / "sample_pipeline.workflow.json").is_file())
 
 
 class TestPhase3UniversalProjectGraphAndAgileCoach(unittest.TestCase):
@@ -364,9 +350,9 @@ class TestPhase4CognitiveTriageGate(unittest.TestCase):
             d_chat = triage_turn("Hey, how are you doing today?", store=store, root=settings.root)
             self.assertEqual(d_chat.route, "DIRECT_TURN")
 
-            d_dag = triage_turn("Please run the `full-audit` DAG on the repository now", store=store, root=settings.root)
+            d_dag = triage_turn("Please run the `pre-commit-verify` DAG on the repository now", store=store, root=settings.root)
             self.assertEqual(d_dag.route, "EXECUTE_VERIFIED_DAG")
-            self.assertEqual(d_dag.matched_dag, "full-audit")
+            self.assertEqual(d_dag.matched_dag, "pre-commit-verify")
 
             d_adv = triage_turn("Continue advancing our active goal slice", store=store, root=settings.root)
             self.assertEqual(d_adv.route, "ADVANCE_ACTIVE_GOAL")
@@ -443,7 +429,7 @@ class TestPhase5SelfWiringHarvesterAndDomainValidators(unittest.TestCase):
                 self.assertTrue((pack_dir / "SKILL.md").is_file())
                 self.assertTrue((pack_dir / "references" / "mcp-tools.md").is_file())
                 self.assertTrue((pack_dir / "scripts" / "mcp_client_helper.py").is_file())
-                dags = list((pack_dir / "dags").glob("*.py"))
+                dags = list((pack_dir / "workflows").glob("*.workflow.json"))
                 self.assertEqual(len(dags), 1)
                 self.assertTrue(self_test_dag(dags[0])["ok"])
 
@@ -486,10 +472,10 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
             self.assertEqual(td.route, "DIRECT_TURN")
 
             picked = match_verified_dag(
-                "Run the `sdd-verify` or `full-audit` DAG check? Wait: run the `release-check` DAG.",
+                "Run the `publish-pr` check? Wait: run the `pre-commit-verify` DAG.",
                 root=settings.root,
             )
-            self.assertEqual(picked, "release-check")
+            self.assertEqual(picked, "pre-commit-verify")
 
     def test_dag_spec_dict_coercion_kwarg_fn_and_summary_output(self) -> None:
         dag = DAGSpec(
@@ -537,19 +523,19 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
                 )
                 self.assertTrue(ok, detail)
 
-                dag_src = (
-                    "from companion.dag_runtime import DAGNode, DAGSpec\n"
-                    "DAG = DAGSpec(name='ext-data-dag', description='External data dir DAG test', "
-                    "nodes=[DAGNode('n1', fn=lambda _c: {'ok': True})], self_test_fn=lambda: True)\n"
-                )
+                wf_src = json.dumps({
+                    "name": "ext-data-dag",
+                    "description": "External data dir declarative JSON workflow test",
+                    "nodes": [{"id": "n1", "type": "call_tool", "config": {"tool_name": "list_dir", "args": {"path": "."}}}],
+                })
                 err, _warn = lint_single_file_edit(
-                    settings.root / "data" / "skills" / "ext-pack" / "dags" / "ext_dag.py",
-                    dag_src,
+                    settings.root / "data" / "skills" / "ext-pack" / "workflows" / "ext_dag.workflow.json",
+                    wf_src,
                 )
                 self.assertIsNone(err)
-                dag_dir = custom_data / "skills" / "ext-pack" / "dags"
-                dag_dir.mkdir(parents=True)
-                (dag_dir / "ext_dag.py").write_text(dag_src, encoding="utf-8")
+                wf_dir = custom_data / "skills" / "ext-pack" / "workflows"
+                wf_dir.mkdir(parents=True)
+                (wf_dir / "ext_dag.workflow.json").write_text(wf_src, encoding="utf-8")
                 names = [d["name"] for d in discover_dags(root=settings.root)]
                 self.assertIn("ext-data-dag", names)
         finally:
@@ -571,8 +557,8 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
 
     def test_project_focus_bridge_personal_triage_and_flashcard_fence_guard(self) -> None:
         from companion.agent import _extract_turn_widget_fence
-        from companion.intake import assess_turn_readiness, triage_turn
-        from companion.project_graph import format_project_graph_hud
+        from companion.agent import assess_turn_readiness, triage_turn
+        from companion.projects import format_project_graph_hud
 
         with tempfile.TemporaryDirectory() as tmp, contextlib.closing(MemoryStore(db_path=Path(tmp) / "focus.db")) as store:
             pg = get_project_graph(store=store)
@@ -607,6 +593,142 @@ class TestLiveDogfoodHardeningRegressions(unittest.TestCase):
                 0,
             )
             self.assertTrue(fence.startswith("```companion-flashcards"))
+
+
+class TestFrontierStandardHarnessContracts(unittest.TestCase):
+    """End-to-end verification of the 25-module Frontier Standard Harness invariants."""
+
+    def test_module_budget_tool_budget_and_zero_builder_leakage(self) -> None:
+        from companion.context import discover_skills
+        from companion.tools import TOOLS
+
+        py_modules = sorted(p.name for p in (settings.root / "companion").glob("*.py"))
+        self.assertLessEqual(len(py_modules), 25, f"Expected <=25 companion/*.py modules, found {len(py_modules)}: {py_modules}")
+        self.assertLess(len(TOOLS), 20, f"Expected <20 orthogonal tool schemas, found {len(TOOLS)}")
+
+        runtime_skill_names = {str(s["name"]) for s in discover_skills(root=settings.root)}
+        builder_only = {"anti-sprawl-gate", "product-intent-dogfood", "web-surface-dev", "devops-ops", "release-readiness"}
+        self.assertEqual(runtime_skill_names & builder_only, set())
+
+        legacy_py_dags = list((settings.root / "skills").glob("*/dags/*.py"))
+        self.assertEqual(legacy_py_dags, [])
+
+    def test_domain_sqlite_pack_declarative_json_workflow_and_18_core_action_domains(self) -> None:
+        import base64
+        import sqlite3
+        from companion.attachments import ingest_attachment, rehydrate_recent_turn_images
+        from companion.workflows import DAGRuntimeBindings, ensure_domain_pack, execute_dag_by_name
+        from tests.test_attachments import _make_valid_png
+
+        orig_data = settings.data_dir
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                custom_data = (tmp_path / "data").resolve()
+                settings.data_dir = custom_data
+                with contextlib.closing(MemoryStore(db_path=custom_data / "companion.db")) as store, memory_store_context(store):
+                    # 1. Initialize isolated Domain Capability Pack (`household-finance.db` in WAL mode)
+                    pack_res = ensure_domain_pack("household-finance", description="Track groceries and receipts in isolated SQLite.")
+                    self.assertTrue(pack_res["ok"], pack_res)
+                    db_path = Path(pack_res["db_path"])
+                    self.assertTrue(db_path.is_file())
+                    with contextlib.closing(sqlite3.connect(db_path)) as dconn:
+                        jmode = dconn.execute("PRAGMA journal_mode;").fetchone()[0].lower()
+                        self.assertEqual(jmode, "wal")
+
+                    # 2. Write deterministic script + declarative `.workflow.json` inside the domain pack
+                    pack_dir = Path(pack_res["path"])
+                    script_file = pack_dir / "scripts" / "rollup.py"
+                    script_file.write_text(
+                        "import json, sqlite3, sys\n"
+                        "db = sys.argv[1]\n"
+                        "conn = sqlite3.connect(db)\n"
+                        "conn.execute('CREATE TABLE IF NOT EXISTS expenses (category TEXT, cents INTEGER)')\n"
+                        "conn.execute('DELETE FROM expenses')\n"
+                        "conn.executemany('INSERT INTO expenses VALUES (?, ?)', [('produce', 4250), ('bakery', 1875)])\n"
+                        "conn.commit()\n"
+                        "tot = conn.execute('SELECT SUM(cents) FROM expenses').fetchone()[0]\n"
+                        "conn.close()\n"
+                        "print(json.dumps({'total_cents': tot, 'total_usd': round(tot / 100.0, 2)}))\n",
+                        encoding="utf-8",
+                    )
+                    wf_file = pack_dir / "workflows" / "budget_check.workflow.json"
+                    wf_file.write_text(
+                        json.dumps({
+                            "name": "household-budget-check",
+                            "description": "Compute deterministic SQLite grocery rollup and synthesize budget note.",
+                            "nodes": [
+                                {"id": "calc", "type": "run_script", "script": str(script_file), "args": [str(db_path)]},
+                                {
+                                    "id": "brief",
+                                    "type": "llm_step",
+                                    "depends_on": ["calc"],
+                                    "prompt": "Summarize grocery spend: {{calc}}",
+                                    "output_schema": {"headline": "str"},
+                                },
+                            ],
+                        }),
+                        encoding="utf-8",
+                    )
+
+                    wf_out = execute_dag_by_name(
+                        "household-budget-check",
+                        store=store,
+                        root=settings.root,
+                        bindings=DAGRuntimeBindings(
+                            llm_fn=lambda *_a, **_kw: json.dumps({"headline": "Spent $61.25 across produce and bakery."})
+                        ),
+                    )
+                    self.assertTrue(wf_out["ok"], wf_out)
+                    self.assertEqual(wf_out["status"], "completed")
+                    self.assertEqual(wf_out["nodes"]["calc"]["total_cents"], 6125)
+                    self.assertIn("$61.25", wf_out["final_output"]["headline"])
+
+                    # 3. Verify `customizations.list` exposes Domain Capability Pack + workflow cleanly
+                    cust = execute_core_action("customizations", {"subaction": "list"}, actor="web", store=store)
+                    self.assertTrue(cust["ok"])
+                    pack_entries = [s for s in cust["skills"] if s["name"] == "household-finance"]
+                    self.assertEqual(len(pack_entries), 1)
+                    self.assertEqual(pack_entries[0]["scope"], "domain")
+                    self.assertTrue(any(d["name"] == "household-budget-check" for d in cust["dags"]))
+
+                    # 4. Verify follow-up image vision rehydration from persisted turn history
+                    png_b64 = "data:image/png;base64," + base64.b64encode(_make_valid_png(8, 8)).decode("ascii")
+                    att_r = ingest_attachment("receipt.png", png_b64, store=store)
+                    self.assertTrue(att_r["ok"])
+                    aid = att_r["attachment"]["id"]
+                    prior_msgs = [{"role": "user", "content": f"Here is the market photo [Attached Image `receipt.png` | attachment_id=`{aid}`]"}]
+                    rehydrated = rehydrate_recent_turn_images(prior_msgs, user_message="What total is on the receipt?", store=store)
+                    self.assertEqual(len(rehydrated), 1)
+                    self.assertTrue(rehydrated[0].startswith("data:image/png;base64,"))
+
+                    # 5. Smoke-check all 18 CoreActions domains
+                    domain_probes = [
+                        ("jobs", {"subaction": "list"}),
+                        ("wiki", {"subaction": "list_templates"}),
+                        ("vault", {"subaction": "list"}),
+                        ("endpoints", {"subaction": "list"}),
+                        ("mcp", {"subaction": "list_servers"}),
+                        ("partners", {"subaction": "list"}),
+                        ("routines", {"subaction": "list"}),
+                        ("autonomy", {"subaction": "status"}),
+                        ("approvals", {"subaction": "list"}),
+                        ("models", {"subaction": "matrix"}),
+                        ("agile", {"subaction": "hud"}),
+                        ("calendar", {"subaction": "agenda"}),
+                        ("education", {"subaction": "list_courses"}),
+                        ("customizations", {"subaction": "list"}),
+                        ("dags", {"subaction": "list"}),
+                        ("git", {"subaction": "status"}),
+                        ("worktrees", {"subaction": "list"}),
+                        ("preview", {"subaction": "list"}),
+                    ]
+                    self.assertEqual(len(domain_probes), 18)
+                    for dom, payload in domain_probes:
+                        res = execute_core_action(dom, payload, actor="web", store=store)
+                        self.assertIn("ok", res, f"Domain {dom} missing ok key: {res}")
+        finally:
+            settings.data_dir = orig_data
 
 
 if __name__ == "__main__":

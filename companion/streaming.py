@@ -247,6 +247,11 @@ def emit_stream_event(event: Dict[str, Any]) -> None:
     sink = _STREAM_SINK.get()
     if sink is None:
         return
+    if event.get("type") in ("text_delta", "thinking_delta", "orphan_think_closed"):
+        from companion.config import is_in_agent_tool_turn
+
+        if is_in_agent_tool_turn():
+            return
     with contextlib.suppress(Exception):
         sink(event)
 

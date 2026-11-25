@@ -10,12 +10,13 @@ fenced `companion-flashcards` Markdown payloads rendered inline inside Forever C
 import json
 import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from companion.llm import chat, normalize_assistant_message, tier_context
 from companion.memory_store import MemoryStore, get_memory_store
-from companion.wiki_engine import get_wiki_engine
-from companion.wiki_templates import slugify_wiki
+from companion.wiki import get_wiki_engine, slugify_wiki
 
 __all__ = [
     "EducationEngine", "ITEM_KINDS", "PEDAGOGY_STAGES", "SRS_INTERVAL_DAYS",
@@ -59,6 +60,32 @@ def _slug(raw: str, prefix: str = "course") -> str:
 
 def _make_item_id() -> str:
     return f"edu_{_now_utc().strftime('%Y%m%d')}_{os.urandom(3).hex()}"
+
+
+def _is_placeholder_echo(val: Any) -> bool:
+    s = str(val or "").strip().lower()
+    return s in ("...", "…", "1-2 sentences", "kebab-slug", "2-3 sentence core mental model", "1.") or s.startswith("1. ...")
+
+
+def _extract_edu_json(raw_text: str) -> Dict[str, Any]:
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.DOTALL | re.IGNORECASE).strip()
+    if "</think>" in cleaned.lower():
+        cleaned = re.split(r"</think>", cleaned, flags=re.IGNORECASE)[-1].strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+    decoder = json.JSONDecoder()
+    pos = 0
+    while pos < len(cleaned):
+        idx = cleaned.find("{", pos)
+        if idx == -1:
+            break
+        try:
+            obj, _ = decoder.raw_decode(cleaned[idx:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        pos = idx + 1
+    return {}
 
 
 def _normalize_modules(raw_modules: Any, existing: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -142,16 +169,67 @@ class EducationEngine:
             return next((c for c in courses if c["course_id"] in (course_id.strip(), target)), None)
         return next((c for c in courses if c["active"]), courses[0])
 
-    def upsert_course(self, title: str, domain: str = "general", goal_summary: str = "", modules: Any = None, course_id: str = "", set_active: bool = True, wiki_hub_path: str = "") -> Dict[str, Any]:
+    def upsert_course(
+        self,
+        title: str,
+        domain: str = "general",
+        goal_summary: str = "",
+        modules: Any = None,
+        course_id: str = "",
+        set_active: bool = True,
+        wiki_hub_path: str = "",
+        chat_fn: Any = None,
+    ) -> Dict[str, Any]:
         clean_title = (title or "").strip()
         if not clean_title:
             return {"ok": False, "error": "Course `title` is required."}
         cid = _slug(course_id or clean_title, "course")
         prev = self.get_course(cid)
-        norm_mods = _normalize_modules(modules, existing=prev["modules"] if prev else None) if modules is not None or not prev else prev["modules"]
+        eff_domain_raw = domain
+        eff_goal_raw = goal_summary
+        eff_modules_in = modules
+
+        has_explicit_modules = bool(
+            (isinstance(modules, list) and len(modules) > 0)
+            or (isinstance(modules, str) and modules.strip())
+        )
+        should_ai_syllabus = (
+            not has_explicit_modules
+            and prev is None
+            and (chat_fn is not None or ("unittest" not in sys.modules and os.environ.get("COMPANION_TEST_MODE") != "1"))
+        )
+        if should_ai_syllabus:
+            llm_call = chat_fn or chat
+            sys_msg = (
+                "You are Companion's Socratic Curriculum Architect designing a focused 4-5 module study syllabus.\n"
+                "Think very briefly (at most 3 short sentences), then make every module title and objective specific and authentic to the subject (culinary, music, languages, science, or software).\n"
+                "Respond ONLY with a JSON object containing keys `domain` (kebab-case slug), `goal_summary` (concise learning goal), and `modules` (array of 4-5 objects each with `slug`, `title`, and `objective`)."
+            )
+            usr_msg = f"Course Title: {clean_title}\nGoal Hint: {goal_summary or '(design practical mastery path)'}"
+            try:
+                with tier_context("fast"):
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_edu_json(txt)
+                valid_mods = [
+                    m for m in (parsed.get("modules") or [])
+                    if isinstance(m, dict) and str(m.get("title") or "").strip() and not _is_placeholder_echo(m.get("title"))
+                ] if isinstance(parsed.get("modules"), list) else []
+                if valid_mods:
+                    eff_modules_in = valid_mods
+                dom_cand = str(parsed.get("domain") or "").strip()
+                if (not eff_domain_raw or eff_domain_raw == "general") and dom_cand and not _is_placeholder_echo(dom_cand):
+                    eff_domain_raw = dom_cand
+                goal_cand = str(parsed.get("goal_summary") or "").strip()
+                if not eff_goal_raw and goal_cand and not _is_placeholder_echo(goal_cand):
+                    eff_goal_raw = goal_cand
+            except Exception:
+                pass
+
+        norm_mods = _normalize_modules(eff_modules_in, existing=prev["modules"] if prev else None) if eff_modules_in is not None or not prev else prev["modules"]
         cur_idx = min(len(norm_mods) - 1, int(prev["current_module_idx"]) if prev else 0)
-        dom = slugify_wiki(domain or (prev or {}).get("domain") or "general", "general")
-        goal = (goal_summary or (prev or {}).get("goal_summary") or "").strip()[:400]
+        dom = slugify_wiki(eff_domain_raw or (prev or {}).get("domain") or "general", "general")
+        goal = (eff_goal_raw or (prev or {}).get("goal_summary") or "").strip()[:400]
         hub = (wiki_hub_path or (prev or {}).get("wiki_hub_path") or "").strip()
         now_s = _fmt_iso()
         with self.store._lock:
@@ -301,7 +379,7 @@ class EducationEngine:
         rows = self.store._fetch_dicts(_ITEM_COLS, f"SELECT {', '.join(_ITEM_COLS)} FROM education_mastery {where}ORDER BY srs_box ASC, due_at ASC LIMIT ?", tuple(params))
         return [self._hydrate_item(r) for r in rows]
 
-    def build_inline_flashcard_block(self, course_id: str = "", topic: str = "", item_ids: Optional[List[str]] = None, limit: int = 6) -> Dict[str, Any]:
+    def build_inline_flashcard_block(self, course_id: str = "", topic: str = "", item_ids: Optional[List[str]] = None, limit: int = 6, empty_ok: bool = False) -> Dict[str, Any]:
         """Generate a fenced `companion-flashcards` Markdown block for inline interactive Chat rendering."""
         course = self.get_course(course_id)
         cid = course["course_id"] if course else _slug(course_id)
@@ -319,6 +397,8 @@ class EducationEngine:
             cards = filtered or cards
         cards = cards[: max(1, min(15, int(limit)))]
         if not cards:
+            if empty_ok:
+                return {"ok": True, "course_id": cid, "deck": None, "cards": [], "markdown_block": "", "summary": f"0 flashcards saved yet for `{cid}`."}
             return {"ok": False, "error": "No flashcards found for this course/topic yet. Add study items first via `upsert_items`."}
         deck = {
             "course_id": cid,
@@ -334,31 +414,152 @@ class EducationEngine:
         fenced = f"```companion-flashcards\n{json.dumps(deck, ensure_ascii=False)}\n```"
         return {"ok": True, "course_id": cid, "deck": deck, "markdown_block": fenced, "summary": f"Built inline flashcard deck ({len(cards)} card(s)) for `{cid}`."}
 
+    def generate_study_items(
+        self,
+        course_id: str = "",
+        module_slug: str = "",
+        item_kind: str = "flashcard",
+        count: int = 5,
+        topic: str = "",
+        chat_fn: Any = None,
+    ) -> Dict[str, Any]:
+        """Author grounded retrieval flashcards or multiple-choice quiz items via LLM + deterministic schema validation."""
+        course = self.get_course(course_id)
+        if not course:
+            return {"ok": False, "error": f"Course `{course_id}` not found. Create a study course first."}
+        cid = course["course_id"]
+        mods = course.get("modules") or []
+        mod = next((m for m in mods if m["slug"] == _slug(module_slug)), course.get("current_module") or (mods[0] if mods else {}))
+        eff_mod_slug = str(mod.get("slug") or "")
+        eff_mod_title = str(mod.get("title") or course["title"])
+        eff_obj = str(mod.get("objective") or course.get("goal_summary") or "")
+        kind = "quiz" if str(item_kind or "").strip().lower() == "quiz" else "flashcard"
+        n_cards = max(1, min(10, int(count or 5)))
+
+        note_excerpt = ""
+        wk = get_wiki_engine(store=self.store)
+        if mod.get("wiki_path"):
+            rd = wk.read_note(str(mod["wiki_path"]))
+            if rd.get("ok"):
+                note_excerpt = str(rd.get("body") or "")[:3000]
+        if not note_excerpt:
+            hits = wk.search_notes(f"{course['title']} {eff_mod_title}", limit=2)
+            if hits:
+                rd_h = wk.read_note(str(hits[0]["rel_path"]))
+                if rd_h.get("ok"):
+                    note_excerpt = str(rd_h.get("body") or "")[:2400]
+
+        llm_call = chat_fn or chat
+        sys_msg = (
+            "You are Companion's Socratic Active-Recall Author creating high-signal spaced-repetition items.\n"
+            "Think very briefly (at most 3 short sentences), then follow these rules:\n"
+            f"1. Author {n_cards} `{kind}` items testing real domain understanding (mechanisms, techniques, ratios, tradeoffs, or troubleshooting).\n"
+            "2. Every item MUST include `prompt` (question), `answer` (concise exact answer), `explanation` (1-2 sentences why), and `topic`.\n"
+            + ("3. Because `item_kind` is `quiz`, include `choices`: an array of 4 plausible options where one matches `answer`.\n" if kind == "quiz" else "")
+            + "Respond ONLY with a JSON object containing key `items` (array of item objects)."
+        )
+        usr_msg = (
+            f"Course: {course['title']} (domain: {course.get('domain')})\n"
+            f"Module: {eff_mod_title}\nObjective: {eff_obj}\nTopic Focus: {topic or eff_mod_title}\n"
+            + (f"\nGrounded Wiki Context:\n{note_excerpt}" if note_excerpt else "")
+        )
+        parsed_items: List[Dict[str, Any]] = []
+        used_tier = ""
+        for tier_name in ("fast", "reasoning"):
+            try:
+                with tier_context(tier_name):
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_edu_json(txt)
+                cand_list = parsed.get("items")
+                if isinstance(cand_list, list) and cand_list:
+                    for raw_it in cand_list:
+                        if not isinstance(raw_it, dict):
+                            continue
+                        p_txt = str(raw_it.get("prompt") or raw_it.get("question") or "").strip()
+                        a_txt = str(raw_it.get("answer") or "").strip()
+                        if len(p_txt) < 8 or len(a_txt) < 2:
+                            continue
+                        raw_choices = [str(c).strip() for c in (raw_it.get("choices") or []) if str(c).strip()] if isinstance(raw_it.get("choices"), list) else []
+                        if kind == "quiz" and len(raw_choices) >= 2 and a_txt not in raw_choices:
+                            raw_choices = [a_txt, *raw_choices[:3]]
+                        parsed_items.append({
+                            "item_kind": kind,
+                            "prompt": p_txt,
+                            "answer": a_txt,
+                            "choices": raw_choices if kind == "quiz" else [],
+                            "explanation": str(raw_it.get("explanation") or "").strip(),
+                            "topic": str(raw_it.get("topic") or topic or eff_mod_title).strip(),
+                        })
+                    if parsed_items:
+                        used_tier = tier_name
+                        break
+            except Exception:
+                continue
+
+        if not parsed_items:
+            return {"ok": False, "error": "Could not generate verified study items from LLM provider. Check Settings -> Models & Tiers."}
+        up_res = self.upsert_study_items(cid, parsed_items[:n_cards], module_slug=eff_mod_slug, default_topic=topic or eff_mod_title)
+        deck_res = self.build_inline_flashcard_block(course_id=cid, item_ids=up_res.get("item_ids"), limit=n_cards)
+        return {
+            **up_res,
+            "used_tier": used_tier,
+            "deck": deck_res.get("deck"),
+            "markdown_block": deck_res.get("markdown_block", ""),
+            "summary": f"Generated {up_res['count']} AI {kind} item(s) ({used_tier}) for `{course['title']}` -> `{eff_mod_title}`.",
+        }
+
     def curate_study_note(
-        self, course_id: str, module_title: str, core_idea: str, mechanism_markdown: str,
+        self, course_id: str, module_title: str, core_idea: str = "", mechanism_markdown: str = "",
         mermaid_diagram: str = "", connections: Optional[List[str]] = None, module_slug: str = "", actor: str = "user",
+        chat_fn: Any = None,
     ) -> Dict[str, Any]:
         """Curate a Priming + Dual-Coding + Elaboration study note into `02_knowledge/education/<course>/` via WikiEngine."""
         course = self.get_course(course_id)
         if not course:
             return {"ok": False, "error": f"Course `{course_id}` not found."}
+        eff_mod_title = (module_title or str((course.get("current_module") or {}).get("title") or course["title"])).strip()
+        eff_core = (core_idea or "").strip()
+        eff_mech = (mechanism_markdown or "").strip()
+        eff_mermaid = (mermaid_diagram or "").strip()
+
+        if (not eff_core or not eff_mech) and (chat_fn is not None or ("unittest" not in sys.modules and os.environ.get("COMPANION_TEST_MODE") != "1")):
+            llm_call = chat_fn or chat
+            sys_msg = (
+                "You are Companion's Socratic Study Note Author writing a crisp Priming + Dual-Coding reference note.\n"
+                "Respond ONLY with JSON: {\"core_idea\":\"2-3 sentence core mental model\",\"mechanism_markdown\":\"clear structured prose & examples\",\"mermaid_diagram\":\"flowchart LR\\n  A[\\\"...\\\"] --> B[\\\"...\\\"]\"}"
+            )
+            usr_msg = f"Course: {course['title']} ({course.get('goal_summary')})\nModule: {eff_mod_title}"
+            try:
+                with tier_context("fast"):
+                    resp = llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none", max_tokens=4096) if chat_fn is None else llm_call([{"role": "system", "content": sys_msg}, {"role": "user", "content": usr_msg}], None, "none")
+                txt, _thk, _ = normalize_assistant_message((resp.get("choices") or [{}])[0].get("message") or {})
+                parsed = _extract_edu_json(txt)
+                eff_core = eff_core or str(parsed.get("core_idea") or "").strip()
+                eff_mech = eff_mech or str(parsed.get("mechanism_markdown") or "").strip()
+                eff_mermaid = eff_mermaid or str(parsed.get("mermaid_diagram") or "").strip()
+            except Exception:
+                pass
+        if not eff_core or not eff_mech:
+            return {"ok": False, "error": "Both `core_idea` and `mechanism_markdown` are required (or a live LLM provider to synthesize them)."}
+
         wk = get_wiki_engine(store=self.store)
         c_slug = slugify_wiki(course["course_id"], "study-course")
-        m_slug = slugify_wiki(module_slug or module_title, "study-module")
+        m_slug = slugify_wiki(module_slug or eff_mod_title, "study-module")
         hub_stem = f"{c_slug}-course-map"
         links = [f"[[{hub_stem}]]", *[f"[[{slugify_wiki(x)}]]" for x in (connections or []) if str(x).strip()]]
-        diag_block = f"\n\n```mermaid\n{mermaid_diagram.strip()}\n```\n" if mermaid_diagram.strip() else ""
+        diag_block = f"\n\n```mermaid\n{eff_mermaid}\n```\n" if eff_mermaid else ""
         body = (
-            f"# {module_title.strip()}\n\n"
-            f"## Core Idea\n{core_idea.strip()}\n\n"
-            f"## Mechanism & Context\n{mechanism_markdown.strip()}{diag_block}\n\n"
+            f"# {eff_mod_title}\n\n"
+            f"## Core Idea\n{eff_core}\n\n"
+            f"## Mechanism & Context\n{eff_mech}{diag_block}\n\n"
             f"## Connections\n- Course & Concept Links: {', '.join(dict.fromkeys(links))}\n"
         )
-        summary_txt = f"Curated study guide for {course['title']}: {core_idea.strip()[:140]}"
+        summary_txt = f"Curated study guide for {course['title']}: {eff_core[:140]}"
         if len(summary_txt) < 24:
             summary_txt = f"{summary_txt} — structured priming and dual-coding reference."
         inbox_res = wk.capture_inbox(
-            title=module_title.strip(), content=body, tags=["education", c_slug, course["domain"]],
+            title=eff_mod_title, content=body, tags=["education", c_slug, course["domain"]],
             source="education-engine", slug=f"{c_slug}-{m_slug}", actor=actor, template="zettelkasten-atomic",
             summary=summary_txt, ontology=["knowledge-synthesis"], domain_hint="education",
         )
@@ -429,6 +630,15 @@ def execute_education_action(p: Dict[str, Any], store: Optional[MemoryStore] = N
     if sub in ("upsert_items", "add_items", "save_items"):
         items = p.get("items") if isinstance(p.get("items"), list) else ([{"prompt": p.get("prompt"), "answer": p.get("answer"), "topic": p.get("topic", ""), "item_kind": p.get("item_kind", "flashcard"), "explanation": p.get("explanation", "")}] if p.get("prompt") else [])
         return eng.upsert_study_items(str(p.get("course_id") or ""), items, str(p.get("module_slug") or ""), str(p.get("topic") or ""))
+    if sub in ("generate_items", "generate_flashcards", "generate_quiz"):
+        def_kind = "quiz" if sub == "generate_quiz" else str(p.get("item_kind") or "flashcard")
+        return eng.generate_study_items(
+            course_id=str(p.get("course_id") or ""),
+            module_slug=str(p.get("module_slug") or ""),
+            item_kind=def_kind,
+            count=int(p.get("count") or 5),
+            topic=str(p.get("topic") or ""),
+        )
     if sub in ("grade_item", "grade"):
         passed = p.get("passed") if isinstance(p.get("passed"), bool) else str(p.get("grade") or p.get("passed") or "pass").strip().lower() in ("pass", "true", "1", "got_it", "correct")
         return eng.grade_item(str(p.get("item_id") or ""), passed=passed, miss_reason=str(p.get("miss_reason") or ""), confidence=int(p.get("confidence") or (4 if passed else 2)))
@@ -439,7 +649,7 @@ def execute_education_action(p: Dict[str, Any], store: Optional[MemoryStore] = N
         items = eng.list_due_items(str(p.get("course_id") or ""), int(p.get("limit") or 20), bool(p.get("include_upcoming", False)))
         return {"ok": True, "items": items, "count": len(items), "summary": f"{len(items)} study item(s) due for review."}
     if sub in ("flashcard_deck", "flashcards", "deck"):
-        res = eng.build_inline_flashcard_block(str(p.get("course_id") or ""), str(p.get("topic") or ""), p.get("item_ids") if isinstance(p.get("item_ids"), list) else None, int(p.get("limit") or 6))
+        res = eng.build_inline_flashcard_block(str(p.get("course_id") or ""), str(p.get("topic") or ""), p.get("item_ids") if isinstance(p.get("item_ids"), list) else None, int(p.get("limit") or 6), empty_ok=bool(p.get("empty_ok", False)))
         if res.get("ok") and res.get("markdown_block") and bool(p.get("persist_to_chat", False)):
             chat_text = f"**{res['deck']['deck_title']}**\n\n{res['markdown_block']}"
             msg_id = eng.store.log_message("assistant", chat_text, session_tag="study_deck")

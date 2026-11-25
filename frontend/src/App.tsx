@@ -163,6 +163,13 @@ export const App: React.FC = () => {
   const handleSelectSurface = (next: SurfaceId) => {
     setShowActivity(false);
     setSurface(next);
+    setAuxTarget((prev) => {
+      if (!prev) return null;
+      if ((prev.kind === 'work_item' || prev.kind === 'project') && next !== 'boards') return null;
+      if ((prev.kind === 'skill' || prev.kind === 'dag' || prev.kind === 'dag_run') && next !== 'customizations') return null;
+      if (prev.kind === 'routine' && next !== 'automations') return null;
+      return prev;
+    });
     if (typeof window !== 'undefined' && window.innerWidth <= 768) {
       setRailCollapsed(true);
     }

@@ -118,8 +118,8 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         from companion.context import compact_messages_if_needed
         from companion.tools import dispatch
 
-        spec_out = dispatch("sdd_manage", {"action": "read_spec", "spec_name": "PRODUCT.md", "title": None})
-        self.assertIn("Companion AI OS", spec_out)
+        doc_out = dispatch("memory_manage", {"action": "get_adrs", "title": None})
+        self.assertIn("ADR-001", doc_out)
 
         head_out = tool_run_shell({"command": "python -c \"for i in range(5): print(i)\" | head -2", "cwd": None})
         self.assertIn("exit=0", head_out)
@@ -151,8 +151,8 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         from unittest.mock import patch
         from companion.config import settings
         from companion.context import execute_identity_action, is_identity_bootstrapped, manage_companion_tone, run_first_boot_onboarding
-        from companion.grounding import discover_skills
-        from companion.skill_forge import stage_and_promote_skill
+        from companion.context import discover_skills
+        from companion.workflows import stage_and_promote_skill
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
@@ -274,7 +274,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
 
                 prompt = build_system_prompt(store=store)
                 self.assertIn("[COMPANION SOUL & USER IDENTITY]", prompt)
-                self.assertIn("[AVAILABLE SKILLS — PROGRESSIVE DISCLOSURE RUNBOOKS (L2)]", prompt)
+                self.assertIn("[AVAILABLE SKILLS & DOMAIN CAPABILITY PACKS — TIER-1 INDEX]", prompt)
                 self.assertTrue(mem_md.is_file())
                 self.assertTrue(id_md.is_file())
                 self.assertFalse(is_identity_bootstrapped(store=store))
@@ -288,8 +288,9 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         skills = discover_skills()
         names = {s["name"] for s in skills}
         self.assertIn("proactive-checkin", names)
-        self.assertIn("sdd-compliance", names)
-        self.assertIn("engineering-workflow", names)
+        self.assertNotIn("sdd-compliance", names)
+        self.assertNotIn("anti-sprawl-gate", names)
+        self.assertNotIn("web-surface-dev", names)
         self.assertIn("skill-creator", names)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -300,7 +301,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
                 self.assertIn("skill-creator", str(catalog_out))
 
                 runbook_out = handle_slash_command("/skills skill-creator", [], store=store)
-                self.assertIn("# Skill Creator & Capability Pack Forge Guide", str(runbook_out))
+                self.assertIn("# Skill Creator & Domain Capability Pack Guide", str(runbook_out))
                 wiki_out = handle_slash_command("/skills knowledge-wiki", [], store=store)
                 self.assertIn("agentic-patterns.md", str(wiki_out))
             finally:
@@ -350,7 +351,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
             try:
                 summary = run_subagent(
                     goal="Audit all skills",
-                    skill_name="sdd-compliance",
+                    skill_name="deep-thinking",
                     max_iters=4,
                     chat_fn=fake_worker_chat,
                     store=store,
@@ -360,12 +361,12 @@ class TestToolsAndAgentLoop(unittest.TestCase):
                 # Parent message list must still have only 1 message (zero worker tool bloat!)
                 self.assertEqual(len(parent_msgs), 1)
                 # Pre-loaded Tier-2 SKILL.md must be injected into the worker prompt
-                self.assertTrue(any("PRE-LOADED TIER-2 SKILL RUNBOOK (`skills/sdd-compliance/SKILL.md`)" in p for p in captured_prompts))
+                self.assertTrue(any("PRE-LOADED TIER-2 SKILL RUNBOOK (`skills/deep-thinking/SKILL.md`)" in p for p in captured_prompts))
                 # Parent trace ID must be restored!
                 self.assertEqual(telemetry.active_trace_id, parent_tid)
                 wf_text = telemetry.format_waterfall(parent_tid)
-                self.assertIn("subagent_call:subagent:sdd-compliance", wf_text)
-                self.assertIn("ADR-001", dispatch("sdd_manage", {"action": "get_adrs"}))
+                self.assertIn("subagent_call:subagent:deep-thinking", wf_text)
+                self.assertIn("ADR-001", dispatch("memory_manage", {"action": "get_adrs"}))
             finally:
                 telemetry.end_trace(parent_tid, status="ok")
                 telemetry.db_path, telemetry.conn = old_db, old_conn
@@ -521,7 +522,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         """Test per-endpoint ModelGates, /model commands, reasoning subagent tier routing, and OODA LoopGuard nudge."""
         from companion.agent import run_subagent
         from companion.llm import current_tier_name, get_endpoint_gate, model_gate, tier_context
-        from companion.safety import LoopGuard
+        from companion.tools import LoopGuard
 
         # 1. Per-endpoint ModelGate isolation
         g_default = get_endpoint_gate()
@@ -563,8 +564,7 @@ class TestToolsAndAgentLoop(unittest.TestCase):
         self.assertIsNone(lg.record_result("run_python", "error: syntax failure 1"))
         hint = lg.record_result("run_python", "error: syntax failure 2")
         self.assertIsNotNone(hint)
-        self.assertIn("OODA Loop", str(hint))
-        self.assertIn("ooda-troubleshooting", str(hint))
+        self.assertIn("SELF-RECOVERY HINT", str(hint))
 
     def test_frontier_core_parsers_wire_and_bounded_read(self) -> None:
         """Verify CORE-4, CORE-5, CORE-8: prefix-orphan </think>, unclosed <think> tool rescue, parallel deltas, strict JSON args, & bounded read_file."""
@@ -685,6 +685,52 @@ class TestToolsAndAgentLoop(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertIn("*(Stopped by user.)*", sess.messages[-1]["content"])
                 self.assertIn("Partial stream", sess.messages[-1]["content"])
+            finally:
+                st.close()
+
+    def test_frontier_phase2_spillover_compaction_and_approval_halt(self) -> None:
+        """Verify <20 tool schemas, scratch spillover, LLM KeyTokens compaction, and foreground approval halt."""
+        from companion.context import compact_messages_if_needed
+        from companion.tools import TOOLS, spill_tool_output, tool_run_command
+
+        self.assertLess(len(TOOLS), 20)
+        py_res = tool_run_command({"python_code": "print(6 * 7)"})
+        self.assertIn("42", py_res)
+
+        huge = "ROW_START\n" + ("x" * 9500) + "\nROW_TAIL"
+        spilled = spill_tool_output(huge, label="unit_spill", limit=8000)
+        self.assertIn("ROW_START", spilled)
+        self.assertIn("ROW_TAIL", spilled)
+        self.assertIn("saved to ", spilled)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            st = MemoryStore(db_path=Path(tmp) / "p2.db")
+            try:
+                msgs: List[Dict[str, Any]] = [{"role": "system", "content": "sys"}]
+                for i in range(10):
+                    msgs.append({"role": "user", "content": f"Inspect companion/tools.py item {i} " + ("pad " * 180)})
+                    msgs.append({"role": "assistant", "content": f"Checked ValueError in companion/tools.py step {i} " + ("pad " * 180)})
+                compact_messages_if_needed(
+                    msgs, store=st, force=True,
+                    summarizer_fn=lambda _txt: "Semantic summary preserving `companion/tools.py` and `ValueError`.",
+                )
+                self.assertIn("companion/tools.py", msgs[1]["content"])
+                self.assertIn("ValueError", msgs[1]["content"])
+
+                seen_tool_choices: List[str] = []
+
+                def _apr_chat(_m: List[Dict[str, Any]], _tools=None, tool_choice="auto") -> Dict[str, Any]:
+                    seen_tool_choices.append(str(tool_choice))
+                    if len(seen_tool_choices) == 1:
+                        return {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [
+                            {"id": "c1", "function": {"name": "routine_manage", "arguments": '{"action":"create","routine_id":"nightly-test","target_kind":"snapshot_backup","mode":"scheduled","schedule_expr":"daily 02:00"}'}}
+                        ]}}]}
+                    return {"choices": [{"message": {"role": "assistant", "content": "Queued routine approval cleanly."}}]}
+
+                turn_msgs: List[Dict[str, Any]] = [{"role": "user", "content": "Schedule a nightly backup routine"}]
+                out = run_agent_turn(turn_msgs, chat_fn=_apr_chat, store=st, verbose=False)
+                self.assertEqual(seen_tool_choices, ["auto", "none"])
+                self.assertIn("Queued routine approval", out)
             finally:
                 st.close()
 

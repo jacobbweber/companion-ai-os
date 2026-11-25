@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from companion.memory_store import MemoryStore, parse_time_window
-from memory.chat_memory import ChatMemory, get_backlog
 
 
 class TestMemoryStore(unittest.TestCase):
@@ -60,14 +59,6 @@ class TestMemoryStore(unittest.TestCase):
         items = self.store.get_backlog(category="memory")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0][0], bid)
-
-    def test_chat_memory_backward_compatibility(self) -> None:
-        cm = ChatMemory(db_path=self.db_path)
-        cm.add_backlog("Test alias method", category="test")
-        # Both get_backlog(cm) and cm.get_backlog() should work without error
-        rows = get_backlog(cm, category="test")
-        self.assertEqual(len(rows), 1)
-        cm.close()
 
     def test_sync_memory_md(self) -> None:
         md_path = Path(self.tmp_dir.name) / "MEMORY.md"

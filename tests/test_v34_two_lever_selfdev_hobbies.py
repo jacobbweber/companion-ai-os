@@ -12,13 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 from companion.agent import handle_slash_command
-from companion.archive_and_approvals import (
-    ApprovalQueue,
-    consume_session_nudges,
-    enqueue_session_nudge,
-    peek_session_nudges,
-    set_trust_mode,
-)
+from companion.approvals import ApprovalQueue, consume_session_nudges, enqueue_session_nudge, peek_session_nudges, set_trust_mode
 from companion.config import (
     Settings,
     agent_tool_turn_context,
@@ -26,26 +20,26 @@ from companion.config import (
     workspace_context,
 )
 from companion.core_actions import execute_core_action
-from companion.dag_runtime import execute_dag_by_name, resume_dag_run
-from companion.intake import classify_turn_intent
+from companion.workflows import execute_dag_by_name, resume_dag_run
+from companion.agent import classify_turn_intent
 from companion.memory_store import MemoryStore, memory_store_context
-from companion.project_graph import get_project_graph
+from companion.projects import get_project_graph
 from companion.routines import (
     BUILTIN_IDLE_ROUTINES,
     IdleAutonomyWatcher,
     describe_operating_quadrant,
     get_routine_manager,
 )
-from companion.safety import check_path_safety
-from companion.sdlc_tools import (
+from companion.tools import check_path_safety
+from companion.worktrees import (
     PreviewProcessManager,
     discover_repo_sdlc_context,
     preview_turn_cleanup_scope,
     tool_dev_preview,
     tool_git_manage,
 )
-from companion.skill_forge import stage_and_promote_skill
-from companion.tool_schemas import phase_tool_context
+from companion.workflows import stage_and_promote_skill
+from companion.tools import phase_tool_context
 from companion.tools import dispatch
 from companion.vault import VaultManager
 from surfaces.api_extensions import register_service_reload_handler
@@ -221,7 +215,7 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
                         captured_askpass.append(out_pw.stdout.strip())
                         return 0, vm.scrub_output(f"To https://github.com/acme/demo.git (auth={tok})\n * [new branch] feat/widget -> feat/widget")
 
-                    with patch.dict(os.environ, {"COMPANION_SECRETS_FILE": str(base / "secrets.env")}, clear=False), patch("companion.sdlc_tools._run_git_cmd", side_effect=_fake_git_push):
+                    with patch.dict(os.environ, {"COMPANION_SECRETS_FILE": str(base / "secrets.env")}, clear=False), patch("companion.worktrees._run_git_cmd", side_effect=_fake_git_push):
                         p_ok = tool_git_manage({"action": "push", "remote": "origin", "branch": "feat/widget"})
                     self.assertEqual(captured_askpass, [tok])
                     self.assertNotIn(tok, p_ok)
@@ -245,7 +239,7 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
                 encoding="utf-8",
             )
             mgr = PreviewProcessManager()
-            with patch("companion.sdlc_tools.preview_manager", mgr), workspace_context(repo, "web-app"):
+            with patch("companion.worktrees.preview_manager", mgr), workspace_context(repo, "web-app"):
                 with preview_turn_cleanup_scope():
                     cmd = f'"{sys.executable}" srv.py {{port}}'
                     started = json.loads(tool_dev_preview({"action": "start", "command": cmd, "ready_path": "/"}))
@@ -256,38 +250,11 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
                 st = json.loads(tool_dev_preview({"action": "list"}))
                 self.assertEqual(st["previews"], [])
 
-    def test_safe_deploy_dag_human_gate_and_simulated_failure_rollback(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            base = Path(tmp)
-            src_v1, src_v2, target_app = base / "src_v1", base / "src_v2", base / "runtime" / "app"
-            for d, tag in ((src_v1, "v1-good"), (src_v2, "v2-bad")):
-                (d / "companion").mkdir(parents=True)
-                (d / "harness.py").write_text(f"RELEASE = {tag!r}\n", encoding="utf-8")
-            (target_app / "companion").mkdir(parents=True)
-            (target_app / "harness.py").write_text("RELEASE = 'v1-good'\n", encoding="utf-8")
-
-            with contextlib.closing(MemoryStore(db_path=base / "deploy.db")) as store:
-                set_trust_mode("balanced", store=store)
-                with memory_store_context(store):
-                    paused = execute_dag_by_name(
-                        "safe-deploy",
-                        params={
-                            "source_repo": str(src_v2),
-                            "target_app_dir": str(target_app),
-                            "backup_dir": str(base / "backups"),
-                            "simulate_health_failure": True,
-                            "run_doctor": False,
-                            "snapshot_data_store": False,
-                        },
-                        store=store,
-                    )
-                    self.assertEqual(paused["status"], "waiting_approval")
-                    ApprovalQueue(store=store).resolve(paused["approval_id"], "approve", actor="user")
-                    resumed = resume_dag_run(paused["run_id"], store=store)
-                    self.assertEqual(resumed["status"], "completed")
-                    ver_node = resumed["nodes"]["verify_or_rollback"]
-                    self.assertTrue(ver_node["rolled_back"])
-                    self.assertIn("v1-good", (target_app / "harness.py").read_text(encoding="utf-8"))
+    def test_safe_deploy_ops_builder_script_and_rollback(self) -> None:
+        script = Path(__file__).resolve().parent.parent / ".agents" / "skills" / "devops-ops" / "scripts" / "safe_deploy_ops.py"
+        proc = subprocess.run([sys.executable, "-B", str(script), "--self-test"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+        self.assertIn("pass", proc.stdout.lower())
 
     def test_builtin_idle_routines_web_watcher_nudges_and_reload_endpoint(self) -> None:
         builtin_ids = {r["routine_id"] for r in BUILTIN_IDLE_ROUTINES}
@@ -369,7 +336,7 @@ class TestImmutableRuntimeAndOrthogonalSDLC(unittest.TestCase):
 
                     dag_out = dispatch("workflow_manage", {"action": "run_dag", "dag_name": "pre-commit-verify", "params": {"repo_path": str(repo)}})
                     self.assertIn("pre-commit-verify", dag_out.lower())
-                    scr_out = dispatch("workflow_manage", {"action": "run_script", "skill": "devops-ops", "script": "safe_deploy_ops.py", "args": ["--self-test"]})
+                    scr_out = dispatch("workflow_manage", {"action": "run_script", "skill": "remote-endpoints", "script": "endpoint_probe.py", "args": ["--self-test"]})
                     self.assertIn("pass", scr_out.lower())
 
                     with agent_tool_turn_context():

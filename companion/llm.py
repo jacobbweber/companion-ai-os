@@ -546,7 +546,9 @@ def _post_completion(
     eff_dialect, span_label, call_start = (dialect or "openai_compat").strip().lower(), (f"{tier_label}:{target_model}" if tier_label else target_model), time.perf_counter()
     if settings.effective_privacy_mode() == "local_only" and not is_local_or_lan_endpoint(target_base_url):
         raise _fail_llm(span_label, call_start, f"Privacy Lock (`local_only`) blocked outbound cloud LLM call to `{target_base_url}` (`{target_model}`).")
-    want_stream = bool(has_stream_sink() and settings.stream_tokens)
+    from companion.config import is_in_agent_tool_turn
+
+    want_stream = bool(has_stream_sink() and settings.stream_tokens and not is_in_agent_tool_turn())
     target_url, headers, body = prepare_wire_request(eff_dialect, messages, tools, tool_choice, target_base_url, target_model, target_key, target_temp, target_max_tokens, reasoning_effort=reasoning_effort, stream=want_stream)
     payload, gate, scope = json.dumps(body).encode("utf-8"), get_endpoint_gate(target_base_url), get_active_cancel_scope()
     is_local_oai = eff_dialect == "openai_compat" and is_local_or_lan_endpoint(target_base_url)
@@ -666,6 +668,17 @@ def chat(
             )
         def_cfg = settings.resolve_tier("default")
         same_box, err_s = target_base_url.lower() == def_cfg.base_url.lower(), str(exc)
+        if any(tok in err_s.lower() for tok in ("not a multimodal model", "does not support image", "image_url")):
+            reas_cfg = settings.resolve_tier("reasoning")
+            reas_allowed = priv != "local_only" or is_local_or_lan_endpoint(reas_cfg.base_url)
+            if reas_allowed and (reas_cfg.model != target_model or reas_cfg.base_url.lower() != target_base_url.lower()):
+                telemetry.log("INFO", "llm", f"Model `{target_model}` is text-only; routing multimodal turn to `reasoning` (`{reas_cfg.model}`).")
+                return _post_completion(
+                    messages, tools, tool_choice, reas_cfg.base_url, reas_cfg.model, reas_cfg.api_key,
+                    temperature if temperature is not None else reas_cfg.temperature,
+                    max_tokens or reas_cfg.max_tokens, target_timeout, max_retries, priority, "image->reasoning",
+                    dialect=reas_cfg.dialect, reasoning_effort=reas_cfg.reasoning_effort, max_concurrency=reas_cfg.max_concurrency,
+                )
         def_allowed = priv != "local_only" or is_local_or_lan_endpoint(def_cfg.base_url)
         can_failover = tier_cfg.tier != "default" and def_allowed and (not same_box or (target_model != def_cfg.model and ("HTTP 404" in err_s or "Privacy Lock" in err_s)))
         if not can_failover:
