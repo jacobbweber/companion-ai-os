@@ -10,7 +10,15 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { apiPost, callAction, cancelActiveJob, fetchHistory, subscribeJobStream } from '../api';
+import {
+  apiPost,
+  type ApprovalResolvedDetail,
+  callAction,
+  cancelActiveJob,
+  emitApprovalResolved,
+  fetchHistory,
+  subscribeJobStream,
+} from '../api';
 import { MarkdownView } from '../components/MarkdownView';
 import type {
   ActiveWebJob,
@@ -448,7 +456,10 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
     if (resolvingApprovalId) return;
     setResolvingApprovalId(approvalId);
     try {
-      const res = await callAction('approvals', {
+      const res = await callAction<{
+        category?: string;
+        resumed_background_job?: boolean;
+      }>('approvals', {
         subaction: decision,
         approval_id: approvalId,
       });
@@ -458,10 +469,43 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
           ? res.error || `Approval ${decision} failed.`
           : res.summary || `Approval ${decision}d.`
       );
+      if (res.ok !== false) {
+        emitApprovalResolved({
+          approvalId,
+          decision,
+          category: res.category,
+          resumedBackgroundJob: Boolean(res.resumed_background_job),
+          source: 'chat',
+        });
+      }
     } finally {
       setResolvingApprovalId('');
     }
   };
+
+  const autoContinueRef = useRef<(detail: ApprovalResolvedDetail) => void>(() => {});
+  autoContinueRef.current = (detail: ApprovalResolvedDetail) => {
+    if (detail.decision !== 'approve' || detail.resumedBackgroundJob) return;
+    if (sending || Boolean(status?.busy) || attachedJobIdRef.current) return;
+    const isInteractiveExec =
+      detail.source === 'chat' ||
+      detail.category === 'endpoint_exec' ||
+      detail.category === 'r3_tool' ||
+      detail.category === 'mcp_tool';
+    if (!isInteractiveExec) return;
+    void sendMessage(`Approved \`${detail.approvalId}\` — please continue with the results.`, [], 'chat');
+  };
+
+  useEffect(() => {
+    const onResolved = (ev: Event) => {
+      const custom = ev as CustomEvent<ApprovalResolvedDetail>;
+      if (custom.detail) {
+        autoContinueRef.current(custom.detail);
+      }
+    };
+    window.addEventListener('companion:approval-resolved', onResolved);
+    return () => window.removeEventListener('companion:approval-resolved', onResolved);
+  }, []);
 
   const userName = status?.user_name || 'Partner';
   const inlineApprovals = status?.pending_approvals || [];

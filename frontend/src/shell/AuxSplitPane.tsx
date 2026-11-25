@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Check, ExternalLink, Eye, Play, Plus, RotateCcw, X } from 'lucide-react';
-import { callAction } from '../api';
+import { callAction, emitApprovalResolved } from '../api';
 import { DiffView } from '../components/DiffView';
 import { MarkdownView } from '../components/MarkdownView';
 import { WorkItemInspector } from '../surfaces/WorkItemInspector';
@@ -242,7 +242,10 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
     if (resolvingAprId) return;
     setResolvingAprId(apr.approval_id);
     try {
-      const r = await callAction('approvals', {
+      const r = await callAction<{
+        category?: string;
+        resumed_background_job?: boolean;
+      }>('approvals', {
         subaction: decision,
         approval_id: apr.approval_id,
       });
@@ -251,6 +254,13 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
       } else {
         setApprovals((prev) => prev.filter((x) => x.approval_id !== apr.approval_id));
         onToast(r.summary || `Approval ${decision}d.`);
+        emitApprovalResolved({
+          approvalId: apr.approval_id,
+          decision,
+          category: r.category || apr.category,
+          resumedBackgroundJob: Boolean(r.resumed_background_job),
+          source: 'inspector',
+        });
       }
       onChanged();
     } finally {

@@ -447,8 +447,14 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
             self.assertNotIn("SuperSecretPass!42", ro_res["output"])
             self.assertFalse(Path(captured_env["SSH_ASKPASS"]).exists())
 
-            # 3. Compound SSH command queues approval -> Web approve executes once & caches one-shot output for follow-up turn
-            comp_cmd = "echo '=== OS ===' && uname -a"
+            # 3a. Compound read-only diagnostic runs immediately in balanced mode (while sensitive/mutating commands still gate!)
+            ro_diag = em.ssh_exec("nimopc", "echo '=== OS ===' && cat /etc/os-release 2>/dev/null | head -5 && free -h", actor="companion")
+            self.assertTrue(ro_res["ok"] and ro_diag["ok"])
+            sens_paused = em.ssh_exec("nimopc", "cat ~/.ssh/id_ed25519", actor="companion")
+            self.assertTrue(sens_paused.get("awaiting_approval"))
+
+            # 3b. Mutating SSH command queues approval -> Web approve executes once & delivers full multi-line output!
+            comp_cmd = "sudo systemctl restart gdm && uname -a"
             paused = em.ssh_exec("nimopc", comp_cmd, actor="companion")
             self.assertTrue(paused.get("awaiting_approval"))
             apr_id = paused["approval_id"]
@@ -464,8 +470,16 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
                 apr_ok = execute_core_action("approvals", {"subaction": "approve", "approval_id": apr_id}, actor="web", store=self.primary_store)
                 self.assertTrue(apr_ok["ok"], apr_ok)
                 self.assertEqual(call_counter["n"], 1)
+                self.assertFalse(apr_ok.get("resumed_background_job"))
+                self.assertEqual(apr_ok.get("category"), "endpoint_exec")
 
-                # Immediate follow-up turn receives cached approved output without running SSH twice or re-prompting!
+                from companion.approvals import consume_session_nudges
+
+                nudge_out = consume_session_nudges("web_ui", store=self.primary_store)
+                self.assertIn("[APPROVED ACTION EXECUTION RESULTS", nudge_out)
+                self.assertIn("Ubuntu 24.04 LTS", nudge_out)
+
+                # Immediate follow-up tool call also receives cached approved output without running SSH twice or re-prompting!
                 followup = em.ssh_exec("nimopc", comp_cmd, actor="companion")
                 self.assertTrue(followup["ok"], followup)
                 self.assertIn("Ubuntu 24.04 LTS", followup["output"])

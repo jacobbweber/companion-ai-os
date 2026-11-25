@@ -423,16 +423,20 @@ def get_approval_queue(store: Optional[MemoryStore] = None) -> ApprovalQueue:
 def enqueue_session_nudge(
     message: str, category: str = "job", session_id: str = "main", ref_id: str = "", store: Optional[MemoryStore] = None,
 ) -> int:
-    """Queue a polite 1-line turn-boundary notification scoped strictly to `session_id`."""
+    """Queue a turn-boundary notification scoped strictly to `session_id` (preserving full multi-line output for `approval_executed`)."""
     mem = store or get_memory_store()
     _ensure_tables(mem)
-    clean_msg = redact_secrets((message or "").strip().replace("\n", " "))[:280]
+    cat_clean = (category or "job").strip()[:32]
+    if cat_clean == "approval_executed":
+        clean_msg = redact_secrets((message or "").strip())[:8000]
+    else:
+        clean_msg = redact_secrets((message or "").strip().replace("\n", " "))[:280]
     if not clean_msg:
         return 0
     with mem._lock:
         cur = mem.conn.execute(
             "INSERT INTO session_nudges (session_id, category, ref_id, message, seen) VALUES (?, ?, ?, ?, 0)",
-            ((session_id or "main").strip(), (category or "job").strip()[:32], (ref_id or "").strip()[:64], clean_msg),
+            ((session_id or "main").strip(), cat_clean, (ref_id or "").strip()[:64], clean_msg),
         )
         mem.conn.commit()
         return int(cur.lastrowid or 0)
@@ -451,11 +455,14 @@ def peek_session_nudges(session_id: str = "main", store: Optional[MemoryStore] =
             mem.conn.execute(f"UPDATE session_nudges SET seen = 1 WHERE {stale_where}")
             mem.conn.commit()
     cols = ["id", "session_id", "category", "ref_id", "message", "created_at"]
-    return mem._fetch_dicts(
+    rows = mem._fetch_dicts(
         cols,
         f"SELECT {', '.join(cols)} FROM session_nudges WHERE session_id = ? AND seen = 0 ORDER BY id ASC LIMIT ?",
         ((session_id or "main").strip(), max(1, int(limit))),
     )
+    for r in rows:
+        r["message"] = str(r.get("message") or "").replace("\n", " ")[:220]
+    return rows
 
 
 def dismiss_session_nudges(
@@ -499,11 +506,24 @@ def consume_session_nudges(session_id: str = "main", store: Optional[MemoryStore
         ids = [int(r["id"]) for r in rows]
         mem.conn.execute(f"UPDATE session_nudges SET seen = 1 WHERE id IN ({','.join('?' for _ in ids)})", tuple(ids))
         mem.conn.commit()
-    lines = ["[COMPLETED BACKGROUND UPDATES (mention briefly if helpful, do not derail the user's request)]"]
-    for r in rows:
-        ref = f" (`{r['ref_id']}`)" if r["ref_id"] else ""
-        lines.append(f"  - [{r['category']}{ref}] {r['message']}")
-    return "\n".join(lines)
+    apr_exec_rows = [r for r in rows if r["category"] == "approval_executed"]
+    other_rows = [r for r in rows if r["category"] != "approval_executed"]
+    blocks: List[str] = []
+    if apr_exec_rows:
+        apr_lines = [
+            "[APPROVED ACTION EXECUTION RESULTS — Complete output from user-approved request(s); analyze directly and DO NOT re-run the same command]"
+        ]
+        for r in apr_exec_rows:
+            ref = f" (`{r['ref_id']}`)" if r["ref_id"] else ""
+            apr_lines.append(f"--- Approved Result{ref} ---\n{r['message']}\n--- End Approved Result ---")
+        blocks.append("\n".join(apr_lines))
+    if other_rows:
+        lines = ["[COMPLETED BACKGROUND UPDATES (mention briefly if helpful, do not derail the user's request)]"]
+        for r in other_rows:
+            ref = f" (`{r['ref_id']}`)" if r["ref_id"] else ""
+            lines.append(f"  - [{r['category']}{ref}] {r['message']}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 def archive_aged_conversations(

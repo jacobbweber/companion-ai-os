@@ -719,10 +719,11 @@ def _execute_tool_calls(
                     messages.append({"role": "tool", "tool_call_id": rem_tc.get("id"), "content": "Skipped: worker paused awaiting user approval."})
                 return doctor_ok, pause_id, False
         elif is_approval_gate:
+            m_apr = re.search(r"apr_[a-zA-Z0-9_]+", result)
             for rem_tc in tool_calls[idx + 1 :]:
                 messages.append({"role": "tool", "tool_call_id": rem_tc.get("id"), "content": "Skipped: turn halted awaiting user approval on prior action."})
-            return doctor_ok, None, True
-    return doctor_ok, None, False
+            return doctor_ok, None, (m_apr.group(0) if m_apr else "pending")
+    return doctor_ok, None, ""
 
 
 def _select_step_tier(
@@ -825,6 +826,7 @@ def _run_step_loop(
     turn_t0, turn_thoughts, turn_tools = time.perf_counter(), [], []
     turn_iso, cur_nudges, turn_start_idx = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), 0, max(1, len(messages) - 1)
     force_final_text = False
+    paused_approval_id = ""
     with turn_context_scope(turn_ctx):
         for step in range(iter_limit):
             check_cancelled()
@@ -893,6 +895,7 @@ def _run_step_loop(
             last_tokens = int((data.get("usage") or {}).get("total_tokens") or 0) if isinstance(data.get("usage"), dict) else 0
             raw_asst = data["choices"][0]["message"]
             clean_text, thinking_text, tool_calls = normalize_assistant_message(raw_asst)
+            dropped_forced_tools = bool(force_final_text and tool_calls)
             if force_final_text:
                 tool_calls = []
             if thinking_text:
@@ -907,6 +910,10 @@ def _run_step_loop(
                     continue
                 with tier_context(step_tier):
                     final_text = clean_text if clean_text.strip() else recover_empty_synthesis(messages, chat_fn, prior_thinking=thinking_text)
+                if force_final_text and (dropped_forced_tools or "approv" not in final_text.lower()):
+                    apr_lbl = f" (`{paused_approval_id}`)" if paused_approval_id and paused_approval_id != "pending" else ""
+                    apr_note = f"*(Action queued for approval{apr_lbl} — click **Approve** above and I will continue automatically.)*"
+                    final_text = f"{final_text.rstrip()}\n\n{apr_note}".strip() if not dropped_forced_tools else apr_note
                 wfence = _extract_turn_widget_fence(messages, turn_start_idx)
                 if wfence and "```companion-flashcards" not in final_text:
                     final_text = f"{final_text.rstrip()}\n\n{wfence}".strip()
@@ -930,6 +937,7 @@ def _run_step_loop(
             if pause_id:
                 return "waiting_approval", "", pause_id
             if fg_approval_halt:
+                paused_approval_id = str(fg_approval_halt)
                 if step + 1 >= iter_limit:
                     return "done", _synthesize_turn_budget_exit(
                         messages, chat_fn, mem, session_tag, tid, last_doctor_pass, log_to_conversations=log_to_conversations,

@@ -202,9 +202,10 @@ def _act_approvals(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str,
                         aq.mark_executed(str(apr_obj.get("approval_id") or aid), output=full_exec_out)
                         res_note = app_res["summary"]
                         res["applied_summary"] = res_note
+                        res["execution_output"] = full_exec_out[:8000]
                         res["summary"] = f"{res['summary']} -> Executed: {res_note[:240]}"
                         enqueue_session_nudge(
-                            f"Approved & executed `{apr_obj.get('action_name')}` on `{apr_obj.get('target')}`: {full_exec_out[:220]}",
+                            f"Action `{apr_obj.get('action_name')}` on `{apr_obj.get('target')}` succeeded:\n{full_exec_out[:7600]}",
                             category="approval_executed",
                             session_id=str(apr_obj.get("session_id") or "web_ui"),
                             ref_id=str(apr_obj.get("approval_id") or aid),
@@ -215,10 +216,14 @@ def _act_approvals(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str,
                         res["execution_error"] = app_res["error"]
                         res["error"] = f"Approved `{aid}`, but execution failed: {app_res['error']}"
                         return res
+            resumed_bg = False
             if _as_bool(p.get("resume_job"), True):
                 node_id = str(apr_payload.get("node_id") or "")
                 for j in waiting_jobs:
                     jm.resume_job(j["job_id"], resolution_note=res_note or f"Approved `{aid}`.", approved_node_id=node_id)
+                    resumed_bg = True
+            res["resumed_background_job"] = resumed_bg
+            res["category"] = str(apr_obj.get("category") or "")
         return res
     st = str(p.get("status") or "waiting")
     return {"ok": True, "approvals": aq.list_requests(status=st), "summary": aq.format_board(status=st)}

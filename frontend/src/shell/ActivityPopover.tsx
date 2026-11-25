@@ -11,7 +11,7 @@ import {
   Terminal,
   X,
 } from 'lucide-react';
-import { callAction, cancelActiveJob } from '../api';
+import { callAction, cancelActiveJob, emitApprovalResolved } from '../api';
 import type {
   AuxInspectorTarget,
   BackgroundJob,
@@ -62,7 +62,10 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
     if (resolvingId) return;
     setResolvingId(approvalId);
     try {
-      const res = await callAction('approvals', {
+      const res = await callAction<{
+        category?: string;
+        resumed_background_job?: boolean;
+      }>('approvals', {
         subaction: decision,
         approval_id: approvalId,
       });
@@ -72,6 +75,15 @@ export const ActivityPopover: React.FC<ActivityPopoverProps> = ({
           ? res.error || `Approval ${decision} failed.`
           : res.summary || `Approval ${decision}d.`
       );
+      if (res.ok !== false) {
+        emitApprovalResolved({
+          approvalId,
+          decision,
+          category: res.category,
+          resumedBackgroundJob: Boolean(res.resumed_background_job),
+          source: 'popover',
+        });
+      }
     } finally {
       setResolvingId('');
     }

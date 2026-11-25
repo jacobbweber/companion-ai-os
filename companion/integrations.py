@@ -105,11 +105,14 @@ _DEFAULT_PORTS = {"ssh": 22, "winrm": 5985, "http_api": 80}
 _BLOCKED_META_HOSTS = {"metadata.google.internal", "metadata", "instance-data", "169.254.169.254"}
 _SECRET_ENV_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASS")
 _READONLY_SINGLE_CMDS = frozenset({
-    "uname", "hostname", "uptime", "df", "free", "ps", "ls", "cat", "head",
-    "tail", "grep", "rg", "find", "stat", "journalctl", "nvidia-smi", "ss",
+    "echo", "uname", "hostname", "uptime", "df", "free", "lscpu", "lspci", "lsblk",
+    "nproc", "ps", "ls", "cat", "head", "tail", "grep", "rg", "wc", "stat",
+    "id", "whoami", "find", "journalctl", "nvidia-smi", "ss",
 })
-_READONLY_TWO_WORD_CMDS = frozenset({"systemctl status", "docker ps", "docker logs", "ip addr", "ip route"})
+_READONLY_TWO_WORD_CMDS = frozenset({"systemctl status", "docker ps", "docker info", "docker logs", "ip addr", "ip route"})
 _SAFE_SED_READ_RE = re.compile(r"^sed\s+-n\s+'1,\d+p'\s+--\s+\S+$")
+_SENSITIVE_REMOTE_SUBSTRS = (".ssh", "shadow", "secrets", ".env", "id_rsa", "id_ed25519", "authorized_keys", "private_key")
+_STDERR_REDIRECT_RE = re.compile(r"(?:^|\s)2>(?:/dev/null|&1)(?=\s|$|;|&&|\|\||\|)")
 
 
 def _parse_user_host_port(raw_host: str, raw_user: str, raw_port: int) -> Tuple[str, str, int]:
@@ -127,21 +130,13 @@ def _parse_user_host_port(raw_host: str, raw_user: str, raw_port: int) -> Tuple[
     return h, u, p
 
 
-def _is_readonly_remote_command(command: str, protocol: str) -> bool:
-    if protocol != "ssh":
-        return False
-    clean = (command or "").strip()
-    if not clean or any(ch in clean for ch in (";", "|", "&", ">", "<", "`", "\n", "\r")) or "$(" in clean:
-        return False
-    if _SAFE_SED_READ_RE.match(clean):
-        return True
-    try:
-        toks = shlex.split(clean)
-    except ValueError:
-        return False
+def _is_readonly_segment(toks: List[str]) -> bool:
     if not toks:
         return False
-    cmd0 = Path(toks[0]).name.lower()
+    raw0 = toks[0]
+    if ("/" in raw0 or "\\" in raw0) and not raw0.startswith(("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/")):
+        return False
+    cmd0 = Path(raw0).name.lower()
     if cmd0 == "find" and any(t in ("-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fls") for t in toks[1:]):
         return False
     if cmd0 in _READONLY_SINGLE_CMDS:
@@ -149,6 +144,62 @@ def _is_readonly_remote_command(command: str, protocol: str) -> bool:
     if len(toks) >= 2 and f"{cmd0} {toks[1].lower()}" in _READONLY_TWO_WORD_CMDS:
         return True
     return False
+
+
+def _is_readonly_remote_command(command: str, protocol: str) -> bool:
+    if protocol != "ssh":
+        return False
+    clean = (command or "").strip()
+    if not clean or any(ch in clean for ch in ("`", "\n", "\r")) or "$(" in clean or "${" in clean:
+        return False
+    low = clean.lower()
+    if any(s in low for s in _SENSITIVE_REMOTE_SUBSTRS):
+        return False
+    if _SAFE_SED_READ_RE.match(clean):
+        return True
+    scrubbed = _STDERR_REDIRECT_RE.sub(" ", clean)
+    if ">" in scrubbed or "<" in scrubbed:
+        return False
+    try:
+        lex = shlex.shlex(scrubbed, posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    segments: List[List[str]] = []
+    cur: List[str] = []
+    paren_depth = 0
+    for tok in tokens:
+        if tok == "&" or any(c in tok for c in (">", "<", "`")):
+            return False
+        if tok == "(":
+            if cur:
+                return False
+            paren_depth += 1
+            continue
+        if tok == ")":
+            paren_depth -= 1
+            if paren_depth < 0:
+                return False
+            if cur:
+                segments.append(cur)
+                cur = []
+            continue
+        if tok in ("&&", "||", ";", "|"):
+            if not cur and not segments:
+                return False
+            if cur:
+                segments.append(cur)
+                cur = []
+            continue
+        cur.append(tok)
+    if paren_depth != 0:
+        return False
+    if cur:
+        segments.append(cur)
+    return bool(segments) and all(_is_readonly_segment(seg) for seg in segments)
 
 
 ENDPOINTS_DDL: Tuple[str, ...] = (

@@ -318,3 +318,17 @@ export function subscribeJobStream(jobId: string, cb: StreamCallbacks, cursor = 
     es.close();
   };
 }
+
+export interface ApprovalResolvedDetail {
+  approvalId: string;
+  decision: 'approve' | 'deny';
+  category?: string;
+  resumedBackgroundJob?: boolean;
+  source: 'chat' | 'popover' | 'inspector';
+}
+
+export function emitApprovalResolved(detail: ApprovalResolvedDetail): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent<ApprovalResolvedDetail>('companion:approval-resolved', { detail }));
+  }
+}
