@@ -287,6 +287,8 @@ class CompanionWebSession:
                     self.messages[:] = pre_msgs
                     err_text = f"Turn error: {type(exc).__name__}: {exc}"
                     telemetry.log("ERROR", "web_ui", err_text)
+                    with contextlib.suppress(Exception):
+                        self.store.log_message("assistant", f"⚠️ **{err_text}**", session_tag="web_ui")
                     return 500, {"ok": False, "error": err_text}
         finally:
             self._active_cancel_scope = None

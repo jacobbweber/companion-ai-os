@@ -448,7 +448,12 @@ def record_coalesced_job_event(job: Dict[str, Any], ev: Dict[str, Any]) -> None:
     """Update live job stream snapshot and coalesce consecutive delta events so long turns never drop tail events."""
     etype = str(ev.get("type") or "")
     if etype == "text_delta":
-        job["stream_text"] = job.get("stream_text", "") + str(ev.get("delta") or "")
+        delta_s = str(ev.get("delta") or "")
+        cur_txt = job.get("stream_text", "")
+        if job.pop("_needs_step_break", False) and cur_txt and not cur_txt.endswith("\n") and delta_s and not delta_s.startswith("\n"):
+            delta_s = "\n\n" + delta_s
+            ev = {**ev, "delta": delta_s}
+        job["stream_text"] = cur_txt + delta_s
     elif etype == "thinking_delta":
         job["stream_thinking"] = job.get("stream_thinking", "") + str(ev.get("delta") or "")
     elif etype == "orphan_think_closed":
@@ -461,6 +466,8 @@ def record_coalesced_job_event(job: Dict[str, Any], ev: Dict[str, Any]) -> None:
         job["active_tool"] = str(ev.get("summary") or ev.get("tool") or "")
     elif etype == "tool_end":
         job["active_tool"] = ""
+        if job.get("stream_text"):
+            job["_needs_step_break"] = True
         steps = job.setdefault("tool_steps", [])
         steps.append({"tool": str(ev.get("tool") or ""), "summary": str(ev.get("summary") or ev.get("tool") or ""), "ok": bool(ev.get("ok", True)), "duration_ms": ev.get("duration_ms", 0)})
     events: List[Dict[str, Any]] = job["events"]

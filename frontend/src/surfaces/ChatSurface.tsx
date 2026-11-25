@@ -71,6 +71,8 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
   const [resolvingApprovalId, setResolvingApprovalId] = useState('');
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [stagedIds, setStagedIds] = useState<Record<string, boolean>>({});
+  const [liveElapsedSec, setLiveElapsedSec] = useState(0);
+  const turnStartedMsRef = useRef<number>(0);
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   const lastTailIdRef = useRef<string>('');
@@ -88,7 +90,9 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
         const transientTail = prev.filter(
           (m) =>
             m.streaming ||
-            (typeof m.id === 'string' && m.id.startsWith('job_') && m.content.startsWith('Error:'))
+            (typeof m.id === 'string' &&
+              m.id.startsWith('job_') &&
+              (m.content.startsWith('Error:') || m.content.includes('⚠️')))
         );
         if (transientTail.length === 0) return res.messages;
         return [...res.messages, ...transientTail];
@@ -195,16 +199,21 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
           unsubRef.current = null;
           const isTurnError = doneStatus === 'error' || Boolean(error && !response);
           setMessages((prev) =>
-            prev.map((m) =>
-              m.id === streamId
-                ? {
-                    ...m,
-                    content: response || m.content || (error ? `Error: ${error}` : ''),
-                    streaming: false,
-                    activeTool: '',
-                  }
-                : m
-            )
+            prev.map((m) => {
+              if (m.id !== streamId) return m;
+              let nextContent = response || m.content || '';
+              if (isTurnError && error) {
+                nextContent = m.content
+                  ? `${m.content.trimEnd()}\n\n⚠️ **${error}**`
+                  : `Error: ${error}`;
+              }
+              return {
+                ...m,
+                content: nextContent,
+                streaming: false,
+                activeTool: '',
+              };
+            })
           );
           setSending(false);
           if (isTurnError) {
@@ -512,6 +521,24 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
   const totalWaitingApprovals = status?.pending_approvals_count ?? inlineApprovals.length;
   const isTurnBusy = sending || Boolean(status?.busy);
 
+  useEffect(() => {
+    if (!isTurnBusy) {
+      turnStartedMsRef.current = 0;
+      setLiveElapsedSec(0);
+      return;
+    }
+    const srvElapsed = status?.active_job?.elapsed_seconds ?? status?.busy_seconds ?? 0;
+    if (!turnStartedMsRef.current) {
+      turnStartedMsRef.current = Date.now() - Math.round(Number(srvElapsed || 0) * 1000);
+    }
+    const updateTick = () => {
+      setLiveElapsedSec(Math.max(0, Math.floor((Date.now() - turnStartedMsRef.current) / 1000)));
+    };
+    updateTick();
+    const timer = window.setInterval(updateTick, 1000);
+    return () => window.clearInterval(timer);
+  }, [isTurnBusy, status?.active_job?.job_id]);
+
   return (
     <div className="chat-canvas-wrap" data-testid="chat-surface">
       {status?.awaiting_approval && (
@@ -746,9 +773,37 @@ export const ChatSurface: React.FC<ChatSurfaceProps> = ({
                         }
                         onFlashcardGraded={() => void onRefreshStatus()}
                       />
-                    ) : msg.streaming ? (
-                      <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>Thinking...</span>
                     ) : null}
+                    {msg.streaming && (
+                      <div
+                        data-testid="chat-live-activity"
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 8,
+                          marginTop: msg.content ? 10 : 2,
+                          padding: '6px 10px',
+                          borderRadius: 'var(--radius-sm)',
+                          background: 'var(--bg-elevated)',
+                          border: '1px solid var(--border-hairline)',
+                          color: 'var(--text-secondary)',
+                          fontSize: 12.5,
+                        }}
+                      >
+                        <span className="status-dot busy" style={{ flexShrink: 0 }} />
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {msg.activeTool
+                            ? `Running ${msg.activeTool}...`
+                            : msg.activePhase
+                              ? `Thinking · ${msg.activePhase}`
+                              : 'Thinking...'}
+                          {liveElapsedSec > 0 ? ` · ${liveElapsedSec}s` : ''}
+                          {msg.thinking && !msg.activeTool
+                            ? ` — ${msg.thinking.trim().split('\n').pop()?.slice(0, 88) || ''}`
+                            : ''}
+                        </span>
+                      </div>
+                    )}
                   </div>
 
                   {!msg.streaming && msg.content && (

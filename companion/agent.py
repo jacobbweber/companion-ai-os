@@ -853,8 +853,11 @@ def _run_step_loop(
                 suggested_tier=suggested_tier, allow_error_escalation=allow_error_escalation,
             )
             prior_step_tier = step_tier
-            if step == 0 and not current_workflow_phase():
-                emit_stream_event({"type": "phase", "phase": eff_phase or intent_mode, "tier": step_tier or "fast"})
+            if not current_workflow_phase():
+                step_model_lbl = settings.resolve_tier(step_tier).model
+                phase_lbl = eff_phase or intent_mode
+                step_tag = f"{phase_lbl} · Step {step + 1} ({step_model_lbl})" if step > 0 else f"{phase_lbl} ({step_model_lbl})"
+                emit_stream_event({"type": "phase", "phase": step_tag, "tier": step_tier or "fast"})
             tag_s = session_tag or ""
             if force_final_text or tag_s.startswith("autonomy:design:"):
                 step_tools = None

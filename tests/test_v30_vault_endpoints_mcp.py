@@ -485,7 +485,8 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
                 self.assertIn("Ubuntu 24.04 LTS", followup["output"])
                 self.assertEqual(call_counter["n"], 1)
 
-        # 4. ops_manage(domain='endpoints', action='create', params={'transport': 'ssh', 'auth_type': 'basic_auth', ...}) stages proposal
+        # 4. ops_manage(domain='endpoints', action='create', params={'transport': 'ssh', 'auth_type': 'basic_auth', ...}) stages proposal,
+        #    AND stringified JSON `params` never crashes check_phase_tool_permission or _check_r3_risk_gate!
         with memory_store_context(self.primary_store):
             ops_out = dispatch("ops_manage", {
                 "domain": "endpoints",
@@ -494,6 +495,21 @@ class TestStage5FederatedMcpPartnerHudRoutinesAndSandbox(unittest.TestCase):
                 "params": {"transport": "ssh", "host": "192.168.1.29", "port": 22, "ssh_username": "nimopc", "auth_type": "basic_auth", "credential_ref": "nimopc"},
             })
             self.assertIn("AWAITING_USER_APPROVAL", ops_out)
+
+            str_params_out = dispatch("ops_manage", {
+                "domain": "endpoints",
+                "action": "list",
+                "params": '{"protocol": "ssh"}',
+            })
+            self.assertIn("nimopc", str_params_out)
+            with phase_tool_context("PLAN"):
+                plan_blk = dispatch("ops_manage", {
+                    "domain": "endpoints",
+                    "action": "ssh_exec",
+                    "target": "nimopc",
+                    "params": '{"command": "uname -a"}',
+                })
+                self.assertIn("PHASE TOOL GATE REJECTED", plan_blk)
 
 
 if __name__ == "__main__":

@@ -975,7 +975,7 @@ def check_phase_tool_permission(tool_name: str, phase: Optional[str] = None, arg
                 "projects": "project_manage", "checkpoints": "checkpoint_manage",
             }.get(dom, "")
             if mapped:
-                return check_phase_tool_permission(mapped, phase=eff, args={**(args.get("params") or {}), "action": act, "target": args.get("target")})
+                return check_phase_tool_permission(mapped, phase=eff, args={**(_dict_arg(args, "params") or {}), "action": act, "target": args.get("target")})
             return None
         act = str(args.get("action") or "").strip().lower()
         if tool_name == "project_manage":
@@ -2165,7 +2165,7 @@ def _check_r3_risk_gate(name: str, args: Dict[str, Any]) -> Optional[str]:
     elif name == "ops_manage":
         dom = str_arg(args, "domain").lower()
         eff_name = {"endpoints": "endpoint_manage", "workflows": "workflow_manage", "checkpoints": "checkpoint_manage"}.get(dom, name)
-        eff_args = {**(args.get("params") or {}), **args}
+        eff_args = {**(_dict_arg(args, "params") or {}), **args}
 
     if classify_action_risk(eff_name, eff_args) != ActionRiskTier.R3_HIGH_IMPACT_MUTATION:
         return None
@@ -2215,12 +2215,17 @@ def _resolve_mcp_tool(name: str) -> Optional[Callable[[Dict[str, Any]], str]]:
 
 
 def dispatch(name: str, args: Dict[str, Any]) -> str:
+    if not isinstance(args, dict):
+        args = _dict_arg({"a": args}, "a") or {}
     with agent_tool_turn_context():
         fn = TOOL_IMPLS.get(name) or _resolve_mcp_tool(name)
         if fn is None:
             telemetry.log("WARN", "tools", f"Unknown tool requested: {name}")
             return f"error: unknown tool: {name}"
-        gate_err = check_phase_tool_permission(name, args=args) or _check_r3_risk_gate(name, args)
+        try:
+            gate_err = check_phase_tool_permission(name, args=args) or _check_r3_risk_gate(name, args)
+        except Exception as exc:
+            gate_err = f"error: invalid arguments for `{name}`: {type(exc).__name__}: {exc}"
         if gate_err:
             telemetry.record_span("tool_call", name, 0.1, status="error", detail=gate_err[:140])
             if telemetry.active_trace_id:
