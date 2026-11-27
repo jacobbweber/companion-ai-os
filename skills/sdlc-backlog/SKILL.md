@@ -26,7 +26,7 @@ Wear the **Technical Delivery Lead Hat**. Carve approved product/feature scope a
    - **Choice A (Compact — <= 6 features):** Write `docs/features.md` AND `docs/user-stories.md`.
    - **Choice B (Feature Folders — multi-feature apps or features inside existing apps):** Write `docs/features/F0X-<slug>/00-feature-overview.md` AND one Stage 3 story file per Increment (`inc-01-<slug>.md`, `inc-02-<slug>.md`, ...) containing Increment Goal, Rules, User Stories + `Given / When / Then` criteria, and a `## Stage 4: Engineering Design (Pending)` section ready for `sdlc-design` to populate one Increment at a time.
 3. **Companion Project Board Sync (`agile_manage`):**
-   - After writing the backlog artifacts to disk, mirror the approved Feature Milestones (`agile_manage(action="create_milestone", title="...")`) and sequential Increment / Story cards (`agile_manage(action="create_item", title="...", owner="collaborative", status="ready", acceptance_criteria=[...], depends_on=[...])`) onto the focused Project Board so Kanban and Roadmap views track live SDLC progress.
+   - After writing the backlog artifacts to disk, mirror the approved Feature Milestones (`agile_manage(action="create_milestone", title="...")`) and sequential Increment / Story cards (`agile_manage(action="create_item", title="...", epic_id="...", owner="collaborative", status="ready", description="...", acceptance_criteria="...", checklist=[...], depends_on=[...])`) onto the focused Project Board so Kanban and Roadmap views track live SDLC progress.
 
 ## Exit Check & Checkpoint Output
 Confirm every story has both happy-path and fail-safe acceptance criteria and maps cleanly to upstream scope/ADRs, then output:

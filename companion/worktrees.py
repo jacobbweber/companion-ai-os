@@ -216,18 +216,73 @@ def validate_external_repo_path(target: Path) -> Optional[str]:
     return None
 
 
-def _extract_layout_source_paths(design_text: str) -> List[str]:
+_NON_IMPL_CONFIG_FILES = frozenset({
+    "conftest.py", "setup.py", "vite.config.ts", "vite.config.js", "vitest.config.ts", "vitest.config.js",
+    "jest.config.js", "jest.config.ts", "eslint.config.js", "eslint.config.mjs", "tailwind.config.js", "postcss.config.js",
+})
+
+
+def _is_planned_impl_source(rel_path: str) -> bool:
+    clean = rel_path.replace("\\", "/").strip("/")
+    if not clean or Path(clean).suffix.lower() not in _SDLC_CODE_EXTS:
+        return False
+    low, fname = f"/{clean.lower()}", Path(clean).name.lower()
+    if fname in _NON_IMPL_CONFIG_FILES or any(seg in low for seg in ("/docs/", "/.github/", "/.agents/", "/tests/", "/test/", "/__tests__/", "/spec/")):
+        return False
+    return not (fname.startswith("test_") or any(k in fname for k in ("_test.", ".test.", ".spec.")))
+
+
+def _extract_layout_source_paths(design_text: str, repo_root: Optional[Path] = None) -> List[str]:
     m = re.search(r"(?im)^#{2,3}\s*(?:1\.?\s*)?Project\s*&\s*Module\s+File\s+Layout\b[^\n]*\n(.*?)(?=^#{2,3}\s|\Z)", design_text, re.S)
     scope = m.group(1) if m else ""
     if not scope:
         return []
     found: List[str] = []
-    for tok in re.findall(r"(?:src|app|lib|pkg|cmd|internal|backend|server|client)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+", scope):
-        clean = tok.strip("`'\".,;:()[]")
-        low = clean.lower()
-        if Path(clean).suffix.lower() in _SDLC_CODE_EXTS and not any(k in low for k in ("test_", "_test.", ".test.", ".spec.", "/tests/", "/test/")):
-            if clean not in found:
-                found.append(clean)
+    repo_slug = repo_root.resolve().name.lower().replace("_", "-") if repo_root else ""
+    dir_stack: List[Tuple[int, str]] = []
+    in_fence = False
+    for raw_ln in scope.splitlines():
+        stripped = raw_ln.strip()
+        if stripped.startswith("```"):
+            in_fence, dir_stack = (not in_fence), []
+            continue
+        no_comment = re.split(r"\s+#(?:\s|$)|\s+//\s+|\s+—\s+", raw_ln, maxsplit=1)[0].rstrip()
+        if not no_comment.strip():
+            continue
+        m_tree = re.match(r"^([ \t│|├└─`*-]*?)([A-Za-z0-9_./-]+/?)(?:`|\s|$)", no_comment)
+        if m_tree and (in_fence or any(c in m_tree.group(1) for c in "├└│|-*`")):
+            col = len(m_tree.group(1).expandtabs(4))
+            tok = m_tree.group(2).strip("`'\" ")
+            while dir_stack and dir_stack[-1][0] >= col:
+                dir_stack.pop()
+            if tok.endswith("/"):
+                dname = tok.rstrip("/")
+                is_root_wrap = (
+                    col == 0
+                    and not dir_stack
+                    and dname in (".", repo_root.resolve().name if repo_root else "")
+                    or (
+                        col == 0
+                        and not dir_stack
+                        and bool(repo_slug)
+                        and dname.lower().replace("_", "-") == repo_slug
+                        and (repo_root is None or not (repo_root / dname).is_dir())
+                    )
+                )
+                if dname and not is_root_wrap:
+                    dir_stack.append((col, dname))
+                continue
+            cand = "/".join([*(d for _, d in dir_stack), tok]) if "/" not in tok else tok
+            if _is_planned_impl_source(cand) and cand not in found:
+                found.append(cand)
+        for inline in re.findall(r"(?:`([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]+)`|\b([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+))", no_comment):
+            cand_i = (inline[0] or inline[1]).strip("`'\".,;:()[]/")
+            if repo_root and "/" in cand_i:
+                first_seg, rest_seg = cand_i.split("/", 1)
+                if first_seg.lower().replace("_", "-") == repo_slug and not (repo_root / first_seg).is_dir():
+                    cand_i = rest_seg
+            if _is_planned_impl_source(cand_i) and cand_i not in found:
+                found.append(cand_i)
     return found
 
 
@@ -282,10 +337,10 @@ def _inspect_choice_b_increments(repo_root: Path) -> Tuple[List[str], List[Dict[
             design_body = ""
         else:
             rest = txt[m_des.end() :]
-            nxt_h = re.search(r"(?m)^#{1,2}\s+\S+", rest)
+            nxt_h = re.search(r"(?im)^(?:#\s+\S+|#{1,3}\s*(?:Stage\s*[567]\b|Verification\b|Sign-?Off\b|Checkpoint\b))", rest)
             design_body = (rest[: nxt_h.start()] if nxt_h else rest).strip()
             design_pending = len(design_body) < 40 or design_body.lower().strip("() ") in ("pending", "tbd", "todo")
-        planned = [] if design_pending else _extract_layout_source_paths(design_body or txt)
+        planned = [] if design_pending else _extract_layout_source_paths(design_body or txt, repo_root=repo_root)
         missing_src = [sp for sp in planned if not (repo_root / sp).is_file()]
         increments.append({
             "path": inc_p.relative_to(repo_root).as_posix(),
@@ -319,11 +374,40 @@ def _scan_sdlc_placeholders(repo_root: Path, pending_inc_paths: set[str]) -> Lis
     return violations
 
 
+def _build_sdlc_upstream_list(
+    root: Path,
+    host_arch_docs: List[str],
+    adr_rels: List[str],
+    has_choice_a_backlog: bool,
+    overviews: List[str],
+    active_inc: str,
+    has_choice_a_design: bool,
+    has_test_strategy: bool,
+    has_runbook: bool,
+) -> List[str]:
+    upstream: List[str] = []
+    for cand in ("product.md", "architecture.md", *host_arch_docs, *adr_rels[:6]):
+        if (root / cand).is_file() and cand not in upstream:
+            upstream.append(cand)
+    if has_choice_a_backlog:
+        upstream.extend(["docs/features.md", "docs/user-stories.md"])
+    if overviews:
+        upstream.extend(overviews[:3])
+    if active_inc and active_inc not in upstream:
+        upstream.append(active_inc)
+    elif has_choice_a_design:
+        upstream.append("docs/engineering-design.md")
+    if has_test_strategy:
+        upstream.append("docs/testing-strategy.md")
+    if has_runbook:
+        upstream.append("docs/operations-runbook.md")
+    return upstream
+
+
 def inspect_sdlc_repo_state(repo_root: Path) -> Dict[str, Any]:
     """Deterministically inspect SDLC artifacts, Greenfield vs Brownfield posture, Choice B Increments, and hygiene."""
     root = Path(repo_root).expanduser().resolve()
-    has_product = (root / "product.md").is_file()
-    has_root_arch = (root / "architecture.md").is_file()
+    has_product, has_root_arch = (root / "product.md").is_file(), (root / "architecture.md").is_file()
     host_arch_docs = [d for d in ("AGENTS.md", "CLAUDE.md", "docs/architecture.md", "docs/project-layout.md") if (root / d).is_file()]
     adr_rels = (["adr.md"] if (root / "adr.md").is_file() else []) + (
         [p.relative_to(root).as_posix() for p in sorted((root / "docs" / "adr").glob("*.md")) if p.is_file()]
@@ -338,16 +422,13 @@ def inspect_sdlc_repo_state(repo_root: Path) -> Dict[str, Any]:
     eng_design_p = root / "docs" / "engineering-design.md"
     eng_design_txt = eng_design_p.read_text(encoding="utf-8", errors="ignore") if eng_design_p.is_file() else ""
     has_choice_a_design = bool(eng_design_txt.strip() and len(eng_design_txt.strip()) >= 40)
-    choice_a_missing_src = [sp for sp in _extract_layout_source_paths(eng_design_txt) if not (root / sp).is_file()] if has_choice_a_design else []
+    choice_a_missing_src = [sp for sp in _extract_layout_source_paths(eng_design_txt, repo_root=root) if not (root / sp).is_file()] if has_choice_a_design else []
 
     sources, tests = _scan_repo_code_and_tests(root)
-    has_test_strategy = (root / "docs" / "testing-strategy.md").is_file()
-    has_runbook = (root / "docs" / "operations-runbook.md").is_file()
-    is_brownfield = (not has_product) and (not has_root_arch) and (bool(host_arch_docs) or (len(sources) >= 1 and backlog_mode == "none"))
-    repo_kind = "brownfield" if is_brownfield else "greenfield"
+    has_test_strategy, has_runbook = (root / "docs" / "testing-strategy.md").is_file(), (root / "docs" / "operations-runbook.md").is_file()
+    repo_kind = "brownfield" if ((not has_product) and (not has_root_arch) and (bool(host_arch_docs) or (len(sources) >= 1 and backlog_mode == "none"))) else "greenfield"
 
-    active_inc = ""
-    lifecycle_complete = False
+    active_inc, lifecycle_complete = "", False
     if repo_kind == "greenfield" and not has_product:
         stage = 1
     elif (repo_kind == "greenfield" and (not has_root_arch or not has_adrs)) or (repo_kind == "brownfield" and not has_adrs and not has_choice_b_backlog and not has_choice_a_backlog):
@@ -359,12 +440,7 @@ def inspect_sdlc_repo_state(repo_root: Path) -> Dict[str, Any]:
         if unshipped:
             cur_inc = unshipped[0]
             active_inc = str(cur_inc["path"])
-            if cur_inc["design_pending"]:
-                stage = 4
-            elif cur_inc["missing_sources"] or (len(sources) == 0):
-                stage = 5
-            else:
-                stage = 6
+            stage = 4 if cur_inc["design_pending"] else (5 if (cur_inc["missing_sources"] or len(sources) == 0) else 6)
         elif not has_runbook:
             stage = 7
         else:
@@ -382,42 +458,15 @@ def inspect_sdlc_repo_state(repo_root: Path) -> Dict[str, Any]:
             stage, lifecycle_complete = 8, True
 
     skill_name, stage_lbl = _SDLC_STAGE_META[stage]
-    upstream: List[str] = []
-    for cand in ("product.md", "architecture.md", *host_arch_docs, *adr_rels[:6]):
-        if (root / cand).is_file() and cand not in upstream:
-            upstream.append(cand)
-    if has_choice_a_backlog:
-        upstream.extend(["docs/features.md", "docs/user-stories.md"])
-    if overviews:
-        upstream.extend(overviews[:3])
-    if active_inc and active_inc not in upstream:
-        upstream.append(active_inc)
-    elif has_choice_a_design:
-        upstream.append("docs/engineering-design.md")
-    if has_test_strategy:
-        upstream.append("docs/testing-strategy.md")
-    if has_runbook:
-        upstream.append("docs/operations-runbook.md")
-
-    pending_set = {str(i["path"]) for i in increments if i["design_pending"] and not i["shipped"]}
-    violations = _scan_sdlc_placeholders(root, pending_set)
+    upstream = _build_sdlc_upstream_list(root, host_arch_docs, adr_rels, has_choice_a_backlog, overviews, active_inc, has_choice_a_design, has_test_strategy, has_runbook)
+    violations = _scan_sdlc_placeholders(root, {str(i["path"]) for i in increments if i["design_pending"] and not i["shipped"]})
     inc_note = f" | target_increment=`{active_inc}`" if active_inc else ""
     return {
-        "ok": True,
-        "repo_root": str(root),
-        "is_git_repo": (root / ".git").exists(),
-        "repo_kind": repo_kind,
-        "backlog_mode": backlog_mode,
-        "detected_stage": 7 if lifecycle_complete else stage,
-        "stage_label": stage_lbl,
-        "recommended_skill": skill_name,
-        "active_increment": active_inc,
-        "upstream_artifacts": upstream,
-        "increments": increments,
-        "source_file_count": len(sources),
-        "test_file_count": len(tests),
-        "placeholder_violations": violations,
-        "hygiene_clean": len(violations) == 0,
+        "ok": True, "repo_root": str(root), "is_git_repo": (root / ".git").exists(),
+        "repo_kind": repo_kind, "backlog_mode": backlog_mode, "detected_stage": 7 if lifecycle_complete else stage,
+        "stage_label": stage_lbl, "recommended_skill": skill_name, "active_increment": active_inc,
+        "upstream_artifacts": upstream, "increments": increments, "source_file_count": len(sources),
+        "test_file_count": len(tests), "placeholder_violations": violations, "hygiene_clean": len(violations) == 0,
         "lifecycle_complete": lifecycle_complete,
         "summary": (
             f"SDLC Status (`{root.name}` | `{repo_kind}`): Next=`{stage_lbl}` (`{skill_name}`){inc_note} | "
@@ -899,17 +948,48 @@ def _handle_git_remote(action: str, repo_root: Path, args: Dict[str, Any]) -> st
     return f"git {action} `{remote}/{cur_br}` succeeded.\n{out}".strip() if rc == 0 else f"error: git {action} failed: {out}"
 
 
+def _handle_git_init(raw_repo: str, args: Dict[str, Any]) -> str:
+    ws = settings.get_workspace()
+    title_arg = str_arg(args, "title", aliases=("name", "slug"))
+    if ws.is_self_project:
+        if raw_repo:
+            cand = Path(raw_repo).expanduser()
+            init_target: Any = cand.resolve() if (cand.is_absolute() or raw_repo.startswith("~")) else (settings.projects_dir / cand).resolve()
+        elif title_arg:
+            init_target = ""
+        else:
+            return "error: `repo_path` or `slug` is required for `git_manage(action='init')` when focused on `companion-self`."
+    else:
+        init_target = _resolve_repo_arg(raw_repo)
+    res = init_greenfield_repo(init_target, title=title_arg, default_branch=str_arg(args, "branch", "main") or "main")
+    if not res.get("ok"):
+        return str(res.get("error") or "error: git init failed")
+    repo_p = Path(str(res["repo_root"])).resolve()
+    if bool_arg(args, "focus", ws.is_self_project):
+        from companion.projects import get_project_graph
+
+        pg = get_project_graph()
+        ex_rows = pg.store._fetch_rows(
+            "SELECT project_id FROM projects WHERE status = 'active' AND (workspace_path = ? OR slug = ?) LIMIT 1",
+            (str(repo_p), repo_p.name.lower()),
+        )
+        if ex_rows:
+            pid = str(ex_rows[0][0])
+            pg.update_project(pid, workspace_path=str(repo_p), kind="software", focus=True)
+        else:
+            proj = pg.create_project(title=title_arg or repo_p.name.replace("-", " ").title(), kind="software", workspace_path=str(repo_p), focus=True)
+            pid = str(proj["project_id"])
+        settings.set_workspace(repo_p, pid)
+        return f"{res['summary']} Focused project `{pid}`."
+    return str(res["summary"])
+
+
 def tool_git_manage(args: Dict[str, Any]) -> str:
     """Execute safe local & Blind-Vault-authenticated Git/worktree operations governed by `delivery_policy`."""
     action = str_arg(args, "action", "status").lower()
     raw_repo = str_arg(args, "repo_path", aliases=("cwd", "repo", "workdir"))
     if action == "init":
-        if raw_repo and not Path(raw_repo).expanduser().is_absolute() and not raw_repo.startswith("~") and settings.get_workspace().is_self_project:
-            init_target = (settings.projects_dir / raw_repo).resolve()
-        else:
-            init_target = _resolve_repo_arg(raw_repo)
-        res = init_greenfield_repo(init_target, title=str_arg(args, "title", aliases=("name", "slug")), default_branch=str_arg(args, "branch", "main") or "main")
-        return str(res["summary"]) if res.get("ok") else str(res.get("error") or "error: git init failed")
+        return _handle_git_init(raw_repo, args)
     repo_root = _resolve_repo_arg(raw_repo)
     mutating = action not in ("status", "diff", "log", "worktree_list")
     dir_err = _is_allowed_sdlc_repo_dir(repo_root, mutating=mutating)

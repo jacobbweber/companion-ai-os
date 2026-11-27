@@ -295,14 +295,20 @@ describe('Greenfield Git Repo Bootstrap & /sdlc-* Co-Design Slash Router', () =>
     await flushUi(120);
     expect(container.querySelector('[data-testid="repo-probe-badge"]')?.textContent).toContain('SAFETY GUARD REJECTED');
 
-    // Attach Existing Clone mode must reject a non-existent folder
+    // Attach Existing Clone mode must warn on Check Repo AND reject a non-existent folder on Save
     await act(async () => {
       attachRepoBtn.click();
     });
     await flushUi(60);
     await act(async () => {
       setInputValue(repoPathInput, path.join(bridge.projectsDir, 'missing-clone'));
+      checkBtn.click();
     });
+    await flushUi(120);
+    const attachWarnBadge = container.querySelector('[data-testid="repo-probe-badge"] .badge');
+    expect(attachWarnBadge?.classList.contains('warn')).toBe(true);
+    expect(attachWarnBadge?.textContent).toContain('does not exist');
+
     const saveBtn = container.querySelector('[data-testid="save-project-policy-btn"]') as HTMLButtonElement;
     await act(async () => {
       saveBtn.click();
@@ -392,5 +398,56 @@ describe('Greenfield Git Repo Bootstrap & /sdlc-* Co-Design Slash Router', () =>
     }
     expect(container.textContent).toContain('Stage 1: Product Specification (sdlc-product)');
     expect(container.textContent).toContain('Stop 1 — Problem, Vision & Stakeholders');
+
+    // Split-brain regression: switch to a Personal Goal Board (`life-home`), verify `/` puts everyday actions first,
+    // then run `/project init chat-bootstrapped-app` in Chat and verify Turn 2 preserves the new repo focus!
+    const personalRailBtn = Array.from(container.querySelectorAll('aside button')).find((b) =>
+      b.textContent?.includes('Home & Life')
+    ) as HTMLButtonElement | undefined;
+    if (personalRailBtn) {
+      await act(async () => {
+        personalRailBtn.click();
+      });
+      await flushUi(120);
+      await act(async () => {
+        setInputValue(composer, '/');
+      });
+      await flushUi(60);
+      const personalMenu = container.querySelector('[data-testid="slash-autocomplete-menu"]');
+      const firstCmd = personalMenu?.querySelector('button strong')?.textContent?.trim();
+      expect(firstCmd).toBe('/morning');
+    }
+
+    await act(async () => {
+      setInputValue(composer, '/project init chat-bootstrapped-app');
+    });
+    await flushUi(60);
+    await act(async () => {
+      composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    const initDeadline = Date.now() + 5000;
+    while (Date.now() < initDeadline) {
+      if ((container.textContent || '').includes('Initialized & activated project')) {
+        break;
+      }
+      await flushUi(100);
+    }
+    await flushUi(150);
+    expect(container.textContent).toContain('Initialized & activated project');
+
+    // Send Turn 2 (`Hello`) without clicking the sidebar -> must NOT clobber `chat-bootstrapped-app` back to `life-home`!
+    await act(async () => {
+      setInputValue(composer, 'Ready for co-design');
+    });
+    await flushUi(60);
+    await act(async () => {
+      composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    await flushUi(350);
+    const statusAfter = JSON.parse((await bridge.request('GET', '/api/status')).body);
+    expect(path.normalize(statusAfter.workspace.project_root)).toBe(
+      path.normalize(path.join(bridge.projectsDir, 'chat-bootstrapped-app'))
+    );
+    expect(statusAfter.workspace.is_self_project).toBe(false);
   });
 });

@@ -1,7 +1,7 @@
 # Feature F01 / Increment 01: Greenfield Git Bootstrap & Native 7-Stage Co-Design SDLC Skill System
 
 - **Milestone:** `v5.1.0`
-- **Status:** Stage 4 Engineering Design Approved (Ready for Implementation)
+- **Status:** SHIPPED (Verified locally & on `Spark` `v5.1.0`)
 
 ## 1. Increment Goal & Anti-Sprawl Gate Verification
 

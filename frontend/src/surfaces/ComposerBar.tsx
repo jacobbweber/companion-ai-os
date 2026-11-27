@@ -33,7 +33,13 @@ interface ComposerBarProps {
   onToast: (msg: string) => void;
 }
 
-const SLASH_COMMANDS = [
+interface SlashCommandItem {
+  cmd: string;
+  desc: string;
+  mode?: 'plan' | 'goal';
+}
+
+const SDLC_SLASH_COMMANDS: SlashCommandItem[] = [
   { cmd: '/sdlc-next ', desc: 'Auto-detect next SDLC stage & co-design step-by-step (add "express" for fast draft)' },
   { cmd: '/sdlc-1-product ', desc: 'Stage 1 (Product Manager): scope, personas, KPIs -> product.md' },
   { cmd: '/sdlc-2-architecture ', desc: 'Stage 2 (Architect): stack, boundaries & trade-offs -> architecture.md + ADRs' },
@@ -43,10 +49,13 @@ const SLASH_COMMANDS = [
   { cmd: '/sdlc-6-verify ', desc: 'Stage 6 (QA Engineer): adversarial unit/integration tests & clean commit' },
   { cmd: '/sdlc-7-operate ', desc: 'Stage 7 (SRE): Day-2 runbook, observability & recovery -> operations-runbook.md' },
   { cmd: '/sdlc-change ', desc: 'Day-2 Change Ripple: locate Entry-Hat stage & ripple surgical updates' },
-  { cmd: '/plan ', desc: 'Draft an aligned Blueprint before changing code', mode: 'plan' as const },
-  { cmd: '/goal ', desc: 'Run multi-step autonomous execution with Doctor gates', mode: 'goal' as const },
+];
+
+const CORE_SLASH_COMMANDS: SlashCommandItem[] = [
   { cmd: '/morning', desc: 'Read overnight & idle Autonomy Briefing' },
   { cmd: '/checkin', desc: 'Executive check-in on goals, priorities & health' },
+  { cmd: '/plan ', desc: 'Draft an aligned Blueprint before changing code', mode: 'plan' },
+  { cmd: '/goal ', desc: 'Run multi-step autonomous execution with Doctor gates', mode: 'goal' },
   { cmd: '/doctor', desc: 'Run 7-stage System Doctor diagnostics' },
   { cmd: '/compact', desc: 'Compact working window into long-term memory (keeps Forever Chat)' },
   { cmd: '/clear', desc: 'Fresh Focus — shift topic cleanly (keeps Forever Chat history)' },
@@ -83,9 +92,18 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
     projects.find((p) => p.project_id === selectedProjectId || p.slug === selectedProjectId) ||
     projects[0];
 
+  const isSoftwareProject = Boolean(
+    currentProj?.workspace_path ||
+      currentProj?.kind === 'software' ||
+      (status?.workspace && !status.workspace.is_self_project)
+  );
+  const orderedSlash =
+    isSoftwareProject || draft.toLowerCase().startsWith('/s')
+      ? [...SDLC_SLASH_COMMANDS, ...CORE_SLASH_COMMANDS]
+      : [...CORE_SLASH_COMMANDS, ...SDLC_SLASH_COMMANDS];
   const showSlashMenu = draft.startsWith('/') && !draft.includes(' ') && draft.length <= 28;
   const filteredSlash = showSlashMenu
-    ? SLASH_COMMANDS.filter((s) => s.cmd.startsWith(draft.toLowerCase()))
+    ? orderedSlash.filter((s) => s.cmd.startsWith(draft.toLowerCase()))
     : [];
 
   useEffect(() => {
@@ -295,14 +313,20 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
           <div
             className="composer-up-menu"
             data-testid="slash-autocomplete-menu"
-            style={{ left: 12, maxHeight: 280, overflowY: 'auto' }}
+            style={{ left: 12, right: 12, maxWidth: 560, maxHeight: 280, overflowY: 'auto' }}
           >
-            <div className="popover-group-label">Actions</div>
+            <div className="popover-group-label">{isSoftwareProject ? 'SDLC & Actions' : 'Actions'}</div>
             {filteredSlash.map((item) => (
               <button
                 key={item.cmd}
                 type="button"
                 className="popover-row"
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(136px, auto) 1fr',
+                  alignItems: 'baseline',
+                  gap: 10,
+                }}
                 onClick={() => {
                   if (item.mode) {
                     setExecMode(item.mode);
@@ -318,8 +342,12 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
                   }
                 }}
               >
-                <strong className="mono">{item.cmd.trim()}</strong>
-                <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>{item.desc}</span>
+                <strong className="mono" style={{ flexShrink: 0, whiteSpace: 'nowrap' }}>
+                  {item.cmd.trim()}
+                </strong>
+                <span style={{ fontSize: 11.5, color: 'var(--text-muted)', textAlign: 'left', lineHeight: 1.35 }}>
+                  {item.desc}
+                </span>
               </button>
             ))}
           </div>

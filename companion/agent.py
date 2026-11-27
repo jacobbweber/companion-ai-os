@@ -307,18 +307,28 @@ def _triage_via_llm(
     )
 
 
-def _is_active_sdlc_codesign_turn(user_text: str, messages: List[Dict[str, Any]]) -> bool:
+_SDLC_STOP_MARKER_RE = re.compile(r"\bstop\s+[1-4]\s*[:—–-]", re.I)
+
+
+def _is_active_sdlc_codesign_turn(user_text: str, messages: List[Dict[str, Any]], is_software_ws: bool = True) -> bool:
     clean = (user_text or "").strip().lower()
     if clean.startswith("/sdlc-"):
         return True
-    if clean.startswith(("/", ".")):
+    if clean.startswith(("/", ".")) or not is_software_ws:
         return False
-    markers = ("/sdlc-", "[sdlc router directive", "guided co-design", "### checkpoint ", "stop 1 —", "stop 2 —", "stop 3 —", "stop 4 —")
+    if re.search(r"\b(?:draft|create|start)\s+(?:a\s+)?blueprint\b", clean):
+        return False
     non_sys = [m for m in messages if m.get("role") in ("user", "assistant")]
-    for m in non_sys[-6:]:
+    for m in reversed(non_sys[-20:]):
+        role = str(m.get("role") or "")
         txt = str(m.get("content") or "").lower()
-        if any(mk in txt for mk in markers):
-            return True
+        if role == "assistant":
+            if "### checkpoint " in txt or "### day-2 change ripple complete" in txt:
+                return False
+            if _SDLC_STOP_MARKER_RE.search(txt) or "entry-hat impact triage" in txt or "guided co-design" in txt or "[sdlc router directive" in txt:
+                return True
+        elif role == "user" and txt.lstrip().startswith("/sdlc-"):
+            return not bool(re.search(r"\bexpress\b", txt))
     return False
 
 
@@ -1033,7 +1043,10 @@ def run_agent_turn(
 
     awaiting_bp = is_top and is_awaiting_blueprint_approval(mem)
     bp_action = classify_blueprint_reply(user_text) if awaiting_bp else None
-    in_sdlc_codesign = is_top and _is_active_sdlc_codesign_turn(user_text, messages[:-1] if is_user_msg else messages)
+    proj_rec = get_project_graph(store=mem).get_project() if is_top else {}
+    has_ext_ws = (not settings.get_workspace().is_self_project) or bool(proj_rec.get("workspace_path"))
+    is_sw_ctx = has_ext_ws or str(proj_rec.get("kind") or "").lower() == "software" or str(proj_rec.get("project_id") or "") in ("", "companion-self")
+    in_sdlc_codesign = is_top and _is_active_sdlc_codesign_turn(user_text, messages[:-1] if is_user_msg else messages, is_software_ws=is_sw_ctx)
     with (get_project_graph(store=mem).project_workspace_scope() if is_top else contextlib.nullcontext()):
         intent = triage_turn(user_text, store=mem, root=settings.active_project_root) if is_top else triage_turn("")
     if in_sdlc_codesign and intent.route != "EXECUTE_VERIFIED_DAG":
@@ -1050,7 +1063,6 @@ def run_agent_turn(
     can_orchestrate = is_top and not awaiting_bp and not in_sdlc_codesign and (auto_promote is True or (auto_promote is None and max_iters is None and mem.get_active_workflow() is None))
     if is_top and not awaiting_bp and in_sdlc_codesign and intent.route == "EXECUTE_VERIFIED_DAG":
         can_orchestrate = True
-    has_ext_ws = (not settings.get_workspace().is_self_project) or bool(get_project_graph(store=mem).get_project().get("workspace_path"))
     code_build_allowed = has_ext_ws or intent.risk_tier == "R3"
     should_blueprint = is_top and not awaiting_bp and not in_sdlc_codesign and auto_promote is True and intent.needs_blueprint and code_build_allowed
     should_promote = is_top and not awaiting_bp and not in_sdlc_codesign and auto_promote is True and not should_blueprint and intent.mode == "AUTONOMOUS_BUILD" and code_build_allowed
@@ -2102,6 +2114,25 @@ def _dispatch_checkpoint_slash(arg: str) -> str:
     return dispatch("checkpoint_manage", {"action": "create", "label": lbl})
 
 
+def _format_sdlc_audit_slash(arg: str, mem: MemoryStore) -> str:
+    from companion.worktrees import inspect_sdlc_repo_state
+
+    with get_project_graph(store=mem).project_workspace_scope():
+        target_r = Path(arg.split(None, 1)[1]).expanduser().resolve() if arg.lower().startswith(("status ", "audit ")) and len(arg.split(None, 1)) > 1 else settings.active_project_root
+        st = inspect_sdlc_repo_state(target_r)
+    viol = ("\nPlaceholder / Stub Violations:\n" + "\n".join(f"  - {v}" for v in st["placeholder_violations"])) if st["placeholder_violations"] else ""
+    ups = ", ".join(f"`{u}`" for u in st["upstream_artifacts"]) or "(none yet)"
+    return (
+        f"=== SDLC Repository Audit (`{Path(st['repo_root']).name}`) ===\n"
+        f"Repo Root        : {st['repo_root']} (git={st['is_git_repo']} | posture=`{st['repo_kind']}` | backlog=`{st['backlog_mode']}`)\n"
+        f"Next Stage       : {st['stage_label']} (`{st['recommended_skill']}`)"
+        + (f" | Target Increment: `{st['active_increment']}`" if st.get("active_increment") else "")
+        + f"\nUpstream Docs    : {ups}\n"
+        f"Code & Tests     : {st['source_file_count']} source file(s), {st['test_file_count']} test file(s) | Hygiene: {'CLEAN' if st['hygiene_clean'] else 'ISSUES FOUND'}{viol}\n"
+        "(Run `/sdlc-next [notes | express]`, `/sdlc-1-product`..`/sdlc-7-operate`, or `/sdlc-change` in chat.)"
+    )
+
+
 def handle_slash_command(
     cmd_str: str, messages: List[Dict[str, Any]], store: Optional[MemoryStore] = None,
     chat_fn: Callable[..., Dict[str, Any]] = chat, interactive: bool = True,
@@ -2187,25 +2218,12 @@ def handle_slash_command(
         return _dispatch_checkpoint_slash(arg)
     if verb in ("rollback", "rb"):
         return dispatch("checkpoint_manage", {"action": "rollback", "checkpoint_id": arg or None})
-    from companion.worktrees import SDLC_SLASH_MAP, inspect_sdlc_repo_state
+    from companion.worktrees import SDLC_SLASH_MAP
 
     if verb in SDLC_SLASH_MAP:
         return None
     if verb == "sdlc":
-        with get_project_graph(store=mem).project_workspace_scope():
-            target_r = Path(arg.split(None, 1)[1]).expanduser().resolve() if arg.lower().startswith(("status ", "audit ")) and len(arg.split(None, 1)) > 1 else settings.active_project_root
-            st = inspect_sdlc_repo_state(target_r)
-        viol = ("\nPlaceholder / Stub Violations:\n" + "\n".join(f"  - {v}" for v in st["placeholder_violations"])) if st["placeholder_violations"] else ""
-        ups = ", ".join(f"`{u}`" for u in st["upstream_artifacts"]) or "(none yet)"
-        return (
-            f"=== SDLC Repository Audit (`{Path(st['repo_root']).name}`) ===\n"
-            f"Repo Root        : {st['repo_root']} (git={st['is_git_repo']} | posture=`{st['repo_kind']}` | backlog=`{st['backlog_mode']}`)\n"
-            f"Next Stage       : {st['stage_label']} (`{st['recommended_skill']}`)"
-            + (f" | Target Increment: `{st['active_increment']}`" if st.get("active_increment") else "")
-            + f"\nUpstream Docs    : {ups}\n"
-            f"Code & Tests     : {st['source_file_count']} source file(s), {st['test_file_count']} test file(s) | Hygiene: {'CLEAN' if st['hygiene_clean'] else 'ISSUES FOUND'}{viol}\n"
-            "(Run `/sdlc-next [notes | express]`, `/sdlc-1-product`..`/sdlc-7-operate`, or `/sdlc-change` in chat.)"
-        )
+        return _format_sdlc_audit_slash(arg, mem)
     from companion.core_actions import HARVEST_SLASH_VERBS, handle_harvest_slash
 
     if f"/{verb}" in HARVEST_SLASH_VERBS:

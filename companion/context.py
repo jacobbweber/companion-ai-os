@@ -527,19 +527,35 @@ def _load_known_projects(mem: MemoryStore) -> Dict[str, str]:
         return {}
 
 
-def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known: Dict[str, str]) -> None:
+def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known: Dict[str, str]) -> str:
     from companion.projects import get_project_graph
 
     pg = get_project_graph(store=mem)
+    eff_pid = pid
     if pid != SELF_PROJECT_ID:
-        known[pid] = str(proot)
+        res_str = str(proot.resolve())
+        known[pid] = res_str
+        ex_rows = mem._fetch_rows(
+            "SELECT project_id, kind FROM projects WHERE status = 'active' AND (workspace_path = ? OR project_id = ? OR slug = ?) LIMIT 1",
+            (res_str, pid, pid),
+        )
         eff_kind = "software" if (proot / ".git").exists() else "project"
-        pg.create_project(title=pid.replace("-", " ").title(), kind=eff_kind, workspace_id=pid, workspace_path=str(proot), project_id=pid)
-    pg.set_focus_project(pid)
-    mem.set_user_profile("active_project_id", pid)
-    mem.set_user_profile("active_project_path", str(proot))
+        if ex_rows:
+            eff_pid, cur_kind = str(ex_rows[0][0]), str(ex_rows[0][1] or "")
+            upd_kw: Dict[str, Any] = {"workspace_path": res_str}
+            if eff_kind == "software" and cur_kind in ("project", "goal", ""):
+                upd_kw["kind"] = "software"
+            pg.update_project(eff_pid, **upd_kw)
+        else:
+            pg.create_project(title=pid.replace("-", " ").title(), kind=eff_kind, workspace_id=pid, workspace_path=res_str, project_id=pid)
+    pg.set_focus_project(eff_pid)
+    if eff_pid != SELF_PROJECT_ID:
+        settings.set_workspace(proot, eff_pid)
+    mem.set_user_profile("active_project_id", eff_pid)
+    mem.set_user_profile("active_project_path", str(proot.resolve()))
     mem.set_user_profile("known_projects_json", json.dumps(known, sort_keys=True))
     mem.sync_memory_md()
+    return eff_pid
 
 
 def _resolve_external_target(raw_target: str, known: Dict[str, str]) -> Path:

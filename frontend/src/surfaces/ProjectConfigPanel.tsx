@@ -348,7 +348,7 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
                 data-testid="project-workspace-path-input"
                 placeholder={
                   repoSubMode === 'create' && projectsDir
-                    ? `${projectsDir}/my-service`
+                    ? deriveRepoPath(projectsDir, 'my-service')
                     : 'e.g. D:/Projects/MyService'
                 }
                 value={projWsPath}
@@ -369,14 +369,29 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
                 <RefreshCw size={12} /> {probing ? 'Checking...' : 'Check Repo'}
               </button>
             </div>
-            {probeResult && (
-              <div style={{ marginTop: 6 }} data-testid="repo-probe-badge">
-                <span className={`badge ${probeResult.ok === false ? 'warn' : probeResult.is_git_repo || probeResult.can_init ? 'ok' : 'warn'}`}>
-                  {probeResult.is_git_repo && <CheckCircle2 size={11} />}
-                  {probeResult.summary || probeResult.error || 'Inspected path'}
-                </span>
-              </div>
-            )}
+            {probeResult && (() => {
+              const probeValid =
+                probeResult.ok !== false &&
+                (repoSubMode === 'attach'
+                  ? probeResult.is_git_repo
+                  : Boolean(probeResult.is_git_repo || probeResult.can_init));
+              const probeText =
+                probeResult.ok === false
+                  ? probeResult.error || probeResult.summary || 'Invalid repository path'
+                  : repoSubMode === 'attach' && !probeResult.exists
+                    ? `Directory "${probeResult.repo_root || projWsPath.trim()}" does not exist — switch to "Create New Repo" to initialize it.`
+                    : repoSubMode === 'attach' && !probeResult.is_git_repo
+                      ? `${probeResult.summary || 'Folder is not a Git repository'} — switch to "Create New Repo" to initialize Git on main.`
+                      : probeResult.summary || probeResult.error || 'Inspected path';
+              return (
+                <div style={{ marginTop: 6 }} data-testid="repo-probe-badge">
+                  <span className={`badge ${probeValid ? 'ok' : 'warn'}`}>
+                    {probeResult.is_git_repo && <CheckCircle2 size={11} />}
+                    {probeText}
+                  </span>
+                </div>
+              );
+            })()}
           </div>
 
           <div className="form-grid-2">

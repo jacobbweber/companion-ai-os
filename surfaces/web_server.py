@@ -242,11 +242,11 @@ class CompanionWebSession:
         self._active_cancel_scope = scope
         self.busy, self._busy_started = True, time.monotonic()
         self.active_action = "blueprint plan" if mode == "plan" else ("autonomous goal" if mode == "goal" else (clean_msg.split()[0] if clean_msg.startswith("/") else "chat turn"))
-        if focus_project_id:
-            get_project_graph(store=self.store).set_focus_project(focus_project_id)
         pre_msgs = copy.deepcopy(self.messages)
         try:
             with cancel_scope_context(scope), memory_store_context(self.store), telemetry_db_context(self.db_path):
+                if focus_project_id and not clean_msg.lower().startswith(("/project init", "/project create", "/project new", "/project switch", "/project self", "/project reset")):
+                    get_project_graph(store=self.store).set_focus_project(focus_project_id)
                 try:
                     slash_out = handle_slash_command(clean_msg, self.messages, store=self.store, chat_fn=self.chat_fn, interactive=False)
                     if slash_out is not None:
@@ -259,7 +259,7 @@ class CompanionWebSession:
                         vis_slash = ensure_visible_turn_reply(slash_out, mode="slash")
                         self.store.log_message("user", clean_msg, session_tag="web_slash")
                         self.store.log_message("assistant", vis_slash, session_tag="web_slash")
-                        return 200, {"ok": True, "role": "assistant", "mode": "slash", "response": vis_slash}
+                        return 200, {"ok": True, "role": "assistant", "mode": "slash", "focus_project_id": get_project_graph(store=self.store).resolve_project_id(), "response": vis_slash}
                     if mode in ("plan", "goal") and not is_awaiting_blueprint_approval(self.store):
                         tag, label = ("web_plan", "[Plan First]") if mode == "plan" else ("web_goal", "[Goal Mode]")
                         self.store.log_message("user", f"{label} {clean_msg}", session_tag=tag)
@@ -281,7 +281,7 @@ class CompanionWebSession:
                     reply = ensure_visible_turn_reply(raw_reply, mode="chat")
                     if followup_doc_note and u_idx < len(self.messages) and self.messages[u_idx].get("role") == "user":
                         self.messages[u_idx]["content"] = f"{self.messages[u_idx]['content']}\n\n{followup_doc_note}".strip()
-                    return 200, {"ok": True, "role": "assistant", "mode": "chat", "awaiting_approval": is_awaiting_blueprint_approval(self.store), "response": reply}
+                    return 200, {"ok": True, "role": "assistant", "mode": "chat", "focus_project_id": get_project_graph(store=self.store).resolve_project_id(), "awaiting_approval": is_awaiting_blueprint_approval(self.store), "response": reply}
                 except InterruptedError:
                     return commit_cancelled_turn(self, pre_msgs, clean_msg, mode, is_awaiting_blueprint_approval(self.store))
                 except Exception as exc:
@@ -604,10 +604,7 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             sess.idle_watcher.record_human_activity()
         ext_act = handle_extended_post(route, body, self.headers, sess.store)
         if ext_act is not None:
-            if route in ("/api/actions/autonomy", "/api/actions/identity", "/api/actions/trust", "/api/actions/models") or (
-                route == "/api/actions/agile"
-                and sub in ("create_project", "update_project", "create_board", "save_board", "upsert_project")
-            ):
+            if route in ("/api/actions/autonomy", "/api/actions/identity", "/api/actions/trust", "/api/actions/models") or (route == "/api/actions/agile" and sub in ("create_project", "update_project", "create_board", "save_board", "upsert_project")):
                 fresh_sys = build_system_prompt(store=sess.store)
                 with sess._turn_lock:
                     if sess.messages and sess.messages[0].get("role") == "system":

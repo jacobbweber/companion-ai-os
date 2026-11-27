@@ -13,13 +13,13 @@ from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import patch
 
-from companion.agent import handle_slash_command, is_awaiting_blueprint_approval, run_agent_turn, triage_turn
+from companion.agent import _is_active_sdlc_codesign_turn, handle_slash_command, is_awaiting_blueprint_approval, run_agent_turn, triage_turn
 from companion.config import Settings, settings, workspace_context
 from companion.context import build_turn_context, discover_skills, manage_active_project
 from companion.core_actions import execute_core_action
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.projects import get_project_graph
-from companion.tools import dispatch
+from companion.tools import TOOLS, dispatch
 from companion.workflows import discover_dags, execute_dag_by_name, validate_skill_markdown
 from companion.worktrees import (
     SDLC_SLASH_MAP,
@@ -137,6 +137,8 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                     {
                         "subaction": "create_project",
                         "title": "Telemetry Gateway",
+                        "goal_summary": "High-throughput OTEL collector",
+                        "delivery_policy": "ask_me",
                         "kind": "software",
                         "init_git": True,
                         "focus": True,
@@ -145,10 +147,12 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                     store=store,
                 )
                 self.assertTrue(res_create["ok"], res_create)
+                created_pid = res_create["project"]["project_id"]
                 expected_repo = (proj_root / "telemetry-gateway").resolve()
                 self.assertTrue((expected_repo / ".git").exists())
                 self.assertEqual(settings.get_workspace().project_root.resolve(), expected_repo)
                 self.assertFalse(settings.get_workspace().is_self_project)
+                card = get_project_graph(store=store).create_item(project_id=created_pid, title="Implement OTLP parser")
 
                 # 2. Switch to a Personal Goal Board -> must reset WorkspaceContext back to companion-self!
                 personal = get_project_graph(store=store).create_project("Marathon Prep", kind="goal")
@@ -156,7 +160,17 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                 self.assertTrue(settings.get_workspace().is_self_project)
                 self.assertEqual(settings.get_workspace().project_root.resolve(), settings.root.resolve())
 
-                # 3. "Attach Existing Clone" rejects missing or non-git directories
+                # 2b. `/project switch telemetry-gateway` must reuse existing SQLite project (zero duplicate rows, zero clobber!)
+                sw_out = manage_active_project("switch telemetry-gateway", store=store)
+                self.assertIn("Switched active WorkspaceContext", sw_out)
+                gw_rows = [p for p in get_project_graph(store=store).list_projects() if p["workspace_path"] == str(expected_repo)]
+                self.assertEqual(len(gw_rows), 1)
+                self.assertEqual(gw_rows[0]["project_id"], created_pid)
+                self.assertEqual(gw_rows[0]["delivery_policy"], "ask_me")
+                self.assertEqual(gw_rows[0]["goal_summary"], "High-throughput OTEL collector")
+                self.assertEqual(len(get_project_graph(store=store).list_items(project_id=created_pid)), 1, card)
+
+                # 3. "Attach Existing Clone" rejects BOTH missing AND non-git plain directories
                 res_missing = execute_core_action(
                     "agile",
                     {
@@ -171,6 +185,24 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                     store=store,
                 )
                 self.assertFalse(res_missing["ok"])
+
+                plain_dir = proj_root / "plain-non-git-folder"
+                plain_dir.mkdir()
+                res_plain = execute_core_action(
+                    "agile",
+                    {
+                        "subaction": "create_project",
+                        "title": "Plain Folder Clone",
+                        "kind": "software",
+                        "workspace_path": str(plain_dir),
+                        "init_git": False,
+                        "require_existing": True,
+                    },
+                    actor="web",
+                    store=store,
+                )
+                self.assertFalse(res_plain["ok"])
+                self.assertIn("not a Git repository", res_plain["error"])
 
                 # 4. Rejects paths inside Companion's app/
                 res_app = execute_core_action(
@@ -199,6 +231,17 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                 )
                 self.assertEqual(head_proc.stdout.strip(), "main")
 
+                # 6. `git_manage(action='init', slug='...')` from `companion-self` initializes & focuses repo for immediate writes
+                manage_active_project("self", store=store)
+                self.assertTrue(settings.get_workspace().is_self_project)
+                gm_out = dispatch("git_manage", {"action": "init", "slug": "trail-gear-cli", "title": "Trail Gear CLI"})
+                self.assertIn("Initialized greenfield Git repository", gm_out)
+                trail_repo = (proj_root / "trail-gear-cli").resolve()
+                self.assertEqual(settings.get_workspace().project_root.resolve(), trail_repo)
+                dispatch("write_file", {"path": "product.md", "content": "# Trail Gear CLI\n\nScoped product spec.\n"})
+                self.assertTrue((trail_repo / "product.md").is_file())
+                self.assertFalse((settings.scratch_dir / "product.md").exists())
+
     def test_cross_workspace_skill_template_read_and_external_write_isolation(self) -> None:
         """Verify external repos can read Companion's skills/*/references/*.template.md while writes stay in external repo."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -210,6 +253,16 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                 tpl = dispatch("read_file", {"path": "skills/sdlc-design/references/engineering-design.template.md"})
                 self.assertFalse(tpl.startswith("error:"), tpl[:200])
                 self.assertIn("Engineering Design", tpl)
+
+                tpl_dot = dispatch("read_file", {"path": "./skills/sdlc-product/references/product.template.md"})
+                self.assertFalse(tpl_dot.startswith("error:"), tpl_dot[:200])
+                self.assertIn("Product", tpl_dot)
+
+                trav = dispatch("read_file", {"path": "skills/../companion/vault.py"})
+                self.assertTrue(trav.startswith("error: file not found:") or "SAFETY GUARD REJECTED" in trav, trav)
+                self.assertNotIn("VaultManager", trav)
+                trav_escape = dispatch("read_file", {"path": "../../../../outside_secret.txt"})
+                self.assertIn("SAFETY GUARD REJECTED", trav_escape)
 
                 skill_doc = dispatch("read_file", {"path": "skills/sdlc-product/SKILL.md"})
                 self.assertIn("name: sdlc-product", skill_doc)
@@ -235,11 +288,18 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
         self.assertNotIn("sdlc-engineering", discovered)
         self.assertFalse((settings.root / "skills" / "sdlc-engineering").exists())
 
+        exposed_tools = {t["function"]["name"] for t in TOOLS}
+        disc_map = {s["name"]: s for s in discover_skills(root=settings.root)}
         for sname in sorted(expected_skills):
             md_path = settings.root / "skills" / sname / "SKILL.md"
             md_txt = md_path.read_text(encoding="utf-8")
             self.assertIsNone(validate_skill_markdown(md_txt, expected_name=sname))
             self.assertNotIn("(./references/", md_txt, f"{sname} still has unadapted relative ./references/ link")
+            req_raw = str(disc_map[sname].get("required_tools") or "").strip("[] ")
+            req_list = [tok.strip() for tok in req_raw.split(",") if tok.strip()]
+            for rt in req_list:
+                self.assertIn(rt, exposed_tools, f"{sname} required_tools `{rt}` is missing from live TOOLS schema")
+            self.assertNotIn("workflow_manage(", md_txt, f"{sname} references legacy non-TOOLS `workflow_manage`")
 
         dags = {d["name"] for d in discover_dags(root=settings.root)}
         self.assertIn("sdlc-audit", dags)
@@ -334,6 +394,30 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
             self.assertEqual(s_inc2["recommended_skill"], "sdlc-design")
             self.assertEqual(s_inc2["active_increment"], "docs/features/F01-core/inc-02-export.md")
 
+            # Lock inc-02 using level-2 `## 1.` template headings + ASCII directory tree + flat root `cli.py`:
+            # Must NOT get stuck in Stage 4 (`design_pending=False`) and MUST route to Stage 5 (`sdlc-implement`)!
+            (fdir / "inc-02-export.md").write_text(
+                "# Inc 02\n\n## Stage 4: Engineering Design\n\n## 1. Project & Module File Layout\n\n"
+                "```text\ngreenfield-b/\n├── cli.py              # Flat root CLI entrypoint\n├── src/\n"
+                "│   ├── parser.py       # Existing parser\n│   └── exporter.py     # New CSV exporter\n"
+                "└── tests/\n    └── test_exporter.py\n```\n\n## 2. Entry Surface & Input Contracts\n"
+                "Complete typed CSV export contract and idempotency rules.\n",
+                encoding="utf-8",
+            )
+            s_inc2_impl = inspect_sdlc_repo_state(repo_b)
+            self.assertFalse(s_inc2_impl["increments"][1]["design_pending"], s_inc2_impl["increments"][1])
+            self.assertEqual(s_inc2_impl["recommended_skill"], "sdlc-implement")
+            self.assertIn("cli.py", s_inc2_impl["increments"][1]["missing_sources"])
+            self.assertIn("src/exporter.py", s_inc2_impl["increments"][1]["missing_sources"])
+
+            # Create only `src/exporter.py` -> still Stage 5 because flat root `cli.py` is still missing!
+            (repo_b / "src" / "exporter.py").write_text("def export_csv() -> str:\n    return 'ok'\n", encoding="utf-8")
+            self.assertEqual(inspect_sdlc_repo_state(repo_b)["recommended_skill"], "sdlc-implement")
+
+            # Create `cli.py` -> all inc-02 planned sources exist -> advances to Stage 6 (`sdlc-verify`)!
+            (repo_b / "cli.py").write_text("from src.exporter import export_csv\n", encoding="utf-8")
+            self.assertEqual(inspect_sdlc_repo_state(repo_b)["recommended_skill"], "sdlc-verify")
+
         # 3. Brownfield repository (`AGENTS.md` + existing code, no `product.md`) skips Stage 1
         with tempfile.TemporaryDirectory() as tmp:
             brown = Path(tmp).resolve() / "existing_app"
@@ -419,6 +503,17 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                 self.assertIn("Stop 2 —", out2)
                 self.assertFalse(is_awaiting_blueprint_approval(store))
                 self.assertIsNone(store.get_active_workflow())
+
+                # Multi-turn (>8 back-and-forth turns, colon-formatted `### Stop 3: ...`) stays in active co-design,
+                # then IMMEDIATELY exits co-design once `### Checkpoint 1: ...` completes or user switches to Personal Board!
+                long_hist: List[Dict[str, Any]] = [{"role": "user", "content": "/sdlc-4-design"}]
+                for turn_idx in range(1, 9):
+                    long_hist.append({"role": "assistant", "content": f"### Stop {(turn_idx % 4) + 1}: Layer Contracts (turn {turn_idx})"})
+                    long_hist.append({"role": "user", "content": f"Clarification {turn_idx} looks solid, next"})
+                self.assertTrue(_is_active_sdlc_codesign_turn("Not sure about retry backoff—align with me first", long_hist, is_software_ws=True))
+                self.assertFalse(_is_active_sdlc_codesign_turn("What is on my schedule?", long_hist, is_software_ws=False))
+                long_hist.append({"role": "assistant", "content": "### Checkpoint 4: Engineering Design & Hardening Pass Complete\n\n1. Artifact Written: `docs/engineering-design.md`"})
+                self.assertFalse(_is_active_sdlc_codesign_turn("What time is my meeting?", long_hist, is_software_ws=True))
 
                 # Verify Web SSE `/api/chat` (`async: true`) accepts `/sdlc-next` with HTTP 202 (streaming job)
                 srv, sess = create_web_server(port=0, store=store, chat_fn=_fake_llm)

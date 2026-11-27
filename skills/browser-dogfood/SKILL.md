@@ -1,7 +1,7 @@
 ---
 name: browser-dogfood
 description: Drive headless Chromium against live dev_preview URLs to trap console.error, uncaught JS pageerrors, and HTTP 4xx/5xx failures while capturing Desktop (1440x900) and Mobile (390x844) PNG screenshots for multimodal critique.
-required_tools: [dev_preview, workflow_manage, run_python]
+required_tools: [dev_preview, ops_manage, run_command]
 ---
 
 # Browser Dogfood & Multimodal UI Verification (`browser-dogfood`)
@@ -15,19 +15,22 @@ Verify live web applications like a senior product engineer—rendering real DOM
 
 ## Step-by-Step Procedure
 1. **Start Ephemeral Preview Server**:
-   - Launch the target app on a free localhost port via `dev_preview(action="start", command="...", ready_path="/api/health")`.
+   - Launch the target app on a free localhost port via `dev_preview(action="start", command="...", health_path="/api/health")`.
 2. **Execute Headless Browser Dogfood Pass**:
-   - Invoke `workflow_manage`:
+   - Invoke `ops_manage`:
      ```json
      {
+       "domain": "workflows",
        "action": "run_script",
-       "skill": "browser-dogfood",
-       "script": "browser_dogfood.py",
-       "args": [
-         "--url", "http://127.0.0.1:<port>/",
-         "--out-dir", "data/scratch/dogfood",
-         "--expect-selector", "[data-testid='floating-composer']"
-       ]
+       "target": "browser-dogfood",
+       "params": {
+         "script": "browser_dogfood.py",
+         "args": [
+           "--url", "http://127.0.0.1:<port>/",
+           "--out-dir", "data/scratch/dogfood",
+           "--expect-selector", "[data-testid='floating-composer']"
+         ]
+       }
      }
      ```
    - Pass `--click-selector "<css>"` to exercise interactive buttons/tabs and `--expect-text "<substring>"` to assert rendered copy.

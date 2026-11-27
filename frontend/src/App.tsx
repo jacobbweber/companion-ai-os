@@ -49,6 +49,8 @@ export const App: React.FC = () => {
   const [status, setStatus] = useState<WebStatus | null>(null);
   const [projects, setProjects] = useState<ProjectGraphEntry[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>('');
+  const lastServerFocusRef = useRef<string>('');
+  const pendingClientFocusRef = useRef<string>('');
   const [auxTarget, setAuxTarget] = useState<AuxInspectorTarget>(null);
   const [showActivity, setShowActivity] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -107,8 +109,18 @@ export const App: React.FC = () => {
     }
   };
 
+  const reconcileServerFocus = (st: WebStatus): string => {
+    const srvFocus = st.focus_project_id || st.workspace?.project_id || '';
+    if (srvFocus && !pendingClientFocusRef.current && srvFocus !== lastServerFocusRef.current) {
+      lastServerFocusRef.current = srvFocus;
+      setSelectedProjectId(srvFocus);
+    }
+    return srvFocus;
+  };
+
   const refreshStatusAndProjects = async () => {
     try {
+      let resolvedFocus = '';
       const st = await fetchStatus();
       if (st.auth_required) {
         setAuthRequired(true);
@@ -118,15 +130,13 @@ export const App: React.FC = () => {
         setAuthRequired(false);
         setStatus(st);
         checkServerVersionDrift(st);
-        const initialFocus = st.focus_project_id || st.workspace?.project_id || '';
-        if (!selectedProjectId && initialFocus) {
-          setSelectedProjectId(initialFocus);
-        }
+        resolvedFocus = reconcileServerFocus(st);
       }
       const bRes = await callAction<{ boards?: ProjectGraphEntry[] }>('agile', { subaction: 'list_boards' });
       if (bRes.boards) {
         setProjects(bRes.boards);
-        if (!selectedProjectId && bRes.boards.length > 0) {
+        if (!resolvedFocus && !lastServerFocusRef.current && bRes.boards.length > 0) {
+          lastServerFocusRef.current = bRes.boards[0].project_id;
           setSelectedProjectId(bRes.boards[0].project_id);
         }
       }
@@ -145,6 +155,13 @@ export const App: React.FC = () => {
             setAuthRequired(false);
             setStatus(s);
             checkServerVersionDrift(s);
+            const prevFocus = lastServerFocusRef.current;
+            const nextFocus = reconcileServerFocus(s);
+            if (nextFocus && nextFocus !== prevFocus) {
+              void callAction<{ boards?: ProjectGraphEntry[] }>('agile', { subaction: 'list_boards' }).then((b) => {
+                if (b.boards) setProjects(b.boards);
+              });
+            }
           }
         });
       }
@@ -207,8 +224,16 @@ export const App: React.FC = () => {
   };
 
   const syncProjectFocus = (projectId: string) => {
+    pendingClientFocusRef.current = projectId;
+    lastServerFocusRef.current = projectId;
     setSelectedProjectId(projectId);
-    void apiPost('/api/settings', { focus_project_id: projectId }).catch(() => {});
+    void apiPost('/api/settings', { focus_project_id: projectId })
+      .finally(() => {
+        if (pendingClientFocusRef.current === projectId) {
+          pendingClientFocusRef.current = '';
+        }
+      })
+      .catch(() => {});
   };
 
   const handleSelectProject = (projectId: string, openBoard = false) => {

@@ -271,8 +271,11 @@ class ProjectGraphManager:
             resolved_ws = cand.resolve() if (cand.is_absolute() or raw_ws.startswith("~")) else (settings.projects_dir / cand).resolve()
             if bound_err := validate_external_repo_path(resolved_ws):
                 raise ValueError(bound_err)
-            if require_existing and not resolved_ws.is_dir():
-                raise ValueError(f"Repository folder `{resolved_ws}` does not exist on disk. Switch to 'Create New Repo' to initialize it.")
+            if require_existing:
+                if not resolved_ws.is_dir():
+                    raise ValueError(f"Repository folder `{resolved_ws}` does not exist on disk. Switch to 'Create New Repo' to initialize it.")
+                if not (resolved_ws / ".git").exists():
+                    raise ValueError(f"Folder `{resolved_ws}` is not a Git repository (`.git` missing). Switch to 'Create New Repo' to initialize Git on main.")
             ws_p = str(resolved_ws)
         else:
             ws_p = ""
@@ -353,8 +356,11 @@ class ProjectGraphManager:
                 res_ws = cand.resolve() if (cand.is_absolute() or clean_ws.startswith("~")) else (settings.projects_dir / cand).resolve()
                 if bound_err := validate_external_repo_path(res_ws):
                     raise ValueError(bound_err)
-                if bool(updates.get("require_existing")) and not res_ws.is_dir():
-                    raise ValueError(f"Repository folder `{res_ws}` does not exist on disk. Switch to 'Create New Repo' to initialize it.")
+                if bool(updates.get("require_existing")):
+                    if not res_ws.is_dir():
+                        raise ValueError(f"Repository folder `{res_ws}` does not exist on disk. Switch to 'Create New Repo' to initialize it.")
+                    if not (res_ws / ".git").exists():
+                        raise ValueError(f"Folder `{res_ws}` is not a Git repository (`.git` missing). Switch to 'Create New Repo' to initialize Git on main.")
                 ws_p = str(res_ws)
             else:
                 ws_p = ""

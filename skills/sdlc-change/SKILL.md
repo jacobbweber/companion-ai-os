@@ -1,7 +1,7 @@
 ---
 name: sdlc-change
 description: Day-2 Change Management & Entry-Hat Ripple Triage discipline. Identifies the highest invalidated SDLC stage for new requests or defects and ripples surgical updates downward through docs, code, tests, and runbooks.
-required_tools: [read_file, write_file, edit_file, search, git_manage, agile_manage, run_python, run_shell]
+required_tools: [read_file, write_file, edit_file, search, git_manage, agile_manage, run_command]
 user-invocable: true
 ---
 

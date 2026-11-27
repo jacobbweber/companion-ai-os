@@ -1,7 +1,7 @@
 ---
 name: sdlc-verify
 description: Stage 6 Quality & Verification Engineering discipline. Authors docs/testing-strategy.md, executes adversarial unit/integration tests, dev_preview + browser-dogfood UI checks, pre-commit-verify / sdlc-audit workflows, and clean local git commits.
-required_tools: [read_file, write_file, edit_file, search, git_manage, dev_preview, workflow_manage, agile_manage, run_python, run_shell]
+required_tools: [read_file, write_file, edit_file, search, git_manage, dev_preview, ops_manage, agile_manage, run_command]
 user-invocable: true
 ---
 
@@ -29,14 +29,14 @@ Wear the **Adversarial QA & Verification Engineer Hat**. Assume every safety gat
    - Raw telemetry/error inspection proving secrets/tokens are `[REDACTED]`
    - Guaranteed cleanup execution when a mid-run fault is injected
 3. **Implement Integration Tests:** Exercise the real entry boundary against deterministic local fixtures/fakes—verifying preview mode, live convergence, error signaling, and correlated telemetry.
-4. **Execute Until 100% Green:** Run the native test runner (`run_python` / `run_shell`) and fix defects until `0` failures remain (using `skills/ooda-troubleshooting/SKILL.md` if an error repeats).
+4. **Execute Until 100% Green:** Run the native test runner (`run_command`) and fix defects until `0` failures remain (using `skills/ooda-troubleshooting/SKILL.md` if an error repeats).
 5. **Live Preview & Browser Dogfooding (Web / HTTP UI Changes):**
-   - Start the application on a free localhost port via `dev_preview(action="start", command="...", ready_path="/api/health")`.
-   - Run `workflow_manage(action="run_script", skill="browser-dogfood", script="browser_dogfood.py", args=["--url", "http://127.0.0.1:<port>"])` to verify `console_errors: []`, `page_errors: []`, and Desktop/Mobile rendering, then stop via `dev_preview(action="stop")`.
+   - Start the application on a free localhost port via `dev_preview(action="start", command="...", health_path="/api/health")`.
+   - Run `ops_manage(domain="workflows", action="run_script", target="browser-dogfood", params={"script": "browser_dogfood.py", "args": ["--url", "http://127.0.0.1:<port>"]})` to verify `console_errors: []`, `page_errors: []`, and Desktop/Mobile rendering, then stop via `dev_preview(action="stop")`.
 6. **Deterministic Audit, Increment Sign-Off & Clean Feature-Branch Commit:**
-   - In Choice B, mark the Increment `STATUS: SHIPPED` in `inc-0Y-*.md` and `00-feature-overview.md`. Sync any matching Project Board card to `done` via `agile_manage(action="update_item", item_id="...", status="done")`.
-   - Run `workflow_manage(action="run_dag", dag_name="sdlc-audit")` and/or `workflow_manage(action="run_dag", dag_name="pre-commit-verify")` to verify placeholder hygiene, secret/DB staging safety, and green tests.
-   - Commit verified files onto the active `feat/*` or `fix/*` branch via `git_manage(action="commit", files=[...], message="feat: ...")`. Stop at the local commit when `delivery_policy == "local_only"`; invoke `github-workflow` only when remote delivery is authorized.
+   - In Choice B, mark the Increment `STATUS: SHIPPED` in `inc-0Y-*.md` and `00-feature-overview.md`. Sync any matching Project Board card to `done` via `agile_manage(action="update_item", card_id="...", status="done")`.
+   - Run `ops_manage(domain="workflows", action="run_dag", target="sdlc-audit")` and/or `ops_manage(domain="workflows", action="run_dag", target="pre-commit-verify")` to verify placeholder hygiene, secret/DB staging safety, and green tests.
+   - Commit verified files onto the active `feat/*` or `fix/*` branch via `git_manage(action="commit", paths=[...], message="feat: ...")`. Stop at the local commit when `delivery_policy == "local_only"`; invoke `github-workflow` only when remote delivery is authorized.
 
 ## Exit Check & Checkpoint Output
 Never finish Stage 6 with failing or unexecuted tests. Output:

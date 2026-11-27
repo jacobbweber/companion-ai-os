@@ -785,6 +785,7 @@ TOOLS: List[Dict[str, Any]] = [
         "stage_kind": _p("string", "DIKW stage.", enum=["OBSERVE_DATA", "CURATE_DIKW", "FORGE_CAPABILITY", "DELIVER_AND_VERIFY"]),
         "depends_on": _p("array", "Upstream work-item IDs.", items_type="string"),
         "dag_name": _p("string", "Optional verified workflow name bound to this item."),
+        "acceptance_criteria": _p("string", "Optional Given/When/Then acceptance criteria text."),
         "checklist": _p("array", "Optional checklist subtask strings.", items_type="string"),
         "status": _p("string", "Column status.", enum=["backlog", "sprint_todo", "ready", "in_progress", "blocked", "verify", "done"]),
         "horizon": _p("string", "Planning horizon.", enum=["now", "next", "later", "someday"]),
@@ -840,11 +841,13 @@ TOOLS: List[Dict[str, Any]] = [
         "target": _p("string", "Target identifier (`job_id`, `routine_id`, `endpoint_id`, `dag`, `skill`, `name`, or project path)."),
         "params": _p("object", "Additional subsystem parameters dictionary (e.g. `{goal, title, mode, schedule_expr, command, skill_md, scripts, workflows}`)."),
     }, ["domain"]),
-    _tool("git_manage", "Execute safe local Git, parallel `git worktree`, secret-shielded commit, and Blind-Vault-authenticated remote operations governed by project `delivery_policy`.", {
+    _tool("git_manage", "Execute greenfield `git init` on `main`, safe local Git, parallel `git worktree`, secret-shielded commit, and Blind-Vault-authenticated remote operations governed by project `delivery_policy`.", {
         "action": _p("string", "Git or worktree sub-action.", enum=["init", "status", "diff", "log", "branch", "worktree_add", "worktree_list", "worktree_remove", "commit", "fetch", "pull", "push"]),
         "repo_path": _p("string", "Optional repository or worktree path."),
-        "branch": _p("string", "Feature/fix branch name."),
-        "slug": _p("string", "Short kebab-case slug for `worktree_add`."),
+        "title": _p("string", "Optional project/repository title for `init`."),
+        "branch": _p("string", "Feature/fix branch name (or default branch for `init`)."),
+        "slug": _p("string", "Short kebab-case slug for `init` or `worktree_add`."),
+        "focus": _p("boolean", "Focus `WorkspaceContext` on initialized repository (`init`, default true)."),
         "worktree_path": _p("string", "Optional worktree checkout path."),
         "message": _p("string", "Descriptive commit message for `commit`."),
         "paths": _p("array", "Explicit relative file paths to stage on `commit`.", items_type="string"),
@@ -1039,7 +1042,10 @@ def resolve(p: str, for_write: bool = False) -> Path:
     cand = Path(p)
     if cand.is_absolute():
         return cand
-    ws, norm = settings.get_workspace(), p.replace("\\", "/").strip("/")
+    ws = settings.get_workspace()
+    norm = p.replace("\\", "/").strip("/")
+    while norm.startswith("./"):
+        norm = norm[2:].lstrip("/")
     if norm in _WIKI_DIRS or norm.startswith(tuple(f"{d}/" for d in _WIKI_DIRS)):
         if ws.is_self_project or not (ws.project_root / p).exists():
             return settings.wiki_dir / norm
@@ -1064,10 +1070,13 @@ def resolve(p: str, for_write: bool = False) -> Path:
     if not for_write and not (ws.project_root / p).exists():
         skill_norm = norm[len(".github/") :] if norm.startswith(".github/skills/") else norm
         if skill_norm == "skills" or skill_norm.startswith("skills/"):
-            if (ws.self_root / skill_norm).exists():
-                return ws.self_root / skill_norm
-            if skill_norm.startswith("skills/") and skill_norm[7:] and (settings.user_skills_dir / skill_norm[7:]).exists():
-                return settings.user_skills_dir / skill_norm[7:]
+            cand_self = (ws.self_root / skill_norm).resolve()
+            if cand_self.is_relative_to((ws.self_root / "skills").resolve()) and cand_self.exists():
+                return cand_self
+            if skill_norm.startswith("skills/") and skill_norm[7:]:
+                cand_user = (settings.user_skills_dir / skill_norm[7:]).resolve()
+                if cand_user.is_relative_to(settings.user_skills_dir.resolve()) and cand_user.exists():
+                    return cand_user
     return ws.project_root / p
 
 
