@@ -773,8 +773,8 @@ TOOLS: List[Dict[str, Any]] = [
         "highlights": _p("string", "Extracted highlights for `create_proxy_note`."),
         "expected_hash": _p("string", "Optional 16-char SHA-256 `content_hash` for optimistic concurrency."),
     }, ["action"]),
-    _tool("agile_manage", "Operate the Universal Project & Goal Graph (`projects`, `milestones`, `timeboxes`, `work_items`, Kanban columns, 15m unblocker slicing, and parallel worktree cards).", {
-        "action": _p("string", "Board/Goal operation.", enum=["board_view", "list_items", "roadmap", "list_boards", "probe_repo", "create_project", "update_project", "save_board", "list_epics", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "list_sprints", "create_timebox", "start_sprint", "rollover_sprint", "capacity", "create_item", "update_item", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker", "start_item", "run_parallel_ready", "merge_item", "push_item_pr", "request_changes", "discard_worktree"]),
+    _tool("agile_manage", "Operate the Universal Project & Goal Graph (`projects`, `milestones`, `timeboxes`, `work_items`, `Projects Root` explorer/subfolders, Kanban columns, 15m unblocker slicing, and parallel worktree cards).", {
+        "action": _p("string", "Board/Goal/Workspace operation.", enum=["board_view", "list_items", "roadmap", "list_boards", "probe_repo", "browse_projects", "create_subfolder", "set_projects_root", "create_project", "update_project", "save_board", "list_epics", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "list_sprints", "create_timebox", "start_sprint", "rollover_sprint", "capacity", "create_item", "update_item", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker", "start_item", "run_parallel_ready", "merge_item", "push_item_pr", "request_changes", "discard_worktree"]),
         "project_id": _p("string", "Project ID or board slug (`life-home`, `work-career`, `prj_...`)."),
         "board_id": _p("string", "Board slug alias (`all-active-sprint` or project ID)."),
         "epic_id": _p("string", "Milestone/Epic ID (`ms_...` or `ep_...`)."),
@@ -797,6 +797,9 @@ TOOLS: List[Dict[str, Any]] = [
         "blocked_reason": _p("string", "Reason blocking a `blocked` work item."),
         "kind": _p("string", "Project category.", enum=["life", "work", "project", "software", "general"]),
         "workspace_path": _p("string", "Optional local Git repository directory bound to this project."),
+        "rel_path": _p("string", "Optional folder path relative to `projects_root` for `browse_projects` or `create_subfolder`."),
+        "parent_rel_path": _p("string", "Optional parent folder relative to `projects_root` for `create_subfolder`."),
+        "projects_root": _p("string", "Pinned `Projects Root` directory path for `set_projects_root` (or `'reset'` for default)."),
         "delivery_policy": _p("string", "Git delivery posture.", enum=["local_only", "remote_branch_pr", "ask_me"]),
         "init_git": _p("boolean", "Set true on `create_project`/`update_project` to initialize a greenfield Git repository on `main` with initial commit and focus it."),
         "focus": _p("boolean", "Set true to immediately focus `WorkspaceContext` on this project."),
@@ -835,11 +838,11 @@ TOOLS: List[Dict[str, Any]] = [
         "mermaid_diagram": _p("string", "Optional Mermaid diagram body for `curate_note`."),
         "limit": _p("integer", "Max items for `due` or `flashcard_deck`."),
     }, ["action"]),
-    _tool("ops_manage", "Manage background jobs, scheduled/idle routines, Blind Credential Vault metadata, SSH/WinRM/HTTP endpoints, Capability Packs/JSON workflows, workspace focus, checkpoints, telemetry, and runtime health.", {
+    _tool("ops_manage", "Manage background jobs, scheduled/idle routines, Blind Credential Vault metadata, SSH/WinRM/HTTP endpoints, Capability Packs/JSON workflows, pinned Projects Root & directory browser (`domain='projects'`), checkpoints, telemetry, and runtime health.", {
         "domain": _p("string", "Operational subsystem to manage.", enum=["jobs", "routines", "vault", "endpoints", "workflows", "projects", "checkpoints", "telemetry", "doctor"]),
-        "action": _p("string", "Subsystem sub-action (e.g. `list`, `dispatch`, `create`, `propose`, `test`, `inspect_host`, `ssh_exec`, `ssh_read_file`, `winrm_exec`, `api_request`, `run_dag`, `resume_dag`, `bootstrap_skill`, `run_script`, `check_secret`, `status`, `switch`)."),
-        "target": _p("string", "Target identifier (`job_id`, `routine_id`, `endpoint_id`, `dag`, `skill`, `name`, or project path)."),
-        "params": _p("object", "Additional subsystem parameters dictionary (e.g. `{goal, title, mode, schedule_expr, command, skill_md, scripts, workflows}`)."),
+        "action": _p("string", "Subsystem sub-action (e.g. `list`, `dispatch`, `create`, `propose`, `test`, `inspect_host`, `ssh_exec`, `ssh_read_file`, `winrm_exec`, `api_request`, `run_dag`, `resume_dag`, `bootstrap_skill`, `run_script`, `check_secret`, `status`, `browse`, `mkdir`, `set_root`, `reset_root`, `init`, `switch`)."),
+        "target": _p("string", "Target identifier (`job_id`, `routine_id`, `endpoint_id`, `dag`, `skill`, `name`, `rel_path`, or project/root path)."),
+        "params": _p("object", "Additional subsystem parameters dictionary (e.g. `{goal, title, mode, schedule_expr, command, rel_path, parent_rel_path, projects_root}`)."),
     }, ["domain"]),
     _tool("git_manage", "Execute greenfield `git init` on `main`, safe local Git, parallel `git worktree`, secret-shielded commit, and Blind-Vault-authenticated remote operations governed by project `delivery_policy`.", {
         "action": _p("string", "Git or worktree sub-action.", enum=["init", "status", "diff", "log", "branch", "worktree_add", "worktree_list", "worktree_remove", "commit", "fetch", "pull", "push"]),
@@ -912,7 +915,7 @@ _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "mcp_manage": frozenset({"propose_server", "register_server", "call_tool", "harvest_skill", "register_partner", "delegate_partner"}),
     "call_mcp": frozenset({"propose_server", "register_server", "call_tool", "harvest_skill", "register_partner", "delegate_partner"}),
     "routine_manage": frozenset({"create", "enable", "disable", "delete", "tick", "run_now", "autonomy_on", "autonomy_off", "prompt_save"}),
-    "agile_manage": frozenset({"create_project", "update_project", "save_board", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "create_timebox", "start_sprint", "rollover_sprint", "create_item", "create_card", "update_item", "update_card", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker", "start_item", "start_card", "dispatch_item", "run_parallel_ready", "run_ready", "merge_item", "merge_local", "push_item_pr", "push_and_pr", "request_changes", "discard_worktree"}),
+    "agile_manage": frozenset({"create_project", "update_project", "save_board", "create_subfolder", "create_projects_subfolder", "mkdir_projects", "mkdir", "set_projects_root", "set_root", "reset_projects_root", "reset_root", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "create_timebox", "start_sprint", "rollover_sprint", "create_item", "create_card", "update_item", "update_card", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker", "start_item", "start_card", "dispatch_item", "run_parallel_ready", "run_ready", "merge_item", "merge_local", "push_item_pr", "push_and_pr", "request_changes", "discard_worktree"}),
     "calendar_manage": frozenset({"add_event", "delete_event"}),
     "education_manage": frozenset({"save_course", "set_active", "advance_stage", "upsert_items", "generate_items", "grade_item", "curate_note"}),
     "git_manage": frozenset({"init", "branch", "worktree_add", "worktree_remove", "commit", "fetch", "pull", "push"}),
@@ -984,8 +987,9 @@ def check_phase_tool_permission(tool_name: str, phase: Optional[str] = None, arg
             return None
         act = str(args.get("action") or "").strip().lower()
         if tool_name == "project_manage":
-            has_tgt = any(str(args.get(k) or "").strip() for k in ("target", "path", "name"))
-            if act not in ("", "status", "current", "list") or (not act and has_tgt):
+            has_tgt = any(str(args.get(k) or "").strip() for k in ("target", "path", "name", "rel_path", "projects_root"))
+            ro_acts = ("", "status", "current", "list", "browse", "ls", "tree", "get_root", "browse_projects", "browse_projects_dir")
+            if act not in ro_acts or (not act and has_tgt):
                 rej_act = act or "switch"
                 return f"PHASE TOOL GATE REJECTED `project_manage(action='{rej_act}')` during `{eff}` phase: mutating or state-overriding sub-action `{rej_act}` is mechanically locked in `{eff}`."
             return None
@@ -1568,6 +1572,11 @@ def tool_memory_manage(args: Dict[str, Any]) -> str:
         k, v = str_arg(args, "key"), str_arg(args, "value")
         if not k or not v:
             return "error: key and value are required"
+        if k.lower() == "projects_root":
+            from companion.worktrees import set_projects_root
+
+            r_pr = set_projects_root(v, store=store)
+            return str(r_pr["summary"]) if r_pr.get("ok") else f"error: {r_pr.get('error')}"
         try:
             store.set_user_profile(k, v)
         except PermissionError as exc:
@@ -1919,15 +1928,38 @@ def tool_checkpoint_manage(args: Dict[str, Any]) -> str:
 
 
 def tool_project_manage(args: Dict[str, Any]) -> str:
-    raw_act = str_arg(args, "action")
-    target = str_arg(args, "target") or str_arg(args, "path") or str_arg(args, "name")
+    from companion.worktrees import browse_projects_dir, create_projects_subfolder, format_projects_browse_text, set_projects_root
+
+    store = get_memory_store()
+    raw_act = str_arg(args, "action") or str_arg(args, "subaction")
+    target = str_arg(args, "target") or str_arg(args, "rel_path") or str_arg(args, "projects_root") or str_arg(args, "path") or str_arg(args, "name")
     action = (raw_act or ("switch" if target else "status")).lower()
     phase = current_workflow_phase()
-    if phase and phase not in ("IMPLEMENT", "RECOVER") and action not in ("status", "current", "list"):
-        return f"PHASE TOOL GATE REJECTED `project_manage(action='{action}')`: cannot switch WorkspaceContext during `{phase}` phase."
-    if action in ("status", "current", "list"):
-        return manage_active_project(action, store=get_memory_store())
-    return manage_active_project(f"{action} {target}".strip() if target else action, store=get_memory_store())
+    ro_acts = ("status", "current", "list", "browse", "ls", "tree", "get_root", "browse_projects", "browse_projects_dir")
+    if phase and phase not in ("IMPLEMENT", "RECOVER") and action not in ro_acts:
+        return f"PHASE TOOL GATE REJECTED `project_manage(action='{action}')`: cannot mutate or switch WorkspaceContext during `{phase}` phase."
+    if action in ("status", "current", "list", "get_root"):
+        return manage_active_project(action, store=store)
+    if action in ("browse", "ls", "tree", "browse_projects", "browse_projects_dir"):
+        rel_p = str_arg(args, "rel_path") or str_arg(args, "target") or str_arg(args, "path")
+        return format_projects_browse_text(browse_projects_dir(rel_p, store=store))
+    if action in ("mkdir", "create_subfolder", "create_projects_subfolder", "mkdir_projects"):
+        mk = create_projects_subfolder(
+            rel_path=str_arg(args, "rel_path") or (str_arg(args, "target") if not str_arg(args, "parent_rel_path") else ""),
+            parent_rel_path=str_arg(args, "parent_rel_path") or str_arg(args, "parent"),
+            name=str_arg(args, "name") or str_arg(args, "folder_name") or (str_arg(args, "target") if str_arg(args, "parent_rel_path") else ""),
+            store=store,
+        )
+        return str(mk["summary"]) if mk.get("ok") else f"error: {mk.get('error')}"
+    if action in ("set_root", "root", "set_projects_root", "projects_root"):
+        if not target and not bool_arg(args, "reset", False):
+            return manage_active_project("get_root", store=store)
+        sr = set_projects_root(target, reset=bool_arg(args, "reset", False), store=store)
+        return str(sr["summary"]) if sr.get("ok") else f"error: {sr.get('error')}"
+    if action in ("reset_root", "reset_projects_root"):
+        sr = set_projects_root("", reset=True, store=store)
+        return str(sr["summary"]) if sr.get("ok") else f"error: {sr.get('error')}"
+    return manage_active_project(f"{action} {target}".strip() if target else action, store=store)
 
 
 def tool_system_doctor(args: Dict[str, Any]) -> str:

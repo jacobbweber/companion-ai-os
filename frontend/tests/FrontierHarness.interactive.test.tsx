@@ -316,7 +316,7 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
   beforeAll(async () => {
     (globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
     await bridge.start();
-    document.head.innerHTML = `<meta name="companion-csrf" content="${bridge.csrfToken}"><meta name="companion-version" content="5.1.0"><meta name="companion-asset-hash" content="${bridge.assetHash}">`;
+    document.head.innerHTML = `<meta name="companion-csrf" content="${bridge.csrfToken}"><meta name="companion-version" content="5.1.1"><meta name="companion-asset-hash" content="${bridge.assetHash}">`;
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const urlStr = typeof input === 'string' ? input : input.toString();
@@ -795,7 +795,7 @@ describe('Frontier Harness Interactive Regressions (WEB-1..6)', () => {
     // `IdleEventSource` never emits `done`, simulating a wedged mobile/Tailscale SSE socket while Python finished the turn.
     // Reconciling `/api/status` (`online` event) must self-heal `sending`, render the reply, and clear the preserved draft!
     expect(container.querySelector('[data-testid="version-drift-banner"]')).toBeNull();
-    expect(container.querySelector('[data-testid="sidebar-version-label"]')?.textContent).toBe('v5.1.0');
+    expect(container.querySelector('[data-testid="sidebar-version-label"]')?.textContent).toBe('v5.1.1');
     for (let poll = 0; poll < 12; poll += 1) {
       await flushUi(120);
       await act(async () => {

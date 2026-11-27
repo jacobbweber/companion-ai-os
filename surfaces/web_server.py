@@ -34,6 +34,7 @@ _LOCAL_HOSTNAME = socket.gethostname().strip().lower()
 _READONLY_SUBACTIONS = frozenset({
     "list", "status", "get", "read", "search", "graph", "metadata", "check",
     "check_secret", "list_missing", "audit", "window", "progress", "board_view", "matrix", "probe_repo",
+    "browse_projects", "browse_projects_dir", "browse_dir",
 })
 
 
@@ -604,7 +605,10 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             sess.idle_watcher.record_human_activity()
         ext_act = handle_extended_post(route, body, self.headers, sess.store)
         if ext_act is not None:
-            if route in ("/api/actions/autonomy", "/api/actions/identity", "/api/actions/trust", "/api/actions/models") or (route == "/api/actions/agile" and sub in ("create_project", "update_project", "create_board", "save_board", "upsert_project")):
+            if route in ("/api/actions/autonomy", "/api/actions/identity", "/api/actions/trust", "/api/actions/models") or (
+                route == "/api/actions/agile"
+                and sub in ("create_project", "update_project", "create_board", "save_board", "upsert_project", "set_projects_root", "set_root", "reset_projects_root", "reset_root")
+            ):
                 fresh_sys = build_system_prompt(store=sess.store)
                 with sess._turn_lock:
                     if sess.messages and sess.messages[0].get("role") == "system":

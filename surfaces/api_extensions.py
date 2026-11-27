@@ -43,6 +43,7 @@ from companion.streaming import wire_attachment_context
 from companion.telemetry import TelemetryEngine, read_ro_rows, telemetry, telemetry_db_context
 from companion.wiki import get_wiki_engine
 from companion.wiki import read_wiki_asset_raw
+from companion.worktrees import get_projects_root_info
 from companion.agent import WorkflowEngine
 from surfaces.web_assets import compute_static_asset_hash
 
@@ -256,13 +257,19 @@ def enrich_web_status(store: MemoryStore) -> Dict[str, Any]:
     bg_on = store.is_background_autonomy_enabled()
     unseen_journal = store.get_autonomy_journal(unseen_only=True, mark_seen=False, limit=20)
     waiting_approvals = get_approval_queue(store=store).list_requests(status="waiting")
+    pr_info = get_projects_root_info(store)
+    pr_str = str(pr_info["projects_root"])
     return {
         "onboarded": prof.get("onboarded", "false").strip().lower() in ("true", "1", "yes"),
         "companion_tone": prof.get("companion_tone", "balanced").strip().lower() or "balanced",
         "companion_soul": prof.get("companion_soul", ""),
         "user_profile": prof.get("user_profile", ""),
         "data_dir": str(settings.effective_data_dir),
-        "projects_dir": str(settings.projects_dir),
+        "projects_root": pr_str,
+        "projects_dir": pr_str,
+        "default_projects_root": str(pr_info["default_projects_root"]),
+        "projects_root_is_custom": bool(pr_info["is_custom_root"]),
+        "projects_root_source": str(pr_info["root_source"]),
         "trust_mode": get_trust_mode(store=store),
         "privacy_mode": settings.effective_privacy_mode(),
         "background_autonomy": "on" if bg_on else "off",
@@ -399,7 +406,7 @@ def build_web_status_payload(sess: Any) -> Dict[str, Any]:
         "user_name": prof.get("user_name") or settings.user_name or "Partner",
         "tone": prof.get("companion_tone", "balanced"), "active_model_tier": prof.get("active_model_tier", "auto"),
         "fast_model": f_cfg.model, "reasoning_model": r_cfg.model,
-        "workspace": {"project_id": ws.project_id, "project_root": str(ws.project_root), "is_self_project": ws.is_self_project, "projects_dir": str(settings.projects_dir)},
+        "workspace": {"project_id": ws.project_id, "project_root": str(ws.project_root), "is_self_project": ws.is_self_project, "projects_root": str(get_projects_root_info(sess.store)["projects_root"]), "projects_dir": str(get_projects_root_info(sess.store)["projects_root"])},
         "busy": sess.busy, "active_action": sess.active_action, "busy_seconds": busy_sec,
         "model_swap": active_swap_status(), "active_job": active_job, "lan_url": sess.lan_url, "workflow": active_wf,
         "awaiting_approval": bool((active_wf or {}).get("metadata", {}).get("awaiting_plan_approval") and (active_wf or {}).get("current_state") == "PLAN"),

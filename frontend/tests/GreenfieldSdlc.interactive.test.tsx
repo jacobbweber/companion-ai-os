@@ -450,4 +450,164 @@ describe('Greenfield Git Repo Bootstrap & /sdlc-* Co-Design Slash Router', () =>
     );
     expect(statusAfter.workspace.is_self_project).toBe(false);
   });
+
+  it('pins custom Projects Root in Settings & inline Change Root, creates nested subfolder (+ New Folder -> experiments -> my-app), strips leading /, and selects clones in 1 click', async () => {
+    const customRoot = path.join(path.dirname(bridge.projectsDir), 'pinned_spark_projects');
+
+    // 1. Open Settings -> General & Autonomy and pin custom Projects Root (rejecting app/ first)
+    const openSettingsBtn = container.querySelector('[data-testid="open-settings-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      openSettingsBtn.click();
+    });
+    await flushUi(100);
+    const settingsRootInput = container.querySelector('[data-testid="settings-projects-root-input"]') as HTMLInputElement;
+    const settingsSaveRootBtn = container.querySelector('[data-testid="settings-save-projects-root-btn"]') as HTMLButtonElement;
+    expect(settingsRootInput).toBeTruthy();
+
+    await act(async () => {
+      setInputValue(settingsRootInput, bridge.appRoot);
+      settingsSaveRootBtn.click();
+    });
+    await flushUi(120);
+    expect(container.querySelector('[data-testid="settings-projects-root-badge"]')?.textContent).toBe('Default');
+
+    await act(async () => {
+      setInputValue(settingsRootInput, customRoot);
+      settingsSaveRootBtn.click();
+    });
+    await flushUi(140);
+    expect(container.querySelector('[data-testid="settings-projects-root-badge"]')?.textContent).toBe('Pinned');
+    expect(fs.existsSync(customRoot)).toBe(true);
+
+    const closeSettingsBtn = container.querySelector('[data-testid="settings-modal"] button[aria-label="Close settings"]') as HTMLButtonElement;
+    await act(async () => {
+      closeSettingsBtn.click();
+    });
+    await flushUi(80);
+
+    // 2. Open Boards -> New Project -> Code Repository -> verify Pinned Root Header & inline + New Folder -> experiments
+    const navBoards = container.querySelector('[data-testid="nav-boards"]') as HTMLButtonElement;
+    await act(async () => {
+      navBoards.click();
+    });
+    await flushUi(100);
+    const newProjBtn = container.querySelector('[data-testid="new-project-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      newProjBtn.click();
+    });
+    await flushUi(120);
+    const codeModeBtn = container.querySelector('[data-testid="project-mode-code"]') as HTMLButtonElement;
+    await act(async () => {
+      codeModeBtn.click();
+    });
+    await flushUi(120);
+
+    const rootDisplay = container.querySelector('[data-testid="projects-root-display"]');
+    expect(path.normalize(rootDisplay?.textContent || '')).toBe(path.normalize(customRoot));
+
+    const upBtn = container.querySelector('[data-testid="explorer-up-btn"]') as HTMLButtonElement;
+    expect(upBtn.disabled).toBe(true);
+
+    const newFolderToggle = container.querySelector('[data-testid="explorer-new-folder-toggle"]') as HTMLButtonElement;
+    await act(async () => {
+      newFolderToggle.click();
+    });
+    await flushUi(60);
+    const newFolderInput = container.querySelector('[data-testid="explorer-new-folder-input"]') as HTMLInputElement;
+    const newFolderSubmit = container.querySelector('[data-testid="explorer-new-folder-submit"]') as HTMLButtonElement;
+    await act(async () => {
+      setInputValue(newFolderInput, '/experiments');
+    });
+    await flushUi(40);
+    expect(newFolderInput.value).toBe('experiments');
+    await act(async () => {
+      newFolderSubmit.click();
+    });
+    await flushUi(150);
+
+    // Explorer automatically drilled into `experiments` (`↑ Up` enabled, plain folder created without .git)
+    expect(upBtn.disabled).toBe(false);
+    expect(fs.existsSync(path.join(customRoot, 'experiments'))).toBe(true);
+    expect(fs.existsSync(path.join(customRoot, 'experiments', '.git'))).toBe(false);
+
+    // 3. Type title + accidental leading `/` in New Repo Folder Name -> strips `/` and previews `<customRoot>/experiments/my-app`
+    const titleInput = container.querySelector('[data-testid="project-title-input"]') as HTMLInputElement;
+    const folderNameInput = container.querySelector('[data-testid="repo-folder-name-input"]') as HTMLInputElement;
+    await act(async () => {
+      setInputValue(titleInput, 'Nested Experiment Service');
+    });
+    await flushUi(60);
+    await act(async () => {
+      setInputValue(folderNameInput, '/my-app');
+    });
+    await flushUi(60);
+    expect(folderNameInput.value).toBe('my-app');
+
+    const expectedNestedRepo = path.join(customRoot, 'experiments', 'my-app');
+    const previewBanner = container.querySelector('[data-testid="create-repo-live-preview"]');
+    expect(path.normalize(previewBanner?.textContent || '')).toContain(path.normalize(expectedNestedRepo));
+
+    // Clearing New Repo Folder Name re-enables title-based derivation, then set `my-app` and create!
+    await act(async () => {
+      setInputValue(folderNameInput, '');
+    });
+    await flushUi(40);
+    await act(async () => {
+      setInputValue(titleInput, 'Agent Sandbox');
+    });
+    await flushUi(40);
+    expect(folderNameInput.value).toBe('agent-sandbox');
+    await act(async () => {
+      setInputValue(folderNameInput, '/my-app');
+    });
+    await flushUi(40);
+
+    const saveBtn = container.querySelector('[data-testid="save-project-policy-btn"]') as HTMLButtonElement;
+    await act(async () => {
+      saveBtn.click();
+    });
+    const saveDeadline = Date.now() + 6000;
+    while (Date.now() < saveDeadline) {
+      if (!container.querySelector('[data-testid="project-inspector"]') && fs.existsSync(path.join(expectedNestedRepo, '.git'))) {
+        break;
+      }
+      await flushUi(100);
+    }
+    expect(fs.existsSync(path.join(expectedNestedRepo, '.git'))).toBe(true);
+
+    // 4. Open New Project -> Attach Existing Clone -> drill into `[Folder] experiments` -> 1-click select `[Git Repo · main] my-app`
+    const freshNewProjBtn = await waitForSelector<HTMLButtonElement>(container, '[data-testid="new-project-btn"]', 4000);
+    await act(async () => {
+      freshNewProjBtn.click();
+    });
+    const freshCodeBtn = await waitForSelector<HTMLButtonElement>(container, '[data-testid="project-mode-code"]', 4000);
+    await act(async () => {
+      freshCodeBtn.click();
+    });
+    const freshAttachBtn = await waitForSelector<HTMLButtonElement>(container, '[data-testid="repo-mode-attach"]', 4000);
+    await act(async () => {
+      freshAttachBtn.click();
+    });
+    await flushUi(120);
+
+    const expRow = await waitForSelector(container, '[data-testid="explorer-entry-experiments"]', 4000);
+    expect(container.querySelector('[data-testid="explorer-badge-folder-experiments"]')?.textContent).toBe('Folder');
+    await act(async () => {
+      expRow.click();
+    });
+    await flushUi(140);
+
+    const myAppRow = await waitForSelector(container, '[data-testid="explorer-entry-my-app"]', 4000);
+    expect(container.querySelector('[data-testid="explorer-badge-git-my-app"]')?.textContent).toContain('Git Repo · main');
+    expect(container.querySelector('[data-testid="explorer-badge-linked-my-app"]')?.textContent).toContain('Linked Project');
+
+    await act(async () => {
+      myAppRow.click();
+    });
+    const probeBadge = await waitForSelector(container, '[data-testid="repo-probe-badge"] .badge', 4000);
+    expect(probeBadge.classList.contains('ok')).toBe(true);
+    expect(probeBadge.textContent).toContain('Git repo on main');
+    const wsInput = container.querySelector('[data-testid="project-workspace-path-input"]') as HTMLInputElement;
+    expect(path.normalize(wsInput.value)).toBe(path.normalize(expectedNestedRepo));
+  }, 15000);
 });

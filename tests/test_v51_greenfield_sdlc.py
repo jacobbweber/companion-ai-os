@@ -15,19 +15,24 @@ from unittest.mock import patch
 
 from companion.agent import _is_active_sdlc_codesign_turn, handle_slash_command, is_awaiting_blueprint_approval, run_agent_turn, triage_turn
 from companion.config import Settings, settings, workspace_context
-from companion.context import build_turn_context, discover_skills, manage_active_project
+from companion.context import build_system_prompt, build_turn_context, discover_skills, manage_active_project
 from companion.core_actions import execute_core_action
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.projects import get_project_graph
-from companion.tools import TOOLS, dispatch
+from companion.tools import TOOLS, dispatch, phase_tool_context
 from companion.workflows import discover_dags, execute_dag_by_name, validate_skill_markdown
 from companion.worktrees import (
     SDLC_SLASH_MAP,
+    browse_projects_dir,
+    create_projects_subfolder,
     discover_repo_sdlc_context,
+    get_projects_root,
+    get_projects_root_info,
     init_greenfield_repo,
     inspect_sdlc_repo_state,
     probe_repo_workspace,
     resolve_sdlc_slash_turn,
+    set_projects_root,
     validate_external_repo_path,
 )
 from surfaces.web_server import create_web_server, dispatch_raw_http
@@ -537,6 +542,223 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                     self.assertEqual((job_snap or {}).get("status"), "completed")
                 finally:
                     srv.server_close()
+
+
+class TestProjectsRootExplorerAndParity(unittest.TestCase):
+    """Adversarial verification for F01/inc-02: Pinned Projects Root, Confined Explorer & Companion Tool/Slash Parity."""
+
+    def tearDown(self) -> None:
+        settings.reset_workspace()
+
+    def test_projects_root_persistence_fallback_and_adversarial_system_path_guards(self) -> None:
+        """Verify user_profile['projects_root'] precedence, mkdir -p, fallback, and mechanical system/root blocks."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp).resolve()
+            env_projects = tmp_p / "env_projects"
+            env_projects.mkdir()
+            pinned_projects = tmp_p / "pinned_workspace" / "repos"
+            db_file = tmp_p / "root_test.db"
+
+            with (
+                patch.dict(os.environ, {"COMPANION_PROJECTS_DIR": str(env_projects)}, clear=False),
+                contextlib.closing(MemoryStore(db_path=db_file)) as store,
+                memory_store_context(store),
+            ):
+                # 1. Default falls back to COMPANION_PROJECTS_DIR when user_profile['projects_root'] is unset
+                info0 = get_projects_root_info(store)
+                self.assertEqual(info0["projects_root"], env_projects)
+                self.assertFalse(info0["is_custom_root"])
+                self.assertEqual(settings.projects_dir, env_projects)
+
+                # 2. Mechanically reject `/`, `$HOME`, `/etc`, `/usr`, `/var`, `app/`, `data/`, `.ssh`, and Windows system dirs
+                blocked_targets = [
+                    "/",
+                    str(Path.home().resolve()),
+                    "/etc",
+                    "/usr/local",
+                    "/var/log",
+                    str(settings.root.resolve()),
+                    str(settings.root.resolve() / "sub"),
+                    str(settings.effective_data_dir.resolve()),
+                    str(tmp_p / ".ssh" / "repos"),
+                ]
+                if os.name == "nt":
+                    blocked_targets.extend(["C:\\Windows", "C:\\Windows\\System32", "C:\\Program Files"])
+                for bad in blocked_targets:
+                    r_bad = set_projects_root(bad, store=store)
+                    self.assertFalse(r_bad["ok"], f"Expected rejection for {bad}: {r_bad}")
+                    self.assertIn("SAFETY GUARD REJECTED", r_bad["error"])
+
+                # Also block `memory_manage(action='set_profile', key='projects_root', value='/')` bypass!
+                prof_bypass = dispatch("memory_manage", {"action": "set_profile", "key": "projects_root", "value": "/"})
+                self.assertIn("SAFETY GUARD REJECTED", prof_bypass)
+
+                # 3. Pinning a valid non-existent path creates it (`mkdir -p`) and overrides COMPANION_PROJECTS_DIR
+                self.assertFalse(pinned_projects.exists())
+                r_pin = set_projects_root(str(pinned_projects), store=store)
+                self.assertTrue(r_pin["ok"], r_pin)
+                self.assertTrue(pinned_projects.is_dir())
+                self.assertEqual(get_projects_root(store), pinned_projects)
+                self.assertEqual(settings.projects_dir, pinned_projects)
+                self.assertTrue(get_projects_root_info(store)["is_custom_root"])
+
+                # Surfaced in [RUNTIME & GOVERNANCE] system prompt & GET /api/status
+                sys_prompt = build_system_prompt(store=store)
+                self.assertIn(f"projects_root=`{pinned_projects}`", sys_prompt)
+                srv, sess = create_web_server(port=0, store=store)
+                try:
+                    code, raw_st = dispatch_raw_http(srv, method="GET", path="/api/status")
+                    self.assertEqual(code, 200)
+                    st_json = json.loads(raw_st)
+                    self.assertEqual(Path(st_json["projects_root"]).resolve(), pinned_projects)
+                    self.assertTrue(st_json["projects_root_is_custom"])
+                    self.assertEqual(Path(st_json["workspace"]["projects_root"]).resolve(), pinned_projects)
+                finally:
+                    srv.server_close()
+
+                # 4. Corrupt DB value fails closed back to env/default without crashing
+                store.set_user_profile("projects_root", str(settings.root.resolve()))
+                self.assertEqual(get_projects_root(store), env_projects)
+                self.assertFalse(get_projects_root_info(store)["is_custom_root"])
+
+                # 5. Resetting restores fallback cleanly
+                r_reset = set_projects_root("", reset=True, store=store)
+                self.assertTrue(r_reset["ok"], r_reset)
+                self.assertFalse(r_reset["is_custom_root"])
+                self.assertEqual(get_projects_root(store), env_projects)
+
+    def test_confined_explorer_metadata_noise_filter_subfolders_and_escape_blocks(self) -> None:
+        """Verify browse_projects_dir metadata, noise filtering, nested subfolders, and ../ + symlink confinement."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp).resolve()
+            proot = tmp_p / "spark_projects"
+            proot.mkdir()
+            outside_secret = tmp_p / "outside_secret"
+            outside_secret.mkdir()
+            db_file = tmp_p / "explorer.db"
+
+            # Noise folders that MUST be hidden
+            for noise in (".git", ".worktrees", "node_modules", "__pycache__", ".venv", ".hidden_cache"):
+                (proot / noise).mkdir()
+            (proot / "bundle_file.bundle").write_text("binary", encoding="utf-8")
+
+            with contextlib.closing(MemoryStore(db_path=db_file)) as store, memory_store_context(store):
+                set_projects_root(str(proot), store=store)
+
+                # Create organizational subfolder `experiments/agents` (plain folder, NO .git)
+                mk_res = create_projects_subfolder(rel_path="/experiments/agents/", store=store)
+                self.assertTrue(mk_res["ok"], mk_res)
+                self.assertTrue((proot / "experiments" / "agents").is_dir())
+                self.assertFalse((proot / "experiments" / ".git").exists())
+                self.assertEqual(mk_res["current_rel_path"], "experiments/agents")
+                self.assertTrue(mk_res["can_go_up"])
+                self.assertEqual(mk_res["parent_rel_path"], "experiments")
+
+                # Block traversal & hidden/reserved subfolder creation
+                for bad_mk in ("../escape", "experiments/../../outside", ".git", ".ssh", "node_modules"):
+                    bad_res = create_projects_subfolder(rel_path=bad_mk, store=store)
+                    self.assertFalse(bad_res["ok"], f"Expected rejection for {bad_mk}")
+                    self.assertIn("SAFETY GUARD REJECTED", bad_res["error"])
+
+                # Create linked Git repo at root + nested Git repo under `experiments/my-app`
+                res_linked = execute_core_action(
+                    "agile",
+                    {"subaction": "create_project", "title": "Core Engine", "kind": "software", "init_git": True},
+                    actor="web",
+                    store=store,
+                )
+                self.assertTrue(res_linked["ok"], res_linked)
+                linked_pid = res_linked["project"]["project_id"]
+
+                init_nested = init_greenfield_repo("experiments/my-app", title="My Nested App")
+                self.assertTrue(init_nested["ok"], init_nested)
+                self.assertEqual(Path(init_nested["repo_root"]).resolve(), (proot / "experiments" / "my-app").resolve())
+
+                # Optional symlink escape test (if OS privileges allow creating directory symlinks)
+                with contextlib.suppress(OSError, NotImplementedError):
+                    os.symlink(outside_secret, proot / "escaped_link", target_is_directory=True)
+
+                root_browse = browse_projects_dir("", store=store)
+                self.assertTrue(root_browse["ok"], root_browse)
+                self.assertFalse(root_browse["can_go_up"])
+                by_name = {e["name"]: e for e in root_browse["entries"]}
+                self.assertEqual(set(by_name.keys()), {"core-engine", "experiments"})
+
+                self.assertTrue(by_name["core-engine"]["is_git_repo"])
+                self.assertEqual(by_name["core-engine"]["branch"], "main")
+                self.assertEqual(by_name["core-engine"]["linked_project_id"], linked_pid)
+                self.assertEqual(by_name["core-engine"]["linked_project_title"], "Core Engine")
+
+                self.assertFalse(by_name["experiments"]["is_git_repo"])
+                self.assertEqual(by_name["experiments"]["branch"], "")
+                self.assertTrue(by_name["experiments"]["has_children"])
+
+                sub_browse = browse_projects_dir("experiments", store=store)
+                self.assertTrue(sub_browse["ok"], sub_browse)
+                self.assertTrue(sub_browse["can_go_up"])
+                self.assertEqual(sub_browse["parent_rel_path"], "")
+                sub_names = {e["name"]: e for e in sub_browse["entries"]}
+                self.assertEqual(set(sub_names.keys()), {"agents", "my-app"})
+                self.assertFalse(sub_names["agents"]["is_git_repo"])
+                self.assertTrue(sub_names["my-app"]["is_git_repo"])
+                self.assertEqual(sub_names["my-app"]["branch"], "main")
+
+                # Escape attempts via `..`, leading `/`, or symlink must be rejected
+                for esc in ("..", "../outside_secret", "experiments/../../outside_secret", "/etc"):
+                    esc_res = browse_projects_dir(esc, store=store)
+                    self.assertFalse(esc_res["ok"], f"Expected rejection for {esc}")
+                    self.assertIn("SAFETY GUARD REJECTED", esc_res["error"])
+                if (proot / "escaped_link").is_symlink():
+                    sym_res = browse_projects_dir("escaped_link", store=store)
+                    self.assertFalse(sym_res["ok"])
+                    self.assertIn("SAFETY GUARD REJECTED", sym_res["error"])
+
+    def test_companion_ops_manage_and_slash_parity_while_focused_on_companion_self(self) -> None:
+        """Verify ops_manage(domain='projects'), agile_manage, and /project slash parity from companion-self."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp).resolve()
+            proot = tmp_p / "companion_parity_root"
+            db_file = tmp_p / "parity.db"
+
+            with contextlib.closing(MemoryStore(db_path=db_file)) as store, memory_store_context(store):
+                settings.reset_workspace()
+                self.assertTrue(settings.get_workspace().is_self_project)
+
+                # While focused on companion-self, direct list_dir outside app/ is blocked by check_path_safety,
+                # whereas ops_manage(domain='projects', action='set_root'|'mkdir'|'browse') works natively!
+                out_root = dispatch("ops_manage", {"domain": "projects", "action": "set_root", "target": str(proot)})
+                self.assertIn("Pinned Projects Root", out_root)
+                self.assertTrue(proot.is_dir())
+
+                out_mkdir = dispatch("ops_manage", {"domain": "projects", "action": "mkdir", "target": "products/billing"})
+                self.assertIn("Created subfolder `products/billing`", out_mkdir)
+
+                # Create mixed-case repo `Agent-OS` to verify exact-case switch resolution
+                init_greenfield_repo(proot / "Agent-OS", title="Agent OS")
+
+                # Browse works in read-only DISCOVER phase, while set_root/mkdir are phase-gated in DISCOVER
+                with phase_tool_context("DISCOVER"):
+                    out_browse_ro = dispatch("ops_manage", {"domain": "projects", "action": "browse"})
+                    self.assertIn("Agent-OS", out_browse_ro)
+                    self.assertIn("products", out_browse_ro)
+                    out_locked = dispatch("ops_manage", {"domain": "projects", "action": "mkdir", "target": "blocked_in_discover"})
+                    self.assertIn("PHASE TOOL GATE REJECTED", out_locked)
+
+                # agile_manage browse_projects alias
+                ag_browse = dispatch("agile_manage", {"action": "browse_projects", "rel_path": "products"})
+                self.assertIn("products/billing/", ag_browse)
+
+                # /project slash parity (`root`, `browse`, `mkdir`, exact-case `switch`, `self`)
+                msgs: List[Dict[str, Any]] = [{"role": "system", "content": build_system_prompt(store=store)}]
+                sl_root = handle_slash_command("/project root", msgs, store=store, interactive=False) or ""
+                self.assertIn(str(proot), sl_root)
+                sl_browse = handle_slash_command("/project browse", msgs, store=store, interactive=False) or ""
+                self.assertIn("Agent-OS", sl_browse)
+                sl_sw = handle_slash_command("/project switch Agent-OS", msgs, store=store, interactive=False) or ""
+                self.assertIn("Switched active WorkspaceContext", sl_sw)
+                self.assertEqual(settings.get_workspace().project_root.resolve(), (proot / "Agent-OS").resolve())
+                handle_slash_command("/project self", msgs, store=store, interactive=False)
+                self.assertTrue(settings.get_workspace().is_self_project)
 
 
 if __name__ == "__main__":

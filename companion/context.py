@@ -558,21 +558,41 @@ def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known:
     return eff_pid
 
 
-def _resolve_external_target(raw_target: str, known: Dict[str, str]) -> Path:
-    clean, slug = raw_target.strip().strip("'\""), slugify_project_id(raw_target.strip().strip("'\""))
+def _resolve_external_target(
+    raw_target: str, known: Dict[str, str], store: Optional[MemoryStore] = None, prefer_existing: bool = True,
+) -> Path:
+    from companion.worktrees import get_projects_root
+
+    clean = raw_target.strip().strip("'\"")
+    slug = slugify_project_id(clean)
+    proj_root = get_projects_root(store)
     if clean in known:
         return Path(known[clean]).resolve()
+    if prefer_existing and clean and not Path(clean).is_absolute() and not clean.startswith("~") and (proj_root / clean).exists():
+        return (proj_root / clean).resolve()
     if slug in known and "/" not in clean and "\\" not in clean and ":" not in clean:
         return Path(known[slug]).resolve()
     cand = Path(clean).expanduser()
-    if cand.is_absolute() or clean.startswith("~"):
+    if cand.is_absolute() or clean.startswith(("~", "/", "\\")):
         return cand.resolve()
-    sub = slug if ("/" not in clean and "\\" not in clean) else clean
-    return (settings.projects_dir / sub).resolve()
+    if "/" not in clean and "\\" not in clean:
+        return (proj_root / slug).resolve()
+    norm_parts = [p.strip() for p in clean.replace("\\", "/").split("/") if p.strip()]
+    if not prefer_existing and norm_parts and " " in norm_parts[-1]:
+        norm_parts[-1] = slugify_project_id(norm_parts[-1])
+    return (proj_root / Path(*norm_parts)).resolve()
 
 
 def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore] = None) -> str:
-    from companion.worktrees import init_greenfield_repo, validate_external_repo_path
+    from companion.worktrees import (
+        browse_projects_dir,
+        create_projects_subfolder,
+        format_projects_browse_text,
+        get_projects_root_info,
+        init_greenfield_repo,
+        set_projects_root,
+        validate_external_repo_path,
+    )
 
     mem = store or get_memory_store()
     known, raw = _load_known_projects(mem), (arg or "").strip()
@@ -580,9 +600,29 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
     verb, rest = (parts[0].lower() if parts else "status"), (parts[1].strip() if len(parts) > 1 else "")
 
     if verb in ("status", "current", ""):
-        ws = settings.get_workspace()
+        ws, r_info = settings.get_workspace(), get_projects_root_info(mem)
+        src_lbl = "pinned" if r_info["is_custom_root"] else str(r_info["root_source"])
         lock = "PERMANENTLY IMMUTABLE (`data/`, `data/domains/`, & `data/scratch/` writable)" if ws.is_self_project else f"IMMUTABLE (`{ws.self_root}` protected)"
-        return f"=== Active WorkspaceContext ===\nProject ID    : `{ws.project_id}`\nProject Root  : {ws.project_root}\nProjects Dir  : {settings.projects_dir}\nCompanion Core: {lock}\n(Use `/project list`, `/project init <name|path>`, `/project switch <name|path>`, or `/project self`.)"
+        return (
+            f"=== Active WorkspaceContext ===\nProject ID    : `{ws.project_id}`\nProject Root  : {ws.project_root}\n"
+            f"Projects Root : {r_info['projects_root']} ({src_lbl})\nCompanion Core: {lock}\n"
+            "(Use `/project browse [rel_path]`, `/project mkdir <rel_path>`, `/project root [path|reset]`, `/project list`, `/project init <name|path>`, `/project switch <name|path>`, or `/project self`.)"
+        )
+    if verb in ("root", "set_root", "projects_root", "get_root"):
+        if not rest or verb == "get_root":
+            r_info = get_projects_root_info(mem)
+            src_lbl = "pinned (`user_profile`)" if r_info["is_custom_root"] else f"default (`{r_info['root_source']}`)"
+            return f"Projects Root: `{r_info['projects_root']}` [{src_lbl}] (default fallback: `{r_info['default_projects_root']}`)"
+        r_res = set_projects_root(rest, store=mem)
+        return str(r_res["summary"]) if r_res.get("ok") else f"error: {r_res.get('error')}"
+    if verb in ("reset_root", "reset_projects_root"):
+        r_res = set_projects_root("", reset=True, store=mem)
+        return str(r_res["summary"]) if r_res.get("ok") else f"error: {r_res.get('error')}"
+    if verb in ("browse", "ls", "tree", "browse_projects"):
+        return format_projects_browse_text(browse_projects_dir(rest, store=mem))
+    if verb in ("mkdir", "create_subfolder", "create_projects_subfolder"):
+        mk_res = create_projects_subfolder(rel_path=rest, store=mem)
+        return str(mk_res["summary"]) if mk_res.get("ok") else f"error: {mk_res.get('error')}"
     if verb == "list":
         ws = settings.get_workspace()
         lines = ["=== Registered Workspaces ===", f"  * `{SELF_PROJECT_ID}` -> {settings.root.resolve()}{' [ACTIVE]' if ws.is_self_project else ''}"]
@@ -596,7 +636,9 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
     if verb in ("init", "create", "new"):
         if not rest:
             return "error: project name or path is required for `init` (e.g., `/project init my-app`)."
-        target = _resolve_external_target(rest, known)
+        target = _resolve_external_target(rest, known, store=mem, prefer_existing=False)
+        if bound_err := validate_external_repo_path(target, raw_input=rest):
+            return f"error: {bound_err}"
         init_res = init_greenfield_repo(target, title=target.name)
         if not init_res.get("ok"):
             err_s = str(init_res.get("error") or "failed to initialize repository")
@@ -613,8 +655,8 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
         return "error: target project name or path is required for `switch`."
     if target_str.lower() in ("self", SELF_PROJECT_ID):
         return manage_active_project("self", store=mem)
-    target = _resolve_external_target(target_str, known)
-    if bound_err := validate_external_repo_path(target):
+    target = _resolve_external_target(target_str, known, store=mem, prefer_existing=True)
+    if bound_err := validate_external_repo_path(target, raw_input=target_str):
         return f"error: {bound_err}"
     if not target.is_dir():
         return f"error: project directory not found: `{target}` (use `/project init {target_str}` to create it)."
@@ -693,6 +735,9 @@ def is_identity_bootstrapped(store: Optional[MemoryStore] = None) -> bool:
 def _build_identity_snapshot(mem: MemoryStore, summary: Optional[str] = None) -> Dict[str, Any]:
     prof, ws = mem.get_user_profile(), settings.get_workspace()
     tone, onboarded = _resolve_tone(prof), prof.get("onboarded", "false").strip().lower() in ("true", "1", "yes")
+    from companion.worktrees import get_projects_root
+
+    proj_root_s = str(get_projects_root(mem))
     return {
         "ok": True, "onboarded": onboarded, "companion_tone": tone, "valid_tones": VALID_TONES,
         "companion_name": prof.get("companion_name") or DEFAULT_SOUL_AND_USER["companion_name"],
@@ -700,8 +745,8 @@ def _build_identity_snapshot(mem: MemoryStore, summary: Optional[str] = None) ->
         "user_name": prof.get("user_name") or DEFAULT_SOUL_AND_USER["user_name"],
         "user_profile": prof.get("user_profile") or DEFAULT_SOUL_AND_USER["user_profile"],
         "role": prof.get("role") or "", "communication_style": prof.get("communication_style") or "",
-        "workspace": {"project_id": ws.project_id, "project_root": str(ws.project_root), "is_self_project": ws.is_self_project, "self_root": str(ws.self_root), "known_projects": _load_known_projects(mem)},
-        "paths": {"data_dir": str(settings.effective_data_dir), "domains_dir": str(settings.domains_dir), "db_path": str(mem.db_path), "identity_md_path": str(settings.identity_md_path), "memory_md_path": str(settings.memory_md_path), "user_skills_dir": str(settings.user_skills_dir)},
+        "workspace": {"project_id": ws.project_id, "project_root": str(ws.project_root), "is_self_project": ws.is_self_project, "self_root": str(ws.self_root), "projects_root": proj_root_s, "known_projects": _load_known_projects(mem)},
+        "paths": {"projects_root": proj_root_s, "data_dir": str(settings.effective_data_dir), "domains_dir": str(settings.domains_dir), "db_path": str(mem.db_path), "identity_md_path": str(settings.identity_md_path), "memory_md_path": str(settings.memory_md_path), "user_skills_dir": str(settings.user_skills_dir)},
         "summary": summary or format_identity_summary(store=mem),
     }
 
@@ -727,9 +772,10 @@ def execute_identity_action(params: Optional[Dict[str, Any]] = None, actor: str 
         snap = _build_identity_snapshot(mem)
         snap["summary"] = f"Saved Identity & Profile (`{snap['companion_name']}` <-> `{snap['user_name']}`, tone=`{snap['companion_tone']}`)."
         return snap
-    if sub in ("project_self", "project_switch", "project_init"):
-        target = str(p.get("target") or p.get("path") or "").strip()
-        cmd = "self" if sub == "project_self" else f"{'init' if sub == 'project_init' else 'switch'} {target}".strip()
+    if sub in ("project_self", "project_switch", "project_init", "project_set_root", "project_reset_root"):
+        target = str(p.get("target") or p.get("path") or p.get("projects_root") or "").strip()
+        verb_map = {"project_self": "self", "project_init": f"init {target}", "project_set_root": f"root {target}", "project_reset_root": "reset_root"}
+        cmd = verb_map.get(sub, f"switch {target}").strip()
         msg = manage_active_project(cmd, store=mem)
         return {"ok": False, "error": msg} if msg.lower().startswith("error:") else _build_identity_snapshot(mem, summary=msg)
     return {"ok": False, "error": f"Unknown `identity` subaction `{sub}`."}
@@ -839,6 +885,9 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
     from companion.education_engine import format_education_hud
     from companion.integrations import format_connected_partners_hud
     from companion.projects import format_project_graph_hud
+    from companion.worktrees import get_projects_root
+
+    eff_projects_root = get_projects_root(mem)
 
     trust_mode, partners_hud = get_trust_mode(store=mem), format_connected_partners_hud(store=mem)
     partners_section = f"\n{partners_hud}\n" if partners_hud else ""
@@ -874,7 +923,7 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
         f"[RUNTIME & GOVERNANCE]\n"
         f"- Runtime  : {host_hud}\n"
         f"- Workspace: {ws_lock}\n"
-        f"- Paths    : data=`{settings.effective_data_dir}` | domains=`{settings.domains_dir}` | scratch=`{settings.scratch_dir}` | wiki=`{settings.wiki_dir}` | trust=`{trust_mode}` | privacy=`{settings.effective_privacy_mode()}`\n"
+        f"- Paths    : projects_root=`{eff_projects_root}` | data=`{settings.effective_data_dir}` | domains=`{settings.domains_dir}` | scratch=`{settings.scratch_dir}` | wiki=`{settings.wiki_dir}` | trust=`{trust_mode}` | privacy=`{settings.effective_privacy_mode()}`\n"
         f"{partners_section}{root_ctx_block}\n"
         f"{agile_hud}\n\n"
         f"{edu_hud}\n"
@@ -884,7 +933,7 @@ def build_system_prompt(store: Optional[MemoryStore] = None, wf_engine: Optional
         f"{skills_block}\n\n"
         f"[EXECUTION REMINDERS]\n"
         f"- Operate as one grounded, proactive ReAct agent: inspect first when uncertain, use deterministic scripts/SQL for exact math, and respond in clear plain English.\n"
-        f"- Use `wiki_manage` for Knowledge Wiki paths (`01_inbox/`..`04_archive/`), `agile_manage` for Goals/Boards, `calendar_manage` for schedule items, and `education_manage` for Courses/Flashcards.\n"
+        f"- Use `wiki_manage` for Knowledge Wiki paths (`01_inbox/`..`04_archive/`), `agile_manage` for Goals/Boards, `ops_manage(domain='projects', action='browse'|'mkdir'|'set_root'|'init'|'switch')` to browse or organize `projects_root` repos/subfolders, `calendar_manage` for schedule items, and `education_manage` for Courses/Flashcards.\n"
         f"- Large tool outputs automatically spill over to `data/scratch/`; use `read_file` or `search` on the spillover path if you need specific lines.\n"
         f"{os_rule}\n"
     )

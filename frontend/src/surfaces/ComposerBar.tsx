@@ -59,6 +59,7 @@ const CORE_SLASH_COMMANDS: SlashCommandItem[] = [
   { cmd: '/doctor', desc: 'Run 7-stage System Doctor diagnostics' },
   { cmd: '/compact', desc: 'Compact working window into long-term memory (keeps Forever Chat)' },
   { cmd: '/clear', desc: 'Fresh Focus — shift topic cleanly (keeps Forever Chat history)' },
+  { cmd: '/project ', desc: 'Browse, pin Projects Root, init, or switch active workspace (/project browse | root | init)' },
 ];
 
 export const ComposerBar: React.FC<ComposerBarProps> = ({

@@ -247,7 +247,7 @@ class ProjectGraphManager:
         metadata: Optional[Dict[str, Any]] = None, project_id: Optional[str] = None,
         init_git: bool = False, focus: bool = False, require_existing: bool = False,
     ) -> Dict[str, Any]:
-        from companion.worktrees import init_greenfield_repo, validate_external_repo_path
+        from companion.worktrees import get_projects_root, init_greenfield_repo, validate_external_repo_path
 
         clean_title = (title or "").strip()
         if not clean_title:
@@ -259,8 +259,14 @@ class ProjectGraphManager:
         eff_meta = dict(metadata or {})
         eff_kind = ("software" if kind in ("goal", "project", "") else kind) if init_git else kind
         raw_ws = (workspace_path or "").strip()
+        proj_root = get_projects_root(self.store)
         if init_git:
-            init_res = init_greenfield_repo(raw_ws or base_slug, title=clean_title, goal_summary=goal_summary)
+            eff_raw = raw_ws or base_slug
+            cand_i = Path(eff_raw).expanduser()
+            init_tgt = cand_i.resolve() if (cand_i.is_absolute() or eff_raw.startswith(("~", "/", "\\"))) else (proj_root / cand_i).resolve()
+            if bound_err := validate_external_repo_path(init_tgt, raw_input=eff_raw):
+                raise ValueError(bound_err)
+            init_res = init_greenfield_repo(init_tgt, title=clean_title, goal_summary=goal_summary)
             if not init_res.get("ok"):
                 raise ValueError(str(init_res.get("error") or "Failed to initialize Git repository."))
             ws_p = str(Path(str(init_res["repo_root"])).resolve())
@@ -268,8 +274,8 @@ class ProjectGraphManager:
             eff_meta["initial_commit"] = str(init_res.get("commit_sha") or "")
         elif raw_ws:
             cand = Path(raw_ws).expanduser()
-            resolved_ws = cand.resolve() if (cand.is_absolute() or raw_ws.startswith("~")) else (settings.projects_dir / cand).resolve()
-            if bound_err := validate_external_repo_path(resolved_ws):
+            resolved_ws = cand.resolve() if (cand.is_absolute() or raw_ws.startswith(("~", "/", "\\"))) else (proj_root / cand).resolve()
+            if bound_err := validate_external_repo_path(resolved_ws, raw_input=raw_ws):
                 raise ValueError(bound_err)
             if require_existing:
                 if not resolved_ws.is_dir():
@@ -325,7 +331,7 @@ class ProjectGraphManager:
         return [_hydrate_project(r) for r in rows]
 
     def update_project(self, project_id: str, **updates: Any) -> Dict[str, Any]:
-        from companion.worktrees import init_greenfield_repo, validate_external_repo_path
+        from companion.worktrees import get_projects_root, init_greenfield_repo, validate_external_repo_path
 
         proj = self.get_project(project_id)
         pid = proj["project_id"]
@@ -344,8 +350,14 @@ class ProjectGraphManager:
         wiki_p = str(updates.get("wiki_hub_path") if updates.get("wiki_hub_path") is not None else proj["wiki_hub_path"]).strip()
         raw_ws_p = updates.get("workspace_path")
         do_init = bool(updates.get("init_git"))
+        proj_root = get_projects_root(self.store)
         if do_init:
-            init_res = init_greenfield_repo(str(raw_ws_p or proj.get("workspace_path") or proj.get("slug") or title), title=title, goal_summary=goal_s)
+            eff_raw = str(raw_ws_p or proj.get("workspace_path") or proj.get("slug") or title).strip()
+            cand_u = Path(eff_raw).expanduser()
+            init_tgt = cand_u.resolve() if (cand_u.is_absolute() or eff_raw.startswith(("~", "/", "\\"))) else (proj_root / cand_u).resolve()
+            if bound_err := validate_external_repo_path(init_tgt, raw_input=eff_raw):
+                raise ValueError(bound_err)
+            init_res = init_greenfield_repo(init_tgt, title=title, goal_summary=goal_s)
             if not init_res.get("ok"):
                 raise ValueError(str(init_res.get("error") or "Failed to initialize Git repository."))
             ws_p = str(Path(str(init_res["repo_root"])).resolve())
@@ -353,8 +365,8 @@ class ProjectGraphManager:
             clean_ws = str(raw_ws_p).strip()
             if clean_ws:
                 cand = Path(clean_ws).expanduser()
-                res_ws = cand.resolve() if (cand.is_absolute() or clean_ws.startswith("~")) else (settings.projects_dir / cand).resolve()
-                if bound_err := validate_external_repo_path(res_ws):
+                res_ws = cand.resolve() if (cand.is_absolute() or clean_ws.startswith(("~", "/", "\\"))) else (proj_root / cand).resolve()
+                if bound_err := validate_external_repo_path(res_ws, raw_input=clean_ws):
                     raise ValueError(bound_err)
                 if bool(updates.get("require_existing")):
                     if not res_ws.is_dir():
@@ -898,4 +910,11 @@ def _precheck_active_goal_ready(store: MemoryStore) -> Tuple[bool, str]:
     return False, "no_ready_goal_items"
 
 
+def _lazy_resolve_projects_root() -> Optional[Path]:
+    from companion.worktrees import get_projects_root
+
+    return get_projects_root(None)
+
+
 register_trigger_precheck("active_goal_has_ready_items", _precheck_active_goal_ready)
+settings.register_projects_root_resolver(_lazy_resolve_projects_root)

@@ -66,14 +66,19 @@ __all__ = [
     "WORKTREE_CODE_TOOLS",
     "_current_branch",
     "_run_git_cmd",
+    "browse_projects_dir",
     "check_git_stage_safety",
     "collect_worktree_deliverable_receipt",
+    "create_projects_subfolder",
     "discard_worktree",
     "discover_repo_sdlc_context",
     "dispatch_parallel_ready_items",
     "dispatch_work_item_agent",
     "execute_agile_worktree_subaction",
     "format_parallel_subagents_tool",
+    "format_projects_browse_text",
+    "get_projects_root",
+    "get_projects_root_info",
     "init_greenfield_repo",
     "inspect_check_runs",
     "inspect_sdlc_repo_state",
@@ -88,6 +93,7 @@ __all__ = [
     "request_worktree_changes",
     "resolve_sdlc_slash_turn",
     "run_parallel_subagents",
+    "set_projects_root",
     "tool_dev_preview",
     "tool_git_manage",
     "upsert_pull_request",
@@ -191,8 +197,20 @@ _DEFAULT_GREENFIELD_GITIGNORE = (
 )
 
 
-def validate_external_repo_path(target: Path) -> Optional[str]:
-    """Mechanically block repository initialization or binding inside Companion's `app/`, `data/`, `$HOME`, or `/`."""
+_POSIX_SYS_ROOTS = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/run", "/var", "/opt/companion")
+_EXPLORER_SKIP_DIRS_LOWER = frozenset({
+    ".git", ".worktrees", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+    "coverage", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".companion_backups", "companion-data",
+})
+
+
+def validate_external_repo_path(target: Path, raw_input: str = "") -> Optional[str]:
+    """Mechanically block repo or `projects_root` paths inside `app/`, `data/`, `$HOME`, `/`, or OS system dirs."""
+    raw_s = (raw_input or str(target) or "").strip()
+    if "\x00" in raw_s or "\x00" in str(target):
+        return "SAFETY GUARD REJECTED: invalid repository path containing null byte."
+    if raw_s in ("/", "\\"):
+        return "SAFETY GUARD REJECTED: Repository path `/` cannot be the filesystem root or home directory directly."
     try:
         resolved = Path(target).expanduser().resolve()
     except Exception as exc:
@@ -200,20 +218,374 @@ def validate_external_repo_path(target: Path) -> Optional[str]:
     self_res = settings.root.resolve()
     data_res = settings.effective_data_dir.resolve()
     raw_data = (self_res / "data").resolve()
+    fallback_dir = settings.default_projects_dir
     if resolved == self_res or resolved.is_relative_to(self_res):
         return (
             f"SAFETY GUARD REJECTED: Repository path `{resolved}` cannot live inside Companion's immutable `app/` "
-            f"runtime (`{self_res}`). Create or attach repositories under `{settings.projects_dir}`."
+            f"runtime (`{self_res}`). Create or attach repositories under `{fallback_dir}`."
         )
     if resolved == data_res or resolved.is_relative_to(data_res) or resolved == raw_data or resolved.is_relative_to(raw_data):
         return (
             f"SAFETY GUARD REJECTED: Repository path `{resolved}` cannot live inside Companion's runtime `data/` "
-            f"directory (`{data_res}`). Create or attach repositories under `{settings.projects_dir}`."
+            f"directory (`{data_res}`). Create or attach repositories under `{fallback_dir}`."
         )
+    if self_res.name.lower() == "app" and self_res.parent.name.lower() == "companion" and resolved == self_res.parent.resolve():
+        return f"SAFETY GUARD REJECTED: Path `{resolved}` is Companion's runtime container directory; use `{fallback_dir}`."
     anchor_res = Path(resolved.anchor).resolve() if resolved.anchor else Path("/")
-    if resolved == anchor_res or resolved == Path.home().resolve():
+    home_res = Path.home().resolve()
+    if resolved == anchor_res or resolved == home_res:
         return f"SAFETY GUARD REJECTED: Repository path `{resolved}` cannot be the filesystem root or home directory directly."
+    if home_res.parent.resolve() != anchor_res and resolved == home_res.parent.resolve():
+        return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot be the top-level users directory directly (use `{fallback_dir}`)."
+    parts_low = {pt.lower() for pt in resolved.parts}
+    if parts_low & {".ssh", ".gnupg"}:
+        return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot live inside credential directory `.ssh`/`.gnupg`."
+    tmp_res = Path(tempfile.gettempdir()).resolve()
+    in_temp_dir = resolved != tmp_res and resolved.is_relative_to(tmp_res)
+    if not in_temp_dir:
+        if raw_s.startswith("/") and not raw_s.startswith("//"):
+            raw_norm = re.sub(r"/+", "/", raw_s.replace("\\", "/")).rstrip("/") or "/"
+            if raw_norm in ("/home", "/Users") or any(raw_norm == p or raw_norm.startswith(p + "/") for p in _POSIX_SYS_ROOTS):
+                return f"SAFETY GUARD REJECTED: Path `{raw_s}` cannot live inside protected system directory `{raw_norm}`."
+        if os.name != "nt":
+            res_posix = resolved.as_posix().rstrip("/") or "/"
+            if any(res_posix == p or res_posix.startswith(p + "/") for p in _POSIX_SYS_ROOTS):
+                return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot live inside protected system directory `{res_posix}`."
+        else:
+            win_roots = [
+                os.environ.get("SystemRoot", ""), os.environ.get("ProgramFiles", ""),
+                os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramData", ""),
+                "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)", "C:\\ProgramData",
+            ]
+            for wr in win_roots:
+                if wr.strip():
+                    with contextlib.suppress(Exception):
+                        wr_res = Path(wr).resolve()
+                        if resolved == wr_res or resolved.is_relative_to(wr_res):
+                            return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot live inside protected Windows system directory `{wr_res}`."
+            if len(resolved.parts) >= 2 and resolved.parts[1].lower() in ("windows", "system volume information", "$recycle.bin"):
+                return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot live inside protected Windows system directory."
     return None
+
+
+def _resolve_projects_root_store(store: Optional[MemoryStore] = None) -> Optional[MemoryStore]:
+    from companion import memory_store as _ms_mod
+
+    if store is not None:
+        return store
+    override = _ms_mod._STORE_OVERRIDE.get()
+    if override is not None:
+        return override
+    if "unittest" in sys.modules or os.environ.get("COMPANION_TEST_MODE") == "1":
+        return None
+    if _ms_mod._store_instance is not None and _ms_mod._store_instance._is_usable():
+        return _ms_mod._store_instance
+    return get_memory_store() if settings.db_path.is_file() else None
+
+
+def get_projects_root_info(store: Optional[MemoryStore] = None) -> Dict[str, Any]:
+    """Resolve `user_profile['projects_root']` -> `COMPANION_PROJECTS_DIR` -> auto-detected `default_projects_dir`."""
+    eff_store = _resolve_projects_root_store(store)
+    default_dir = settings.default_projects_dir.resolve()
+    env_set = bool(os.environ.get("COMPANION_PROJECTS_DIR", "").strip())
+    raw_pinned = (eff_store.get_user_profile().get("projects_root") or "").strip() if eff_store is not None else ""
+    if raw_pinned:
+        with contextlib.suppress(Exception):
+            cand = Path(raw_pinned).expanduser()
+            res_cand = cand.resolve() if (cand.is_absolute() or raw_pinned.startswith("~")) else (Path.home() / cand).resolve()
+            if validate_external_repo_path(res_cand, raw_input=raw_pinned) is None:
+                return {
+                    "projects_root": res_cand,
+                    "default_projects_root": default_dir,
+                    "is_custom_root": True,
+                    "root_source": "user_profile",
+                }
+    return {
+        "projects_root": default_dir,
+        "default_projects_root": default_dir,
+        "is_custom_root": False,
+        "root_source": "env" if env_set else "auto",
+    }
+
+
+def get_projects_root(store: Optional[MemoryStore] = None) -> Path:
+    """Return the active resolved `projects_root` directory `Path`."""
+    return Path(get_projects_root_info(store)["projects_root"]).resolve()
+
+
+def set_projects_root(raw_path: str = "", reset: bool = False, store: Optional[MemoryStore] = None) -> Dict[str, Any]:
+    """Validate, `mkdir -p`, and persist `user_profile['projects_root']` (or reset to host default)."""
+    mem = store or get_memory_store()
+    clean = (raw_path or "").strip().strip("'\"")
+    if reset or clean.lower() in ("reset", "default"):
+        mem.set_user_profile("projects_root", "")
+        info = get_projects_root_info(mem)
+        eff = Path(info["projects_root"]).resolve()
+        if validate_external_repo_path(eff) is None:
+            eff.mkdir(parents=True, exist_ok=True)
+        if mem.db_path.resolve() == settings.db_path.resolve():
+            mem.sync_memory_md()
+        return {
+            "ok": True,
+            "projects_root": str(eff),
+            "projects_dir": str(eff),
+            "default_projects_root": str(info["default_projects_root"]),
+            "is_custom_root": False,
+            "root_source": str(info["root_source"]),
+            "summary": f"Reset Projects Root to default `{eff}` (`{info['root_source']}`).",
+        }
+    if not clean:
+        return {"ok": False, "error": "Projects Root path is required (or pass `reset=True` to restore default)."}
+    try:
+        cand = Path(clean).expanduser()
+        resolved = cand.resolve() if (cand.is_absolute() or clean.startswith(("~", "/", "\\"))) else (Path.home() / cand).resolve()
+    except Exception as exc:
+        return {"ok": False, "error": f"SAFETY GUARD REJECTED: invalid Projects Root `{clean}` ({exc})."}
+    if bound_err := validate_external_repo_path(resolved, raw_input=clean):
+        return {"ok": False, "error": bound_err}
+    if resolved.exists() and not resolved.is_dir():
+        return {"ok": False, "error": f"SAFETY GUARD REJECTED: `{resolved}` is an existing file, not a directory."}
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not create Projects Root directory `{resolved}`: {exc}"}
+    mem.set_user_profile("projects_root", str(resolved))
+    if mem.db_path.resolve() == settings.db_path.resolve():
+        mem.sync_memory_md()
+    return {
+        "ok": True,
+        "projects_root": str(resolved),
+        "projects_dir": str(resolved),
+        "default_projects_root": str(settings.default_projects_dir.resolve()),
+        "is_custom_root": True,
+        "root_source": "user_profile",
+        "summary": f"Pinned Projects Root to `{resolved}`.",
+    }
+
+
+def _fast_git_branch(repo_dir: Path) -> str:
+    """Read `.git/HEAD` directly in `<0.1ms` without spawning a subprocess per folder row."""
+    dot_git = repo_dir / ".git"
+    with contextlib.suppress(OSError):
+        if dot_git.is_dir():
+            head_f = dot_git / "HEAD"
+            if head_f.is_file():
+                raw_h = head_f.read_text(encoding="utf-8", errors="ignore").strip()
+                if raw_h.startswith("ref: refs/heads/"):
+                    return raw_h[len("ref: refs/heads/") :].strip()
+                if raw_h.startswith("ref: "):
+                    return raw_h.rsplit("/", 1)[-1].strip()
+                return raw_h[:7] if raw_h else "HEAD"
+        elif dot_git.is_file():
+            gtxt = dot_git.read_text(encoding="utf-8", errors="ignore").strip()
+            if gtxt.startswith("gitdir:"):
+                raw_gd = gtxt.split(":", 1)[1].strip()
+                gd_path = (repo_dir / raw_gd).resolve() if not Path(raw_gd).is_absolute() else Path(raw_gd).resolve()
+                head_f = gd_path / "HEAD"
+                if head_f.is_file():
+                    raw_h = head_f.read_text(encoding="utf-8", errors="ignore").strip()
+                    if raw_h.startswith("ref: refs/heads/"):
+                        return raw_h[len("ref: refs/heads/") :].strip()
+                    return raw_h[:7] if raw_h else "HEAD"
+    br = _current_branch(repo_dir)
+    return "main" if br == "HEAD" else br
+
+
+def _has_visible_subdirs(dir_path: Path, projects_root: Path) -> bool:
+    with contextlib.suppress(OSError):
+        with os.scandir(dir_path) as it:
+            for sc in it:
+                if sc.name.startswith(".") or sc.name.lower() in _EXPLORER_SKIP_DIRS_LOWER:
+                    continue
+                with contextlib.suppress(OSError):
+                    if sc.is_dir():
+                        c_res = Path(sc.path).resolve()
+                        if c_res.is_relative_to(projects_root):
+                            return True
+    return False
+
+
+def format_projects_browse_text(data: Dict[str, Any]) -> str:
+    """Render a clean, human- and LLM-readable summary of `browse_projects_dir` output."""
+    if not data.get("ok"):
+        return f"error: {data.get('error') or 'Failed to browse Projects Root.'}"
+    proot = data.get("projects_root", "")
+    rel = data.get("current_rel_path") or "."
+    src = "pinned" if data.get("is_custom_root") else str(data.get("root_source") or "auto")
+    entries = data.get("entries") or []
+    head = f"=== Projects Explorer (`{proot}` [{src}] | path=`{rel}` | {len(entries)} folder(s)) ==="
+    if not entries:
+        note = "  (Root directory will be created on first repo/folder.)" if not data.get("exists", True) else "  (No subfolders or repositories here yet.)"
+        return f"{head}\n{note}"
+    rows: List[str] = []
+    for e in entries:
+        badges = [f"Git Repo · {e['branch']}" if e.get("branch") else "Git Repo"] if e.get("is_git_repo") else ["Folder"]
+        if e.get("linked_project_title"):
+            badges.append(f"Linked Project: {e['linked_project_title']}")
+        rows.append(f"  * `{e['rel_path']}/` [{', '.join(badges)}] -> {e['abs_path']}")
+    return "\n".join([head, *rows])
+
+
+def browse_projects_dir(rel_path: str = "", store: Optional[MemoryStore] = None) -> Dict[str, Any]:
+    """List child folders & Git repos confined strictly under `projects_root` (`resolved.is_relative_to(projects_root)`)."""
+    eff_store = _resolve_projects_root_store(store)
+    info = get_projects_root_info(eff_store)
+    projects_root = Path(info["projects_root"]).resolve()
+    raw = (rel_path or "").strip().strip("'\"")
+    if "\x00" in raw:
+        return {"ok": False, "projects_root": str(projects_root), "projects_dir": str(projects_root), "error": "SAFETY GUARD REJECTED: invalid path."}
+    if raw in ("", "."):
+        resolved = projects_root
+    else:
+        cand_exp = Path(raw).expanduser()
+        if raw.startswith("~") or (cand_exp.is_absolute() and (os.name != "nt" or bool(re.match(r"^[A-Za-z]:[\\/]", raw)))):
+            resolved = cand_exp.resolve()
+        elif raw.startswith(("/", "\\")):
+            return {
+                "ok": False,
+                "projects_root": str(projects_root),
+                "projects_dir": str(projects_root),
+                "error": f"SAFETY GUARD REJECTED: Browse `rel_path` (`{raw}`) must be relative to Projects Root (`{projects_root}`), not `/ `.",
+            }
+        else:
+            resolved = (projects_root / raw).resolve()
+
+    if not resolved.is_relative_to(projects_root):
+        return {
+            "ok": False,
+            "projects_root": str(projects_root),
+            "projects_dir": str(projects_root),
+            "error": f"SAFETY GUARD REJECTED: Path `{raw}` escapes Projects Root (`{projects_root}`).",
+        }
+    cur_rel = "" if resolved == projects_root else resolved.relative_to(projects_root).as_posix()
+    can_go_up = resolved != projects_root
+    parent_rel = (
+        ""
+        if not can_go_up or resolved.parent.resolve() == projects_root
+        else resolved.parent.resolve().relative_to(projects_root).as_posix()
+    )
+    crumbs = [{"label": "Root", "rel_path": ""}]
+    if cur_rel:
+        acc: List[str] = []
+        for seg in cur_rel.split("/"):
+            acc.append(seg)
+            crumbs.append({"label": seg, "rel_path": "/".join(acc)})
+
+    base_payload: Dict[str, Any] = {
+        "ok": True,
+        "projects_root": str(projects_root),
+        "projects_dir": str(projects_root),
+        "default_projects_root": str(info["default_projects_root"]),
+        "is_custom_root": bool(info["is_custom_root"]),
+        "root_source": str(info["root_source"]),
+        "exists": resolved.is_dir(),
+        "current_rel_path": cur_rel,
+        "current_abs_path": str(resolved),
+        "parent_rel_path": parent_rel,
+        "can_go_up": can_go_up,
+        "breadcrumbs": crumbs,
+        "entries": [],
+    }
+    if not resolved.exists():
+        if resolved == projects_root:
+            base_payload["summary"] = format_projects_browse_text(base_payload)
+            return base_payload
+        return {"ok": False, "projects_root": str(projects_root), "projects_dir": str(projects_root), "error": f"Directory `{cur_rel}` does not exist under `{projects_root}`."}
+    if not resolved.is_dir():
+        return {"ok": False, "projects_root": str(projects_root), "projects_dir": str(projects_root), "error": f"Path `{cur_rel}` is a file, not a directory."}
+
+    base_payload["entries"] = _scan_projects_dir_entries(resolved, projects_root, eff_store)
+    base_payload["summary"] = format_projects_browse_text(base_payload)
+    return base_payload
+
+
+def _scan_projects_dir_entries(resolved: Path, projects_root: Path, eff_store: Optional[MemoryStore]) -> List[Dict[str, Any]]:
+    linked_map: Dict[Path, Tuple[str, str]] = {}
+    if eff_store is not None:
+        with contextlib.suppress(Exception):
+            for proj in get_project_graph(eff_store).list_projects(status="active"):
+                ws_p = str(proj.get("workspace_path") or "").strip()
+                if ws_p:
+                    with contextlib.suppress(Exception):
+                        linked_map[Path(ws_p).resolve()] = (str(proj["project_id"]), str(proj["title"]))
+    self_res, data_res = settings.root.resolve(), settings.effective_data_dir.resolve()
+    entries: List[Dict[str, Any]] = []
+    with contextlib.suppress(OSError):
+        with os.scandir(resolved) as it:
+            for sc in it:
+                if sc.name.startswith(".") or sc.name.lower() in _EXPLORER_SKIP_DIRS_LOWER:
+                    continue
+                with contextlib.suppress(OSError):
+                    if not sc.is_dir():
+                        continue
+                    child_res = Path(sc.path).resolve()
+                    if not child_res.is_relative_to(projects_root) or child_res in (self_res, data_res):
+                        continue
+                    is_git = (child_res / ".git").exists()
+                    linked_pid, linked_title = linked_map.get(child_res, ("", ""))
+                    entries.append({
+                        "name": sc.name,
+                        "rel_path": child_res.relative_to(projects_root).as_posix(),
+                        "abs_path": str(child_res),
+                        "is_git_repo": is_git,
+                        "branch": _fast_git_branch(child_res) if is_git else "",
+                        "has_children": _has_visible_subdirs(child_res, projects_root),
+                        "linked_project_id": linked_pid,
+                        "linked_project_title": linked_title,
+                    })
+    entries.sort(key=lambda e: (str(e["name"]).lower(), str(e["name"])))
+    return entries
+
+
+def create_projects_subfolder(
+    rel_path: str = "", parent_rel_path: str = "", name: str = "", store: Optional[MemoryStore] = None,
+) -> Dict[str, Any]:
+    """Create a plain organizational subfolder under `projects_root` without initializing Git."""
+    eff_store = _resolve_projects_root_store(store)
+    projects_root = get_projects_root(eff_store)
+    if root_err := validate_external_repo_path(projects_root):
+        return {"ok": False, "error": root_err}
+    raw_rel = (rel_path or "").strip().strip("'\"")
+    if not raw_rel:
+        p_clean = (parent_rel_path or "").strip().replace("\\", "/").strip("/")
+        n_clean = (name or "").strip().replace("\\", "/").strip("/")
+        raw_rel = f"{p_clean}/{n_clean}" if (p_clean and n_clean) else n_clean
+    norm = raw_rel.replace("\\", "/").strip("/")
+    if not norm:
+        return {"ok": False, "error": "Subfolder name is required."}
+    segments = [seg.strip() for seg in norm.split("/") if seg.strip()]
+    for seg in segments:
+        if seg in (".", ".."):
+            return {"ok": False, "error": "SAFETY GUARD REJECTED: `..` path traversal is blocked when creating subfolders."}
+        if seg.startswith(".") or seg.lower() in _EXPLORER_SKIP_DIRS_LOWER:
+            return {"ok": False, "error": f"SAFETY GUARD REJECTED: Hidden or reserved folder name `{seg}` is not allowed."}
+        if any(ch in seg for ch in '<>:"|?*\x00'):
+            return {"ok": False, "error": f"Invalid folder name `{seg}`."}
+    target = (projects_root / Path(*segments)).resolve()
+    if target == projects_root or not target.is_relative_to(projects_root):
+        return {"ok": False, "error": f"SAFETY GUARD REJECTED: Subfolder target escapes Projects Root (`{projects_root}`)."}
+    if bound_err := validate_external_repo_path(target):
+        return {"ok": False, "error": bound_err}
+    if target.exists() and not target.is_dir():
+        return {"ok": False, "error": f"Cannot create folder `{target.name}`: a file with that name already exists."}
+    existed = target.is_dir()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not create subfolder `{target}`: {exc}"}
+    created_rel = target.relative_to(projects_root).as_posix()
+    browse_state = browse_projects_dir(created_rel, store=eff_store)
+    return {
+        **browse_state,
+        "ok": True,
+        "created": not existed,
+        "rel_path": created_rel,
+        "abs_path": str(target),
+        "summary": f"{'Created' if not existed else 'Opened existing'} subfolder `{created_rel}` at `{target}`.",
+    }
+
+
+settings.register_projects_root_resolver(lambda: get_projects_root(None))
 
 
 _NON_IMPL_CONFIG_FILES = frozenset({
@@ -553,13 +925,14 @@ def init_greenfield_repo(
 ) -> Dict[str, Any]:
     """Idempotently initialize an external Git repository on `main` with `.gitignore`, `README.md`, and initial commit."""
     raw = str(target_path or "").strip().strip("'\"")
+    proj_root = get_projects_root()
     if not raw:
         slug = _slugify_part(title or "new-project", fallback="new-project", max_len=48)
-        target = (settings.projects_dir / slug).resolve()
+        target = (proj_root / slug).resolve()
     else:
         cand = Path(raw).expanduser()
-        target = cand.resolve() if (cand.is_absolute() or raw.startswith("~")) else (settings.projects_dir / cand).resolve()
-    bound_err = validate_external_repo_path(target)
+        target = cand.resolve() if (cand.is_absolute() or raw.startswith("~")) else (proj_root / cand).resolve()
+    bound_err = validate_external_repo_path(target, raw_input=raw)
     if bound_err:
         return {"ok": False, "error": bound_err}
     if shutil.which("git") is None:
@@ -1489,18 +1862,18 @@ def _detect_stack_and_rules(root: Path) -> Tuple[str, List[str]]:
 def probe_repo_workspace(path_str: str) -> Dict[str, Any]:
     """Inspect a candidate repository path without mutating anything (powers UI `Check Repo`)."""
     raw = (path_str or "").strip()
-    proj_dir = str(settings.projects_dir)
+    proj_dir = str(get_projects_root())
     if not raw:
-        return {"ok": False, "exists": False, "is_git_repo": False, "projects_dir": proj_dir, "error": "Repository path is required."}
+        return {"ok": False, "exists": False, "is_git_repo": False, "projects_root": proj_dir, "projects_dir": proj_dir, "error": "Repository path is required."}
     cand = Path(raw).expanduser()
-    target = cand.resolve() if (cand.is_absolute() or raw.startswith("~")) else (settings.projects_dir / cand).resolve()
-    bound_err = validate_external_repo_path(target)
+    target = cand.resolve() if (cand.is_absolute() or raw.startswith("~")) else (Path(proj_dir) / cand).resolve()
+    bound_err = validate_external_repo_path(target, raw_input=raw)
     if bound_err:
         return {
             "ok": False, "exists": target.exists(), "is_git_repo": False, "can_init": False,
-            "repo_root": str(target), "projects_dir": proj_dir, "error": bound_err, "summary": bound_err,
+            "repo_root": str(target), "projects_root": proj_dir, "projects_dir": proj_dir, "error": bound_err, "summary": bound_err,
         }
-    base_res = {"ok": True, "repo_root": str(target), "projects_dir": proj_dir, "branch": "", "clean": True, "changed_count": 0, "remote_url": ""}
+    base_res = {"ok": True, "repo_root": str(target), "projects_root": proj_dir, "projects_dir": proj_dir, "branch": "", "clean": True, "changed_count": 0, "remote_url": ""}
     if not target.exists() or not target.is_dir():
         return {**base_res, "exists": False, "is_git_repo": False, "can_init": True, "stack_summary": "", "rules_files": [], "summary": f"Path ready — will initialize new Git repo on main at `{target}`."}
     stack_sum, rules_files = _detect_stack_and_rules(target)
@@ -1517,7 +1890,7 @@ def probe_repo_workspace(path_str: str) -> Dict[str, Any]:
     rules_note = f" · {len(rules_files)} rules file{'s' if len(rules_files) != 1 else ''}" if rules_files else ""
     clean_lbl = "Clean" if not changed else f"{len(changed)} changed"
     return {
-        "ok": True, "exists": True, "is_git_repo": True, "can_init": True, "repo_root": str(target), "projects_dir": proj_dir,
+        "ok": True, "exists": True, "is_git_repo": True, "can_init": True, "repo_root": str(target), "projects_root": proj_dir, "projects_dir": proj_dir,
         "branch": branch, "clean": not changed, "changed_count": len(changed), "remote_url": remote_url,
         "stack_summary": stack_sum, "rules_files": rules_files,
         "summary": f"Git repo on {branch} · {clean_lbl} · {stack_sum}{rules_note}",
@@ -2009,9 +2382,26 @@ def execute_agile_worktree_subaction(
     sub: str, pid: str, p: Dict[str, Any], _actor: str, mem: MemoryStore,
     job_mgr_fn: Callable[..., BackgroundJobManager] = get_job_manager,
 ) -> Optional[Dict[str, Any]]:
-    """Handle Studio repo probe, parallel worktree dispatch, and 1-click deliverable subactions for `agile`."""
+    """Handle Studio repo probe, `projects_root` explorer/pinning, parallel worktrees, and deliverable subactions."""
     if sub == "probe_repo":
         return probe_repo_workspace(str(p.get("workspace_path") or p.get("path") or ""))
+    if sub in ("browse_projects", "browse_projects_dir", "browse_dir", "browse"):
+        return browse_projects_dir(str(p.get("rel_path") or p.get("path") or p.get("workspace_path") or ""), store=mem)
+    if sub in ("create_projects_subfolder", "create_subfolder", "mkdir_projects", "mkdir"):
+        return create_projects_subfolder(
+            rel_path=str(p.get("rel_path") or p.get("path") or ""),
+            parent_rel_path=str(p.get("parent_rel_path") or p.get("parent") or ""),
+            name=str(p.get("name") or p.get("folder_name") or ""),
+            store=mem,
+        )
+    if sub in ("set_projects_root", "set_root"):
+        return set_projects_root(
+            str(p.get("projects_root") or p.get("path") or p.get("workspace_path") or p.get("target") or ""),
+            reset=bool_arg(p, "reset", False),
+            store=mem,
+        )
+    if sub in ("reset_projects_root", "reset_root"):
+        return set_projects_root("", reset=True, store=mem)
     ref = str(p.get("item_id") or p.get("card_id") or "").strip()
     bg = p.get("run_in_background")
     run_bg = True if bg is None else (bg if isinstance(bg, bool) else str(bg).strip().lower() in ("1", "true", "yes", "on"))

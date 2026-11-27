@@ -30,7 +30,7 @@ from companion.wiki_curation import commit_curation_plan, inspect_graduation, li
 from companion.wiki import get_wiki_engine
 from companion.wiki import execute_wiki_maintenance_subaction
 from companion.wiki import get_template, list_templates, load_tag_authority, save_template, slugify_wiki
-from companion.worktrees import execute_agile_worktree_subaction
+from companion.worktrees import execute_agile_worktree_subaction, get_projects_root
 
 __all__ = ["CORE_ACTIONS", "HARVEST_SLASH_VERBS", "ActionSpec", "execute_core_action", "handle_harvest_slash", "list_core_actions"]
 
@@ -596,7 +596,8 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
             trigger_policy=tp_in, project_id=pid or None, init_git=do_init, focus=do_focus, require_existing=req_exist,
         )
         ws_note = f", repo=`{proj['workspace_path']}`" if proj.get("workspace_path") else ""
-        return {"ok": True, "project": proj, "board": proj, "projects_dir": str(settings.projects_dir), "summary": f"Saved project/goal `{proj['title']}` (`{proj['project_id']}`, delivery_policy=`{proj['delivery_policy']}`{ws_note})."}
+        pr_str = str(get_projects_root(mem))
+        return {"ok": True, "project": proj, "board": proj, "projects_root": pr_str, "projects_dir": pr_str, "summary": f"Saved project/goal `{proj['title']}` (`{proj['project_id']}`, delivery_policy=`{proj['delivery_policy']}`{ws_note})."}
     if sub == "update_project":
         proj_upd = {k: v for k, v in p.items() if k in ("title", "goal_summary", "kind", "status", "wiki_hub_path", "workspace_path", "delivery_policy", "git_credential_ref", "max_parallel_workers", "test_command", "preview_command", "trigger_policy", "metadata")}
         if "init_git" in p:
@@ -608,7 +609,8 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         if "goal_summary" not in proj_upd and "description" in p:
             proj_upd["goal_summary"] = str(p.get("description") or "")
         proj = mgr.update_project(pid or mgr.resolve_project_id(), **proj_upd)
-        return {"ok": True, "project": proj, "projects_dir": str(settings.projects_dir), "summary": f"Updated project `{proj['project_id']}` (delivery_policy=`{proj['delivery_policy']}`)."}
+        pr_str = str(get_projects_root(mem))
+        return {"ok": True, "project": proj, "projects_root": pr_str, "projects_dir": pr_str, "summary": f"Updated project `{proj['project_id']}` (delivery_policy=`{proj['delivery_policy']}`)."}
     if sub in ("create_card", "save_card", "add_card", "create_item"):
         ref = str(p.get("item_id") or p.get("card_id") or "").strip()
         if ref:
@@ -658,13 +660,15 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         return {"ok": True, **rmap, "summary": f"Roadmap `{rmap['project']['title']}`: {len(rmap['milestones'])} milestone(s)."}
     if sub == "list_boards":
         projs = mgr.list_projects()
-        return {"ok": True, "boards": projs, "projects": projs, "projects_dir": str(settings.projects_dir), "summary": "Projects & Goals: " + ", ".join(f"`{x['slug']}` ({x['kind']})" for x in projs)}
+        pr_str = str(get_projects_root(mem))
+        return {"ok": True, "boards": projs, "projects": projs, "projects_root": pr_str, "projects_dir": pr_str, "summary": "Projects & Goals: " + ", ".join(f"`{x['slug']}` ({x['kind']})" for x in projs)}
     if sub not in ("", "board_view", "view", "status", "get"):
         return {"ok": False, "error": f"Unknown agile subaction `{sub}`."}
     view = mgr.get_board_projection(pid or None, timebox_id=str(p.get("sprint_id") or p.get("timebox_id") or "") or None, owner_filter=str(p.get("owner") or "") or None)
     cnt, rows = view["counts"], [f"  - `{it['item_id']}` [`{it['owner']}` | `{it['status']}`]: {it['title']}" for it in view.get("items", [])[:15]]
+    pr_str = str(get_projects_root(mem))
     return {
-        "ok": True, **view, "boards": mgr.list_projects(), "projects_dir": str(settings.projects_dir), "aging_cards": [],
+        "ok": True, **view, "boards": mgr.list_projects(), "projects_root": pr_str, "projects_dir": pr_str, "aging_cards": [],
         "summary": f"Project `{view['project']['title']}`: total={cnt['total']}, companion_ready={cnt['companion_ready']}, human_pending={cnt['human_pending']}, blocked={cnt['blocked']}, done={cnt['done']}." + ("\n" + "\n".join(rows) if rows else ""),
     }
 

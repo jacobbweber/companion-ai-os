@@ -1,25 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import {
-  Cpu,
-  Folder,
-  Globe,
-  KeyRound,
-  Palette,
-  Plus,
-  Settings2,
-  Sliders,
-  Trash2,
-  UserCheck,
-  X,
-} from 'lucide-react';
+import { Cpu, Folder, Globe, KeyRound, Palette, Plus, Settings2, Sliders, Trash2, UserCheck, X } from 'lucide-react';
 import { apiPost, callAction } from '../api';
-import type {
-  ProjectGraphEntry,
-  PromptTemplate,
-  SettingsSectionId,
-  ThemeId,
-  WebStatus,
-} from '../types';
+import type { ProjectGraphEntry, PromptTemplate, SettingsSectionId, ThemeId, WebStatus } from '../types';
 import { SettingsInfraPanel } from './SettingsInfraPanel';
 import { SettingsModelsPanel } from './SettingsModelsPanel';
 
@@ -71,6 +53,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [compTone, setCompTone] = useState(status?.companion_tone || status?.tone || 'balanced');
   const [uName, setUName] = useState(status?.user_name || 'Partner');
   const [uProf, setUProf] = useState(status?.user_profile || '');
+  const [projectsRootDraft, setProjectsRootDraft] = useState(
+    status?.projects_root || status?.projects_dir || status?.workspace?.projects_dir || ''
+  );
+  const [savingProjectsRoot, setSavingProjectsRoot] = useState(false);
+
+  useEffect(() => {
+    const nextRoot = status?.projects_root || status?.projects_dir || status?.workspace?.projects_dir || '';
+    if (nextRoot) setProjectsRootDraft(nextRoot);
+  }, [status?.projects_root, status?.projects_dir, status?.workspace?.projects_dir]);
+
+  const saveProjectsRootSetting = async (reset = false) => {
+    if (!reset && !projectsRootDraft.trim()) {
+      onToast('Enter a valid Projects Root directory path.');
+      return;
+    }
+    setSavingProjectsRoot(true);
+    try {
+      const res = await callAction<{ projects_root?: string; summary?: string; error?: string }>('agile', {
+        subaction: reset ? 'reset_projects_root' : 'set_projects_root',
+        projects_root: projectsRootDraft.trim(),
+        reset,
+      });
+      if (!res.ok) {
+        onToast(res.error || 'Could not update Projects Root.');
+        return;
+      }
+      if (res.projects_root) setProjectsRootDraft(res.projects_root);
+      await onRefreshStatus();
+      onToast(res.summary || 'Updated Projects Root.');
+    } finally {
+      setSavingProjectsRoot(false);
+    }
+  };
 
   // Saved Prompts Library state
   const [prompts, setPrompts] = useState<PromptTemplate[]>([]);
@@ -136,34 +151,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const sectionMeta: Record<SettingsSectionId, { title: string; sub: string }> = {
-    general: {
-      title: 'General & Autonomy',
-      sub: 'Configure operating levers, execution permissions, and LAN privacy boundaries.',
-    },
-    appearance: {
-      title: 'Appearance',
-      sub: 'Select color theme and visual surface contrast.',
-    },
-    identity: {
-      title: 'Identity & Soul',
-      sub: 'Customize Companion name, communication ethos, and your operator profile.',
-    },
-    models: {
-      title: 'Models & Tiers',
-      sub: 'Manage LLM providers, Blind Vault API bindings, capability tiers, and context compaction.',
-    },
-    vault: {
-      title: 'Blind Credential Vault & Endpoints',
-      sub: 'Zero-reveal secret references and remote SSH, WinRM, and HTTP endpoints.',
-    },
-    federation: {
-      title: 'Partner Federation & Hosted MCP',
-      sub: 'Configure inbound MCP order counter and paired remote Companion instances.',
-    },
-    ops: {
-      title: 'Backups & System Doctor',
-      sub: 'Secret-free snapshots, 7-stage System Doctor, and service reload.',
-    },
+    general: { title: 'General & Autonomy', sub: 'Configure operating levers, execution permissions, and LAN privacy boundaries.' },
+    appearance: { title: 'Appearance', sub: 'Select color theme and visual surface contrast.' },
+    identity: { title: 'Identity & Soul', sub: 'Customize Companion name, communication ethos, and your operator profile.' },
+    models: { title: 'Models & Tiers', sub: 'Manage LLM providers, Blind Vault API bindings, capability tiers, and context compaction.' },
+    vault: { title: 'Blind Credential Vault & Endpoints', sub: 'Zero-reveal secret references and remote SSH, WinRM, and HTTP endpoints.' },
+    federation: { title: 'Partner Federation & Hosted MCP', sub: 'Configure inbound MCP order counter and paired remote Companion instances.' },
+    ops: { title: 'Backups & System Doctor', sub: 'Secret-free snapshots, 7-stage System Doctor, and service reload.' },
   };
 
   return (
@@ -302,6 +296,54 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </div>
                     </div>
                     <span className="badge ok" data-testid="immutable-app-badge">Immutable</span>
+                  </div>
+
+                  <div
+                    className="card-row"
+                    style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}
+                    data-testid="settings-projects-root-row"
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <div className="card-row-info">
+                        <div className="card-row-title">Projects Root Directory</div>
+                        <div className="card-row-desc">
+                          Pinned host folder where Companion browses subfolders, initializes greenfield Git repos, and attaches clones.
+                        </div>
+                      </div>
+                      <span className={`badge ${status?.projects_root_is_custom ? 'ok' : ''}`} data-testid="settings-projects-root-badge">
+                        {status?.projects_root_is_custom ? 'Pinned' : 'Default'}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      <input
+                        className="input mono"
+                        data-testid="settings-projects-root-input"
+                        style={{ flex: '1 1 240px' }}
+                        placeholder="e.g. /home/spark/projects or D:/Projects"
+                        value={projectsRootDraft}
+                        onChange={(e) => setProjectsRootDraft(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        data-testid="settings-save-projects-root-btn"
+                        disabled={savingProjectsRoot}
+                        onClick={() => void saveProjectsRootSetting(false)}
+                      >
+                        {savingProjectsRoot ? 'Saving...' : 'Save Root'}
+                      </button>
+                      {status?.projects_root_is_custom && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          data-testid="settings-reset-projects-root-btn"
+                          disabled={savingProjectsRoot}
+                          onClick={() => void saveProjectsRootSetting(true)}
+                        >
+                          Reset Default
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   <div className="card-row">

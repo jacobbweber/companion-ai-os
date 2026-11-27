@@ -326,6 +326,7 @@ class Settings:
         self._ws_lock = threading.RLock()
         self._runtime_tier_resolver: Optional[Callable[[str, Dict[str, TierConfig]], Optional[TierConfig]]] = None
         self._runtime_privacy_resolver: Optional[Callable[[str], str]] = None
+        self._runtime_projects_root_resolver: Optional[Callable[[], Optional[Path]]] = None
         self._workspace = WorkspaceContext(
             project_id=SELF_PROJECT_ID,
             project_root=self.root.resolve(),
@@ -374,6 +375,10 @@ class Settings:
         """Bind Domain-layer dynamic SQLite/Vault tier & privacy resolvers without upward A-Frame imports."""
         self._runtime_tier_resolver = tier_fn
         self._runtime_privacy_resolver = privacy_fn
+
+    def register_projects_root_resolver(self, resolver_fn: Optional[Callable[[], Optional[Path]]]) -> None:
+        """Bind Domain-layer SQLite `user_profile['projects_root']` resolver without upward A-Frame imports."""
+        self._runtime_projects_root_resolver = resolver_fn
 
     def effective_privacy_mode(self) -> str:
         """Return active privacy policy (`hybrid`, `local_only`, or `cloud_allowed`)."""
@@ -516,8 +521,8 @@ class Settings:
         return self.effective_data_dir / "scratch"
 
     @property
-    def projects_dir(self) -> Path:
-        """Return default parent directory for external Git repos (`COMPANION_PROJECTS_DIR`), never inside `app/` or `data/`."""
+    def default_projects_dir(self) -> Path:
+        """Return fallback parent directory for external Git repos (`COMPANION_PROJECTS_DIR` -> host auto-detect)."""
         override = os.environ.get("COMPANION_PROJECTS_DIR", "").strip()
         if override:
             p = Path(override).expanduser()
@@ -537,6 +542,15 @@ class Settings:
         if is_packaged_runtime:
             return (Path.home() / "projects").resolve()
         return parent_res
+
+    @property
+    def projects_dir(self) -> Path:
+        """Return active `projects_root` (`user_profile['projects_root']` -> `COMPANION_PROJECTS_DIR` -> auto-detect)."""
+        if self._runtime_projects_root_resolver is not None:
+            dyn_root = self._runtime_projects_root_resolver()
+            if dyn_root is not None:
+                return dyn_root
+        return self.default_projects_dir
 
     @property
     def compact_trigger_tokens(self) -> int:
@@ -574,7 +588,9 @@ class Settings:
             "secrets_env_present": self.secrets_env_path.is_file(),
             "root": str(self.root),
             "data_dir": str(self.effective_data_dir),
+            "projects_root": str(self.projects_dir),
             "projects_dir": str(self.projects_dir),
+            "default_projects_root": str(self.default_projects_dir),
             "wiki_dir": str(self.wiki_dir),
             "active_project_id": ws.project_id,
             "active_project_root": str(ws.project_root),

@@ -21,6 +21,7 @@ export interface WorkspaceInfo {
   project_id: string;
   project_root: string;
   is_self_project: boolean;
+  projects_root?: string;
   projects_dir?: string;
 }
 
@@ -111,7 +112,11 @@ export interface WebStatus {
   companion_soul?: string;
   user_profile?: string;
   data_dir?: string;
+  projects_root?: string;
   projects_dir?: string;
+  default_projects_root?: string;
+  projects_root_is_custom?: boolean;
+  projects_root_source?: string;
   active_model_tier: string;
   fast_model: string;
   reasoning_model: string;
@@ -685,6 +690,7 @@ export interface RepoProbeResult {
   exists: boolean;
   is_git_repo: boolean;
   can_init?: boolean;
+  projects_root?: string;
   projects_dir?: string;
   repo_root?: string;
   branch?: string;
@@ -693,6 +699,43 @@ export interface RepoProbeResult {
   remote_url?: string;
   stack_summary?: string;
   rules_files?: string[];
+  summary?: string;
+  error?: string;
+}
+
+export interface ProjectsExplorerBreadcrumb {
+  label: string;
+  rel_path: string;
+}
+
+export interface ProjectsExplorerEntry {
+  name: string;
+  rel_path: string;
+  abs_path: string;
+  is_git_repo: boolean;
+  branch: string;
+  has_children: boolean;
+  linked_project_id: string;
+  linked_project_title: string;
+}
+
+export interface ProjectsBrowseResult {
+  ok: boolean;
+  projects_root: string;
+  projects_dir?: string;
+  default_projects_root?: string;
+  is_custom_root?: boolean;
+  root_source?: 'user_profile' | 'env' | 'auto' | string;
+  exists?: boolean;
+  current_rel_path: string;
+  current_abs_path: string;
+  parent_rel_path: string;
+  can_go_up: boolean;
+  breadcrumbs: ProjectsExplorerBreadcrumb[];
+  entries: ProjectsExplorerEntry[];
+  created?: boolean;
+  rel_path?: string;
+  abs_path?: string;
   summary?: string;
   error?: string;
 }
@@ -836,6 +879,7 @@ export interface ProjectBoardProjection {
   project: ProjectGraphEntry;
   board: ProjectGraphEntry;
   boards: ProjectGraphEntry[];
+  projects_root?: string;
   projects_dir?: string;
   columns: BoardColumnProjection[];
   cards: WorkItem[];
