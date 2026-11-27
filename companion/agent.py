@@ -307,7 +307,7 @@ def _triage_via_llm(
     )
 
 
-_SDLC_STOP_MARKER_RE = re.compile(r"\bstop\s+[1-4]\s*[:—–-]", re.I)
+_SDLC_STOP_MARKER_RE = re.compile(r"\bstop\s+[1-4](?:\s+of\s+[2-4])?\s*[:—–-]", re.I)
 
 
 def _is_active_sdlc_codesign_turn(user_text: str, messages: List[Dict[str, Any]], is_software_ws: bool = True) -> bool:

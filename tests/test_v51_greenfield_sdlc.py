@@ -507,8 +507,8 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                 # Multi-turn (>8 back-and-forth turns, colon-formatted `### Stop 3: ...`) stays in active co-design,
                 # then IMMEDIATELY exits co-design once `### Checkpoint 1: ...` completes or user switches to Personal Board!
                 long_hist: List[Dict[str, Any]] = [{"role": "user", "content": "/sdlc-4-design"}]
-                for turn_idx in range(1, 9):
-                    long_hist.append({"role": "assistant", "content": f"### Stop {(turn_idx % 4) + 1}: Layer Contracts (turn {turn_idx})"})
+                for turn_idx in range(1, 12):
+                    long_hist.append({"role": "assistant", "content": f"**Stop {(turn_idx % 4) + 1} of 4: Layer Contracts (turn {turn_idx})**"})
                     long_hist.append({"role": "user", "content": f"Clarification {turn_idx} looks solid, next"})
                 self.assertTrue(_is_active_sdlc_codesign_turn("Not sure about retry backoff—align with me first", long_hist, is_software_ws=True))
                 self.assertFalse(_is_active_sdlc_codesign_turn("What is on my schedule?", long_hist, is_software_ws=False))
