@@ -74,6 +74,8 @@ from companion.streaming import (
     emit_stream_event,
     get_active_wire_doc_context,
     get_active_wire_images,
+    has_stream_sink,
+    is_length_truncated,
     turn_context_scope,
     wire_attachment_context,
 )
@@ -697,6 +699,7 @@ def _execute_tool_calls(
     on_tool_result: Optional[Callable[[str, str], Optional[str]]] = None,
     log_to_conversations: bool = True,
     tool_steps_out: Optional[List[Dict[str, Any]]] = None,
+    truncated: bool = False,
 ) -> Tuple[Optional[bool], Optional[str], bool]:
     """Dispatch tool calls with strict JSON validation, LoopGuard, and mechanical approval-queue halting."""
     doctor_ok: Optional[bool] = None
@@ -708,6 +711,11 @@ def _execute_tool_calls(
         args, parse_err = _parse_strict_tool_args(raw_args)
         if parse_err is not None or args is None:
             result = parse_err or "Tool argument JSON parse error at char 0 — pass a valid JSON object."
+            if truncated:
+                result += (
+                    "\n[TRUNCATION RECOVERY: Tool arguments were cut off because generation hit `max_tokens` (`finish_reason=length`). "
+                    "Keep `<think>` under 150 words and retry immediately; for very large files, write a concise complete document or write Part 1 with `write_file` and append Part 2 with `edit_file`.]"
+                )
             hint = loop_guard.record_result(name, result)
             if hint:
                 result = f"{result}\n{hint}"
@@ -850,6 +858,22 @@ def _extract_turn_widget_fence(messages: List[Dict[str, Any]], start_idx: int) -
     return latest
 
 
+_TRUNCATION_BANNER = "⚠️ *(Output hit the model's `max_tokens` generation limit before completing. Reply `continue` to resume from here.)*"
+
+
+def _build_truncation_recovery_prompt(attempt: int, had_tools_enabled: bool) -> str:
+    tool_hint = (
+        "immediately execute the pending tool call (if writing a large file, write a concise complete file via `write_file`, or write Part 1 via `write_file` and append Part 2 via `edit_file`)"
+        if had_tools_enabled
+        else "continue directly from where your text stopped"
+    )
+    return (
+        f"[HARNESS TRUNCATION RECOVERY ({attempt}/2): Your previous output hit `max_tokens` (`finish_reason=length`) "
+        f"and any in-progress tool call or trailing text was cut off before completing. "
+        f"Keep `<think>` reasoning under 150 words, do NOT repeat text already sent, and {tool_hint}.]"
+    )
+
+
 def _run_step_loop(
     messages: List[Dict[str, Any]], iter_limit: int, user_text: str, intent_mode: str, top_tier: Optional[str],
     chat_fn: Callable[..., Dict[str, Any]], mem: MemoryStore, session_tag: Optional[str], tid: Optional[str], verbose: bool,
@@ -862,8 +886,8 @@ def _run_step_loop(
     loop_guard, last_doctor_pass, rolling_scratchpad, prior_step_tier = LoopGuard(), None, "", None
     turn_t0, turn_thoughts, turn_tools = time.perf_counter(), [], []
     turn_iso, cur_nudges, turn_start_idx = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), 0, max(1, len(messages) - 1)
-    force_final_text = False
-    paused_approval_id = ""
+    force_final_text, paused_approval_id, length_recoveries = False, "", 0
+    trunc_prose_parts: List[str] = []
     with turn_context_scope(turn_ctx):
         for step in range(iter_limit):
             check_cancelled()
@@ -933,8 +957,11 @@ def _run_step_loop(
             with tier_context(step_tier), phase_tool_context(eff_phase):
                 data = chat_fn(messages, step_tools if step_tools else None, "none" if not step_tools else "auto")
             last_tokens = int((data.get("usage") or {}).get("total_tokens") or 0) if isinstance(data.get("usage"), dict) else 0
-            raw_asst = data["choices"][0]["message"]
+            choice0 = (data.get("choices") or [{}])[0]
+            fin_reason = str(choice0.get("finish_reason") or "stop")
+            raw_asst = choice0["message"]
             clean_text, thinking_text, tool_calls = normalize_assistant_message(raw_asst)
+            hit_max_tokens = is_length_truncated(fin_reason) or bool(raw_asst.get("_truncated_tool_call"))
             dropped_forced_tools = bool(force_final_text and tool_calls)
             if force_final_text:
                 tool_calls = []
@@ -942,6 +969,18 @@ def _run_step_loop(
                 rolling_scratchpad = thinking_text[-900:].strip()
                 turn_thoughts.append(thinking_text.strip())
             if not tool_calls:
+                if hit_max_tokens and not force_final_text and step + 1 < iter_limit and length_recoveries < 2:
+                    length_recoveries += 1
+                    if clean_text.strip():
+                        trunc_prose_parts.append(clean_text.strip())
+                    if telemetry.active_trace_id:
+                        telemetry.log("WARN", "agent", f"Step {step + 1} truncated (`finish_reason={fin_reason}`); auto-recovering ({length_recoveries}/2).")
+                    emit_stream_event({"type": "phase", "phase": f"Recovering truncated step ({length_recoveries}/2) · {settings.resolve_tier(step_tier).model}", "tier": step_tier or "fast"})
+                    messages.extend([
+                        {"role": "assistant", "content": clean_text or "Continuing interrupted step."},
+                        {"role": "user", "content": _build_truncation_recovery_prompt(length_recoveries, bool(step_tools))},
+                    ])
+                    continue
                 allow_wiki = bool(step_tools and step + 1 < iter_limit and cur_nudges < 2 and (allowed_tool_names is None or "wiki_manage" in allowed_tool_names))
                 cur_nudge = pending_curation_nudge(mem, turn_iso, clean_text, require_intent_phrase=(allowed_tool_names is None)) if allow_wiki else None
                 if cur_nudge:
@@ -950,6 +989,12 @@ def _run_step_loop(
                     continue
                 with tier_context(step_tier):
                     final_text = clean_text if clean_text.strip() else recover_empty_synthesis(messages, chat_fn, prior_thinking=thinking_text)
+                if trunc_prose_parts and final_text.strip() and not final_text.lstrip().startswith(trunc_prose_parts[0][:40]):
+                    final_text = "\n\n".join([*trunc_prose_parts, final_text.strip()]).strip()
+                if hit_max_tokens and _TRUNCATION_BANNER not in final_text:
+                    if has_stream_sink():
+                        emit_stream_event({"type": "text_delta", "delta": f"\n\n{_TRUNCATION_BANNER}"})
+                    final_text = f"{final_text.rstrip()}\n\n{_TRUNCATION_BANNER}".strip()
                 if force_final_text and (dropped_forced_tools or "approv" not in final_text.lower()):
                     apr_lbl = f" (`{paused_approval_id}`)" if paused_approval_id and paused_approval_id != "pending" else ""
                     apr_note = f"*(Action queued for approval{apr_lbl} — click **Approve** above and I will continue automatically.)*"
@@ -962,7 +1007,7 @@ def _run_step_loop(
                     t_meta = {"thinking": "\n\n".join(turn_thoughts)[-4000:], "tool_steps": turn_tools, "duration_ms": round((time.perf_counter() - turn_t0) * 1000.0, 1), "model": settings.resolve_tier(step_tier).model}
                     mem.log_message("assistant", final_text, session_tag=session_tag, meta=t_meta)
                 if tid:
-                    telemetry.end_trace(tid, status="ok")
+                    telemetry.end_trace(tid, status="warn" if hit_max_tokens else "ok")
                 return "done", final_text, ""
 
             messages.append({"role": "assistant", "content": clean_text, "tool_calls": tool_calls, **({"_provider_meta": raw_asst["_provider_meta"]} if "_provider_meta" in raw_asst else {})})
@@ -970,7 +1015,7 @@ def _run_step_loop(
                 doc_res, pause_id, fg_approval_halt = _execute_tool_calls(
                     tool_calls, messages, loop_guard, mem, session_tag, verbose,
                     allowed_tool_names=allowed_tool_names, dispatch_fn=dispatch_fn, on_tool_result=on_tool_result,
-                    log_to_conversations=log_to_conversations, tool_steps_out=turn_tools,
+                    log_to_conversations=log_to_conversations, tool_steps_out=turn_tools, truncated=hit_max_tokens,
                 )
             if doc_res is not None:
                 last_doctor_pass = doc_res

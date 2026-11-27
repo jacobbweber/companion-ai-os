@@ -305,7 +305,7 @@ class TestWebSurfaceAndAutonomy(unittest.TestCase):
         """Async `/api/chat` in `plan`/`goal` mode records `status='error'` and clears `active_job_id` on LLM timeout."""
         import time
 
-        self.assertEqual(settings.resolve_tier("reasoning").max_tokens, 4096)
+        self.assertEqual(settings.resolve_tier("reasoning").max_tokens, 16384)
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(db_path=Path(tmp) / "err_job.db")
 

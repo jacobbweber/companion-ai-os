@@ -558,7 +558,10 @@ def _read_anthropic_sse(resp: Any) -> Dict[str, Any]:
             elif dtype == "signature_delta" and delta.get("signature"):
                 slot["signature"] += str(delta["signature"])
             elif dtype == "input_json_delta" and delta.get("partial_json"):
+                prev_b = len(slot["json_buf"]) // 2048
                 slot["json_buf"] += str(delta["partial_json"])
+                if slot.get("name") and (len(slot["json_buf"]) // 2048) > prev_b:
+                    emit_stream_event({"type": "phase", "phase": f"Drafting `{slot['name']}` ({len(slot['json_buf']) / 1024.0:.1f} KB)"})
         elif etype == "message_delta":
             stop_reason = str((ev.get("delta") or {}).get("stop_reason") or stop_reason)
             out_tok = int((ev.get("usage") or {}).get("output_tokens") or out_tok)
@@ -675,21 +678,21 @@ def heal_http_400_request(dialect: str, url: str, body: Dict[str, Any], err_body
         return (url, mutated) if (_is_stream_error(low_err) and mutated.pop("stream", None) is not None) else None
     changed = False
     if "max_completion_tokens" in low_err and "max_tokens" in mutated:
-        mutated["max_completion_tokens"] = mutated.pop("max_tokens")
-        changed = True
+        mutated["max_completion_tokens"], changed = mutated.pop("max_tokens"), True
+    elif any(k in low_err for k in ("maximum context length", "max_tokens", "max_completion_tokens")):
+        tkey = "max_completion_tokens" if "max_completion_tokens" in mutated else ("max_tokens" if "max_tokens" in mutated else "")
+        if tkey and int(mutated.get(tkey) or 0) > 1024:
+            mutated[tkey], changed = max(1024, int(mutated[tkey]) // 2), True
     if "temperature" in low_err and "temperature" in mutated:
         mutated.pop("temperature", None)
         changed = True
     if ("reasoning_effort" in low_err or "reasoning" in low_err) and ("reasoning_effort" in mutated or "reasoning" in mutated):
-        mutated.pop("reasoning_effort", None)
-        mutated.pop("reasoning", None)
+        mutated.pop("reasoning_effort", None), mutated.pop("reasoning", None)
         changed = True
     if "stream_options" in low_err and "stream_options" in mutated:
         mutated.pop("stream_options", None)
         changed = True
     if not changed and mutated.get("stream") and _is_stream_error(low_err):
-        mutated.pop("stream", None)
-        mutated.pop("stream_options", None)
+        mutated.pop("stream", None), mutated.pop("stream_options", None)
         changed = True
     return (url, mutated) if changed else None
-

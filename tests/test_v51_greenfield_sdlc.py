@@ -813,5 +813,184 @@ class TestProjectsRootExplorerAndParity(unittest.TestCase):
                 self.assertEqual(Path(probe_rel["projects_root"]).resolve(), proot.resolve())
 
 
+class TestTurnTruncationRecoveryAndOutputBudget(unittest.TestCase):
+    """Regression verification for F01/inc-03 (`v5.1.2`): max_tokens budgets, finish_reason='length' recovery & live tool-stream progress."""
+
+    def tearDown(self) -> None:
+        settings.reset_workspace()
+
+    def test_tier_output_token_defaults_legacy_env_upgrade_and_http_400_clamp(self) -> None:
+        """Verify 8192 default / 16384 coding+reasoning budgets even with legacy COMPANION_MAX_TOKENS=4096, plus 400 clamp."""
+        from companion.config import Settings
+        from companion.llm_wire import heal_http_400_request
+
+        env_keys = (
+            "COMPANION_MAX_TOKENS",
+            "COMPANION_FAST_MAX_TOKENS",
+            "COMPANION_CODING_MAX_TOKENS",
+            "COMPANION_REASONING_MAX_TOKENS",
+        )
+        with patch.dict(os.environ, {k: "" for k in env_keys}, clear=False):
+            cfg_fresh = Settings(reload_env=False)
+            self.assertEqual(cfg_fresh.max_tokens, 8192)
+            self.assertEqual(cfg_fresh.resolve_tier("fast").max_tokens, 8192)
+            self.assertEqual(cfg_fresh.resolve_tier("coding").max_tokens, 16384)
+            self.assertEqual(cfg_fresh.resolve_tier("reasoning").max_tokens, 16384)
+
+        with patch.dict(
+            os.environ,
+            {
+                "COMPANION_MAX_TOKENS": "4096",
+                "COMPANION_FAST_MAX_TOKENS": "",
+                "COMPANION_CODING_MAX_TOKENS": "",
+                "COMPANION_REASONING_MAX_TOKENS": "",
+            },
+            clear=False,
+        ):
+            cfg_legacy = Settings(reload_env=False)
+            self.assertEqual(cfg_legacy.max_tokens, 4096)
+            self.assertEqual(cfg_legacy.resolve_tier("coding").max_tokens, 16384)
+            self.assertEqual(cfg_legacy.resolve_tier("reasoning").max_tokens, 16384)
+
+        with patch.dict(os.environ, {"COMPANION_REASONING_MAX_TOKENS": "6144"}, clear=False):
+            self.assertEqual(Settings(reload_env=False).resolve_tier("reasoning").max_tokens, 6144)
+
+        healed = heal_http_400_request(
+            "openai_compat",
+            "http://127.0.0.1:8000/v1/chat/completions",
+            {"model": "qwen3", "max_tokens": 16384},
+            "This model's maximum context length is 32768 tokens and max_tokens 16384 exceeds remaining window",
+        )
+        self.assertIsNotNone(healed)
+        self.assertEqual(healed[1]["max_tokens"], 8192)
+
+    def test_ollama_buffered_length_truncation_recovers_and_writes_product_md(self) -> None:
+        """Exact Spark tr_1795807702001_01a373 repro: finish_reason='length' with dropped tool_calls self-recovers and writes file."""
+        from companion.streaming import stream_event_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp).resolve()
+            repo = tmp_p / "companion-origin"
+            init_greenfield_repo(repo, title="companion-origin")
+            db_file = tmp_p / "trunc.db"
+            events: List[Dict[str, Any]] = []
+            step_counter = {"n": 0}
+
+            def _mock_ollama_trunc_chat(messages: List[Dict[str, Any]], _tools=None, _choice="auto") -> Dict[str, Any]:
+                step_counter["n"] += 1
+                if step_counter["n"] == 1:
+                    # Step 1: Ollama cut off unclosed <tool_call> at max_tokens -> tools_called=0, finish_reason='length'
+                    return {
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": "length",
+                            "message": {
+                                "role": "assistant",
+                                "reasoning_content": "Composing all 7 sections of product.md now...",
+                                "content": "Writing `product.md` to disk. This is the foundation everything else builds on.",
+                            },
+                        }],
+                        "usage": {"prompt_tokens": 25865, "completion_tokens": 4096, "total_tokens": 29961},
+                    }
+                if step_counter["n"] == 2:
+                    self.assertIn("HARNESS TRUNCATION RECOVERY", str(messages[-1].get("content", "")))
+                    return {
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_prod_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": json.dumps({
+                                            "path": str(repo / "docs" / "product.md"),
+                                            "content": "# Product Specification: Companion Origin\n\n## 1. Product Vision\nSovereign AI partner.\n",
+                                        }),
+                                    },
+                                }],
+                            },
+                        }],
+                    }
+                return {
+                    "choices": [{
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "### Checkpoint 1: Product Spec Complete\n\nWrote `docs/product.md` cleanly.",
+                        },
+                    }],
+                }
+
+            with contextlib.closing(MemoryStore(db_path=db_file)) as store, memory_store_context(store):
+                pg = get_project_graph(store=store)
+                pg.create_project("companion-origin", kind="software", workspace_path=str(repo), focus=True)
+                conv = [{"role": "user", "content": "yes"}]
+                with stream_event_context(events.append):
+                    reply = run_agent_turn(conv, chat_fn=_mock_ollama_trunc_chat, store=store, session_tag="web_ui", verbose=False)
+
+                self.assertEqual(step_counter["n"], 3)
+                self.assertTrue((repo / "docs" / "product.md").is_file())
+                self.assertIn("Sovereign AI partner.", (repo / "docs" / "product.md").read_text(encoding="utf-8"))
+                self.assertIn("Writing `product.md` to disk.", reply)
+                self.assertIn("### Checkpoint 1: Product Spec Complete", reply)
+                self.assertTrue(any("Recovering truncated step" in str(e.get("phase", "")) for e in events if e.get("type") == "phase"))
+
+    def test_unclosed_text_tool_call_streamed_progress_and_exhausted_banner(self) -> None:
+        """Verify raw unclosed <tool_call> stripping, streamed delta.tool_calls KB progress, and exhausted-budget banner."""
+        import io
+        from companion.llm import normalize_assistant_message
+        from companion.streaming import read_completion_or_sse_stream, stream_event_context
+
+        # 1. Raw unclosed `<tool_call>` never leaks broken JSON into visible prose and marks `_truncated_tool_call`
+        msg_raw: Dict[str, Any] = {
+            "role": "assistant",
+            "content": "Writing spec now.\n<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"docs/product.md\", \"content\": \"# Half",
+        }
+        clean_txt, _, tcalls = normalize_assistant_message(msg_raw)
+        self.assertEqual(clean_txt, "Writing spec now.")
+        self.assertEqual(tcalls, [])
+        self.assertTrue(msg_raw.get("_truncated_tool_call"))
+
+        # 2. SSE `delta.tool_calls` emits live `Drafting \`write_file\`` phase progress events
+        sse_lines = [
+            b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"write_file","arguments":""}}]}}]}\n\n',
+            f'data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"function":{{"arguments":{json.dumps("x" * 2600)}}}}}]}}}}]}}\n\n'.encode("utf-8"),
+            b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+
+        class _FakeSSEResp(io.BytesIO):
+            headers = {"Content-Type": "text/event-stream"}
+
+        stream_evs: List[Dict[str, Any]] = []
+        with stream_event_context(stream_evs.append):
+            parsed_sse = read_completion_or_sse_stream(_FakeSSEResp(b"".join(sse_lines)))
+        self.assertEqual(parsed_sse["choices"][0]["finish_reason"], "length")
+        phases = [str(e.get("phase", "")) for e in stream_evs if e.get("type") == "phase"]
+        self.assertTrue(any("Drafting `write_file`" in p for p in phases), phases)
+        self.assertTrue(any("KB)" in p for p in phases), phases)
+
+        # 3. Exhausted recovery budget surfaces explicit `max_tokens` warning banner (zero silent drops)
+        def _always_truncated(_msgs, _tools=None, _choice="auto") -> Dict[str, Any]:
+            return {
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": "Partial output chunk."},
+                }]
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with contextlib.closing(MemoryStore(db_path=Path(tmp) / "exh.db")) as store, memory_store_context(store):
+                out_exh = run_agent_turn([{"role": "user", "content": "Write huge doc"}], max_iters=3, chat_fn=_always_truncated, store=store, verbose=False)
+                self.assertIn("max_tokens", out_exh)
+                self.assertIn("Reply `continue`", out_exh)
+
+
 if __name__ == "__main__":
     unittest.main()

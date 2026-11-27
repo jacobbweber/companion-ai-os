@@ -55,7 +55,7 @@ def walk_pruned_files(root: Path) -> List[Path]:
     return found
 
 _DEFAULT_TIER_TEMPS: Dict[str, float] = {"fast": 0.15, "coding": 0.15, "reasoning": 0.6}
-_DEFAULT_TIER_MAX_TOKENS: Dict[str, int] = {"reasoning": 4096}
+_DEFAULT_TIER_MAX_TOKENS: Dict[str, int] = {"coding": 16384, "reasoning": 16384}
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,7 @@ class TierConfig:
     context_window_tokens: int
     temperature: float = 0.2
     is_dedicated: bool = False
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     provider_id: str = "local-default"
     dialect: str = "openai_compat"
     reasoning_effort: str = ""
@@ -232,7 +232,7 @@ class Settings:
     data_dir: Optional[Path] = None
     max_iters: int = 25
     temperature: float = 0.2
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     shell_timeout: int = 60
     http_timeout: int = 900
     swap_timeout: int = 1800
@@ -288,7 +288,7 @@ class Settings:
         self.api_key = os.environ.get("COMPANION_API_KEY", "").strip()
         self.max_iters = max(3, _env_int("COMPANION_MAX_ITERS", 25))
         self.temperature = max(0.0, min(2.0, _env_float("COMPANION_TEMP", 0.2)))
-        self.max_tokens = max(256, _env_int("COMPANION_MAX_TOKENS", 4096))
+        self.max_tokens = max(256, _env_int("COMPANION_MAX_TOKENS", 8192))
         self.shell_timeout = max(5, _env_int("COMPANION_SHELL_TIMEOUT", 60))
         self.http_timeout = max(10, _env_int("COMPANION_HTTP_TIMEOUT", 900))
         self.swap_timeout = max(60, _env_int("COMPANION_SWAP_TIMEOUT", 1800))
@@ -353,7 +353,8 @@ class Settings:
             raw_effort = os.environ.get(f"{pfx}REASONING_EFFORT", "").strip().lower()
             raw_ctx, raw_temp_str = _env_int(f"{pfx}CONTEXT_WINDOW", 0), os.environ.get(f"{pfx}TEMP", "").strip()
             tier_temp = max(0.0, min(2.0, _env_float(f"{pfx}TEMP", _DEFAULT_TIER_TEMPS.get(t, self.temperature))))
-            tier_max_tok = max(256, _env_int(f"{pfx}MAX_TOKENS", _DEFAULT_TIER_MAX_TOKENS.get(t, self.max_tokens)))
+            tier_def_tok = max(self.max_tokens, _DEFAULT_TIER_MAX_TOKENS[t]) if t in _DEFAULT_TIER_MAX_TOKENS else self.max_tokens
+            tier_max_tok = max(256, _env_int(f"{pfx}MAX_TOKENS", tier_def_tok))
             eff_url = (raw_url or self.base_url).rstrip("/")
             t_conc = max(1, min(8, _env_int(f"{pfx}MAX_CONCURRENCY", 1 if ":11434" in eff_url else def_conc)))
             self.tiers[t] = TierConfig(

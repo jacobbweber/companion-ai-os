@@ -211,7 +211,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
             data-testid="sidebar-version-label"
             style={{ fontSize: 10.5, color: 'var(--text-muted)' }}
           >
-            v{status?.app_version || '5.1.1'}
+            v{status?.app_version || '5.1.2'}
           </span>
         </button>
       </div>

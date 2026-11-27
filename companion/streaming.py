@@ -434,6 +434,7 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     tc_acc: Dict[int, Dict[str, Any]] = {}
+    tc_prog_buckets: Dict[int, int] = {}
     usage: Dict[str, Any] = {}
     finish_reason = "stop"
     splitter = _ThinkTagStreamSplitter()
@@ -481,6 +482,16 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
             splitter.feed(c_piece)
         if isinstance(delta.get("tool_calls"), list):
             _merge_tool_call_deltas(tc_acc, delta["tool_calls"])
+            if has_stream_sink() and tc_acc:
+                top_slot = max(tc_acc)
+                fn_d = tc_acc[top_slot].get("function") or {}
+                fn_nm = str(fn_d.get("name") or "").strip()
+                arg_len = len(str(fn_d.get("arguments") or ""))
+                bucket = 1 + (arg_len // 2048) if fn_nm else 0
+                if bucket > tc_prog_buckets.get(top_slot, 0):
+                    tc_prog_buckets[top_slot] = bucket
+                    kb_lbl = f" ({arg_len / 1024.0:.1f} KB)" if arg_len >= 512 else ""
+                    emit_stream_event({"type": "phase", "phase": f"Drafting `{fn_nm}`{kb_lbl}"})
 
     splitter.flush()
     msg_out: Dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
@@ -489,6 +500,31 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
     if tc_acc:
         msg_out["tool_calls"] = [tc_acc[k] for k in sorted(tc_acc)]
     return {"choices": [{"index": 0, "message": msg_out, "finish_reason": finish_reason}], "usage": usage}
+
+
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "model_context_window_exceeded"})
+
+
+def is_length_truncated(finish_reason: Any) -> bool:
+    """Return `True` when an LLM completion stopped because `max_tokens` or context length was reached."""
+    return str(finish_reason or "").strip().lower() in _TRUNCATED_FINISH_REASONS
+
+
+def strip_unclosed_tool_call_tail(text: str) -> Tuple[str, bool]:
+    """Strip any trailing unclosed `<tool_call>` or `<function=...>` block and report whether one was cut off."""
+    if not text:
+        return "", False
+    low = text.lower()
+    cut_positions: List[int] = []
+    last_tc_open, last_tc_close = low.rfind("<tool_call>"), low.rfind("</tool_call>")
+    if last_tc_open != -1 and last_tc_open > last_tc_close:
+        cut_positions.append(last_tc_open)
+    last_fn_open, last_fn_close = low.rfind("<function="), low.rfind("</function>")
+    if last_fn_open != -1 and last_fn_open > last_fn_close:
+        cut_positions.append(last_fn_open)
+    if not cut_positions:
+        return text, False
+    return text[: min(cut_positions)].rstrip(), True
 
 
 _THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)

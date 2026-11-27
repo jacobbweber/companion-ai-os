@@ -15,8 +15,8 @@ from companion.llm_wire import (
     is_local_or_lan_endpoint, prepare_wire_request, read_wire_response, urlopen_safe,
 )
 from companion.streaming import (
-    check_cancelled, emit_stream_event, get_active_cancel_scope,
-    has_stream_sink, rescue_text_tool_calls, strip_thinking_tags,
+    check_cancelled, emit_stream_event, get_active_cancel_scope, has_stream_sink,
+    is_length_truncated, rescue_text_tool_calls, strip_thinking_tags, strip_unclosed_tool_call_tail,
 )
 from companion.telemetry import telemetry
 
@@ -374,13 +374,8 @@ def format_model_tiers_status(active_mode: str = "auto", check_health: bool = Fa
             if not ok and t_name != "default" and (cfg.fallback_model or cfg.base_url != settings.base_url.rstrip("/")):
                 detail += f" -> FAILOVER to `{cfg.fallback_model or 'default'}`"
             health_str = f" | Health: {detail}"
-        lines.append(
-            f"  * `{t_name:<9}` : `{cfg.model}` @ `{cfg.base_url}` "
-            f"(ctx={cfg.context_window_tokens:,} | temp={cfg.temperature:.2f}{eff_tag}{fb_tag} | {src_badge}){health_str}"
-        )
-    lines.append(
-        "\nCommands: `/model status`, `/model check` (live ping), `/model auto|<tier>`, `/providers` (provider & Vault matrix)."
-    )
+        lines.append(f"  * `{t_name:<9}` : `{cfg.model}` @ `{cfg.base_url}` (ctx={cfg.context_window_tokens:,} | max_out={cfg.max_tokens:,} | temp={cfg.temperature:.2f}{eff_tag}{fb_tag} | {src_badge}){health_str}")
+    lines.append("\nCommands: `/model status`, `/model check` (live ping), `/model auto|<tier>`, `/providers` (provider & Vault matrix).")
     return "\n".join(lines)
 
 
@@ -408,7 +403,10 @@ def normalize_assistant_message(msg_obj: Dict[str, Any]) -> Tuple[str, str, List
                 telemetry.log("INFO", "llm", f"Rescued {len(rescued_r_tcalls)} text tool call(s) from reasoning trace.")
 
     clean_content, tag_thinking = strip_thinking_tags(raw_content)
+    clean_content, unclosed_tc = strip_unclosed_tool_call_tail(clean_content)
     clean_content = re.sub(r"</?tool_call>", "", clean_content, flags=re.IGNORECASE).strip()
+    if unclosed_tc and not existing_tcalls:
+        msg_obj["_truncated_tool_call"] = True
     clean_reas, inner_reas = strip_thinking_tags(raw_reasoning)
     eff_reas = "\n\n".join(x for x in (inner_reas, clean_reas) if x).strip()
     parts: List[str] = []
@@ -580,10 +578,14 @@ def _post_completion(
                     dur_ms = (time.perf_counter() - call_start) * 1000.0
                     if is_swap:
                         print(f"  [gpu-swap] Model {target_model} loaded and responded ({dur_ms / 1000.0:.1f}s).", file=sys.stderr, flush=True)
-                    clean_content, thinking_text, tcalls = normalize_assistant_message(data["choices"][0].get("message") or {})
+                    choice0 = data["choices"][0] or {}
+                    fin = str(choice0.get("finish_reason") or "stop")
+                    clean_content, thinking_text, tcalls = normalize_assistant_message(choice0.get("message") or {})
                     toks = (data.get("usage") or {}).get("total_tokens", 0) if isinstance(data.get("usage"), dict) else 0
-                    detail = f"tier={tier_label} dialect={eff_dialect} temp={target_temp:.2f}{' swapped=1' if is_swap else ''} msgs={len(messages)} tools_called={len(tcalls)} tokens={toks} chars={len(clean_content)} think_chars={len(thinking_text)}"
+                    detail = f"tier={tier_label} dialect={eff_dialect} finish={fin} temp={target_temp:.2f}{' swapped=1' if is_swap else ''} msgs={len(messages)} tools_called={len(tcalls)} tokens={toks} chars={len(clean_content)} think_chars={len(thinking_text)}"
                     telemetry.record_span("llm_call", span_label, dur_ms, status="ok", detail=detail)
+                    if is_length_truncated(fin):
+                        telemetry.log("WARN", "llm", f"Completion hit max_tokens={target_max_tokens} on `{span_label}` (finish={fin}, tools={len(tcalls)}, chars={len(clean_content)})")
                     return data
                 except InterruptedError:
                     raise
