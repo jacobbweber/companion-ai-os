@@ -1,18 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { FolderGit2, GitBranchPlus, Link2, Sparkles } from 'lucide-react';
 import { callAction } from '../api';
-import { ProjectsFolderExplorer, RepoTargetPreviewControls, deriveTargetPath, sanitizeRelativeRepoSegment, slugifyRepoTitle } from './ProjectsFolderExplorer';
+import { ProjectsFolderExplorer, RepoTargetPreviewControls, deriveTargetPath, parentRelUnderRoot, sanitizeRelativeRepoSegment, slugifyRepoTitle } from './ProjectsFolderExplorer';
 import type { ProjectBoardProjection, ProjectGraphEntry, ProjectsBrowseResult, ProjectsExplorerEntry, RepoProbeResult, VaultSecretMeta } from '../types';
 
 export { sanitizeRelativeRepoSegment };
 
 interface ProjectConfigPanelProps {
-  projectId?: string; createNew?: boolean; onSaved: () => void;
+  projectId?: string; createNew?: boolean; externalProjectsRoot?: string; onSaved: () => void;
   onCreatedProject?: (newProjectId: string) => void; onClose: () => void; onToast: (msg: string) => void;
 }
 
 export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
-  projectId, createNew = false, onSaved, onCreatedProject, onClose, onToast,
+  projectId, createNew = false, externalProjectsRoot, onSaved, onCreatedProject, onClose, onToast,
 }) => {
   const [loadedProj, setLoadedProj] = useState<ProjectGraphEntry | null>(null);
   const [projectMode, setProjectMode] = useState<'personal' | 'code'>('personal');
@@ -64,11 +64,15 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
     relPathRef.current = relStr;
     if (subModeRef.current === 'create' && !customPathEditedRef.current && rootStr) {
       const leaf = folderNameRef.current.trim() || slugifyRepoTitle(titleRef.current);
-      if (leaf) updateWsPath(deriveTargetPath(rootStr, relStr, leaf));
+      updateWsPath(leaf ? deriveTargetPath(rootStr, relStr, leaf) : '');
     }
   };
 
-  const navigateExplorer = async (relPath: string) => {
+  const navigateExplorer = async (relPath: string, resetCreateSelection = false) => {
+    if (resetCreateSelection && subModeRef.current === 'create') {
+      customPathEditedRef.current = false;
+      setProbeResult(null);
+    }
     setExplorerLoading(true);
     try {
       const res = await callAction<ProjectsBrowseResult>('agile', {
@@ -98,8 +102,9 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
     }
     const nextRoot = String(res.projects_root || res.projects_dir || '');
     if (nextRoot) setProjectsDir(nextRoot);
+    onSaved();
     onToast(res.summary || `Updated Projects Root to ${nextRoot}`);
-    await navigateExplorer('');
+    await navigateExplorer('', true);
     return true;
   };
 
@@ -112,6 +117,10 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
     if (!res.ok) {
       onToast(res.error || 'Could not create subfolder.');
       return false;
+    }
+    if (subModeRef.current === 'create') {
+      customPathEditedRef.current = false;
+      setProbeResult(null);
     }
     applyBrowsePayload(res as unknown as ProjectsBrowseResult);
     onToast(res.summary || `Created subfolder "${folderName}".`);
@@ -140,9 +149,9 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
   };
 
   const handleSelectEntry = (entry: ProjectsExplorerEntry) => {
-    if (repoSubMode === 'create') {
+    if (subModeRef.current === 'create') {
       if (!entry.is_git_repo) {
-        void navigateExplorer(entry.rel_path);
+        void navigateExplorer(entry.rel_path, true);
       } else {
         customPathEditedRef.current = true;
         updateWsPath(entry.abs_path);
@@ -153,17 +162,25 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
     if (entry.is_git_repo) {
       customPathEditedRef.current = true;
       updateWsPath(entry.abs_path);
-      if (!projTitle.trim()) {
+      if (!titleRef.current.trim()) {
         const niceTitle =
           entry.linked_project_title ||
           entry.name.replace(/[-_]+/g, ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
         setProjTitle(niceTitle);
+        titleRef.current = niceTitle;
       }
       void runProbe(entry.abs_path);
     } else {
       void navigateExplorer(entry.rel_path);
     }
   };
+
+  useEffect(() => {
+    const ext = (externalProjectsRoot || '').trim();
+    if (!ext || !projectsDir || ext === projectsDir) return;
+    setProjectsDir(ext);
+    void navigateExplorer('', true);
+  }, [externalProjectsRoot]);
 
   useEffect(() => {
     setProbeResult(null);
@@ -194,27 +211,33 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
       return;
     }
 
-    void navigateExplorer('');
+    customPathEditedRef.current = true;
+    folderNameEditedRef.current = false;
+    setRepoSubMode('attach');
+    subModeRef.current = 'attach';
     void callAction<ProjectBoardProjection>('agile', {
       subaction: 'board_view',
       project_id: projectId || '',
     }).then((bRes) => {
-      if (!bRes.ok) return;
+      if (!bRes.ok) {
+        void navigateExplorer('');
+        return;
+      }
       const view = bRes as unknown as ProjectBoardProjection;
-      const pRoot = view.projects_root || view.projects_dir;
-      if (pRoot) setProjectsDir(String(pRoot));
+      const pRoot = String(view.projects_root || view.projects_dir || externalProjectsRoot || '');
+      if (pRoot) setProjectsDir(pRoot);
       const p = view.project;
-      if (!p) return;
+      if (!p) {
+        void navigateExplorer('');
+        return;
+      }
       setLoadedProj(p);
       const hasWs = Boolean(p.workspace_path && p.workspace_path.trim());
       const isCode = Boolean(
         hasWs || p.kind === 'software' || (p.delivery_policy && p.delivery_policy !== 'local_only')
       );
       customPathEditedRef.current = hasWs || p.project_id === 'companion-self';
-      folderNameEditedRef.current = false;
       setProjectMode(isCode ? 'code' : 'personal');
-      setRepoSubMode('attach');
-      subModeRef.current = 'attach';
       setProjTitle(p.title);
       setProjGoal(p.goal_summary || '');
       updateWsPath(p.workspace_path || '');
@@ -225,6 +248,7 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
       setTpWindow(p.trigger_policy?.allowed_window || '22:00-06:00');
       setTpIdleSec(p.trigger_policy?.idle_min_seconds ?? 900);
       setTpCooldownSec(p.trigger_policy?.cooldown_seconds ?? 3600);
+      void navigateExplorer(hasWs && pRoot ? parentRelUnderRoot(p.workspace_path || '', pRoot) : '');
     });
   }, [projectId, createNew]);
 
@@ -295,28 +319,17 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
     }
   };
 
-  const credOptions = Array.from(
-    new Set([...vaultSecrets.map((s) => s.name), ...(projGitCred ? [projGitCred] : [])])
-  );
+  const credOptions = Array.from(new Set([...vaultSecrets.map((s) => s.name), ...(projGitCred ? [projGitCred] : [])]));
   const previewPath =
     projWsPath.trim() ||
-    deriveTargetPath(
-      projectsDir,
-      currentRelPath,
-      repoFolderName.trim() || slugifyRepoTitle(projTitle) || '<repo-slug>'
-    );
+    deriveTargetPath(projectsDir, currentRelPath, repoFolderName.trim() || slugifyRepoTitle(projTitle) || '<repo-slug>');
 
   return (
     <div style={{ display: 'grid', gap: 12 }} data-testid="project-inspector">
       <div>
         <label className="field-label">Project Mode</label>
         <div className="segmented-pills" style={{ width: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr' }}>
-          <button
-            type="button"
-            data-testid="project-mode-personal"
-            className={`segmented-pill ${projectMode === 'personal' ? 'active' : ''}`}
-            onClick={() => setProjectMode('personal')}
-          >
+          <button type="button" data-testid="project-mode-personal" className={`segmented-pill ${projectMode === 'personal' ? 'active' : ''}`} onClick={() => setProjectMode('personal')}>
             <Sparkles size={12} /> Personal / Goal Board
           </button>
           <button
@@ -349,14 +362,14 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
             const val = e.target.value;
             setProjTitle(val);
             titleRef.current = val;
-            if (repoSubMode === 'create') {
-              const nextLeaf = folderNameEditedRef.current ? repoFolderName : slugifyRepoTitle(val);
+            if (subModeRef.current === 'create') {
+              const nextLeaf = folderNameEditedRef.current ? folderNameRef.current : slugifyRepoTitle(val);
               if (!folderNameEditedRef.current) {
                 setRepoFolderName(nextLeaf);
                 folderNameRef.current = nextLeaf;
               }
               if (!customPathEditedRef.current && projectsDir) {
-                updateWsPath(deriveTargetPath(projectsDir, currentRelPath, nextLeaf));
+                updateWsPath(deriveTargetPath(projectsDir, relPathRef.current, nextLeaf));
                 setProbeResult(null);
               }
             }
@@ -371,14 +384,7 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
 
       {projectMode === 'code' && (
         <div
-          style={{
-            display: 'grid',
-            gap: 10,
-            padding: 12,
-            borderRadius: 'var(--radius-sm)',
-            border: '1px solid var(--border-hairline)',
-            background: 'var(--bg-elevated)',
-          }}
+          style={{ display: 'grid', gap: 10, padding: 12, borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-hairline)', background: 'var(--bg-elevated)' }}
           data-testid="code-repo-settings-box"
         >
           <div>
@@ -393,9 +399,12 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
                   subModeRef.current = 'create';
                   setProbeResult(null);
                   customPathEditedRef.current = false;
-                  const leaf = repoFolderName.trim() || slugifyRepoTitle(projTitle);
-                  if (!folderNameEditedRef.current && leaf) setRepoFolderName(leaf);
-                  updateWsPath(projectsDir && leaf ? deriveTargetPath(projectsDir, currentRelPath, leaf) : '');
+                  const leaf = folderNameRef.current.trim() || slugifyRepoTitle(titleRef.current);
+                  if (!folderNameEditedRef.current && leaf) {
+                    setRepoFolderName(leaf);
+                    folderNameRef.current = leaf;
+                  }
+                  updateWsPath(projectsDir && leaf ? deriveTargetPath(projectsDir, relPathRef.current, leaf) : '');
                 }}
               >
                 <GitBranchPlus size={12} /> Create New Repo
@@ -422,7 +431,7 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
             projectsRoot={projectsDir}
             loading={explorerLoading}
             selectedAbsPath={projWsPath}
-            onNavigateRel={navigateExplorer}
+            onNavigateRel={(rel) => navigateExplorer(rel, true)}
             onSaveRoot={handleSaveRoot}
             onCreateSubfolder={handleCreateSubfolder}
             onSelectEntry={handleSelectEntry}

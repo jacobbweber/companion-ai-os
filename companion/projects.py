@@ -262,11 +262,7 @@ class ProjectGraphManager:
         proj_root = get_projects_root(self.store)
         if init_git:
             eff_raw = raw_ws or base_slug
-            cand_i = Path(eff_raw).expanduser()
-            init_tgt = cand_i.resolve() if (cand_i.is_absolute() or eff_raw.startswith(("~", "/", "\\"))) else (proj_root / cand_i).resolve()
-            if bound_err := validate_external_repo_path(init_tgt, raw_input=eff_raw):
-                raise ValueError(bound_err)
-            init_res = init_greenfield_repo(init_tgt, title=clean_title, goal_summary=goal_summary)
+            init_res = init_greenfield_repo(eff_raw, title=clean_title, goal_summary=goal_summary, store=self.store)
             if not init_res.get("ok"):
                 raise ValueError(str(init_res.get("error") or "Failed to initialize Git repository."))
             ws_p = str(Path(str(init_res["repo_root"])).resolve())
@@ -274,8 +270,11 @@ class ProjectGraphManager:
             eff_meta["initial_commit"] = str(init_res.get("commit_sha") or "")
         elif raw_ws:
             cand = Path(raw_ws).expanduser()
-            resolved_ws = cand.resolve() if (cand.is_absolute() or raw_ws.startswith(("~", "/", "\\"))) else (proj_root / cand).resolve()
-            if bound_err := validate_external_repo_path(resolved_ws, raw_input=raw_ws):
+            is_abs = cand.is_absolute() or raw_ws.startswith(("~", "/", "\\")) or bool(re.match(r"^[A-Za-z]:[\\/]", raw_ws))
+            resolved_ws = cand.resolve() if is_abs else (proj_root / cand).resolve()
+            if not is_abs and not resolved_ws.is_relative_to(proj_root):
+                raise ValueError(f"SAFETY GUARD REJECTED: Relative repository path `{raw_ws}` escapes Projects Root (`{proj_root}`).")
+            if bound_err := validate_external_repo_path(resolved_ws, raw_input=raw_ws, disallow_projects_root=True, store=self.store):
                 raise ValueError(bound_err)
             if require_existing:
                 if not resolved_ws.is_dir():
@@ -353,11 +352,7 @@ class ProjectGraphManager:
         proj_root = get_projects_root(self.store)
         if do_init:
             eff_raw = str(raw_ws_p or proj.get("workspace_path") or proj.get("slug") or title).strip()
-            cand_u = Path(eff_raw).expanduser()
-            init_tgt = cand_u.resolve() if (cand_u.is_absolute() or eff_raw.startswith(("~", "/", "\\"))) else (proj_root / cand_u).resolve()
-            if bound_err := validate_external_repo_path(init_tgt, raw_input=eff_raw):
-                raise ValueError(bound_err)
-            init_res = init_greenfield_repo(init_tgt, title=title, goal_summary=goal_s)
+            init_res = init_greenfield_repo(eff_raw, title=title, goal_summary=goal_s, store=self.store)
             if not init_res.get("ok"):
                 raise ValueError(str(init_res.get("error") or "Failed to initialize Git repository."))
             ws_p = str(Path(str(init_res["repo_root"])).resolve())
@@ -365,8 +360,11 @@ class ProjectGraphManager:
             clean_ws = str(raw_ws_p).strip()
             if clean_ws:
                 cand = Path(clean_ws).expanduser()
-                res_ws = cand.resolve() if (cand.is_absolute() or clean_ws.startswith(("~", "/", "\\"))) else (proj_root / cand).resolve()
-                if bound_err := validate_external_repo_path(res_ws, raw_input=clean_ws):
+                is_abs = cand.is_absolute() or clean_ws.startswith(("~", "/", "\\")) or bool(re.match(r"^[A-Za-z]:[\\/]", clean_ws))
+                res_ws = cand.resolve() if is_abs else (proj_root / cand).resolve()
+                if not is_abs and not res_ws.is_relative_to(proj_root):
+                    raise ValueError(f"SAFETY GUARD REJECTED: Relative repository path `{clean_ws}` escapes Projects Root (`{proj_root}`).")
+                if bound_err := validate_external_repo_path(res_ws, raw_input=clean_ws, disallow_projects_root=True, store=self.store):
                     raise ValueError(bound_err)
                 if bool(updates.get("require_existing")):
                     if not res_ws.is_dir():

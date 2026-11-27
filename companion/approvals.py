@@ -62,7 +62,7 @@ _R0_ACTIONS: Dict[str, FrozenSet[str]] = {
     "checkpoint_manage": frozenset({"", "list", "git_log"}),
     "memory_manage": frozenset({"get_notes", "get_adrs", "get_profile", "search", "search_history", "recent_history", "query_facts", "read_fact"}),
     "task_manage": frozenset({"list_tasks", "list_backlog", "list_all"}),
-    "project_manage": frozenset({"", "status", "current", "list", "browse", "ls", "tree", "get_root", "browse_projects"}),
+    "project_manage": frozenset({"", "status", "current", "list", "browse", "ls", "tree", "get_root", "browse_projects", "browse_projects_dir"}),
     "job_manage": frozenset({"", "list", "status"}),
     "wiki_manage": frozenset({"", "list", "tree", "read", "search", "graph", "diff", "list_stale", "list_trash", "list_templates", "read_template", "tag_authority", "inspect_graduation", "validate_curation", "curation_history"}),
     "vault_manage": frozenset({"", "list", "check_secret", "list_missing", "audit"}),
@@ -77,7 +77,20 @@ _R0_ACTIONS: Dict[str, FrozenSet[str]] = {
 
 def classify_action_risk(tool_name: str, args: Optional[Dict[str, Any]] = None) -> ActionRiskTier:
     """Classify `(tool_name, args)` into `R0`..`R3` without domain-specific hardcoding."""
-    payload, action = args or {}, str((args or {}).get("action") or (args or {}).get("subaction") or "").strip().lower()
+    payload = args or {}
+    if tool_name == "ops_manage":
+        dom = str(payload.get("domain") or "jobs").strip().lower()
+        if dom == "doctor":
+            return ActionRiskTier.R0_READ_ONLY
+        sub_p = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        mapped = {
+            "jobs": "job_manage", "routines": "routine_manage", "vault": "vault_manage",
+            "endpoints": "endpoint_manage", "workflows": "workflow_manage",
+            "projects": "project_manage", "checkpoints": "checkpoint_manage", "telemetry": "telemetry_manage",
+        }.get(dom, "")
+        if mapped:
+            return classify_action_risk(mapped, {**sub_p, **{k: v for k, v in payload.items() if k not in ("domain", "params")}})
+    action = str(payload.get("action") or payload.get("subaction") or "").strip().lower()
     if tool_name in ("read_file", "list_dir", "search", "web_fetch", "web_search", "system_doctor"):
         return ActionRiskTier.R0_READ_ONLY
     if tool_name == "telemetry_manage":

@@ -474,6 +474,7 @@ export const App: React.FC = () => {
         {/* Closed-by-default Right Split Auxiliary Inspector Pane (Mobile Bottom Sheet) */}
         <AuxSplitPane
           target={auxTarget}
+          projectsRoot={status?.projects_root || status?.projects_dir || ''}
           onClose={() => setAuxTarget(null)}
           onChanged={() => {
             setDataRefreshNonce((n) => n + 1);

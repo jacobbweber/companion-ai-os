@@ -197,14 +197,21 @@ _DEFAULT_GREENFIELD_GITIGNORE = (
 )
 
 
-_POSIX_SYS_ROOTS = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/run", "/var", "/opt/companion")
+_POSIX_SYS_ROOTS = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/run", "/var", "/root", "/opt/companion")
 _EXPLORER_SKIP_DIRS_LOWER = frozenset({
     ".git", ".worktrees", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
     "coverage", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".companion_backups", "companion-data",
 })
+_RESERVED_REPO_LEAF_LOWER = frozenset({".git", ".worktrees", "node_modules", "__pycache__", ".venv"})
 
 
-def validate_external_repo_path(target: Path, raw_input: str = "") -> Optional[str]:
+def validate_external_repo_path(
+    target: Path,
+    raw_input: str = "",
+    *,
+    disallow_projects_root: bool = False,
+    store: Optional[MemoryStore] = None,
+) -> Optional[str]:
     """Mechanically block repo or `projects_root` paths inside `app/`, `data/`, `$HOME`, `/`, or OS system dirs."""
     raw_s = (raw_input or str(target) or "").strip()
     if "\x00" in raw_s or "\x00" in str(target):
@@ -215,9 +222,7 @@ def validate_external_repo_path(target: Path, raw_input: str = "") -> Optional[s
         resolved = Path(target).expanduser().resolve()
     except Exception as exc:
         return f"SAFETY GUARD REJECTED: invalid repository path `{target}` ({exc})."
-    self_res = settings.root.resolve()
-    data_res = settings.effective_data_dir.resolve()
-    raw_data = (self_res / "data").resolve()
+    self_res, data_res, raw_data = settings.root.resolve(), settings.effective_data_dir.resolve(), (settings.root / "data").resolve()
     fallback_dir = settings.default_projects_dir
     if resolved == self_res or resolved.is_relative_to(self_res):
         return (
@@ -237,11 +242,12 @@ def validate_external_repo_path(target: Path, raw_input: str = "") -> Optional[s
         return f"SAFETY GUARD REJECTED: Repository path `{resolved}` cannot be the filesystem root or home directory directly."
     if home_res.parent.resolve() != anchor_res and resolved == home_res.parent.resolve():
         return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot be the top-level users directory directly (use `{fallback_dir}`)."
-    parts_low = {pt.lower() for pt in resolved.parts}
-    if parts_low & {".ssh", ".gnupg"}:
+    if {pt.lower() for pt in resolved.parts} & {".ssh", ".gnupg"}:
         return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot live inside credential directory `.ssh`/`.gnupg`."
     tmp_res = Path(tempfile.gettempdir()).resolve()
-    in_temp_dir = resolved != tmp_res and resolved.is_relative_to(tmp_res)
+    if resolved == tmp_res:
+        return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot be the shared OS temp directory directly."
+    in_temp_dir = resolved.is_relative_to(tmp_res)
     if not in_temp_dir:
         if raw_s.startswith("/") and not raw_s.startswith("//"):
             raw_norm = re.sub(r"/+", "/", raw_s.replace("\\", "/")).rstrip("/") or "/"
@@ -265,6 +271,17 @@ def validate_external_repo_path(target: Path, raw_input: str = "") -> Optional[s
                             return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot live inside protected Windows system directory `{wr_res}`."
             if len(resolved.parts) >= 2 and resolved.parts[1].lower() in ("windows", "system volume information", "$recycle.bin"):
                 return f"SAFETY GUARD REJECTED: Path `{resolved}` cannot live inside protected Windows system directory."
+    if disallow_projects_root:
+        proj_root = get_projects_root(store)
+        if resolved == proj_root:
+            return f"SAFETY GUARD REJECTED: Repository path `{resolved}` cannot be the Projects Root container itself; choose a subfolder under `{proj_root}`."
+        if resolved.name.lower() in _RESERVED_REPO_LEAF_LOWER:
+            return f"SAFETY GUARD REJECTED: Repository folder cannot be reserved directory `{resolved.name}`."
+        is_rel_raw = bool(raw_s) and not Path(raw_s).expanduser().is_absolute() and not raw_s.startswith(("~", "/", "\\")) and not re.match(r"^[A-Za-z]:[\\/]", raw_s)
+        if is_rel_raw:
+            segs = [seg.strip() for seg in raw_s.replace("\\", "/").split("/") if seg.strip()]
+            if ".." in segs or (not resolved.is_relative_to(proj_root) and (proj_root / raw_s).resolve() == resolved):
+                return f"SAFETY GUARD REJECTED: Relative repository path `{raw_s}` escapes Projects Root (`{proj_root}`)."
     return None
 
 
@@ -363,30 +380,31 @@ def set_projects_root(raw_path: str = "", reset: bool = False, store: Optional[M
     }
 
 
+def _parse_git_head_file(head_f: Path) -> Optional[str]:
+    if not head_f.is_file():
+        return None
+    raw_h = head_f.read_text(encoding="utf-8", errors="ignore").strip()
+    if raw_h.startswith("ref: refs/heads/"):
+        return raw_h[len("ref: refs/heads/") :].strip()
+    if raw_h.startswith("ref: "):
+        return raw_h.rsplit("/", 1)[-1].strip()
+    return raw_h[:7] if raw_h else "HEAD"
+
+
 def _fast_git_branch(repo_dir: Path) -> str:
     """Read `.git/HEAD` directly in `<0.1ms` without spawning a subprocess per folder row."""
     dot_git = repo_dir / ".git"
     with contextlib.suppress(OSError):
         if dot_git.is_dir():
-            head_f = dot_git / "HEAD"
-            if head_f.is_file():
-                raw_h = head_f.read_text(encoding="utf-8", errors="ignore").strip()
-                if raw_h.startswith("ref: refs/heads/"):
-                    return raw_h[len("ref: refs/heads/") :].strip()
-                if raw_h.startswith("ref: "):
-                    return raw_h.rsplit("/", 1)[-1].strip()
-                return raw_h[:7] if raw_h else "HEAD"
+            if parsed := _parse_git_head_file(dot_git / "HEAD"):
+                return parsed
         elif dot_git.is_file():
             gtxt = dot_git.read_text(encoding="utf-8", errors="ignore").strip()
             if gtxt.startswith("gitdir:"):
                 raw_gd = gtxt.split(":", 1)[1].strip()
                 gd_path = (repo_dir / raw_gd).resolve() if not Path(raw_gd).is_absolute() else Path(raw_gd).resolve()
-                head_f = gd_path / "HEAD"
-                if head_f.is_file():
-                    raw_h = head_f.read_text(encoding="utf-8", errors="ignore").strip()
-                    if raw_h.startswith("ref: refs/heads/"):
-                        return raw_h[len("ref: refs/heads/") :].strip()
-                    return raw_h[:7] if raw_h else "HEAD"
+                if parsed := _parse_git_head_file(gd_path / "HEAD"):
+                    return parsed
     br = _current_branch(repo_dir)
     return "main" if br == "HEAD" else br
 
@@ -922,23 +940,32 @@ def init_greenfield_repo(
     title: str = "",
     goal_summary: str = "",
     default_branch: str = "main",
+    store: Optional[MemoryStore] = None,
 ) -> Dict[str, Any]:
     """Idempotently initialize an external Git repository on `main` with `.gitignore`, `README.md`, and initial commit."""
     raw = str(target_path or "").strip().strip("'\"")
-    proj_root = get_projects_root()
+    proj_root = get_projects_root(store)
     if not raw:
         slug = _slugify_part(title or "new-project", fallback="new-project", max_len=48)
         target = (proj_root / slug).resolve()
     else:
         cand = Path(raw).expanduser()
-        target = cand.resolve() if (cand.is_absolute() or raw.startswith("~")) else (proj_root / cand).resolve()
-    bound_err = validate_external_repo_path(target, raw_input=raw)
+        is_abs_or_home = cand.is_absolute() or raw.startswith(("~", "/", "\\")) or bool(re.match(r"^[A-Za-z]:[\\/]", raw))
+        target = cand.resolve() if is_abs_or_home else (proj_root / cand).resolve()
+        if not is_abs_or_home and not target.is_relative_to(proj_root):
+            return {"ok": False, "error": f"SAFETY GUARD REJECTED: Relative repository path `{raw}` escapes Projects Root (`{proj_root}`)."}
+    bound_err = validate_external_repo_path(target, raw_input=raw, disallow_projects_root=True, store=store)
     if bound_err:
         return {"ok": False, "error": bound_err}
+    if target.exists() and not target.is_dir():
+        return {"ok": False, "error": f"SAFETY GUARD REJECTED: `{target}` is an existing file, not a directory."}
     if shutil.which("git") is None:
         return {"ok": False, "error": "error: git executable not found on PATH"}
 
-    target.mkdir(parents=True, exist_ok=True)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"error: could not create repository folder `{target}`: {exc}"}
     created_repo = False
     if not (target / ".git").exists():
         rc_i, out_i = _run_git_cmd(target, ["init", "-b", default_branch])
@@ -1326,14 +1353,13 @@ def _handle_git_init(raw_repo: str, args: Dict[str, Any]) -> str:
     title_arg = str_arg(args, "title", aliases=("name", "slug"))
     if ws.is_self_project:
         if raw_repo:
-            cand = Path(raw_repo).expanduser()
-            init_target: Any = cand.resolve() if (cand.is_absolute() or raw_repo.startswith("~")) else (settings.projects_dir / cand).resolve()
+            init_target: Any = raw_repo
         elif title_arg:
             init_target = ""
         else:
             return "error: `repo_path` or `slug` is required for `git_manage(action='init')` when focused on `companion-self`."
     else:
-        init_target = _resolve_repo_arg(raw_repo)
+        init_target = raw_repo or _resolve_repo_arg(raw_repo)
     res = init_greenfield_repo(init_target, title=title_arg, default_branch=str_arg(args, "branch", "main") or "main")
     if not res.get("ok"):
         return str(res.get("error") or "error: git init failed")
@@ -1343,8 +1369,8 @@ def _handle_git_init(raw_repo: str, args: Dict[str, Any]) -> str:
 
         pg = get_project_graph()
         ex_rows = pg.store._fetch_rows(
-            "SELECT project_id FROM projects WHERE status = 'active' AND (workspace_path = ? OR slug = ?) LIMIT 1",
-            (str(repo_p), repo_p.name.lower()),
+            "SELECT project_id FROM projects WHERE status = 'active' AND (workspace_path = ? OR (slug = ? AND COALESCE(workspace_path, '') = '')) ORDER BY CASE WHEN workspace_path = ? THEN 0 ELSE 1 END LIMIT 1",
+            (str(repo_p), repo_p.name.lower(), str(repo_p)),
         )
         if ex_rows:
             pid = str(ex_rows[0][0])
@@ -1859,15 +1885,20 @@ def _detect_stack_and_rules(root: Path) -> Tuple[str, List[str]]:
     return (" + ".join(stacks) if stacks else "General"), rules
 
 
-def probe_repo_workspace(path_str: str) -> Dict[str, Any]:
+def probe_repo_workspace(path_str: str, store: Optional[MemoryStore] = None) -> Dict[str, Any]:
     """Inspect a candidate repository path without mutating anything (powers UI `Check Repo`)."""
     raw = (path_str or "").strip()
-    proj_dir = str(get_projects_root())
+    proj_root = get_projects_root(store)
+    proj_dir = str(proj_root)
     if not raw:
         return {"ok": False, "exists": False, "is_git_repo": False, "projects_root": proj_dir, "projects_dir": proj_dir, "error": "Repository path is required."}
     cand = Path(raw).expanduser()
-    target = cand.resolve() if (cand.is_absolute() or raw.startswith("~")) else (Path(proj_dir) / cand).resolve()
-    bound_err = validate_external_repo_path(target, raw_input=raw)
+    is_abs_or_home = cand.is_absolute() or raw.startswith(("~", "/", "\\")) or bool(re.match(r"^[A-Za-z]:[\\/]", raw))
+    target = cand.resolve() if is_abs_or_home else (proj_root / cand).resolve()
+    if not is_abs_or_home and not target.is_relative_to(proj_root):
+        esc_err = f"SAFETY GUARD REJECTED: Relative repository path `{raw}` escapes Projects Root (`{proj_root}`)."
+        return {"ok": False, "exists": False, "is_git_repo": False, "can_init": False, "repo_root": str(target), "projects_root": proj_dir, "projects_dir": proj_dir, "error": esc_err, "summary": esc_err}
+    bound_err = validate_external_repo_path(target, raw_input=raw, disallow_projects_root=True, store=store)
     if bound_err:
         return {
             "ok": False, "exists": target.exists(), "is_git_repo": False, "can_init": False,
@@ -2384,7 +2415,7 @@ def execute_agile_worktree_subaction(
 ) -> Optional[Dict[str, Any]]:
     """Handle Studio repo probe, `projects_root` explorer/pinning, parallel worktrees, and deliverable subactions."""
     if sub == "probe_repo":
-        return probe_repo_workspace(str(p.get("workspace_path") or p.get("path") or ""))
+        return probe_repo_workspace(str(p.get("workspace_path") or p.get("path") or ""), store=mem)
     if sub in ("browse_projects", "browse_projects_dir", "browse_dir", "browse"):
         return browse_projects_dir(str(p.get("rel_path") or p.get("path") or p.get("workspace_path") or ""), store=mem)
     if sub in ("create_projects_subfolder", "create_subfolder", "mkdir_projects", "mkdir"):

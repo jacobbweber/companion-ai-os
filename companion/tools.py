@@ -976,14 +976,15 @@ def check_phase_tool_permission(tool_name: str, phase: Optional[str] = None, arg
     if args is not None and eff in ("INTAKE", "DISCOVER", "DESIGN", "PLAN", "VERIFY", "REFLECT"):
         if tool_name == "ops_manage":
             dom = str_arg(args, "domain").lower()
-            act = str_arg(args, "action", "list").lower()
+            sub_p = _dict_arg(args, "params") or {}
+            act = (str_arg(args, "action") or str_arg(sub_p, "action") or ("" if dom == "projects" else "list")).lower()
             mapped = {
                 "jobs": "job_manage", "routines": "routine_manage", "vault": "vault_manage",
                 "endpoints": "endpoint_manage", "workflows": "workflow_manage",
                 "projects": "project_manage", "checkpoints": "checkpoint_manage",
             }.get(dom, "")
             if mapped:
-                return check_phase_tool_permission(mapped, phase=eff, args={**(_dict_arg(args, "params") or {}), "action": act, "target": args.get("target")})
+                return check_phase_tool_permission(mapped, phase=eff, args={**sub_p, "action": act, "target": args.get("target") or sub_p.get("target")})
             return None
         act = str(args.get("action") or "").strip().lower()
         if tool_name == "project_manage":

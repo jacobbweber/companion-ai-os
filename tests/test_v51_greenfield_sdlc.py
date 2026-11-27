@@ -14,15 +14,17 @@ from typing import Any, Dict, List
 from unittest.mock import patch
 
 from companion.agent import _is_active_sdlc_codesign_turn, handle_slash_command, is_awaiting_blueprint_approval, run_agent_turn, triage_turn
+from companion.approvals import ActionRiskTier, classify_action_risk
 from companion.config import Settings, settings, workspace_context
 from companion.context import build_system_prompt, build_turn_context, discover_skills, manage_active_project
 from companion.core_actions import execute_core_action
 from companion.memory_store import MemoryStore, memory_store_context
 from companion.projects import get_project_graph
-from companion.tools import TOOLS, dispatch, phase_tool_context
+from companion.tools import TOOLS, check_phase_tool_permission, dispatch, phase_tool_context
 from companion.workflows import discover_dags, execute_dag_by_name, validate_skill_markdown
 from companion.worktrees import (
     SDLC_SLASH_MAP,
+    _fast_git_branch,
     browse_projects_dir,
     create_projects_subfolder,
     discover_repo_sdlc_context,
@@ -570,10 +572,13 @@ class TestProjectsRootExplorerAndParity(unittest.TestCase):
                 self.assertFalse(info0["is_custom_root"])
                 self.assertEqual(settings.projects_dir, env_projects)
 
-                # 2. Mechanically reject `/`, `$HOME`, `/etc`, `/usr`, `/var`, `app/`, `data/`, `.ssh`, and Windows system dirs
+                # 2. Mechanically reject `/`, `$HOME`, `/root`, `gettempdir()`, `/etc`, `/usr`, `/var`, `app/`, `data/`, `.ssh`, and Windows system dirs
                 blocked_targets = [
                     "/",
                     str(Path.home().resolve()),
+                    "/root",
+                    "/root/private",
+                    str(Path(tempfile.gettempdir()).resolve()),
                     "/etc",
                     "/usr/local",
                     "/var/log",
@@ -759,6 +764,53 @@ class TestProjectsRootExplorerAndParity(unittest.TestCase):
                 self.assertEqual(settings.get_workspace().project_root.resolve(), (proot / "Agent-OS").resolve())
                 handle_slash_command("/project self", msgs, store=store, interactive=False)
                 self.assertTrue(settings.get_workspace().is_self_project)
+
+                # R0/R3 ops_manage risk classification & omitted-action phase gate
+                self.assertEqual(classify_action_risk("ops_manage", {"domain": "projects", "action": "browse"}), ActionRiskTier.R0_READ_ONLY)
+                self.assertEqual(classify_action_risk("ops_manage", {"domain": "endpoints", "action": "ssh_exec"}), ActionRiskTier.R3_HIGH_IMPACT_MUTATION)
+                self.assertIn(
+                    "PHASE TOOL GATE REJECTED",
+                    check_phase_tool_permission("ops_manage", phase="DISCOVER", args={"domain": "projects", "target": "Agent-OS"}) or "",
+                )
+
+                # Layer-1 vs Layer-3 guard: `projects_root` itself, plain files, and relative `..` escapes cannot be `git init`ed
+                r_self_root = init_greenfield_repo(proot, title="Root Clobber", store=store)
+                self.assertFalse(r_self_root["ok"], r_self_root)
+                self.assertFalse((proot / ".git").exists())
+                r_rel_esc = init_greenfield_repo("../escaped_outside", title="Escape", store=store)
+                self.assertFalse(r_rel_esc["ok"], r_rel_esc)
+                self.assertIn("SAFETY GUARD REJECTED", r_rel_esc["error"])
+                plain_f = proot / "not_a_dir.txt"
+                plain_f.write_text("file", encoding="utf-8")
+                r_file = init_greenfield_repo(plain_f, store=store)
+                self.assertFalse(r_file["ok"], r_file)
+                self.assertIn("SAFETY GUARD REJECTED", r_file["error"])
+
+                # Nested subfolder repo name collision (`experiments/my-app` vs `products/my-app`) preserves both project records!
+                dispatch("ops_manage", {"domain": "projects", "action": "init", "target": "experiments/my-app"})
+                dispatch("ops_manage", {"domain": "projects", "action": "init", "target": "products/my-app"})
+                bound_paths = {
+                    Path(str(p["workspace_path"])).resolve()
+                    for p in get_project_graph(store).list_projects()
+                    if str(p.get("workspace_path") or "").strip()
+                }
+                self.assertIn((proot / "experiments" / "my-app").resolve(), bound_paths)
+                self.assertIn((proot / "products" / "my-app").resolve(), bound_paths)
+
+                # `.git` gitdir worktree/submodule symbolic refs parse cleanly without truncation
+                wt_dir, gd_dir = tmp_p / "wt_sub", tmp_p / "gd_meta"
+                wt_dir.mkdir()
+                gd_dir.mkdir()
+                (wt_dir / ".git").write_text(f"gitdir: {gd_dir}\n", encoding="utf-8")
+                (gd_dir / "HEAD").write_text("ref: refs/remotes/origin/release\n", encoding="utf-8")
+                self.assertEqual(_fast_git_branch(wt_dir), "release")
+
+            # Store-scoped `probe_repo` honors pinned `projects_root` even outside `memory_store_context`
+            with contextlib.closing(MemoryStore(db_path=db_file)) as plain_store:
+                probe_rel = execute_core_action("agile", {"subaction": "probe_repo", "workspace_path": "products/my-app"}, actor="web", store=plain_store)
+                self.assertTrue(probe_rel["ok"], probe_rel)
+                self.assertTrue(probe_rel["is_git_repo"])
+                self.assertEqual(Path(probe_rel["projects_root"]).resolve(), proot.resolve())
 
 
 if __name__ == "__main__":

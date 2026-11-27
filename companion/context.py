@@ -9,6 +9,7 @@ Unifies:
 4. Real `fast`-tier LLM Stage-2 Semantic Compaction bounded deterministically by `KeyTokens` verification, plus durable fact distillation into `knowledge_facts` and `MEMORY.md`.
 """
 
+import hashlib
 import json
 import os
 import platform
@@ -527,6 +528,25 @@ def _load_known_projects(mem: MemoryStore) -> Dict[str, str]:
         return {}
 
 
+def _disambiguate_repo_pid(mem: MemoryStore, base_pid: str, proot: Path, res_str: str) -> str:
+    from companion.worktrees import get_projects_root
+
+    proj_root = get_projects_root(mem)
+    cands: List[str] = []
+    if proot.parent.resolve() != proj_root:
+        cands.append(slugify_project_id(f"{proot.parent.name}-{proot.name}"))
+    digest = hashlib.sha1(res_str.encode("utf-8")).hexdigest()[:4]
+    cands.append(f"{base_pid[:42]}-{digest}")
+    for cand_pid in cands:
+        clash = mem._fetch_rows(
+            "SELECT workspace_path FROM projects WHERE status = 'active' AND (project_id = ? OR slug = ?) LIMIT 1",
+            (cand_pid, cand_pid),
+        )
+        if not clash or str(clash[0][0] or "").strip() in ("", res_str):
+            return cand_pid
+    return f"{base_pid[:38]}-{hashlib.sha1(res_str.encode('utf-8')).hexdigest()[:8]}"
+
+
 def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known: Dict[str, str]) -> str:
     from companion.projects import get_project_graph
 
@@ -534,20 +554,32 @@ def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known:
     eff_pid = pid
     if pid != SELF_PROJECT_ID:
         res_str = str(proot.resolve())
-        known[pid] = res_str
-        ex_rows = mem._fetch_rows(
-            "SELECT project_id, kind FROM projects WHERE status = 'active' AND (workspace_path = ? OR project_id = ? OR slug = ?) LIMIT 1",
-            (res_str, pid, pid),
-        )
         eff_kind = "software" if (proot / ".git").exists() else "project"
-        if ex_rows:
-            eff_pid, cur_kind = str(ex_rows[0][0]), str(ex_rows[0][1] or "")
+        by_ws = mem._fetch_rows(
+            "SELECT project_id, kind FROM projects WHERE status = 'active' AND workspace_path = ? LIMIT 1",
+            (res_str,),
+        )
+        if by_ws:
+            eff_pid, cur_kind = str(by_ws[0][0]), str(by_ws[0][1] or "")
             upd_kw: Dict[str, Any] = {"workspace_path": res_str}
             if eff_kind == "software" and cur_kind in ("project", "goal", ""):
                 upd_kw["kind"] = "software"
             pg.update_project(eff_pid, **upd_kw)
         else:
-            pg.create_project(title=pid.replace("-", " ").title(), kind=eff_kind, workspace_id=pid, workspace_path=res_str, project_id=pid)
+            by_id = mem._fetch_rows(
+                "SELECT project_id, kind, workspace_path FROM projects WHERE status = 'active' AND (project_id = ? OR slug = ?) LIMIT 1",
+                (pid, pid),
+            )
+            if by_id and not str(by_id[0][2] or "").strip():
+                eff_pid, cur_kind = str(by_id[0][0]), str(by_id[0][1] or "")
+                upd_kw = {"workspace_path": res_str, **({"kind": "software"} if eff_kind == "software" and cur_kind in ("project", "goal", "") else {})}
+                pg.update_project(eff_pid, **upd_kw)
+            else:
+                if by_id:
+                    eff_pid = _disambiguate_repo_pid(mem, pid, proot, res_str)
+                disp_title = proot.name if any(c.isupper() for c in proot.name) else eff_pid.replace("-", " ").title()
+                pg.create_project(title=disp_title, slug=eff_pid, kind=eff_kind, workspace_id=eff_pid, workspace_path=res_str, project_id=eff_pid)
+        known[eff_pid] = res_str
     pg.set_focus_project(eff_pid)
     if eff_pid != SELF_PROJECT_ID:
         settings.set_workspace(proot, eff_pid)
@@ -566,15 +598,19 @@ def _resolve_external_target(
     clean = raw_target.strip().strip("'\"")
     slug = slugify_project_id(clean)
     proj_root = get_projects_root(store)
+    is_rel = bool(clean) and not Path(clean).is_absolute() and not clean.startswith(("~", "/", "\\")) and not re.match(r"^[A-Za-z]:[\\/]", clean)
+    if prefer_existing and is_rel and (proj_root / clean).exists():
+        return (proj_root / clean).resolve()
     if clean in known:
         return Path(known[clean]).resolve()
-    if prefer_existing and clean and not Path(clean).is_absolute() and not clean.startswith("~") and (proj_root / clean).exists():
-        return (proj_root / clean).resolve()
     if slug in known and "/" not in clean and "\\" not in clean and ":" not in clean:
-        return Path(known[slug]).resolve()
+        if prefer_existing or not (proj_root / slug).exists():
+            return Path(known[slug]).resolve()
     cand = Path(clean).expanduser()
-    if cand.is_absolute() or clean.startswith(("~", "/", "\\")):
+    if cand.is_absolute() or clean.startswith(("~", "/", "\\")) or bool(re.match(r"^[A-Za-z]:[\\/]", clean)):
         return cand.resolve()
+    if ".." in [p.strip() for p in clean.replace("\\", "/").split("/")]:
+        return (proj_root / clean).resolve()
     if "/" not in clean and "\\" not in clean:
         return (proj_root / slug).resolve()
     norm_parts = [p.strip() for p in clean.replace("\\", "/").split("/") if p.strip()]
@@ -637,14 +673,15 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
         if not rest:
             return "error: project name or path is required for `init` (e.g., `/project init my-app`)."
         target = _resolve_external_target(rest, known, store=mem, prefer_existing=False)
-        if bound_err := validate_external_repo_path(target, raw_input=rest):
+        if bound_err := validate_external_repo_path(target, raw_input=rest, disallow_projects_root=True, store=mem):
             return f"error: {bound_err}"
-        init_res = init_greenfield_repo(target, title=target.name)
+        init_res = init_greenfield_repo(target, title=target.name, store=mem)
         if not init_res.get("ok"):
             err_s = str(init_res.get("error") or "failed to initialize repository")
             return err_s if err_s.lower().startswith("error:") else f"error: {err_s}"
         ws = settings.set_workspace(target)
         _persist_workspace_selection(mem, ws.project_id, ws.project_root, known)
+        ws = settings.get_workspace()
         return (
             f"Initialized & activated project `{ws.project_id}` at `{ws.project_root}` "
             f"on `{init_res.get('branch', 'main')}` (`{init_res.get('commit_sha', '')}`; `{ws.self_root}` locked READ-ONLY)."
@@ -656,12 +693,13 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
     if target_str.lower() in ("self", SELF_PROJECT_ID):
         return manage_active_project("self", store=mem)
     target = _resolve_external_target(target_str, known, store=mem, prefer_existing=True)
-    if bound_err := validate_external_repo_path(target, raw_input=target_str):
+    if bound_err := validate_external_repo_path(target, raw_input=target_str, disallow_projects_root=True, store=mem):
         return f"error: {bound_err}"
     if not target.is_dir():
         return f"error: project directory not found: `{target}` (use `/project init {target_str}` to create it)."
     ws = settings.set_workspace(target)
     _persist_workspace_selection(mem, ws.project_id, ws.project_root, known)
+    ws = settings.get_workspace()
     return f"Switched active WorkspaceContext to `{ws.project_id}` at `{ws.project_root}` (`{ws.self_root}` locked READ-ONLY)."
 
 

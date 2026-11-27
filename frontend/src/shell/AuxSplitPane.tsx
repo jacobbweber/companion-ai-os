@@ -19,6 +19,7 @@ import type {
 
 interface AuxSplitPaneProps {
   target: AuxInspectorTarget;
+  projectsRoot?: string;
   onClose: () => void;
   onChanged: () => void;
   onSelectProject?: (projectId: string) => void;
@@ -43,6 +44,7 @@ function formatApprovalPayloadPreview(apr: ApprovalRequest): string {
 
 export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
   target,
+  projectsRoot,
   onClose,
   onChanged,
   onSelectProject,
@@ -285,6 +287,7 @@ export const AuxSplitPane: React.FC<AuxSplitPaneProps> = ({
             itemId={target.kind === 'work_item' ? target.itemId : undefined}
             projectId={target.projectId}
             createNewProject={target.kind === 'project' ? Boolean(target.createNew) : false}
+            projectsRoot={projectsRoot}
             onSaved={onChanged}
             onCreatedProject={onSelectProject}
             onClose={onClose}

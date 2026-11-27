@@ -2037,7 +2037,7 @@ def check_in(store: Optional[MemoryStore] = None, chat_fn: Optional[Callable[...
 SLASH_HELP_TEXT = (
     "=== Companion AI OS Commands ===\n"
     "  /status | /checkin      — Live system status, WorkspaceContext, workflow HUD, tasks & proactive check-in\n"
-    "  /project [init|switch..]— Manage isolated workspaces (`/project list`, `init <name>`, `switch <name>`, `self`)\n"
+    "  /project [browse|root..]— Manage workspaces (`/project browse [rel]`, `mkdir <rel>`, `root [path]`, `init`, `switch`, `self`)\n"
     "  /model & /providers     — View, ping (`check`), switch model tiers, or inspect multi-provider & Vault matrix\n"
     "  /identity | /tone | /onboard — Soul & User Identity cards, tone (`concise|balanced|elaborate`), First-Boot setup\n"
     "  /telemetry | /traces | /logs — Live KPI scorecard, Waterfall execution traces & structured app logs\n"

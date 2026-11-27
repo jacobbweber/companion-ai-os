@@ -609,5 +609,59 @@ describe('Greenfield Git Repo Bootstrap & /sdlc-* Co-Design Slash Router', () =>
     expect(probeBadge.textContent).toContain('Git repo on main');
     const wsInput = container.querySelector('[data-testid="project-workspace-path-input"]') as HTMLInputElement;
     expect(path.normalize(wsInput.value)).toBe(path.normalize(expectedNestedRepo));
-  }, 15000);
+
+    // 5. Regression: in Create New Repo mode, clicking a [Git Repo] row then navigating Up -> [Folder] experiments
+    // must NOT trap projWsPath on `my-app` — it must resume deriving `<customRoot>/experiments/<slug>`!
+    const freshCreateBtn = container.querySelector('[data-testid="repo-mode-create"]') as HTMLButtonElement;
+    const freshTitle = container.querySelector('[data-testid="project-title-input"]') as HTMLInputElement;
+    await act(async () => {
+      freshCreateBtn.click();
+      setInputValue(freshTitle, 'Billing Worker');
+    });
+    await flushUi(60);
+    await act(async () => {
+      (container.querySelector('[data-testid="explorer-entry-my-app"]') as HTMLElement).click();
+    });
+    await flushUi(100);
+    expect(path.normalize(wsInput.value)).toBe(path.normalize(expectedNestedRepo));
+    await act(async () => {
+      (container.querySelector('[data-testid="explorer-up-btn"]') as HTMLButtonElement).click();
+    });
+    await flushUi(120);
+    await act(async () => {
+      (container.querySelector('[data-testid="explorer-entry-experiments"]') as HTMLElement).click();
+    });
+    await flushUi(120);
+    expect(path.normalize(wsInput.value)).toBe(path.normalize(path.join(customRoot, 'experiments', 'billing-worker')));
+
+    // 6. Regression: inline `Change Root` syncs `SettingsModal`, and `SettingsModal` syncs an already-open `ProjectConfigPanel`!
+    const secondRoot = path.join(path.dirname(bridge.projectsDir), 'inline_changed_root');
+    await act(async () => {
+      (container.querySelector('[data-testid="change-projects-root-btn"]') as HTMLButtonElement).click();
+    });
+    await flushUi(40);
+    await act(async () => {
+      setInputValue(container.querySelector('[data-testid="projects-root-input"]') as HTMLInputElement, secondRoot);
+      (container.querySelector('[data-testid="save-projects-root-btn"]') as HTMLButtonElement).click();
+    });
+    await flushUi(160);
+    await act(async () => {
+      openSettingsBtn.click();
+    });
+    await flushUi(100);
+    const modalInput = container.querySelector('[data-testid="settings-projects-root-input"]') as HTMLInputElement;
+    expect(path.normalize(modalInput.value)).toBe(path.normalize(secondRoot));
+    await act(async () => {
+      setInputValue(modalInput, customRoot);
+      (container.querySelector('[data-testid="settings-save-projects-root-btn"]') as HTMLButtonElement).click();
+    });
+    await flushUi(160);
+    await act(async () => {
+      (container.querySelector('[data-testid="settings-modal"] button[aria-label="Close settings"]') as HTMLButtonElement).click();
+    });
+    await flushUi(100);
+    expect(path.normalize(container.querySelector('[data-testid="projects-root-display"]')?.textContent || '')).toBe(
+      path.normalize(customRoot)
+    );
+  }, 20000);
 });

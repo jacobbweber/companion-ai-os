@@ -14,6 +14,7 @@ interface WorkItemInspectorProps {
   itemId?: string;
   projectId?: string;
   createNewProject?: boolean;
+  projectsRoot?: string;
   onSaved: () => void;
   onCreatedProject?: (newProjectId: string) => void;
   onClose: () => void;
@@ -25,6 +26,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
   itemId,
   projectId,
   createNewProject = false,
+  projectsRoot,
   onSaved,
   onCreatedProject,
   onClose,
@@ -112,6 +114,7 @@ export const WorkItemInspector: React.FC<WorkItemInspectorProps> = ({
       <ProjectConfigPanel
         projectId={projectId}
         createNew={createNewProject}
+        externalProjectsRoot={projectsRoot}
         onSaved={onSaved}
         onCreatedProject={onCreatedProject}
         onClose={onClose}

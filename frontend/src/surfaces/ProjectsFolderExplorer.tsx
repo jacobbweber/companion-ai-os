@@ -52,6 +52,15 @@ export function deriveTargetPath(projectsRoot: string, parentRel: string, repoFo
   return cleanLeaf ? joinHostPath(projectsRoot, parentRel, cleanLeaf) : '';
 }
 
+export function parentRelUnderRoot(wsPath: string, rootPath: string): string {
+  const normWs = (wsPath || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  const normRoot = (rootPath || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!normWs || !normRoot || !normWs.toLowerCase().startsWith(`${normRoot.toLowerCase()}/`)) return '';
+  const rel = normWs.slice(normRoot.length + 1);
+  const slashIdx = rel.lastIndexOf('/');
+  return slashIdx > 0 ? rel.slice(0, slashIdx) : '';
+}
+
 function normalizePathCompare(p: string): string {
   return (p || '').trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
