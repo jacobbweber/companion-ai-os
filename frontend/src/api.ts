@@ -363,7 +363,6 @@ export function subscribeJobStream(
   watchdogMs = 20000
 ): () => void {
   const qs = cursor > 0 ? `?cursor=${cursor}` : '';
-  const es = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream${qs}`);
   let closed = false;
   let unsubscribed = false;
   let watchdogTimer = 0;
@@ -423,6 +422,17 @@ export function subscribeJobStream(
       cb.onError?.('Stream connection interrupted — could not reach server to finish turn.');
     }
   };
+
+  if (typeof EventSource === 'undefined') {
+    closed = true;
+    void pollFallback();
+    return () => {
+      unsubscribed = true;
+      clearWatchdog();
+    };
+  }
+
+  const es = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream${qs}`);
 
   const armWatchdog = () => {
     clearWatchdog();

@@ -10,7 +10,7 @@ Verify live web applications like a senior product engineer—rendering real DOM
 
 ## When to Use This Skill
 - After modifying frontend components, CSS themes, HTML templates, or HTTP API routes that power a Web UI.
-- Whenever `sdlc-engineering` starts a local server via `dev_preview(action="start")` and needs objective visual + runtime verification.
+- Whenever `sdlc-verify` or `sdlc-implement` starts a local server via `dev_preview(action="start")` and needs objective visual + runtime verification.
 - Reproducing a reported browser console error, broken button interaction, or mobile viewport overflow bug.
 
 ## Step-by-Step Procedure

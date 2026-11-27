@@ -307,11 +307,38 @@ def _triage_via_llm(
     )
 
 
+def _is_active_sdlc_codesign_turn(user_text: str, messages: List[Dict[str, Any]]) -> bool:
+    clean = (user_text or "").strip().lower()
+    if clean.startswith("/sdlc-"):
+        return True
+    if clean.startswith(("/", ".")):
+        return False
+    markers = ("/sdlc-", "[sdlc router directive", "guided co-design", "### checkpoint ", "stop 1 —", "stop 2 —", "stop 3 —", "stop 4 —")
+    non_sys = [m for m in messages if m.get("role") in ("user", "assistant")]
+    for m in non_sys[-6:]:
+        txt = str(m.get("content") or "").lower()
+        if any(mk in txt for mk in markers):
+            return True
+    return False
+
+
 def triage_turn(
     user_text: str, grounding: Optional[EpistemicGrounding] = None, store: Optional[Any] = None,
     root: Optional[Any] = None, triage_llm_fn: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> TriageDecision:
     clean = (user_text or "").strip()
+    if clean.lower().startswith("/sdlc-"):
+        from companion.worktrees import resolve_sdlc_slash_turn
+
+        eff_sdlc_root = Path(root).resolve() if root else settings.active_project_root
+        sdlc_turn = resolve_sdlc_slash_turn(clean, eff_sdlc_root, is_self_project=(eff_sdlc_root == settings.root.resolve()))
+        if sdlc_turn is not None:
+            s_tier = str(sdlc_turn["suggested_tier"])
+            s_mode = "DEEP_CONSULT" if s_tier == "reasoning" else "GUIDED_CHANGE"
+            return TriageDecision(
+                s_mode, s_tier, f"SDLC router (`/{sdlc_turn['verb']}` -> `{sdlc_turn['skill']}`, `{sdlc_turn['mode']}`)",
+                readiness="READY", needs_blueprint=False, route="DIRECT_TURN",
+            )
     if not clean or clean.startswith(("/", ".", "[AUTONOMOUS WORKFLOW PHASE:", "[ISOLATED SUBAGENT WORKER TASK]")):
         return TriageDecision("CHAT_DIRECT", "fast", "slash or internal system framing", route="DIRECT_TURN")
     m_tier = _resolve_active_media_tier()
@@ -1006,12 +1033,27 @@ def run_agent_turn(
 
     awaiting_bp = is_top and is_awaiting_blueprint_approval(mem)
     bp_action = classify_blueprint_reply(user_text) if awaiting_bp else None
-    intent = triage_turn(user_text, store=mem, root=settings.active_project_root) if is_top else triage_turn("")
-    can_orchestrate = is_top and not awaiting_bp and (auto_promote is True or (auto_promote is None and max_iters is None and mem.get_active_workflow() is None))
+    in_sdlc_codesign = is_top and _is_active_sdlc_codesign_turn(user_text, messages[:-1] if is_user_msg else messages)
+    with (get_project_graph(store=mem).project_workspace_scope() if is_top else contextlib.nullcontext()):
+        intent = triage_turn(user_text, store=mem, root=settings.active_project_root) if is_top else triage_turn("")
+    if in_sdlc_codesign and intent.route != "EXECUTE_VERIFIED_DAG":
+        eff_sug_tier = "reasoning" if intent.suggested_tier == "fast" else intent.suggested_tier
+        intent = TriageDecision(
+            mode="DEEP_CONSULT" if eff_sug_tier == "reasoning" else intent.mode,
+            suggested_tier=eff_sug_tier,
+            reason=intent.reason,
+            readiness="READY",
+            needs_blueprint=False,
+            route="DIRECT_TURN",
+            risk_tier=intent.risk_tier,
+        )
+    can_orchestrate = is_top and not awaiting_bp and not in_sdlc_codesign and (auto_promote is True or (auto_promote is None and max_iters is None and mem.get_active_workflow() is None))
+    if is_top and not awaiting_bp and in_sdlc_codesign and intent.route == "EXECUTE_VERIFIED_DAG":
+        can_orchestrate = True
     has_ext_ws = (not settings.get_workspace().is_self_project) or bool(get_project_graph(store=mem).get_project().get("workspace_path"))
     code_build_allowed = has_ext_ws or intent.risk_tier == "R3"
-    should_blueprint = is_top and not awaiting_bp and auto_promote is True and intent.needs_blueprint and code_build_allowed
-    should_promote = is_top and not awaiting_bp and auto_promote is True and not should_blueprint and intent.mode == "AUTONOMOUS_BUILD" and code_build_allowed
+    should_blueprint = is_top and not awaiting_bp and not in_sdlc_codesign and auto_promote is True and intent.needs_blueprint and code_build_allowed
+    should_promote = is_top and not awaiting_bp and not in_sdlc_codesign and auto_promote is True and not should_blueprint and intent.mode == "AUTONOMOUS_BUILD" and code_build_allowed
 
     prev_trace_tok = telemetry._active_trace_var.set(telemetry.active_trace_id)
     tid = telemetry.start_trace(trace_type=session_tag or "user_turn", name=user_text[:100]) if mem.db_path.resolve() == settings.db_path.resolve() else None
@@ -1990,6 +2032,7 @@ SLASH_HELP_TEXT = (
     "  /doctor                 — 7-stage Runtime Health Doctor\n"
     "  /autonomy | /morning   — Background Autonomy controls & Morning Briefing\n"
     "  /skills [name]          — List Progressive-Disclosure `SKILL.md` & `data/domains/` packs or read a skill\n"
+    "  /sdlc-next [notes|express] — Auto-detect next SDLC stage (`sdlc-1-product`..`sdlc-7-operate`, `/sdlc-change`, `/sdlc status`)\n"
     "  /plan <obj> | /approve  — Draft/revise read-only Blueprint (`DISCOVER -> DESIGN -> PLAN`) & approve build\n"
     "  /goal <obj|resume>      — Execute or resume a multi-phase autonomous build with verification gates\n"
     "  /subagent               — Spawn an isolated subagent worker\n"
@@ -2144,6 +2187,25 @@ def handle_slash_command(
         return _dispatch_checkpoint_slash(arg)
     if verb in ("rollback", "rb"):
         return dispatch("checkpoint_manage", {"action": "rollback", "checkpoint_id": arg or None})
+    from companion.worktrees import SDLC_SLASH_MAP, inspect_sdlc_repo_state
+
+    if verb in SDLC_SLASH_MAP:
+        return None
+    if verb == "sdlc":
+        with get_project_graph(store=mem).project_workspace_scope():
+            target_r = Path(arg.split(None, 1)[1]).expanduser().resolve() if arg.lower().startswith(("status ", "audit ")) and len(arg.split(None, 1)) > 1 else settings.active_project_root
+            st = inspect_sdlc_repo_state(target_r)
+        viol = ("\nPlaceholder / Stub Violations:\n" + "\n".join(f"  - {v}" for v in st["placeholder_violations"])) if st["placeholder_violations"] else ""
+        ups = ", ".join(f"`{u}`" for u in st["upstream_artifacts"]) or "(none yet)"
+        return (
+            f"=== SDLC Repository Audit (`{Path(st['repo_root']).name}`) ===\n"
+            f"Repo Root        : {st['repo_root']} (git={st['is_git_repo']} | posture=`{st['repo_kind']}` | backlog=`{st['backlog_mode']}`)\n"
+            f"Next Stage       : {st['stage_label']} (`{st['recommended_skill']}`)"
+            + (f" | Target Increment: `{st['active_increment']}`" if st.get("active_increment") else "")
+            + f"\nUpstream Docs    : {ups}\n"
+            f"Code & Tests     : {st['source_file_count']} source file(s), {st['test_file_count']} test file(s) | Hygiene: {'CLEAN' if st['hygiene_clean'] else 'ISSUES FOUND'}{viol}\n"
+            "(Run `/sdlc-next [notes | express]`, `/sdlc-1-product`..`/sdlc-7-operate`, or `/sdlc-change` in chat.)"
+        )
     from companion.core_actions import HARVEST_SLASH_VERBS, handle_harvest_slash
 
     if f"/{verb}" in HARVEST_SLASH_VERBS:

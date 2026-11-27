@@ -304,7 +304,7 @@ class CompanionWebSession:
         if not clean_msg:
             log_http_rejection(self, 400, "POST", "/api/chat", "empty message")
             return 400, {"ok": False, "error": "message is required", "error_code": "empty_message"}
-        if clean_msg.startswith(("/", ".")) and not clean_msg.lower().startswith(("/goal ", "/plan ", "/blueprint ", "/approve", "/eval", "/subagent ", "/doctor")):
+        if clean_msg.startswith(("/", ".")) and not clean_msg.lower().startswith(("/goal ", "/plan ", "/blueprint ", "/approve", "/eval", "/subagent ", "/doctor", "/sdlc-")):
             return self.execute_chat(clean_msg, mode=mode, focus_project_id=focus_project_id, followup_doc_note=followup_doc_note)
         scope = CancelScope()
         with self._jobs_lock:
@@ -379,7 +379,8 @@ class CompanionWebSession:
         if payload.get("project"):
             notes.append(manage_active_project(str(payload["project"]), store=self.store))
         if payload.get("focus_project_id"):
-            fp = get_project_graph(store=self.store).set_focus_project(str(payload["focus_project_id"]))
+            with memory_store_context(self.store):
+                fp = get_project_graph(store=self.store).set_focus_project(str(payload["focus_project_id"]))
             notes.append(f"Focused Goal/Project set to `{fp['title']}` (`{fp['project_id']}`).")
         if notes:
             fresh_sys = build_system_prompt(store=self.store)
@@ -603,7 +604,10 @@ class CompanionWebRequestHandler(BaseHTTPRequestHandler):
             sess.idle_watcher.record_human_activity()
         ext_act = handle_extended_post(route, body, self.headers, sess.store)
         if ext_act is not None:
-            if route in ("/api/actions/autonomy", "/api/actions/identity", "/api/actions/trust", "/api/actions/models"):
+            if route in ("/api/actions/autonomy", "/api/actions/identity", "/api/actions/trust", "/api/actions/models") or (
+                route == "/api/actions/agile"
+                and sub in ("create_project", "update_project", "create_board", "save_board", "upsert_project")
+            ):
                 fresh_sys = build_system_prompt(store=sess.store)
                 with sess._turn_lock:
                     if sess.messages and sess.messages[0].get("role") == "system":

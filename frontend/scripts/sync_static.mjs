@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf-8'));
-const appVersion = String(pkg.version || '5.0.5').trim();
+const appVersion = String(pkg.version || '5.1.0').trim();
 const distDir = path.resolve(__dirname, '..', 'dist');
 const staticDir = path.resolve(__dirname, '..', '..', 'surfaces', 'static');
 

@@ -1,0 +1,48 @@
+{
+  "name": "sdlc-audit",
+  "description": "Deterministic SDLC repository stage detector and artifact placeholder/TODO hygiene auditor.",
+  "input_schema": {
+    "repo_root?": "str",
+    "repo_path?": "str",
+    "fail_on_placeholders?": "bool"
+  },
+  "nodes": [
+    {
+      "id": "inspect_sdlc_status",
+      "type": "run_script",
+      "config": {
+        "script": "scripts/sdlc_repo_status.py",
+        "cli_args": ["--action", "status"]
+      },
+      "output_schema": {
+        "ok": "bool",
+        "repo_root": "str",
+        "repo_kind": "str",
+        "detected_stage": "int",
+        "recommended_skill": "str",
+        "upstream_artifacts": "list"
+      }
+    },
+    {
+      "id": "audit_artifact_hygiene",
+      "type": "run_script",
+      "depends_on": ["inspect_sdlc_status"],
+      "config": {
+        "script": "scripts/sdlc_repo_status.py",
+        "cli_args": ["--action", "audit"]
+      },
+      "output_schema": {
+        "ok": "bool",
+        "placeholder_count": "int",
+        "placeholder_violations": "list"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "inspect_sdlc_status",
+      "to": "audit_artifact_hygiene",
+      "condition": "inspect_sdlc_status.ok"
+    }
+  ]
+}

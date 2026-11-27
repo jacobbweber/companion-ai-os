@@ -516,6 +516,29 @@ class Settings:
         return self.effective_data_dir / "scratch"
 
     @property
+    def projects_dir(self) -> Path:
+        """Return default parent directory for external Git repos (`COMPANION_PROJECTS_DIR`), never inside `app/` or `data/`."""
+        override = os.environ.get("COMPANION_PROJECTS_DIR", "").strip()
+        if override:
+            p = Path(override).expanduser()
+            return p.resolve() if p.is_absolute() else (Path.home() / p).resolve()
+        self_res = self.root.resolve()
+        parent_res = self_res.parent.resolve()
+        norm_self = self_res.as_posix().lower()
+        parent_parts = {pt.lower() for pt in parent_res.parts}
+        is_packaged_runtime = (
+            norm_self.endswith("/.local/share/companion/app")
+            or norm_self == "/opt/companion"
+            or (self_res.name.lower() == "app" and parent_res.name.lower() == "companion")
+            or bool(parent_parts & {".local", "appdata", "programdata"})
+            or parent_res == Path(self_res.anchor).resolve()
+            or parent_res == self.effective_data_dir.resolve()
+        )
+        if is_packaged_runtime:
+            return (Path.home() / "projects").resolve()
+        return parent_res
+
+    @property
     def compact_trigger_tokens(self) -> int:
         return int(self.context_window_tokens * (self.compact_trigger_pct / 100.0))
 
@@ -551,6 +574,7 @@ class Settings:
             "secrets_env_present": self.secrets_env_path.is_file(),
             "root": str(self.root),
             "data_dir": str(self.effective_data_dir),
+            "projects_dir": str(self.projects_dir),
             "wiki_dir": str(self.wiki_dir),
             "active_project_id": ws.project_id,
             "active_project_root": str(ws.project_root),

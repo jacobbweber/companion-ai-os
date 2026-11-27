@@ -34,6 +34,15 @@ interface ComposerBarProps {
 }
 
 const SLASH_COMMANDS = [
+  { cmd: '/sdlc-next ', desc: 'Auto-detect next SDLC stage & co-design step-by-step (add "express" for fast draft)' },
+  { cmd: '/sdlc-1-product ', desc: 'Stage 1 (Product Manager): scope, personas, KPIs -> product.md' },
+  { cmd: '/sdlc-2-architecture ', desc: 'Stage 2 (Architect): stack, boundaries & trade-offs -> architecture.md + ADRs' },
+  { cmd: '/sdlc-3-backlog ', desc: 'Stage 3 (Delivery Lead): vertical features, increments & stories + Board sync' },
+  { cmd: '/sdlc-4-design ', desc: 'Stage 4 (Design Engineer): contracts, schemas, idempotency & hardening pass' },
+  { cmd: '/sdlc-5-implement ', desc: 'Stage 5 (Software Engineer): branch isolation & modular source implementation' },
+  { cmd: '/sdlc-6-verify ', desc: 'Stage 6 (QA Engineer): adversarial unit/integration tests & clean commit' },
+  { cmd: '/sdlc-7-operate ', desc: 'Stage 7 (SRE): Day-2 runbook, observability & recovery -> operations-runbook.md' },
+  { cmd: '/sdlc-change ', desc: 'Day-2 Change Ripple: locate Entry-Hat stage & ripple surgical updates' },
   { cmd: '/plan ', desc: 'Draft an aligned Blueprint before changing code', mode: 'plan' as const },
   { cmd: '/goal ', desc: 'Run multi-step autonomous execution with Doctor gates', mode: 'goal' as const },
   { cmd: '/morning', desc: 'Read overnight & idle Autonomy Briefing' },
@@ -74,7 +83,7 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
     projects.find((p) => p.project_id === selectedProjectId || p.slug === selectedProjectId) ||
     projects[0];
 
-  const showSlashMenu = draft.startsWith('/') && !draft.includes(' ') && draft.length <= 14;
+  const showSlashMenu = draft.startsWith('/') && !draft.includes(' ') && draft.length <= 28;
   const filteredSlash = showSlashMenu
     ? SLASH_COMMANDS.filter((s) => s.cmd.startsWith(draft.toLowerCase()))
     : [];
@@ -283,7 +292,11 @@ export const ComposerBar: React.FC<ComposerBarProps> = ({
 
         {/* Slash Command Autocomplete Menu */}
         {filteredSlash.length > 0 && (
-          <div className="composer-up-menu" style={{ left: 12 }}>
+          <div
+            className="composer-up-menu"
+            data-testid="slash-autocomplete-menu"
+            style={{ left: 12, maxHeight: 280, overflowY: 'auto' }}
+          >
             <div className="popover-group-label">Actions</div>
             {filteredSlash.map((item) => (
               <button

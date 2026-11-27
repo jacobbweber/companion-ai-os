@@ -21,6 +21,7 @@ export interface WorkspaceInfo {
   project_id: string;
   project_root: string;
   is_self_project: boolean;
+  projects_dir?: string;
 }
 
 export interface TriggerPolicySpec {
@@ -110,6 +111,7 @@ export interface WebStatus {
   companion_soul?: string;
   user_profile?: string;
   data_dir?: string;
+  projects_dir?: string;
   active_model_tier: string;
   fast_model: string;
   reasoning_model: string;
@@ -682,6 +684,8 @@ export interface RepoProbeResult {
   ok: boolean;
   exists: boolean;
   is_git_repo: boolean;
+  can_init?: boolean;
+  projects_dir?: string;
   repo_root?: string;
   branch?: string;
   clean?: boolean;
@@ -832,6 +836,7 @@ export interface ProjectBoardProjection {
   project: ProjectGraphEntry;
   board: ProjectGraphEntry;
   boards: ProjectGraphEntry[];
+  projects_dir?: string;
   columns: BoardColumnProjection[];
   cards: WorkItem[];
   items?: WorkItem[];

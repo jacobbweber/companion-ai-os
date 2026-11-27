@@ -349,7 +349,7 @@ def _run_scenario_06_candidate(provider_id: str, model_name: str) -> Dict[str, A
         settings.set_workspace(repo_dir, proj["project_id"])
         rec = LiveCallRecorder(chat)
         sess = CompanionWebSession(store=ctx.store, chat_fn=rec)
-        prompt = "Follow `sdlc-engineering`: inspect `.agents/rules/repo-policy.md`, switch to a new `feat/fix-discount` branch (never commit on `main`), fix the bug in `discount.py`, run `unittest` until all tests pass, and commit your changes cleanly."
+        prompt = "Follow `sdlc-implement` and `sdlc-verify`: inspect `.agents/rules/repo-policy.md`, switch to a new `feat/fix-discount` branch (never commit on `main`), fix the bug in `discount.py`, run `unittest` until all tests pass, and commit your changes cleanly."
         t0 = time.perf_counter()
         with stream_event_context([].append):
             code, payload = sess.execute_chat(prompt, mode="chat", focus_project_id=proj["project_id"])
@@ -378,7 +378,7 @@ def _run_scenario_06_candidate(provider_id: str, model_name: str) -> Dict[str, A
 def scenario_06_tdd_bugfix_comparison() -> Dict[str, Any]:
     res_nemotron = _run_scenario_06_candidate("vllm-spark", VLLM_MODEL)
     res_qwen_coder = _run_scenario_06_candidate("ollama-lan", CODER_MODEL)
-    return {"id": 6, "name": "Single-Repo TDD Bugfix (`sdlc-engineering`: Nemotron vs Qwen3-Coder)", "passed": bool(res_nemotron["passed"] and res_qwen_coder["passed"]), "duration_s": res_nemotron["duration_s"], "nemotron": res_nemotron, "qwen3_coder": res_qwen_coder}
+    return {"id": 6, "name": "Single-Repo TDD Bugfix (`sdlc-implement` + `sdlc-verify`: Nemotron vs Qwen3-Coder)", "passed": bool(res_nemotron["passed"] and res_qwen_coder["passed"]), "duration_s": res_nemotron["duration_s"], "nemotron": res_nemotron, "qwen3_coder": res_qwen_coder}
 
 
 def scenario_07_parallel_vllm_worktrees() -> Dict[str, Any]:

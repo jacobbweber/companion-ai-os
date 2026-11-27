@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { CheckCircle2, FolderGit2, RefreshCw, Sparkles } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { CheckCircle2, FolderGit2, GitBranchPlus, Link2, RefreshCw, Sparkles } from 'lucide-react';
 import { callAction } from '../api';
 import type {
   ProjectBoardProjection,
@@ -17,6 +17,23 @@ interface ProjectConfigPanelProps {
   onToast: (msg: string) => void;
 }
 
+function slugifyRepoTitle(title: string): string {
+  return title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function deriveRepoPath(projectsDir: string, title: string): string {
+  const slug = slugifyRepoTitle(title);
+  const base = projectsDir.trim().replace(/[\\/]+$/, '');
+  if (!slug) return '';
+  if (!base) return slug;
+  const sep = base.includes('\\') && !base.includes('/') ? '\\' : '/';
+  return `${base}${sep}${slug}`;
+}
+
 export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
   projectId,
   createNew = false,
@@ -27,6 +44,8 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
 }) => {
   const [loadedProj, setLoadedProj] = useState<ProjectGraphEntry | null>(null);
   const [projectMode, setProjectMode] = useState<'personal' | 'code'>('personal');
+  const [repoSubMode, setRepoSubMode] = useState<'create' | 'attach'>(createNew ? 'create' : 'attach');
+  const [projectsDir, setProjectsDir] = useState('');
   const [projTitle, setProjTitle] = useState('');
   const [projGoal, setProjGoal] = useState('');
   const [projWsPath, setProjWsPath] = useState('');
@@ -40,6 +59,7 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
   const [vaultSecrets, setVaultSecrets] = useState<VaultSecretMeta[]>([]);
   const [probeResult, setProbeResult] = useState<RepoProbeResult | null>(null);
   const [probing, setProbing] = useState(false);
+  const pathManuallyEditedRef = useRef(false);
 
   useEffect(() => {
     setProbeResult(null);
@@ -51,8 +71,10 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
     });
 
     if (createNew) {
+      pathManuallyEditedRef.current = false;
       setLoadedProj(null);
       setProjectMode('personal');
+      setRepoSubMode('create');
       setProjTitle('');
       setProjGoal('');
       setProjWsPath('');
@@ -60,6 +82,20 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
       setProjGitCred('');
       setMaxWorkers(2);
       setTpMode('manual');
+      void callAction<{ projects_dir?: string }>('agile', {
+        subaction: 'list_boards',
+      }).then((bRes) => {
+        if (bRes.projects_dir) {
+          const dir = String(bRes.projects_dir);
+          setProjectsDir(dir);
+          setProjTitle((curTitle) => {
+            if (!pathManuallyEditedRef.current && curTitle.trim()) {
+              setProjWsPath(deriveRepoPath(dir, curTitle));
+            }
+            return curTitle;
+          });
+        }
+      });
       return;
     }
 
@@ -69,15 +105,21 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
     }).then((bRes) => {
       if (bRes.ok) {
         const view = bRes as unknown as ProjectBoardProjection;
+        if (view.projects_dir) {
+          setProjectsDir(String(view.projects_dir));
+        }
         const p = view.project;
         if (p) {
           setLoadedProj(p);
+          const hasWs = Boolean(p.workspace_path && p.workspace_path.trim());
           const isCode = Boolean(
-            (p.workspace_path && p.workspace_path.trim()) ||
+            hasWs ||
               p.kind === 'software' ||
               (p.delivery_policy && p.delivery_policy !== 'local_only')
           );
+          pathManuallyEditedRef.current = hasWs || p.project_id === 'companion-self';
           setProjectMode(isCode ? 'code' : 'personal');
+          setRepoSubMode('attach');
           setProjTitle(p.title);
           setProjGoal(p.goal_summary || '');
           setProjWsPath(p.workspace_path || '');
@@ -105,7 +147,11 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
         subaction: 'probe_repo',
         workspace_path: cleanPath,
       });
-      setProbeResult(res as unknown as RepoProbeResult);
+      const probe = res as unknown as RepoProbeResult;
+      if (probe.projects_dir && !projectsDir) {
+        setProjectsDir(probe.projects_dir);
+      }
+      setProbeResult(probe);
     } finally {
       setProbing(false);
     }
@@ -118,11 +164,22 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
       return;
     }
     const isCode = projectMode === 'code';
+    const wantInitGit = isCode && repoSubMode === 'create';
+    const cleanWs = isCode
+      ? projWsPath.trim() || (wantInitGit && projectsDir ? deriveRepoPath(projectsDir, cleanTitle) : '')
+      : '';
+    const wantAttachExisting = isCode && repoSubMode === 'attach' && (createNew || Boolean(cleanWs));
+    if (createNew && repoSubMode === 'attach' && isCode && !cleanWs) {
+      onToast('Enter an existing Git clone folder path to attach.');
+      return;
+    }
     const payload = {
       title: cleanTitle,
       goal_summary: projGoal.trim(),
       kind: isCode ? 'software' : loadedProj?.kind === 'software' ? 'project' : loadedProj?.kind || 'project',
-      workspace_path: isCode ? projWsPath.trim() : '',
+      workspace_path: cleanWs,
+      init_git: wantInitGit,
+      require_existing: wantAttachExisting,
       delivery_policy: isCode ? projDelivery : 'local_only',
       git_credential_ref: isCode ? projGitCred.trim() : '',
       max_parallel_workers: isCode ? maxWorkers : 1,
@@ -138,6 +195,7 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
     if (createNew) {
       const res = await callAction<{ project?: ProjectGraphEntry }>('agile', {
         subaction: 'create_project',
+        focus: true,
         ...payload,
       });
       if (res.ok && res.project) {
@@ -189,7 +247,12 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
             type="button"
             data-testid="project-mode-code"
             className={`segmented-pill ${projectMode === 'code' ? 'active' : ''}`}
-            onClick={() => setProjectMode('code')}
+            onClick={() => {
+              setProjectMode('code');
+              if (repoSubMode === 'create' && !pathManuallyEditedRef.current && projectsDir && projTitle.trim()) {
+                setProjWsPath(deriveRepoPath(projectsDir, projTitle));
+              }
+            }}
           >
             <FolderGit2 size={12} /> Code Repository
           </button>
@@ -203,7 +266,14 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
           data-testid="project-title-input"
           placeholder={projectMode === 'code' ? 'e.g. Payments API' : 'e.g. Home Renovation'}
           value={projTitle}
-          onChange={(e) => setProjTitle(e.target.value)}
+          onChange={(e) => {
+            const val = e.target.value;
+            setProjTitle(val);
+            if (repoSubMode === 'create' && !pathManuallyEditedRef.current && projectsDir) {
+              setProjWsPath(deriveRepoPath(projectsDir, val));
+              setProbeResult(null);
+            }
+          }}
         />
       </div>
 
@@ -230,14 +300,60 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
           data-testid="code-repo-settings-box"
         >
           <div>
-            <label className="field-label">Repository Path (Local Git Clone)</label>
+            <label className="field-label">Repository Setup</label>
+            <div className="segmented-pills" style={{ width: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr' }}>
+              <button
+                type="button"
+                data-testid="repo-mode-create"
+                className={`segmented-pill ${repoSubMode === 'create' ? 'active' : ''}`}
+                onClick={() => {
+                  setRepoSubMode('create');
+                  setProbeResult(null);
+                  if (!projWsPath.trim()) {
+                    pathManuallyEditedRef.current = false;
+                    if (projectsDir && projTitle.trim()) {
+                      setProjWsPath(deriveRepoPath(projectsDir, projTitle));
+                    }
+                  }
+                }}
+              >
+                <GitBranchPlus size={12} /> Create New Repo
+              </button>
+              <button
+                type="button"
+                data-testid="repo-mode-attach"
+                className={`segmented-pill ${repoSubMode === 'attach' ? 'active' : ''}`}
+                onClick={() => {
+                  setRepoSubMode('attach');
+                  setProbeResult(null);
+                  if (!pathManuallyEditedRef.current) {
+                    setProjWsPath('');
+                  }
+                }}
+              >
+                <Link2 size={12} /> Attach Existing Clone
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="field-label">
+              {repoSubMode === 'create'
+                ? 'Target Repository Folder (Auto-Initializes Git on main)'
+                : 'Repository Path (Existing Local Git Clone)'}
+            </label>
             <div style={{ display: 'flex', gap: 6 }}>
               <input
                 className="input mono"
                 data-testid="project-workspace-path-input"
-                placeholder="e.g. D:/Projects/MyService"
+                placeholder={
+                  repoSubMode === 'create' && projectsDir
+                    ? `${projectsDir}/my-service`
+                    : 'e.g. D:/Projects/MyService'
+                }
                 value={projWsPath}
                 onChange={(e) => {
+                  pathManuallyEditedRef.current = true;
                   setProjWsPath(e.target.value);
                   setProbeResult(null);
                 }}
@@ -255,7 +371,7 @@ export const ProjectConfigPanel: React.FC<ProjectConfigPanelProps> = ({
             </div>
             {probeResult && (
               <div style={{ marginTop: 6 }} data-testid="repo-probe-badge">
-                <span className={`badge ${probeResult.is_git_repo ? 'ok' : 'warn'}`}>
+                <span className={`badge ${probeResult.ok === false ? 'warn' : probeResult.is_git_repo || probeResult.can_init ? 'ok' : 'warn'}`}>
                   {probeResult.is_git_repo && <CheckCircle2 size={11} />}
                   {probeResult.summary || probeResult.error || 'Inspected path'}
                 </span>

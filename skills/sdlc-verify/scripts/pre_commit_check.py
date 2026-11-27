@@ -3,7 +3,7 @@
 # dependencies = []
 # ///
 """
-Deterministic Pre-Commit SDLC Helper (`skills/sdlc-engineering/scripts/pre_commit_check.py`).
+Deterministic Pre-Commit SDLC Helper (`skills/sdlc-verify/scripts/pre_commit_check.py`).
 
 Supports CLI `--action stage-safety|run-tests` and `--self-test` for `pre_commit_verify.workflow.json`.
 """

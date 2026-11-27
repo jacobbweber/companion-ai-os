@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 from companion.approvals import TRUST_MODES, archive_aged_conversations, current_session_id, delete_prompt_template, dismiss_session_nudges, enqueue_session_nudge, format_forever_search_results, get_approval_queue, get_trust_mode, list_prompt_templates, render_prompt_template, save_prompt_template, search_forever_history, set_trust_mode
 from companion.jobs import get_job_manager
 from companion.calendar_engine import execute_calendar_action
-from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, workspace_context
+from companion.config import agent_tool_turn_context, is_in_agent_tool_turn, settings, workspace_context
 from companion.context import execute_identity_action
 from companion.workflows import resume_dag_run
 from companion.education_engine import execute_education_action
@@ -585,20 +585,30 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
     if sub in ("create_board", "save_board", "create_project", "upsert_project"):
         tp_in = p.get("trigger_policy") if isinstance(p.get("trigger_policy"), dict) else None
         mpw = int(p.get("max_parallel_workers") or 2)
+        do_init = _as_bool(p.get("init_git"))
+        do_focus = _as_bool(p.get("focus"), do_init)
+        req_exist = _as_bool(p.get("require_existing"))
         proj = mgr.create_project(
             title=str(p.get("title") or p.get("project_title") or p.get("name") or "New Goal"), goal_summary=str(p.get("goal_summary") or p.get("description") or ""),
             slug=str(p.get("slug") or "") or None, kind=str(p.get("kind") or "goal"), workspace_path=str(p.get("workspace_path") or p.get("repo_path") or ""),
             delivery_policy=str(p.get("delivery_policy") or "local_only"), git_credential_ref=str(p.get("git_credential_ref") or ""),
             max_parallel_workers=mpw, test_command=str(p.get("test_command") or ""), preview_command=str(p.get("preview_command") or ""),
-            trigger_policy=tp_in, project_id=pid or None,
+            trigger_policy=tp_in, project_id=pid or None, init_git=do_init, focus=do_focus, require_existing=req_exist,
         )
-        return {"ok": True, "project": proj, "board": proj, "summary": f"Saved project/goal `{proj['title']}` (`{proj['project_id']}`, delivery_policy=`{proj['delivery_policy']}`)."}
+        ws_note = f", repo=`{proj['workspace_path']}`" if proj.get("workspace_path") else ""
+        return {"ok": True, "project": proj, "board": proj, "projects_dir": str(settings.projects_dir), "summary": f"Saved project/goal `{proj['title']}` (`{proj['project_id']}`, delivery_policy=`{proj['delivery_policy']}`{ws_note})."}
     if sub == "update_project":
         proj_upd = {k: v for k, v in p.items() if k in ("title", "goal_summary", "kind", "status", "wiki_hub_path", "workspace_path", "delivery_policy", "git_credential_ref", "max_parallel_workers", "test_command", "preview_command", "trigger_policy", "metadata")}
+        if "init_git" in p:
+            proj_upd["init_git"] = _as_bool(p.get("init_git"))
+        if "focus" in p:
+            proj_upd["focus"] = _as_bool(p.get("focus"))
+        if "require_existing" in p:
+            proj_upd["require_existing"] = _as_bool(p.get("require_existing"))
         if "goal_summary" not in proj_upd and "description" in p:
             proj_upd["goal_summary"] = str(p.get("description") or "")
         proj = mgr.update_project(pid or mgr.resolve_project_id(), **proj_upd)
-        return {"ok": True, "project": proj, "summary": f"Updated project `{proj['project_id']}` (delivery_policy=`{proj['delivery_policy']}`)."}
+        return {"ok": True, "project": proj, "projects_dir": str(settings.projects_dir), "summary": f"Updated project `{proj['project_id']}` (delivery_policy=`{proj['delivery_policy']}`)."}
     if sub in ("create_card", "save_card", "add_card", "create_item"):
         ref = str(p.get("item_id") or p.get("card_id") or "").strip()
         if ref:
@@ -646,13 +656,13 @@ def _act_agile(p: Dict[str, Any], actor: str, mem: MemoryStore) -> Dict[str, Any
         return {"ok": True, **rmap, "summary": f"Roadmap `{rmap['project']['title']}`: {len(rmap['milestones'])} milestone(s)."}
     if sub == "list_boards":
         projs = mgr.list_projects()
-        return {"ok": True, "boards": projs, "projects": projs, "summary": "Projects & Goals: " + ", ".join(f"`{x['slug']}` ({x['kind']})" for x in projs)}
+        return {"ok": True, "boards": projs, "projects": projs, "projects_dir": str(settings.projects_dir), "summary": "Projects & Goals: " + ", ".join(f"`{x['slug']}` ({x['kind']})" for x in projs)}
     if sub not in ("", "board_view", "view", "status", "get"):
         return {"ok": False, "error": f"Unknown agile subaction `{sub}`."}
     view = mgr.get_board_projection(pid or None, timebox_id=str(p.get("sprint_id") or p.get("timebox_id") or "") or None, owner_filter=str(p.get("owner") or "") or None)
     cnt, rows = view["counts"], [f"  - `{it['item_id']}` [`{it['owner']}` | `{it['status']}`]: {it['title']}" for it in view.get("items", [])[:15]]
     return {
-        "ok": True, **view, "boards": mgr.list_projects(), "aging_cards": [],
+        "ok": True, **view, "boards": mgr.list_projects(), "projects_dir": str(settings.projects_dir), "aging_cards": [],
         "summary": f"Project `{view['project']['title']}`: total={cnt['total']}, companion_ready={cnt['companion_ready']}, human_pending={cnt['human_pending']}, blocked={cnt['blocked']}, done={cnt['done']}." + ("\n" + "\n".join(rows) if rows else ""),
     }
 

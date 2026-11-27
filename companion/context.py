@@ -533,7 +533,8 @@ def _persist_workspace_selection(mem: MemoryStore, pid: str, proot: Path, known:
     pg = get_project_graph(store=mem)
     if pid != SELF_PROJECT_ID:
         known[pid] = str(proot)
-        pg.create_project(title=pid.replace("-", " ").title(), kind="project", workspace_id=pid, workspace_path=str(proot), project_id=pid)
+        eff_kind = "software" if (proot / ".git").exists() else "project"
+        pg.create_project(title=pid.replace("-", " ").title(), kind=eff_kind, workspace_id=pid, workspace_path=str(proot), project_id=pid)
     pg.set_focus_project(pid)
     mem.set_user_profile("active_project_id", pid)
     mem.set_user_profile("active_project_path", str(proot))
@@ -547,11 +548,16 @@ def _resolve_external_target(raw_target: str, known: Dict[str, str]) -> Path:
         return Path(known[clean]).resolve()
     if slug in known and "/" not in clean and "\\" not in clean and ":" not in clean:
         return Path(known[slug]).resolve()
-    cand = Path(clean)
-    return cand.resolve() if cand.is_absolute() else (settings.root.parent / clean).resolve()
+    cand = Path(clean).expanduser()
+    if cand.is_absolute() or clean.startswith("~"):
+        return cand.resolve()
+    sub = slug if ("/" not in clean and "\\" not in clean) else clean
+    return (settings.projects_dir / sub).resolve()
 
 
 def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore] = None) -> str:
+    from companion.worktrees import init_greenfield_repo, validate_external_repo_path
+
     mem = store or get_memory_store()
     known, raw = _load_known_projects(mem), (arg or "").strip()
     parts = raw.split(None, 1)
@@ -560,7 +566,7 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
     if verb in ("status", "current", ""):
         ws = settings.get_workspace()
         lock = "PERMANENTLY IMMUTABLE (`data/`, `data/domains/`, & `data/scratch/` writable)" if ws.is_self_project else f"IMMUTABLE (`{ws.self_root}` protected)"
-        return f"=== Active WorkspaceContext ===\nProject ID    : `{ws.project_id}`\nProject Root  : {ws.project_root}\nCompanion Core: {lock}\n(Use `/project list`, `/project init <name|path>`, `/project switch <name|path>`, or `/project self`.)"
+        return f"=== Active WorkspaceContext ===\nProject ID    : `{ws.project_id}`\nProject Root  : {ws.project_root}\nProjects Dir  : {settings.projects_dir}\nCompanion Core: {lock}\n(Use `/project list`, `/project init <name|path>`, `/project switch <name|path>`, or `/project self`.)"
     if verb == "list":
         ws = settings.get_workspace()
         lines = ["=== Registered Workspaces ===", f"  * `{SELF_PROJECT_ID}` -> {settings.root.resolve()}{' [ACTIVE]' if ws.is_self_project else ''}"]
@@ -575,16 +581,16 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
         if not rest:
             return "error: project name or path is required for `init` (e.g., `/project init my-app`)."
         target = _resolve_external_target(rest, known)
-        if target != settings.root.resolve() and target.is_relative_to(settings.root.resolve()):
-            return f"error: external project `{target}` must live outside Companion core (`{settings.root.resolve()}`)."
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "tests").mkdir(exist_ok=True)
-        readme = target / "README.md"
-        if not readme.exists():
-            readme.write_text(f"# {target.name}\n\nManaged by Companion.\n", encoding="utf-8")
+        init_res = init_greenfield_repo(target, title=target.name)
+        if not init_res.get("ok"):
+            err_s = str(init_res.get("error") or "failed to initialize repository")
+            return err_s if err_s.lower().startswith("error:") else f"error: {err_s}"
         ws = settings.set_workspace(target)
         _persist_workspace_selection(mem, ws.project_id, ws.project_root, known)
-        return f"Initialized & activated project `{ws.project_id}` at `{ws.project_root}` (`{ws.self_root}` locked READ-ONLY)."
+        return (
+            f"Initialized & activated project `{ws.project_id}` at `{ws.project_root}` "
+            f"on `{init_res.get('branch', 'main')}` (`{init_res.get('commit_sha', '')}`; `{ws.self_root}` locked READ-ONLY)."
+        )
 
     target_str = rest if verb == "switch" else raw
     if not target_str:
@@ -592,8 +598,8 @@ def manage_active_project(arg: Optional[str] = None, store: Optional[MemoryStore
     if target_str.lower() in ("self", SELF_PROJECT_ID):
         return manage_active_project("self", store=mem)
     target = _resolve_external_target(target_str, known)
-    if target != settings.root.resolve() and target.is_relative_to(settings.root.resolve()):
-        return f"error: external project `{target}` must live outside Companion core (`{settings.root.resolve()}`)."
+    if bound_err := validate_external_repo_path(target):
+        return f"error: {bound_err}"
     if not target.is_dir():
         return f"error: project directory not found: `{target}` (use `/project init {target_str}` to create it)."
     ws = settings.set_workspace(target)
@@ -894,6 +900,11 @@ def build_turn_context(
         if sdlc_ctx := discover_repo_sdlc_context(ws.project_root, project=proj_rec):
             lines.append(sdlc_ctx)
     if user_query.strip():
+        if user_query.strip().lower().startswith("/sdlc"):
+            from companion.worktrees import resolve_sdlc_slash_turn
+
+            if sdlc_turn := resolve_sdlc_slash_turn(user_query, ws.project_root, is_self_project=ws.is_self_project):
+                lines.append(str(sdlc_turn["prompt_block"]))
         skills = discover_skills(settings.root)
         grounding = build_epistemic_grounding(user_query, store=mem, root=ws.project_root, skills=skills, top_k=3)
         if grounding.known_facts:

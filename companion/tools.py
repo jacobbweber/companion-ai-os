@@ -290,7 +290,7 @@ def check_path_safety(path: Path, write: bool = False, allowed_roots: Optional[L
                 )
             roots = [ws.project_root, settings.domains_dir.resolve(), settings.user_skills_dir.resolve(), settings.scratch_dir.resolve(), tmp_root]
         else:
-            roots = [ws.project_root, eff_data, (ws.self_root / "skills").resolve(), tmp_root]
+            roots = [ws.project_root, eff_data, (ws.self_root / "skills").resolve(), settings.user_skills_dir.resolve(), tmp_root]
 
     if not any(resolved.is_relative_to(r) for r in roots):
         return f"SAFETY GUARD REJECTED path: `{resolved}` is outside the active WorkspaceContext root (`{roots[0]}`). Cross-directory traversal is blocked."
@@ -797,6 +797,8 @@ TOOLS: List[Dict[str, Any]] = [
         "kind": _p("string", "Project category.", enum=["life", "work", "project", "software", "general"]),
         "workspace_path": _p("string", "Optional local Git repository directory bound to this project."),
         "delivery_policy": _p("string", "Git delivery posture.", enum=["local_only", "remote_branch_pr", "ask_me"]),
+        "init_git": _p("boolean", "Set true on `create_project`/`update_project` to initialize a greenfield Git repository on `main` with initial commit and focus it."),
+        "focus": _p("boolean", "Set true to immediately focus `WorkspaceContext` on this project."),
     }, ["action"]),
     _tool("calendar_manage", "Inspect or schedule across the Unified Calendar (appointments, focus blocks, sprint task dates, deadlines, routines, and due SRS reviews).", {
         "action": _p("string", "Calendar sub-action.", enum=["window", "today", "week", "month", "list_events", "add_event", "delete_event"]),
@@ -839,7 +841,7 @@ TOOLS: List[Dict[str, Any]] = [
         "params": _p("object", "Additional subsystem parameters dictionary (e.g. `{goal, title, mode, schedule_expr, command, skill_md, scripts, workflows}`)."),
     }, ["domain"]),
     _tool("git_manage", "Execute safe local Git, parallel `git worktree`, secret-shielded commit, and Blind-Vault-authenticated remote operations governed by project `delivery_policy`.", {
-        "action": _p("string", "Git or worktree sub-action.", enum=["status", "diff", "log", "branch", "worktree_add", "worktree_list", "worktree_remove", "commit", "fetch", "pull", "push"]),
+        "action": _p("string", "Git or worktree sub-action.", enum=["init", "status", "diff", "log", "branch", "worktree_add", "worktree_list", "worktree_remove", "commit", "fetch", "pull", "push"]),
         "repo_path": _p("string", "Optional repository or worktree path."),
         "branch": _p("string", "Feature/fix branch name."),
         "slug": _p("string", "Short kebab-case slug for `worktree_add`."),
@@ -910,7 +912,7 @@ _PHASE_LOCKED_ACTIONS: Dict[str, FrozenSet[str]] = {
     "agile_manage": frozenset({"create_project", "update_project", "save_board", "create_milestone", "save_epic", "delete_epic", "seed_dikw", "create_timebox", "start_sprint", "rollover_sprint", "create_item", "create_card", "update_item", "update_card", "save_card", "move_card", "delete_item", "delete_card", "slice_unblocker", "start_item", "start_card", "dispatch_item", "run_parallel_ready", "run_ready", "merge_item", "merge_local", "push_item_pr", "push_and_pr", "request_changes", "discard_worktree"}),
     "calendar_manage": frozenset({"add_event", "delete_event"}),
     "education_manage": frozenset({"save_course", "set_active", "advance_stage", "upsert_items", "generate_items", "grade_item", "curate_note"}),
-    "git_manage": frozenset({"branch", "worktree_add", "worktree_remove", "commit", "fetch", "pull", "push"}),
+    "git_manage": frozenset({"init", "branch", "worktree_add", "worktree_remove", "commit", "fetch", "pull", "push"}),
     "dev_preview": frozenset({"start", "vision_critique", "stop", "stop_all"}),
 }
 _PHASE_ACTION_EXCEPTIONS: Dict[str, FrozenSet[Tuple[str, str]]] = {
@@ -1059,8 +1061,13 @@ def resolve(p: str, for_write: bool = False) -> Path:
             sub = norm[len(rname) + 1 :]
             if sub and ((ws.project_root / sub).exists() or (for_write and (ws.project_root / sub).parent.exists())):
                 return ws.project_root / sub
-        if not for_write and not (ws.project_root / p).exists() and norm.startswith("skills/") and (ws.self_root / p).exists():
-            return ws.self_root / p
+    if not for_write and not (ws.project_root / p).exists():
+        skill_norm = norm[len(".github/") :] if norm.startswith(".github/skills/") else norm
+        if skill_norm == "skills" or skill_norm.startswith("skills/"):
+            if (ws.self_root / skill_norm).exists():
+                return ws.self_root / skill_norm
+            if skill_norm.startswith("skills/") and skill_norm[7:] and (settings.user_skills_dir / skill_norm[7:]).exists():
+                return settings.user_skills_dir / skill_norm[7:]
     return ws.project_root / p
 
 

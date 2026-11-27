@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 from companion.config import SELF_PROJECT_ID, _WORKSPACE_OVERRIDE, settings, workspace_context
 from companion.llm import chat, normalize_assistant_message, tier_context
-from companion.memory_store import MemoryStore, get_memory_store
+from companion.memory_store import MemoryStore, get_memory_store, has_memory_store_override
 from companion.routines import TriggerPolicy, evaluate_trigger_eligibility, register_trigger_precheck
 from companion.vault import normalize_secret_name
 
@@ -202,8 +202,23 @@ class ProjectGraphManager:
         proj = self.get_project(pid)
         self.store.set_user_profile("active_goal_project_id", proj["project_id"])
         ws_path = str(proj.get("workspace_path") or "").strip()
-        if self.store.db_path.resolve() == settings.db_path.resolve():
-            if proj["project_id"] == SELF_PROJECT_ID:
+        if ws_path and Path(ws_path).is_dir():
+            res_ws = Path(ws_path).resolve()
+            self.store.set_user_profile("active_project_id", proj["project_id"])
+            self.store.set_user_profile("active_project_path", str(res_ws))
+            raw_kp = self.store.get_user_profile().get("known_projects_json", "{}")
+            try:
+                kp = json.loads(raw_kp) if isinstance(raw_kp, str) and raw_kp.strip() else {}
+            except Exception:
+                kp = {}
+            if isinstance(kp, dict):
+                kp[proj["project_id"]] = str(res_ws)
+                self.store.set_user_profile("known_projects_json", json.dumps(kp, sort_keys=True))
+        elif proj["project_id"] == SELF_PROJECT_ID or not ws_path:
+            self.store.set_user_profile("active_project_id", SELF_PROJECT_ID)
+            self.store.set_user_profile("active_project_path", str(settings.root.resolve()))
+        if self.store.db_path.resolve() == settings.db_path.resolve() or has_memory_store_override():
+            if proj["project_id"] == SELF_PROJECT_ID or not ws_path:
                 settings.reset_workspace()
             elif ws_path and Path(ws_path).is_dir():
                 settings.set_workspace(Path(ws_path).resolve(), proj["project_id"])
@@ -230,7 +245,10 @@ class ProjectGraphManager:
         git_credential_ref: str = "", max_parallel_workers: int = 2, test_command: str = "", preview_command: str = "",
         wiki_hub_path: str = "", risk_ceiling: str = "R2", trigger_policy: Optional[Union[TriggerPolicy, Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None, project_id: Optional[str] = None,
+        init_git: bool = False, focus: bool = False, require_existing: bool = False,
     ) -> Dict[str, Any]:
+        from companion.worktrees import init_greenfield_repo, validate_external_repo_path
+
         clean_title = (title or "").strip()
         if not clean_title:
             raise ValueError("Project/Goal title is required.")
@@ -238,12 +256,30 @@ class ProjectGraphManager:
         existing_p = None if (project_id or slug) else self.store._fetch_rows("SELECT project_id FROM projects WHERE LOWER(title) = LOWER(?) AND status = 'active' LIMIT 1", (clean_title,))
         pid = (project_id or (str(existing_p[0][0]) if existing_p else f"proj_{base_slug}_{uuid.uuid4().hex[:6]}")).strip()
         tp = trigger_policy if isinstance(trigger_policy, TriggerPolicy) else TriggerPolicy.from_dict(trigger_policy)
-        ws_id = (workspace_id or settings.get_workspace().project_id or SELF_PROJECT_ID).strip()
-        ws_p = str(Path(workspace_path).resolve()) if (workspace_path or "").strip() else ""
+        eff_meta = dict(metadata or {})
+        eff_kind = ("software" if kind in ("goal", "project", "") else kind) if init_git else kind
+        raw_ws = (workspace_path or "").strip()
+        if init_git:
+            init_res = init_greenfield_repo(raw_ws or base_slug, title=clean_title, goal_summary=goal_summary)
+            if not init_res.get("ok"):
+                raise ValueError(str(init_res.get("error") or "Failed to initialize Git repository."))
+            ws_p = str(Path(str(init_res["repo_root"])).resolve())
+            eff_meta["git_branch"] = str(init_res.get("branch") or "main")
+            eff_meta["initial_commit"] = str(init_res.get("commit_sha") or "")
+        elif raw_ws:
+            cand = Path(raw_ws).expanduser()
+            resolved_ws = cand.resolve() if (cand.is_absolute() or raw_ws.startswith("~")) else (settings.projects_dir / cand).resolve()
+            if bound_err := validate_external_repo_path(resolved_ws):
+                raise ValueError(bound_err)
+            if require_existing and not resolved_ws.is_dir():
+                raise ValueError(f"Repository folder `{resolved_ws}` does not exist on disk. Switch to 'Create New Repo' to initialize it.")
+            ws_p = str(resolved_ws)
+        else:
+            ws_p = ""
+        ws_id = (workspace_id or (base_slug if ws_p else (settings.get_workspace().project_id or SELF_PROJECT_ID))).strip()
         dp_clean = _clean_delivery_policy(delivery_policy)
         cred_clean = _clean_git_cred_ref(git_credential_ref)
         mpw = max(1, min(4, int(max_parallel_workers or 2)))
-        eff_meta = dict(metadata or {})
         if test_command.strip():
             eff_meta["test_command"] = test_command.strip()
         if preview_command.strip():
@@ -260,9 +296,11 @@ class ProjectGraphManager:
                 "delivery_policy = excluded.delivery_policy, max_parallel_workers = excluded.max_parallel_workers, "
                 "git_credential_ref = CASE WHEN excluded.git_credential_ref != '' THEN excluded.git_credential_ref ELSE projects.git_credential_ref END, "
                 "wiki_hub_path = excluded.wiki_hub_path, risk_ceiling = excluded.risk_ceiling, trigger_policy_json = excluded.trigger_policy_json, metadata_json = excluded.metadata_json, updated_at = CURRENT_TIMESTAMP",
-                (pid, final_slug, clean_title, goal_summary.strip(), kind, ws_id, ws_p, dp_clean, cred_clean, mpw, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(eff_meta)),
+                (pid, final_slug, clean_title, goal_summary.strip(), eff_kind, ws_id, ws_p, dp_clean, cred_clean, mpw, wiki_hub_path.strip(), risk_ceiling, json.dumps(tp.to_dict()), json.dumps(eff_meta)),
             )
             self.store.conn.commit()
+        if focus or init_git:
+            return self.set_focus_project(pid)
         return self.get_project(pid)
 
     def get_project(self, project_id: Optional[str] = None) -> Dict[str, Any]:
@@ -284,6 +322,8 @@ class ProjectGraphManager:
         return [_hydrate_project(r) for r in rows]
 
     def update_project(self, project_id: str, **updates: Any) -> Dict[str, Any]:
+        from companion.worktrees import init_greenfield_repo, validate_external_repo_path
+
         proj = self.get_project(project_id)
         pid = proj["project_id"]
         tp_dict = dict(proj["trigger_policy"])
@@ -300,7 +340,26 @@ class ProjectGraphManager:
         kind = str(updates.get("kind") or proj["kind"]).strip()
         wiki_p = str(updates.get("wiki_hub_path") if updates.get("wiki_hub_path") is not None else proj["wiki_hub_path"]).strip()
         raw_ws_p = updates.get("workspace_path")
-        ws_p = (str(Path(str(raw_ws_p).strip()).resolve()) if str(raw_ws_p).strip() else "") if raw_ws_p is not None else str(proj.get("workspace_path") or "")
+        do_init = bool(updates.get("init_git"))
+        if do_init:
+            init_res = init_greenfield_repo(str(raw_ws_p or proj.get("workspace_path") or proj.get("slug") or title), title=title, goal_summary=goal_s)
+            if not init_res.get("ok"):
+                raise ValueError(str(init_res.get("error") or "Failed to initialize Git repository."))
+            ws_p = str(Path(str(init_res["repo_root"])).resolve())
+        elif raw_ws_p is not None:
+            clean_ws = str(raw_ws_p).strip()
+            if clean_ws:
+                cand = Path(clean_ws).expanduser()
+                res_ws = cand.resolve() if (cand.is_absolute() or clean_ws.startswith("~")) else (settings.projects_dir / cand).resolve()
+                if bound_err := validate_external_repo_path(res_ws):
+                    raise ValueError(bound_err)
+                if bool(updates.get("require_existing")) and not res_ws.is_dir():
+                    raise ValueError(f"Repository folder `{res_ws}` does not exist on disk. Switch to 'Create New Repo' to initialize it.")
+                ws_p = str(res_ws)
+            else:
+                ws_p = ""
+        else:
+            ws_p = str(proj.get("workspace_path") or "")
         dp_clean = _clean_delivery_policy(str(updates["delivery_policy"])) if updates.get("delivery_policy") is not None else str(proj.get("delivery_policy") or "local_only")
         cred_clean = _clean_git_cred_ref(str(updates["git_credential_ref"])) if updates.get("git_credential_ref") is not None else str(proj.get("git_credential_ref") or "")
         mpw = max(1, min(4, int(updates["max_parallel_workers"]))) if updates.get("max_parallel_workers") not in (None, "") else int(proj.get("max_parallel_workers") or 2)
@@ -310,6 +369,8 @@ class ProjectGraphManager:
                 (title, goal_s, kind, status, ws_p, dp_clean, cred_clean, mpw, wiki_p, json.dumps(tp_dict), json.dumps(meta), pid),
             )
             self.store.conn.commit()
+        if bool(updates.get("focus")) or self.store.get_user_profile().get("active_goal_project_id", "").strip() == pid:
+            return self.set_focus_project(pid)
         return self.get_project(pid)
 
     def create_milestone(self, project_id: str, title: str, description: str = "", stage_kind: str = "DELIVER_AND_VERIFY", target_date: str = "", sort_order: Optional[int] = None, milestone_id: str = "") -> Dict[str, Any]:
