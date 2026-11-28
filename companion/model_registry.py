@@ -58,7 +58,7 @@ MODEL_REGISTRY_DDL: Tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS llm_tier_routes (
         tier TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL,
         context_window_tokens INTEGER NOT NULL DEFAULT 262144, temperature REAL NOT NULL DEFAULT 0.2,
-        max_tokens INTEGER NOT NULL DEFAULT 8192, reasoning_effort TEXT NOT NULL DEFAULT '',
+        max_tokens INTEGER NOT NULL DEFAULT 16384, reasoning_effort TEXT NOT NULL DEFAULT '',
         fallback_provider_id TEXT NOT NULL DEFAULT '', fallback_model TEXT NOT NULL DEFAULT '',
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )""",

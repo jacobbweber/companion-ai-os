@@ -71,11 +71,13 @@ from companion.workflows import distill_workflow_reflection
 from companion.streaming import (
     check_cancelled,
     clean_subagent_wire_context,
+    detect_context_ceiling_truncation,
     emit_stream_event,
     get_active_wire_doc_context,
     get_active_wire_images,
     has_stream_sink,
     is_length_truncated,
+    record_live_context_ceiling,
     turn_context_scope,
     wire_attachment_context,
 )
@@ -961,6 +963,10 @@ def _run_step_loop(
             fin_reason = str(choice0.get("finish_reason") or "stop")
             raw_asst = choice0["message"]
             clean_text, thinking_text, tool_calls = normalize_assistant_message(raw_asst)
+            step_cfg = settings.resolve_tier(step_tier)
+            ctx_ceil = int(data.get("_context_ceiling_hit") or detect_context_ceiling_truncation(fin_reason, data.get("usage"), step_cfg.max_tokens))
+            if ctx_ceil > 0:
+                record_live_context_ceiling(step_cfg.base_url, step_cfg.model, ctx_ceil)
             hit_max_tokens = is_length_truncated(fin_reason) or bool(raw_asst.get("_truncated_tool_call"))
             dropped_forced_tools = bool(force_final_text and tool_calls)
             if force_final_text:
@@ -973,9 +979,15 @@ def _run_step_loop(
                     length_recoveries += 1
                     if clean_text.strip():
                         trunc_prose_parts.append(clean_text.strip())
-                    if telemetry.active_trace_id:
-                        telemetry.log("WARN", "agent", f"Step {step + 1} truncated (`finish_reason={fin_reason}`); auto-recovering ({length_recoveries}/2).")
-                    emit_stream_event({"type": "phase", "phase": f"Recovering truncated step ({length_recoveries}/2) · {settings.resolve_tier(step_tier).model}", "tier": step_tier or "fast"})
+                    if ctx_ceil > 0:
+                        if telemetry.active_trace_id:
+                            telemetry.log("WARN", "agent", f"Step {step + 1} hit context ceiling ({ctx_ceil} tokens); auto-compacting & continuing ({length_recoveries}/2).")
+                        emit_stream_event({"type": "phase", "phase": f"Context full ({ctx_ceil // 1024}k) — auto-compacting ({length_recoveries}/2) · {step_cfg.model}", "tier": step_tier or "fast"})
+                        compact_messages_if_needed(messages, keep_recent=6, store=mem, force=True, last_usage_tokens=ctx_ceil, tier=step_tier or top_tier, tools=step_tools, chat_fn=chat_fn)
+                    else:
+                        if telemetry.active_trace_id:
+                            telemetry.log("WARN", "agent", f"Step {step + 1} truncated (`finish_reason={fin_reason}`); auto-recovering ({length_recoveries}/2).")
+                        emit_stream_event({"type": "phase", "phase": f"Recovering truncated step ({length_recoveries}/2) · {step_cfg.model}", "tier": step_tier or "fast"})
                     messages.extend([
                         {"role": "assistant", "content": clean_text or "Continuing interrupted step."},
                         {"role": "user", "content": _build_truncation_recovery_prompt(length_recoveries, bool(step_tools))},
@@ -991,10 +1003,16 @@ def _run_step_loop(
                     final_text = clean_text if clean_text.strip() else recover_empty_synthesis(messages, chat_fn, prior_thinking=thinking_text)
                 if trunc_prose_parts and final_text.strip() and not final_text.lstrip().startswith(trunc_prose_parts[0][:40]):
                     final_text = "\n\n".join([*trunc_prose_parts, final_text.strip()]).strip()
-                if hit_max_tokens and _TRUNCATION_BANNER not in final_text:
-                    if has_stream_sink():
-                        emit_stream_event({"type": "text_delta", "delta": f"\n\n{_TRUNCATION_BANNER}"})
-                    final_text = f"{final_text.rstrip()}\n\n{_TRUNCATION_BANNER}".strip()
+                if hit_max_tokens:
+                    eff_banner = (
+                        f"⚠️ *(Model context window (`{ctx_ceil:,}` tokens) reached before completing. Run `/compact` or reply `continue` to compact and resume.)*"
+                        if ctx_ceil > 0
+                        else _TRUNCATION_BANNER
+                    )
+                    if eff_banner not in final_text:
+                        if has_stream_sink():
+                            emit_stream_event({"type": "text_delta", "delta": f"\n\n{eff_banner}"})
+                        final_text = f"{final_text.rstrip()}\n\n{eff_banner}".strip()
                 if force_final_text and (dropped_forced_tools or "approv" not in final_text.lower()):
                     apr_lbl = f" (`{paused_approval_id}`)" if paused_approval_id and paused_approval_id != "pending" else ""
                     apr_note = f"*(Action queued for approval{apr_lbl} — click **Approve** above and I will continue automatically.)*"
@@ -1004,7 +1022,7 @@ def _run_step_loop(
                     final_text = f"{final_text.rstrip()}\n\n{wfence}".strip()
                 messages.append({"role": "assistant", "content": final_text})
                 if log_to_conversations:
-                    t_meta = {"thinking": "\n\n".join(turn_thoughts)[-4000:], "tool_steps": turn_tools, "duration_ms": round((time.perf_counter() - turn_t0) * 1000.0, 1), "model": settings.resolve_tier(step_tier).model}
+                    t_meta = {"thinking": "\n\n".join(turn_thoughts)[-4000:], "tool_steps": turn_tools, "duration_ms": round((time.perf_counter() - turn_t0) * 1000.0, 1), "model": step_cfg.model}
                     mem.log_message("assistant", final_text, session_tag=session_tag, meta=t_meta)
                 if tid:
                     telemetry.end_trace(tid, status="warn" if hit_max_tokens else "ok")
@@ -1030,8 +1048,8 @@ def _run_step_loop(
                     ), ""
                 force_final_text = True
                 continue
-            if should_compact(messages, tier=step_tier or top_tier, last_usage_tokens=last_tokens, tools=step_tools):
-                compact_messages_if_needed(messages, store=mem, last_usage_tokens=last_tokens, tier=step_tier or top_tier, tools=step_tools, active_turn_start_idx=turn_start_idx)
+            if ctx_ceil > 0 or should_compact(messages, tier=step_tier or top_tier, last_usage_tokens=last_tokens, tools=step_tools):
+                compact_messages_if_needed(messages, keep_recent=6 if ctx_ceil > 0 else None, store=mem, force=ctx_ceil > 0, last_usage_tokens=max(last_tokens, ctx_ceil), tier=step_tier or top_tier, tools=step_tools, active_turn_start_idx=turn_start_idx, chat_fn=chat_fn)
         return "done", _synthesize_turn_budget_exit(messages, chat_fn, mem, session_tag, tid, last_doctor_pass, log_to_conversations=log_to_conversations), ""
 
 
@@ -1136,8 +1154,8 @@ def run_agent_turn(
             phase_tier = session_tag.split(":")[2] if automated_tag and (session_tag or "").count(":") >= 2 else None
             top_tier = phase_tier or (mem.get_user_profile().get("active_model_tier", "auto") if sub_depth == 0 else current_tier_name())
             can_escalate = (not top_tier or top_tier.strip().lower() == "auto") or automated_tag or sub_depth > 0
-            if should_compact(messages, tier=top_tier):
-                compact_messages_if_needed(messages, store=mem, tier=top_tier, active_turn_start_idx=max(1, len(messages) - 1))
+            if should_compact(messages, tier=top_tier, tools=TOOLS):
+                compact_messages_if_needed(messages, store=mem, tier=top_tier, tools=TOOLS, active_turn_start_idx=max(1, len(messages) - 1), chat_fn=chat_fn)
             with get_project_graph(store=mem).project_workspace_scope(), preview_turn_cleanup_scope(), tier_context(top_tier), memory_store_context(mem), session_id_context(session_tag or "main"):
                 turn_ctx = build_turn_context(store=mem, user_query=user_text if is_top else "", nudge_banner=nudge_banner)
                 _st, reply, _meta = _run_step_loop(

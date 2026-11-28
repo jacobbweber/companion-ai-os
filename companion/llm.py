@@ -15,8 +15,9 @@ from companion.llm_wire import (
     is_local_or_lan_endpoint, prepare_wire_request, read_wire_response, urlopen_safe,
 )
 from companion.streaming import (
-    check_cancelled, emit_stream_event, get_active_cancel_scope, has_stream_sink,
-    is_length_truncated, rescue_text_tool_calls, strip_thinking_tags, strip_unclosed_tool_call_tail,
+    check_cancelled, detect_context_ceiling_truncation, emit_stream_event, get_active_cancel_scope,
+    get_live_context_ceiling, has_stream_sink, is_length_truncated, record_live_context_ceiling,
+    rescue_text_tool_calls, strip_thinking_tags, strip_unclosed_tool_call_tail,
 )
 from companion.telemetry import telemetry
 
@@ -81,10 +82,7 @@ class ModelGate:
             with _GLOBAL_FG_LOCK:
                 _GLOBAL_FG_COUNT = max(0, _GLOBAL_FG_COUNT - 1)
                 rem = _GLOBAL_FG_THREADS.get(tid, 1) - 1
-                if rem <= 0:
-                    _GLOBAL_FG_THREADS.pop(tid, None)
-                else:
-                    _GLOBAL_FG_THREADS[tid] = rem
+                _GLOBAL_FG_THREADS.pop(tid, None) if rem <= 0 else _GLOBAL_FG_THREADS.__setitem__(tid, rem)
             with self._cond:
                 self._fg_active = max(0, self._fg_active - 1)
                 self._cond.notify_all()
@@ -122,10 +120,7 @@ class ModelGate:
             finally:
                 with self._cond:
                     rem = self._thread_depth.get(tid, 1) - 1
-                    if rem <= 0:
-                        self._thread_depth.pop(tid, None)
-                    else:
-                        self._thread_depth[tid] = rem
+                    self._thread_depth.pop(tid, None) if rem <= 0 else self._thread_depth.__setitem__(tid, rem)
             return
 
         eff_limit = 1 if exclusive else max(1, min(8, int(limit if limit is not None else self._max_concurrency)))
@@ -331,10 +326,16 @@ def discover_provider_models(base_url: str, api_key: str = "", dialect: str = "o
                 ps_root = re.sub(r"/(?:v1|api/v1)$", "", base, flags=re.I)
                 try:
                     with urlopen_safe(urllib.request.Request(f"{ps_root}/api/ps", method="GET", headers=hdrs), timeout=0.8, allow_private_lan=True, allow_redirects=False) as ps_r:
-                        ps_data = json.loads(ps_r.read().decode("utf-8", errors="replace"))
-                    loaded_ids = {str(x.get("name") or x.get("model")) for x in (ps_data.get("models") or []) if isinstance(x, dict)}
+                        ps_models = (json.loads(ps_r.read().decode("utf-8", errors="replace")).get("models") or [])
+                    loaded_ids = {str(x.get("name") or x.get("model")) for x in ps_models if isinstance(x, dict)}
+                    for x in ps_models:
+                        if isinstance(x, dict) and int(x.get("context_length") or 0) >= 2048:
+                            record_live_context_ceiling(base, str(x.get("name") or x.get("model") or ""), int(x["context_length"]))
                 except Exception:
                     pass
+            for m in raw_models:
+                if int(m.get("context_length") or m.get("max_model_len") or 0) >= 2048:
+                    record_live_context_ceiling(base, str(m["id"]), int(m.get("context_length") or m.get("max_model_len")))
             raw_models.sort(key=lambda m: str(m["id"]) not in loaded_ids)
             items = [{"id": str(m["id"]), "label": f"{m['id']} (loaded)" if str(m["id"]) in loaded_ids else str(m["id"]), "loaded": str(m["id"]) in loaded_ids, "context_window": int(m.get("context_length") or m.get("max_model_len") or 0)} for m in raw_models]
         top_labels = [x["label"] if x.get("loaded") else x["id"] for x in items[:3]]
@@ -354,18 +355,12 @@ def probe_endpoint(base_url: str, api_key: str = "", timeout: float = 2.5, diale
 def format_model_tiers_status(active_mode: str = "auto", check_health: bool = False) -> str:
     """Format a human-readable summary of all capability tiers (`default`, `fast`, `coding`, `reasoning`, `image`, `audio`, `video`, `embedding`)."""
     mode, priv = (active_mode or "auto").strip().lower(), settings.effective_privacy_mode()
-    lines = [
-        f"=== Companion Multi-Tier Model Router (Mode: `{mode}` | Privacy: `{priv}`) ===",
-        "Tiers inherit `default` unless customized in System -> Models, Tiers & Context (`/providers`) or `.env`.",
-        "",
-    ]
+    lines = [f"=== Companion Multi-Tier Model Router (Mode: `{mode}` | Privacy: `{priv}`) ===", "Tiers inherit `default` unless customized in System -> Models, Tiers & Context (`/providers`) or `.env`.", ""]
     probe_cache: Dict[Tuple[str, str], Tuple[bool, str]] = {}
     for t_name in CAPABILITY_TIERS:
         cfg: TierConfig = settings.resolve_tier(t_name)
         src_badge = f"DEDICATED:{cfg.dialect}" if cfg.is_dedicated else f"INHERITED:{cfg.dialect}"
-        eff_tag = f" | effort={cfg.reasoning_effort}" if cfg.reasoning_effort else ""
-        fb_tag = f" | fallback={cfg.fallback_model}" if cfg.fallback_model else ""
-        health_str = ""
+        eff_tag, fb_tag, health_str = (f" | effort={cfg.reasoning_effort}" if cfg.reasoning_effort else ""), (f" | fallback={cfg.fallback_model}" if cfg.fallback_model else ""), ""
         if check_health:
             ckey = (cfg.base_url, cfg.dialect)
             if ckey not in probe_cache:
@@ -374,7 +369,9 @@ def format_model_tiers_status(active_mode: str = "auto", check_health: bool = Fa
             if not ok and t_name != "default" and (cfg.fallback_model or cfg.base_url != settings.base_url.rstrip("/")):
                 detail += f" -> FAILOVER to `{cfg.fallback_model or 'default'}`"
             health_str = f" | Health: {detail}"
-        lines.append(f"  * `{t_name:<9}` : `{cfg.model}` @ `{cfg.base_url}` (ctx={cfg.context_window_tokens:,} | max_out={cfg.max_tokens:,} | temp={cfg.temperature:.2f}{eff_tag}{fb_tag} | {src_badge}){health_str}")
+        live_c = get_live_context_ceiling(cfg.base_url, cfg.model)
+        ctx_lbl = f"{min(cfg.context_window_tokens, live_c):,}" if live_c >= 2048 else f"{cfg.context_window_tokens:,}"
+        lines.append(f"  * `{t_name:<9}` : `{cfg.model}` @ `{cfg.base_url}` (ctx={ctx_lbl} | max_out={cfg.max_tokens:,} | temp={cfg.temperature:.2f}{eff_tag}{fb_tag} | {src_badge}){health_str}")
     lines.append("\nCommands: `/model status`, `/model check` (live ping), `/model auto|<tier>`, `/providers` (provider & Vault matrix).")
     return "\n".join(lines)
 
@@ -438,25 +435,12 @@ def normalize_assistant_message(msg_obj: Dict[str, Any]) -> Tuple[str, str, List
 def recover_empty_synthesis(messages: List[Dict[str, Any]], chat_fn: Callable[..., Dict[str, Any]], prior_thinking: str = "") -> str:
     """Retry once (`tools=None`) when an LLM returns an empty or `<think>`-truncated completion (`t81` guard)."""
     thought_ctx = f"\n[COMPLETED INTERNAL REASONING]\n{prior_thinking[-1600:]}\n" if prior_thinking.strip() else ""
-    prompt_text = (
-        f"{thought_ctx}Your previous response contained no visible answer text. Do NOT call tools or emit `<think>` tags; "
-        "write a concise, direct plain-English response immediately based on the context above."
-    )
-    if messages and messages[-1].get("role") == "tool":
-        retry_msgs = messages + [
-            {"role": "assistant", "content": "I have reviewed the tool outputs."},
-            {"role": "user", "content": prompt_text},
-        ]
-    elif messages and messages[-1].get("role") == "user":
-        retry_msgs = messages + [
-            {"role": "assistant", "content": "Understood."},
-            {"role": "user", "content": prompt_text},
-        ]
-    else:
-        retry_msgs = messages + [{"role": "user", "content": prompt_text}]
+    prompt_text = f"{thought_ctx}Your previous response contained no visible answer text. Do NOT call tools or emit `<think>` tags; write a concise, direct plain-English response immediately based on the context above."
+    last_role = messages[-1].get("role") if messages else ""
+    bridge = [{"role": "assistant", "content": "I have reviewed the tool outputs." if last_role == "tool" else "Understood."}] if last_role in ("tool", "user") else []
+    retry_msgs = messages + bridge + [{"role": "user", "content": prompt_text}]
     try:
-        retry_data = chat_fn(retry_msgs, None, "none")
-        retry_msg = (retry_data.get("choices") or [{}])[0].get("message") or {}
+        retry_msg = ((chat_fn(retry_msgs, None, "none").get("choices") or [{}])[0]).get("message") or {}
         clean_retry, _, _ = normalize_assistant_message(retry_msg)
         if clean_retry.strip():
             if telemetry.active_trace_id:
@@ -467,19 +451,13 @@ def recover_empty_synthesis(messages: List[Dict[str, Any]], chat_fn: Callable[..
     except Exception as exc:
         if telemetry.active_trace_id:
             telemetry.log("WARN", "llm", f"Empty synthesis retry failed: {exc}")
-
     for m in reversed(messages):
         if m.get("role") == "tool" and str(m.get("content") or "").strip():
-            snippet = str(m["content"]).strip()[:400]
-            fb_out = f"Completed the requested operation. Latest tool result:\n{snippet}"
+            fb_out = f"Completed the requested operation. Latest tool result:\n{str(m['content']).strip()[:400]}"
             if has_stream_sink():
                 emit_stream_event({"type": "text_delta", "delta": fb_out})
             return fb_out
-    fb_msg = (
-        "The model completed internal reasoning without emitting visible reply text. Please click Retry or reply `continue`."
-        if prior_thinking.strip()
-        else "Completed the requested check. Let me know how you would like to proceed."
-    )
+    fb_msg = "The model completed internal reasoning without emitting visible reply text. Please click Retry or reply `continue`." if prior_thinking.strip() else "Completed the requested check. Let me know how you would like to proceed."
     if has_stream_sink():
         emit_stream_event({"type": "text_delta", "delta": fb_msg})
     return fb_msg
@@ -529,6 +507,17 @@ def _resolve_swap_window(gate: ModelGate, base_url: str, model: str, api_key: st
     return swap_to, False
 
 
+def _probe_ollama_live_ctx(base_url: str, model: str) -> None:
+    if ":11434" not in base_url or "unittest" in sys.modules or get_live_context_ceiling(base_url, model) > 0:
+        return
+    ps_root = re.sub(r"/(?:v1|api/v1)$", "", base_url.rstrip("/"), flags=re.I)
+    with contextlib.suppress(Exception):
+        with urlopen_safe(urllib.request.Request(f"{ps_root}/api/ps", method="GET"), timeout=0.8, allow_private_lan=True, allow_redirects=False) as r:
+            for x in (json.loads(r.read().decode("utf-8", errors="replace")).get("models") or []):
+                if isinstance(x, dict) and int(x.get("context_length") or 0) >= 2048:
+                    record_live_context_ceiling(base_url, str(x.get("name") or x.get("model") or ""), int(x["context_length"]))
+
+
 def _resolve_ollama_fallback_or_hint(base_url: str, model: str, api_key: str) -> Tuple[Optional[str], str]:
     """Auto-detect an installed non-embedding Ollama model on HTTP 404, or return a plain-English setup hint."""
     disc = discover_provider_models(base_url, api_key=api_key, dialect="openai_compat", timeout=2.0)
@@ -552,10 +541,14 @@ def _post_completion(
         raise _fail_llm(span_label, call_start, f"Privacy Lock (`local_only`) blocked outbound cloud LLM call to `{target_base_url}` (`{target_model}`).")
     from companion.config import is_in_agent_tool_turn
 
-    want_stream = bool(has_stream_sink() and settings.stream_tokens and not is_in_agent_tool_turn())
-    target_url, headers, body = prepare_wire_request(eff_dialect, messages, tools, tool_choice, target_base_url, target_model, target_key, target_temp, target_max_tokens, reasoning_effort=reasoning_effort, stream=want_stream)
-    payload, gate, scope = json.dumps(body).encode("utf-8"), get_endpoint_gate(target_base_url), get_active_cancel_scope()
     is_local_oai = eff_dialect == "openai_compat" and is_local_or_lan_endpoint(target_base_url)
+    if is_local_oai:
+        _probe_ollama_live_ctx(target_base_url, target_model)
+    live_ctx = get_live_context_ceiling(target_base_url, target_model)
+    eff_max_tok = min(target_max_tokens, max(1024, live_ctx // 2)) if (live_ctx >= 2048 and ":11434" not in target_base_url and target_max_tokens >= live_ctx) else target_max_tokens
+    want_stream = bool(has_stream_sink() and settings.stream_tokens and not is_in_agent_tool_turn())
+    target_url, headers, body = prepare_wire_request(eff_dialect, messages, tools, tool_choice, target_base_url, target_model, target_key, target_temp, eff_max_tok, reasoning_effort=reasoning_effort, stream=want_stream)
+    payload, gate, scope = json.dumps(body).encode("utf-8"), get_endpoint_gate(target_base_url), get_active_cancel_scope()
     healed_400, tried_ollama_fb = False, False
     eff_conc = max(1, min(8, int(max_concurrency if max_concurrency is not None else (1 if ":11434" in target_base_url else 4))))
     shares_multi_model = is_local_oai and _endpoint_shares_tiers(target_base_url) and not gate._health_unsupported and ":11434" not in target_base_url
@@ -582,10 +575,16 @@ def _post_completion(
                     fin = str(choice0.get("finish_reason") or "stop")
                     clean_content, thinking_text, tcalls = normalize_assistant_message(choice0.get("message") or {})
                     toks = (data.get("usage") or {}).get("total_tokens", 0) if isinstance(data.get("usage"), dict) else 0
+                    ctx_ceil = detect_context_ceiling_truncation(fin, data.get("usage"), eff_max_tok)
+                    if ctx_ceil > 0:
+                        record_live_context_ceiling(target_base_url, target_model, ctx_ceil)
+                        data["_context_ceiling_hit"] = ctx_ceil
                     detail = f"tier={tier_label} dialect={eff_dialect} finish={fin} temp={target_temp:.2f}{' swapped=1' if is_swap else ''} msgs={len(messages)} tools_called={len(tcalls)} tokens={toks} chars={len(clean_content)} think_chars={len(thinking_text)}"
                     telemetry.record_span("llm_call", span_label, dur_ms, status="ok", detail=detail)
-                    if is_length_truncated(fin):
-                        telemetry.log("WARN", "llm", f"Completion hit max_tokens={target_max_tokens} on `{span_label}` (finish={fin}, tools={len(tcalls)}, chars={len(clean_content)})")
+                    if ctx_ceil > 0:
+                        telemetry.log("WARN", "llm", f"Completion hit context ceiling ({ctx_ceil} tokens) on `{span_label}` (finish={fin}, tools={len(tcalls)}, chars={len(clean_content)})")
+                    elif is_length_truncated(fin):
+                        telemetry.log("WARN", "llm", f"Completion hit max_tokens={eff_max_tok} on `{span_label}` (finish={fin}, tools={len(tcalls)}, chars={len(clean_content)})")
                     return data
                 except InterruptedError:
                     raise

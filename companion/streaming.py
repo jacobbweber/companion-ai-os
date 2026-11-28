@@ -503,11 +503,52 @@ def read_completion_or_sse_stream(resp: Any) -> Dict[str, Any]:
 
 
 _TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "model_context_window_exceeded"})
+_LIVE_CTX_LOCK = threading.Lock()
+_LIVE_CTX_CEILINGS: Dict[Tuple[str, str], int] = {}
 
 
 def is_length_truncated(finish_reason: Any) -> bool:
     """Return `True` when an LLM completion stopped because `max_tokens` or context length was reached."""
     return str(finish_reason or "").strip().lower() in _TRUNCATED_FINISH_REASONS
+
+
+def record_live_context_ceiling(base_url: str, model: str, context_tokens: int) -> None:
+    """Cache the actual loaded runner context window (`num_ctx` / `max_model_len`) for `(base_url, model)`."""
+    if not base_url or not model or int(context_tokens or 0) < 2048:
+        return
+    key = (base_url.strip().rstrip("/").lower(), model.strip().lower())
+    with _LIVE_CTX_LOCK:
+        _LIVE_CTX_CEILINGS[key] = int(context_tokens)
+
+
+def get_live_context_ceiling(base_url: str, model: str) -> int:
+    """Return the discovered live runner context window for `(base_url, model)`, or `0` if unknown."""
+    if not base_url or not model:
+        return 0
+    key = (base_url.strip().rstrip("/").lower(), model.strip().lower())
+    with _LIVE_CTX_LOCK:
+        return _LIVE_CTX_CEILINGS.get(key, 0)
+
+
+def clear_live_context_ceilings() -> None:
+    """Clear cached live runner context ceilings (for isolated unit tests)."""
+    with _LIVE_CTX_LOCK:
+        _LIVE_CTX_CEILINGS.clear()
+
+
+def detect_context_ceiling_truncation(finish_reason: Any, usage: Any, target_max_tokens: int) -> int:
+    """Return `total_tokens` when `finish_reason='length'` was caused by context-window starvation rather than `max_tokens`."""
+    if not is_length_truncated(finish_reason) or not isinstance(usage, dict):
+        return 0
+    total_tok = int(usage.get("total_tokens") or 0)
+    comp_tok = int(usage.get("completion_tokens") or 0)
+    prompt_tok = int(usage.get("prompt_tokens") or 0)
+    if str(finish_reason).strip().lower() == "model_context_window_exceeded" and total_tok >= 2048:
+        return total_tok
+    starved_cap = min(2048, max(256, int(target_max_tokens * 0.5))) if target_max_tokens > 0 else 1024
+    if total_tok >= 4096 and prompt_tok >= int(total_tok * 0.75) and comp_tok < starved_cap:
+        return total_tok
+    return 0
 
 
 def strip_unclosed_tool_call_tail(text: str) -> Tuple[str, bool]:

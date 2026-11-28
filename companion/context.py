@@ -27,6 +27,7 @@ from companion.config import (
     settings, slugify_project_id, walk_pruned_files,
 )
 from companion.llm import chat, format_model_tiers_status, tier_context
+from companion.streaming import get_live_context_ceiling
 from companion.memory_store import (
     MemoryStore, expand_semantic_terms, get_memory_store, semantic_similarity,
 )
@@ -37,7 +38,7 @@ __all__ = [
     "LocalKnowledgeAdapter", "VALID_TONES", "bootstrap_identity", "build_epistemic_grounding",
     "build_lossless_phase_handoff", "build_system_prompt", "build_turn_context", "build_workspace_radar",
     "classify_task_autoskip", "compact_messages_if_needed", "consolidate_turn_memory",
-    "discover_domain_packs", "discover_skills", "estimate_messages_chars", "estimate_messages_tokens",
+    "discover_domain_packs", "discover_skills", "effective_tier_context_window", "estimate_messages_chars", "estimate_messages_tokens",
     "execute_identity_action", "extract_key_tokens", "format_context_budget_status",
     "format_identity_summary", "format_skills_catalog", "format_task_carry_forward",
     "get_knowledge_port", "invalidate_skills_cache", "is_identity_bootstrapped",
@@ -1186,11 +1187,18 @@ def estimate_messages_tokens(
     return max(char_est, int(last_usage_tokens or 0))
 
 
+def effective_tier_context_window(tier: Optional[str] = None) -> int:
+    """Return the active tier's context window clamped to any discovered live runner `context_length` (`num_ctx`)."""
+    cfg = settings.resolve_tier(tier)
+    live = get_live_context_ceiling(cfg.base_url, cfg.model)
+    return min(cfg.context_window_tokens, live) if live >= 2048 else cfg.context_window_tokens
+
+
 def should_compact(
     messages: List[Dict[str, Any]], tier: Optional[str] = None,
     last_usage_tokens: int = 0, tools: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
-    tier_win = settings.resolve_tier(tier).context_window_tokens
+    tier_win = effective_tier_context_window(tier)
     trig_tokens = int(tier_win * (settings.compact_trigger_pct / 100.0))
     return estimate_messages_tokens(messages, last_usage_tokens=last_usage_tokens, tools=tools) > trig_tokens
 
@@ -1382,26 +1390,31 @@ def compact_messages_if_needed(
     """Adaptive 2-stage compaction using real `fast`-tier LLM summarization + deterministic `KeyTokens` check."""
     mem = store or get_memory_store()
     eff_tier = tier or mem.get_user_profile().get("active_model_tier", "auto")
-    tier_win = settings.resolve_tier(eff_tier).context_window_tokens
+    tier_win = effective_tier_context_window(eff_tier)
     trig_tokens = int(tier_win * (settings.compact_trigger_pct / 100.0))
     schema_chars = estimate_tools_chars(tools)
     trigger_chars = max_chars if max_chars is not None else int(trig_tokens * 4)
     keep = keep_recent if keep_recent is not None else settings.keep_recent_messages
     pre_chars = max(estimate_messages_chars(messages) + schema_chars, int(last_usage_tokens or 0) * 4)
-    if not force and (pre_chars <= trigger_chars or len(messages) <= keep + 2):
+    min_msgs = 6 if pre_chars > trigger_chars else (keep + 2)
+    if not force and (pre_chars <= trigger_chars or len(messages) <= min_msgs):
         return messages
 
     is_live_db = mem.db_path.resolve() == settings.db_path.resolve()
     exceeds_70pct = pre_chars > int(tier_win * 0.70 * 4)
     protect_idx = 0 if (force or exceeds_70pct or max_chars is not None) else active_turn_start_idx
     freed = prune_stale_tool_outputs(messages, keep_recent=max(2, keep // 2) if not force else 1, protect_from_idx=protect_idx)
-    post_stage1_chars = estimate_messages_chars(messages) + schema_chars
+    post_stage1_chars = max(estimate_messages_chars(messages) + schema_chars, max(0, (int(last_usage_tokens or 0) * 4) - freed))
     if freed > 0 and is_live_db:
         telemetry.record_span("compaction", "stage1_tool_prune", 0.5, status="ok", detail=f"freed_chars={freed}")
     if not force and post_stage1_chars <= trigger_chars:
         return messages
 
     eff_keep = keep_recent if keep_recent is not None else (2 if force else settings.keep_recent_messages)
+    if len(messages) <= eff_keep + 2 and len(messages) > 6:
+        eff_keep = max(4, len(messages) - 4)
+    while eff_keep > 4 and (estimate_messages_chars(messages[-eff_keep:]) + schema_chars) > int(tier_win * 0.55 * 4):
+        eff_keep = max(4, eff_keep // 2)
     if len(messages) <= eff_keep + 2:
         return messages
 
@@ -1435,7 +1448,7 @@ def format_context_budget_status(
 ) -> str:
     active_tokens = estimate_messages_tokens(messages, last_usage_tokens=last_usage_tokens, tools=tools)
     t_cfg = settings.resolve_tier(tier)
-    win = t_cfg.context_window_tokens
+    win = effective_tier_context_window(tier)
     trig = int(win * (settings.compact_trigger_pct / 100.0))
     targ = int(win * (settings.compact_target_pct / 100.0))
     win_pct, trig_pct = (active_tokens / max(1, win)) * 100.0, (active_tokens / max(1, trig)) * 100.0

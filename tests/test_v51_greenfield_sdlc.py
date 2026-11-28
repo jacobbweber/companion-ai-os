@@ -42,6 +42,9 @@ from surfaces.web_server import create_web_server, dispatch_raw_http
 
 class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
     def tearDown(self) -> None:
+        from companion.streaming import clear_live_context_ceilings
+
+        clear_live_context_ceilings()
         settings.reset_workspace()
 
     def test_projects_dir_resolution_and_path_safety_guards(self) -> None:
@@ -461,6 +464,9 @@ class TestGreenfieldBootstrapAndSdlcSystem(unittest.TestCase):
                 self.assertIsNone(handle_slash_command(verb, []))
 
             with contextlib.closing(MemoryStore(db_path=db_file)) as store, memory_store_context(store):
+                from companion.context import manage_model_tier
+
+                manage_model_tier("reasoning", store=store)
                 pg = get_project_graph(store=store)
                 proj = pg.create_project("Codesign Repo", kind="software", workspace_path=str(repo), focus=True)
 
@@ -550,6 +556,9 @@ class TestProjectsRootExplorerAndParity(unittest.TestCase):
     """Adversarial verification for F01/inc-02: Pinned Projects Root, Confined Explorer & Companion Tool/Slash Parity."""
 
     def tearDown(self) -> None:
+        from companion.streaming import clear_live_context_ceilings
+
+        clear_live_context_ceilings()
         settings.reset_workspace()
 
     def test_projects_root_persistence_fallback_and_adversarial_system_path_guards(self) -> None:
@@ -817,6 +826,9 @@ class TestTurnTruncationRecoveryAndOutputBudget(unittest.TestCase):
     """Regression verification for F01/inc-03 (`v5.1.2`): max_tokens budgets, finish_reason='length' recovery & live tool-stream progress."""
 
     def tearDown(self) -> None:
+        from companion.streaming import clear_live_context_ceilings
+
+        clear_live_context_ceilings()
         settings.reset_workspace()
 
     def test_tier_output_token_defaults_legacy_env_upgrade_and_http_400_clamp(self) -> None:
@@ -832,10 +844,10 @@ class TestTurnTruncationRecoveryAndOutputBudget(unittest.TestCase):
         )
         with patch.dict(os.environ, {k: "" for k in env_keys}, clear=False):
             cfg_fresh = Settings(reload_env=False)
-            self.assertEqual(cfg_fresh.max_tokens, 8192)
-            self.assertEqual(cfg_fresh.resolve_tier("fast").max_tokens, 8192)
-            self.assertEqual(cfg_fresh.resolve_tier("coding").max_tokens, 16384)
-            self.assertEqual(cfg_fresh.resolve_tier("reasoning").max_tokens, 16384)
+            self.assertEqual(cfg_fresh.max_tokens, 16384)
+            self.assertEqual(cfg_fresh.resolve_tier("fast").max_tokens, 16384)
+            self.assertEqual(cfg_fresh.resolve_tier("coding").max_tokens, 32768)
+            self.assertEqual(cfg_fresh.resolve_tier("reasoning").max_tokens, 32768)
 
         with patch.dict(
             os.environ,
@@ -849,8 +861,8 @@ class TestTurnTruncationRecoveryAndOutputBudget(unittest.TestCase):
         ):
             cfg_legacy = Settings(reload_env=False)
             self.assertEqual(cfg_legacy.max_tokens, 4096)
-            self.assertEqual(cfg_legacy.resolve_tier("coding").max_tokens, 16384)
-            self.assertEqual(cfg_legacy.resolve_tier("reasoning").max_tokens, 16384)
+            self.assertEqual(cfg_legacy.resolve_tier("coding").max_tokens, 32768)
+            self.assertEqual(cfg_legacy.resolve_tier("reasoning").max_tokens, 32768)
 
         with patch.dict(os.environ, {"COMPANION_REASONING_MAX_TOKENS": "6144"}, clear=False):
             self.assertEqual(Settings(reload_env=False).resolve_tier("reasoning").max_tokens, 6144)
@@ -927,6 +939,9 @@ class TestTurnTruncationRecoveryAndOutputBudget(unittest.TestCase):
                 }
 
             with contextlib.closing(MemoryStore(db_path=db_file)) as store, memory_store_context(store):
+                from companion.context import manage_model_tier
+
+                manage_model_tier("reasoning", store=store)
                 pg = get_project_graph(store=store)
                 pg.create_project("companion-origin", kind="software", workspace_path=str(repo), focus=True)
                 conv = [{"role": "user", "content": "yes"}]
@@ -990,6 +1005,123 @@ class TestTurnTruncationRecoveryAndOutputBudget(unittest.TestCase):
                 out_exh = run_agent_turn([{"role": "user", "content": "Write huge doc"}], max_iters=3, chat_fn=_always_truncated, store=store, verbose=False)
                 self.assertIn("max_tokens", out_exh)
                 self.assertIn("Reply `continue`", out_exh)
+
+    def test_context_ceiling_65k_vs_262k_env_auto_compacts_mid_turn_and_finishes_f06(self) -> None:
+        """Exact Spark tr_1795833885516_9fa429 repro: 65,536 Ollama KV ceiling vs 262k .env auto-compacts mid-turn and writes F06."""
+        from companion.context import effective_tier_context_window, should_compact
+        from companion.streaming import stream_event_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp).resolve()
+            repo = tmp_p / "companion-origin"
+            init_greenfield_repo(repo, title="companion-origin")
+            db_file = tmp_p / "ctx65k.db"
+            events: List[Dict[str, Any]] = []
+            calls = {"n": 0, "msg_counts": []}
+
+            def _mock_65k_ollama(messages: List[Dict[str, Any]], tools=None, _choice="auto") -> Dict[str, Any]:
+                # Summarizer calls pass tools=None
+                if tools is None:
+                    return {
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": "1. User Goals: Complete F01-F06 specs.\n2. Outcomes: F01-F05 written.\n3. Next: Write F06 increments.",
+                            },
+                        }]
+                    }
+                calls["n"] += 1
+                calls["msg_counts"].append(len(messages))
+                if calls["n"] == 1:
+                    # Simulate Ollama hitting 65,536 total context ceiling (prompt=65400, completion=136)
+                    return {
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": "length",
+                            "message": {
+                                "role": "assistant",
+                                "reasoning_content": "Preparing F06 increments...",
+                                "content": "Finishing the two F06 increment files now.",
+                            },
+                        }],
+                        "usage": {"prompt_tokens": 65400, "completion_tokens": 136, "total_tokens": 65536},
+                    }
+                if calls["n"] == 2:
+                    # Verify messages were compacted down BEFORE retry!
+                    self.assertLess(len(messages), 16)
+                    return {
+                        "choices": [{
+                            "index": 0,
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_f06_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "write_file",
+                                            "arguments": json.dumps({
+                                                "path": str(repo / "docs" / "features" / "F06-ui" / "inc-01-calm.md"),
+                                                "content": "# F06 inc-01\nCalm surface.\n",
+                                            }),
+                                        },
+                                    },
+                                    {
+                                        "id": "call_f06_2",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "write_file",
+                                            "arguments": json.dumps({
+                                                "path": str(repo / "docs" / "features" / "F06-ui" / "inc-02-eng.md"),
+                                                "content": "# F06 inc-02\nEngineering traces.\n",
+                                            }),
+                                        },
+                                    },
+                                ],
+                            },
+                        }],
+                        "usage": {"prompt_tokens": 12400, "completion_tokens": 620, "total_tokens": 13020},
+                    }
+                return {
+                    "choices": [{
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "### Checkpoint 3: Feature & Increment Backlog Complete\n\nAll F01–F06 specs written!",
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 13100, "completion_tokens": 120, "total_tokens": 13220},
+                }
+
+            with contextlib.closing(MemoryStore(db_path=db_file)) as store, memory_store_context(store):
+                from companion.context import manage_model_tier
+
+                manage_model_tier("reasoning", store=store)
+                pg = get_project_graph(store=store)
+                pg.create_project("companion-origin", kind="software", workspace_path=str(repo), focus=True)
+                conv: List[Dict[str, Any]] = []
+                for idx in range(14):
+                    conv.append({"role": "user", "content": f"Approve stop {idx} for F0{(idx % 5) + 1}"})
+                    conv.append({"role": "assistant", "content": f"Drafted spec F0{(idx % 5) + 1}/inc-01.md: " + ("spec body " * 300)})
+                conv.append({"role": "user", "content": "continue"})
+
+                with stream_event_context(events.append):
+                    reply = run_agent_turn(conv, chat_fn=_mock_65k_ollama, store=store, session_tag="web_ui", verbose=False)
+
+                self.assertEqual(calls["n"], 3)
+                self.assertGreater(calls["msg_counts"][0], 25)
+                self.assertLess(calls["msg_counts"][1], 16)
+                self.assertEqual(effective_tier_context_window("reasoning"), 65536)
+                self.assertTrue(should_compact([{"role": "user", "content": "hi"}], tier="reasoning", last_usage_tokens=52000))
+                self.assertTrue((repo / "docs" / "features" / "F06-ui" / "inc-01-calm.md").is_file())
+                self.assertTrue((repo / "docs" / "features" / "F06-ui" / "inc-02-eng.md").is_file())
+                self.assertIn("Checkpoint 3", reply)
+                self.assertTrue(any("Context full (64k)" in str(e.get("phase", "")) for e in events if e.get("type") == "phase"))
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ def walk_pruned_files(root: Path) -> List[Path]:
     return found
 
 _DEFAULT_TIER_TEMPS: Dict[str, float] = {"fast": 0.15, "coding": 0.15, "reasoning": 0.6}
-_DEFAULT_TIER_MAX_TOKENS: Dict[str, int] = {"coding": 16384, "reasoning": 16384}
+_DEFAULT_TIER_MAX_TOKENS: Dict[str, int] = {"coding": 32768, "reasoning": 32768}
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,7 @@ class TierConfig:
     context_window_tokens: int
     temperature: float = 0.2
     is_dedicated: bool = False
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     provider_id: str = "local-default"
     dialect: str = "openai_compat"
     reasoning_effort: str = ""
@@ -232,7 +232,7 @@ class Settings:
     data_dir: Optional[Path] = None
     max_iters: int = 25
     temperature: float = 0.2
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     shell_timeout: int = 60
     http_timeout: int = 900
     swap_timeout: int = 1800
@@ -288,7 +288,7 @@ class Settings:
         self.api_key = os.environ.get("COMPANION_API_KEY", "").strip()
         self.max_iters = max(3, _env_int("COMPANION_MAX_ITERS", 25))
         self.temperature = max(0.0, min(2.0, _env_float("COMPANION_TEMP", 0.2)))
-        self.max_tokens = max(256, _env_int("COMPANION_MAX_TOKENS", 8192))
+        self.max_tokens = max(256, _env_int("COMPANION_MAX_TOKENS", 16384))
         self.shell_timeout = max(5, _env_int("COMPANION_SHELL_TIMEOUT", 60))
         self.http_timeout = max(10, _env_int("COMPANION_HTTP_TIMEOUT", 900))
         self.swap_timeout = max(60, _env_int("COMPANION_SWAP_TIMEOUT", 1800))
